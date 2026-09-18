@@ -1,0 +1,624 @@
+---
+title: "Probability in Action, Interactively — Part 6: The bootstrap"
+description: "Resampling with replacement turns one dataset into a sampling distribution, an error bar and a confidence interval — and shows exactly where that trick stops working."
+permalink: "/math/probability-in-action/bootstrap/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #boot-data-canvas, #boot-hist-canvas, #fail-canvas {
+    background: var(--color-neutral-100); border-radius: var(--radius-sm); display: block;
+  }
+  #boot-readout .hi { font-weight: 600; color: var(--color-accent-800); }
+  .g-btnrow button.active { background: var(--color-accent-700); color: #fff; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>The bootstrap</h1>
+    <p>You have one sample and one number to report. Somebody asks how uncertain that number is, and for the sample mean there is a tidy answer: the standard error is <var>$s/\sqrt{n}$</var>. But the moment the quantity you care about is the median, a correlation, a ratio of two fitted coefficients, or the ninety-fifth percentile of a latency distribution, the tidy answer is gone. The classical escape is to assume a model and grind out an asymptotic variance &mdash; often hard, always approximate, and sometimes wrong in a way nobody notices. The bootstrap takes a different route: it treats the sample itself as a stand-in for the population, draws new samples from it, and watches the statistic move. It needs almost no algebra. This part builds that resampling picture from scratch, turns the resulting cloud of statistics into an error bar, and then spends real effort on the places where the trick quietly lies.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">One dataset, and no error formula</p>
+    <p>Suppose you run an experiment thirty times and record thirty numbers. The quantity you report is some function <var>$\hat\theta$</var> of those numbers: a mean, a median, a slope, an interquartile range. A single number is never the whole story &mdash; repeated experiments would have produced different numbers, and the reader wants to know how much <var>$\hat\theta$</var> would move if the experiment were run again. That movement is the <strong>sampling distribution</strong> of <var>$\hat\theta$</var>, and its standard deviation is the <strong>standard error</strong>. Everything in this part is about getting at that sampling distribution when you have only one sample.</p>
+    <p>The classical route goes through theory. If the observations are independent draws from <var>F</var>, then the sample mean has variance <var>$\sigma^2/n$</var>, estimated by <var>s^2/n</var>; the sample proportion has variance <var>p(1-p)/n</var>; and for anything smooth, the delta method linearises the statistic and the Fisher information gives an asymptotic variance. That is a beautiful machine, and this volume built it in Part 3. But it has costs. It requires a model for <var>F</var>, it requires the statistic to be differentiable in the data, and each new statistic needs its own derivation. The median of a skewed distribution, the ratio of two sample means, the correlation between two noisy series: each is a small research project.</p>
+    <p>The bootstrap sidesteps the derivation. It says: you do not know <var>F</var>, but you have an estimate of it sitting right in front of you. The thirty observations, taken together, define the <strong>empirical distribution</strong> <var>$\hat F$</var>, which puts probability <var>1/n</var> on each observation. That distribution is a crude but honest model of the population. Draw fresh samples of size <var>n</var> from <var>$\hat F$</var>, compute <var>$\hat\theta$</var> on each, and you get a cloud of values. The spread of that cloud estimates the spread of <var>$\hat\theta$</var> under the real <var>F</var>. No formula for the median was needed; the data did the work.</p>
+    <p>This is the <strong>plug-in principle</strong>, applied not to a single number but to a whole distribution: wherever the true sampling distribution would use <var>F</var>, substitute <var>$\hat F$</var>. The only real assumption is that the sample is representative, which is the same thing as saying the observations are independent draws from a common distribution. When that assumption holds, the substitution is remarkably effective. When it fails, the failure is usually loud and diagnosable, and the last section of this part is devoted to making it loud.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> resampling with replacement from one dataset reproduces the sampling distribution of a statistic, how to read an error bar and a confidence interval off the resampled cloud, and which statistics &mdash; maxima, order statistics, anything built on dependent data &mdash; break the method rather than merely stress it.</span></div>
+    <div class="g-toc">
+      <a href="#empirical">2 · Resampling from the empirical distribution</a>
+      <a href="#distribution">3 · The bootstrap distribution and intervals</a>
+      <a href="#fails">4 · When the bootstrap fails</a>
+      <a href="#shows">5 · Where this shows up</a>
+      <a href="#cheat">6 · Cheat sheet</a>
+      <a href="#reading">7 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="empirical">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Resampling from the empirical distribution</h2></div>
+    <p class="g-eyebrow">The sample as a miniature population</p>
+    <p>Write the data as <var>$x_1,\dots,x_n$</var>. The empirical distribution function counts how much of the sample lies at or below <var>x</var>, divided by <var>n</var>: a step function that rises by <var>1/n</var> at each observation and reaches one at the largest one. It is the distribution that would result if each data point were equally likely, and it is the nonparametric maximum-likelihood estimate of <var>F</var> &mdash; the distribution that makes the observed sample as probable as possible without assuming a shape.</p>
+    <div class="g-math g-katex">$$\hat F_n(x)=\frac{1}{n}\sum_{i=1}^{n}\mathbf{1}\{x_i\le x\},\qquad \hat F_n \text{ places mass } \tfrac{1}{n} \text{ on each } x_i.$$</div>
+    <p>A <strong>bootstrap resample</strong> is a fresh sample of size <var>n</var> drawn from <var>$\hat F_n$</var>. Drawing from a distribution that has mass <var>1/n</var> on each observed value means picking one of the <var>n</var> observations uniformly, <var>n</var> times over, <em>with replacement</em>. That last phrase carries all the weight. Because we replace each chosen value before choosing again, one original point can appear several times in a resample, and another can be left out entirely. The resample is not a permutation of the data. It is a new sample of the same size from a world in which the data are the only possible values.</p>
+    <div class="g-math g-katex">$$x_1^*,\dots,x_n^* \sim \hat F_n \quad\text{i.i.d.},\qquad \hat\theta^{*}=T(x_1^*,\dots,x_n^*).$$</div>
+    <p>The expected number of times a particular observation is chosen is exactly one, but that is an average. The count is Binomial<var>(n,1/n)</var>, so about <var>$37\%$</var> of the data points are absent from any given resample and some appear two, three or four times. The statistic <var>$\hat\theta^*$</var> computed on the resample therefore differs from <var>$\hat\theta$</var> computed on the original data, and the pattern of those differences is the thing we are trying to learn.</p>
+    <p>The demo below makes the mechanism visible. There is one fixed dataset of thirty values, generated from a seeded stream so it is the same on every reload. The grey rug along the bottom is that dataset. Press <em>Draw one resample</em> and watch the blue dots land on the grey points: each dot is one draw, and dots stack up on whichever original value was picked. Some grey points collect a small tower; others stay bare. The dashed line is the observed statistic, and the moving marker is the statistic of the resample being built. Each completed resample drops a single tally into the histogram underneath, and after a few hundred of them the histogram has become a picture of the sampling distribution &mdash; reconstructed from the one dataset and nothing else.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="boot-data-canvas" width="640" height="250"></canvas>
+        <p class="g-canvas-hint">Grey rug: the observed dataset of thirty values. Blue dots: copies drawn so far in the current resample, stacked on the original value they came from. The dashed line is the observed statistic.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="boot-hist-canvas" width="640" height="260"></canvas>
+        <p class="g-canvas-hint">Every finished resample adds one count to this histogram. The shaded band is the 95% percentile interval of the bootstrap distribution.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="boot-one">Draw one resample</button>
+          <button type="button" id="boot-many">Draw 1000</button>
+          <button type="button" id="boot-reset">Reset</button>
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="boot-mean" class="active">Mean</button>
+          <button type="button" id="boot-median">Median</button>
+        </div>
+        <div class="g-readout" id="boot-readout"></div>
+      </div>
+    </div>
+    <p>Two habits are worth forming at this point. First, the resample size must equal the original sample size; drawing fewer points would make the resampled statistic noisier than the real one and inflate the error bar. Second, the resampling is done with replacement, full stop. Sampling without replacement would return the original dataset every time, which tells you nothing about how the statistic would move under a new experiment. The entire information content of the bootstrap lives in the fact that a resample is genuinely different from the data it came from.</p>
+  </section>
+
+  <section class="g-step" id="distribution">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The bootstrap distribution and intervals</h2></div>
+    <p class="g-eyebrow">Turning a cloud of numbers into an error bar</p>
+    <p>Repeat the resampling <var>B</var> times, where <var>B</var> is a few thousand for real work, and collect the statistics <var>$\hat\theta^{*1},\dots,\hat\theta^{*B}$</var>. Their distribution is the <strong>bootstrap distribution</strong>. It is not the true sampling distribution of <var>$\hat\theta$</var>; it is an approximation obtained by replacing <var>F</var> with <var>$\hat F$</var>. The claim of the bootstrap is that these two distributions are close whenever the sample is a fair miniature of the population, and that closeness is what makes the method useful.</p>
+    <p>The simplest thing to read off is the <strong>bootstrap standard error</strong>: the sample standard deviation of the resampled statistics. It is an estimate of the standard error of <var>$\hat\theta$</var>, obtained without any formula for the standard error of <var>$\hat\theta$</var>. For the sample mean it will land on the familiar <var>$s/\sqrt n$</var>. For the median it returns a number you could not have written down from memory, and that is precisely the point.</p>
+    <div class="g-math g-katex">$$\widehat{\mathrm{SE}}_{\text{boot}}=\sqrt{\frac{1}{B-1}\sum_{b=1}^{B}\bigl(\hat\theta^{*b}-\bar{\hat\theta}^{*}\bigr)^2},\qquad \bar{\hat\theta}^{*}=\frac{1}{B}\sum_{b=1}^{B}\hat\theta^{*b}.$$</div>
+    <p>An error bar is not an interval, and the bootstrap can produce intervals too. The <strong>percentile interval</strong> simply reads ordered quantiles off the bootstrap distribution: for a 95% interval, take the 2.5th and 97.5th percentiles of the resampled statistics. It is the most direct method and the easiest to explain, and it is what the shaded band in the demo shows.</p>
+    <div class="g-math g-katex">$$\bigl[\hat\theta^{*}_{(B\alpha/2)},\ \hat\theta^{*}_{(B(1-\alpha/2))}\bigr]\ \ \text{(percentile)},\qquad \bigl[2\hat\theta-\hat\theta^{*}_{(B(1-\alpha/2))},\ 2\hat\theta-\hat\theta^{*}_{(B\alpha/2)}\bigr]\ \ \text{(basic)}.$$</div>
+    <p>The <strong>basic interval</strong> exploits the fact that the bootstrap distribution estimates the error distribution of <var>$\hat\theta$</var> around the truth. If <var>$\hat\theta^*-\hat\theta$</var> has the same distribution as <var>$\hat\theta-\theta$</var>, then rearranging gives the reflected interval above, which corrects a systematic shift that the percentile interval bakes in. When the bootstrap distribution is badly skewed, neither endpoint rule is quite right, and the <strong>BCa</strong> interval adds two corrections: a bias term <var>z_0</var> measuring how far the median of the bootstrap distribution sits from <var>$\hat\theta$</var>, and an acceleration term from a jackknife that adjusts for how the statistic's variance changes with the parameter. Even a crude version with the acceleration set to zero, which is what the readout below computes, moves the endpoints visibly when the distribution leans.</p>
+    <p>With <var>B=1000</var> the shape and the standard error are stable to about a percent or so; with <var>B=10</var> the histogram is a rumour. The relevant noise here is Monte Carlo noise &mdash; the error introduced by using finitely many resamples when the ideal has infinitely many. It shrinks like <var>$1/\sqrt B$</var>, exactly like every other simulation in this volume, and it is separate from the modelling error of using <var>$\hat F$</var> in place of <var>F</var>, which no amount of computing removes.</p>
+  </section>
+
+  <section class="g-step" id="fails">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>When the bootstrap fails</h2></div>
+    <p class="g-eyebrow">The maximum, and other statistics that live at the edge</p>
+    <p>The bootstrap assumes that resampling from <var>$\hat F$</var> mimics resampling from <var>F</var>. For an average that assumption is gentle: the sample mean responds to the whole distribution, and the empirical distribution captures the whole distribution well. For a statistic that depends on the extreme value of the sample, the assumption collapses. The sample <strong>maximum</strong> is the clean example.</p>
+    <p>Take a small sample and bootstrap its maximum. Every observation in a resample is a copy of an original observation, so the largest value any resample can contain is the largest value the original sample contained. The bootstrap distribution of the maximum therefore lives entirely below the observed maximum, with a hard wall at that point. Its mean sits <em>below</em> the observed max &mdash; the bootstrap says the maximum is biased low &mdash; and its spread is too narrow, because the real sampling distribution of the maximum has an upper tail that the bootstrap can never reach. The bootstrap is not merely imprecise here; it is structurally incapable of representing the uncertainty, and any confidence interval built from it will be too short.</p>
+    <div class="g-math g-katex">$$\text{support}\bigl(\max_i x_i^*\bigr)\subseteq(-\infty,\ \max_i x_i],\qquad \mathbb{E}\Bigl[\max_i X_i\Bigr]\ \text{can exceed the observed maximum.}$$</div>
+    <p>The demo below makes the failure quantitative. For this one demonstration we allow ourselves to know the true distribution: the sample is drawn from a standard normal. That lets us compute an <em>oracle</em> sampling distribution &mdash; thousands of fresh samples of the same size from the true normal &mdash; and plot it in pink beside the bootstrap in blue. On the right, for the mean, the two histograms sit almost on top of each other: the bootstrap has recovered the sampling distribution, and the standard errors agree. On the left, for the maximum, the oracle extends into a tail the bootstrap cannot enter, and the bootstrap's standard error is far too small. Drag the sample-size slider down and both effects worsen, because a small sample says even less about the tail it has not seen.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fail-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Left: the maximum. Pink is the true sampling distribution from fresh samples, blue is the bootstrap; the bootstrap cannot pass the observed maximum, so it underestimates the spread. Right: the mean, where the two agree.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sample size <span class="val">8</span></label><input type="range" id="fail-n" min="3" max="30" step="1" value="8"></div>
+        <div class="g-legend">
+          <span class="g-legend-item"><span class="g-swatch" style="background:#d6006c"></span> oracle sampling distribution</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#2b5fff"></span> bootstrap distribution</span>
+        </div>
+        <div class="g-readout" id="fail-readout"></div>
+      </div>
+    </div>
+    <p>The maximum is the sharpest case, but it is not the only one. Any statistic whose value is determined by a handful of the most extreme observations &mdash; the minimum, the range, the largest order statistic, the <var>99</var>th percentile of a heavy-tailed distribution &mdash; inherits the same defect, because <var>$\hat F$</var> has no mass beyond the observed extremes. The general diagnosis is that the bootstrap fails when the statistic is <strong>non-smooth</strong> in the data or when the empirical distribution is a poor approximation in the region that matters. A statistic that is a smooth function of many observations, like a mean, a variance or a regression coefficient under well-behaved noise, is safe; a statistic that hinges on a threshold or a maximum is not.</p>
+    <p>There is a second, independent failure mode, and it is about the data rather than the statistic. The bootstrap treats the observations as independent draws from a common <var>F</var>. When the data are a time series or a spatial field, nearby observations are correlated, and independent resampling destroys that dependence. The resampled series is smoother than any real series could be, and error bars come out too narrow. The repair is to resample <em>blocks</em> &mdash; contiguous stretches long enough to carry the dependence &mdash; rather than individual points, which is the block bootstrap; the same logic extends to clustered and hierarchical data through the cluster bootstrap. And the smallest failure of all is the least dramatic: with very few observations, <var>$\hat F$</var> is a coarse approximation and every bootstrap interval is optimistic, no matter how many resamples you draw.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Error bars for the statistics nobody has a formula for</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Robust fitting and RANSAC</h3>
+        <p style="margin-bottom:0;">A <a href="{{ '/vision/multi-view-geometry/ransac/' | relative_url }}">RANSAC</a> estimate is built from whichever random minimal sample happened to be all-inlier, so its variability is not a textbook standard error. Resampling the correspondences gives that estimate an honest error bar, and the same block-resampling idea repairs the case where correspondences are correlated across a sequence.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / ML</div>
+        <h3 style="margin:6px 0;">Uncertainty on benchmark scores</h3>
+        <p style="margin-bottom:0;">An evaluation reports accuracy, an F1, a pass rate on a rubric &mdash; none of which has a clean standard error. Bootstrapping the held-out examples produces the confidence intervals that <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation</a> dashboards need, and pairing the resamples across two models gives a test of whether the difference is real.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">The estimators it stands beside</h3>
+        <p style="margin-bottom:0;">The bootstrap is the computational sibling of the sampling-distribution theory in <a href="{{ '/math/probability-in-action/estimators/' | relative_url }}">Is this estimator any good?</a>: where that part computes bias and variance from a model, the bootstrap measures them from the data. The two should agree whenever the theory applies, and disagreement is itself diagnostic.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Intervals, without the algebra</h3>
+        <p style="margin-bottom:0;">A confidence interval is a statement about the sampling distribution, which is exactly what the bootstrap constructs. The percentile and basic intervals here are the resampling counterpoints to the Wald and likelihood intervals of <a href="{{ '/math/probability-in-action/intervals/' | relative_url }}">Confidence vs credible</a>, and the BCa correction is what to reach for when the simple ones lean.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Empirical CDF</td><td><var>$\hat F_n(x)=\frac{1}{n}\sum_i \mathbf{1}\{x_i\le x\}$</var></td><td>Mass <var>1/n</var> on each observation; the plug-in model for <var>F</var>.</td></tr>
+        <tr><td>Resample</td><td><var>$x_1^*,\dots,x_n^*\sim\hat F_n$</var></td><td>Draw <var>n</var> values with replacement, uniformly from the data.</td></tr>
+        <tr><td>Bootstrap statistic</td><td><var>$\hat\theta^{*}=T(x_1^*,\dots,x_n^*)$</var></td><td>Recompute the statistic on each resample; collect the cloud.</td></tr>
+        <tr><td>Bootstrap SE</td><td><var>$\sqrt{\frac{1}{B-1}\sum_b(\hat\theta^{*b}-\bar{\hat\theta}^{*})^2}$</var></td><td>The spread of the resampled statistics estimates the standard error.</td></tr>
+        <tr><td>Percentile interval</td><td><var>$[\hat\theta^{*}_{(B\alpha/2)},\hat\theta^{*}_{(B(1-\alpha/2))}]$</var></td><td>Read the endpoints straight off the sorted bootstrap cloud.</td></tr>
+        <tr><td>Basic interval</td><td><var>$[2\hat\theta-\hat\theta^{*}_{(1-\alpha/2)},\,2\hat\theta-\hat\theta^{*}_{(\alpha/2)}]$</var></td><td>Reflect the bootstrap error distribution around the estimate.</td></tr>
+        <tr><td>BCa</td><td><var>z_0</var> bias plus jackknife acceleration <var>a</var></td><td>Adjusts the endpoints when the cloud is skewed or the variance moves with the parameter.</td></tr>
+        <tr><td>Monte Carlo noise</td><td>shrinks like <var>$1/\sqrt B$</var></td><td>Finite <var>B</var> adds noise; it never fixes the modelling error of using <var>$\hat F$</var>.</td></tr>
+        <tr><td>Fails for</td><td>maxima, minima, extreme order statistics</td><td><var>$\hat F$</var> has no mass past the observed extremes, so the upper tail is unreachable.</td></tr>
+        <tr><td>Fix for dependence</td><td>block or cluster bootstrap</td><td>Resample contiguous blocks, not single points, when observations are correlated.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Bradley Efron and Robert Tibshirani, <em>An Introduction to the Bootstrap</em>, 1993 &mdash; the standard reference: the plug-in principle, the interval zoo, and the failure cases in one place.</li>
+      <li>Bradley Efron and Trevor Hastie, <em>Computer Age Statistical Inference</em>, 2016 &mdash; the bootstrap in the context of modern inference, with the accuracy theory behind BCa.</li>
+      <li>A. C. Davison and D. V. Hinkley, <em>Bootstrap Methods and Their Application</em>, 1997 &mdash; the careful treatment of dependent data and block resampling.</li>
+      <li>Persi Diaconis and Bradley Efron, <a href="https://projecteuclid.org/journals/statistical-science/volume-38/issue-1/Computer-Intensive-Methods-in-Statistics/10.1214/22-STS867.full">"Computer-Intensive Methods in Statistics"</a>, <em>Statistical Science</em>, 2023 &mdash; a retrospective on why resampling took hold.</li>
+      <li>Larry Wasserman, <em>All of Statistics</em>, chapter 8 &mdash; a compact proof sketch that the bootstrap works for smooth statistics, and a crisp statement of when it does not.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Resampling assumes you can draw from a distribution &mdash; next we build the machines that do the drawing.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var nd = Prob.dist.normal(0, 1);
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; if (!isFinite(x)) return '&mdash;'; return x.toFixed(d); }
+  function meanOf(a) { var s = 0, i; for (i = 0; i < a.length; i++) { s += a[i]; } return a.length ? s / a.length : 0; }
+  function maxOf(a) { var m = -Infinity, i; for (i = 0; i < a.length; i++) { if (a[i] > m) { m = a[i]; } } return m; }
+  function sortedCopy(a) { var b = a.slice(); b.sort(function (x, y) { return x - y; }); return b; }
+  function medianOf(a) {
+    var b = sortedCopy(a), n = b.length;
+    if (!n) { return 0; }
+    return n % 2 ? b[(n - 1) / 2] : 0.5 * (b[n / 2 - 1] + b[n / 2]);
+  }
+  function statOf(a, kind) { return kind === 'median' ? medianOf(a) : meanOf(a); }
+  function sdOf(a) {
+    if (a.length < 2) { return 0; }
+    var m = meanOf(a), s = 0, i;
+    for (i = 0; i < a.length; i++) { s += (a[i] - m) * (a[i] - m); }
+    return Math.sqrt(s / (a.length - 1));
+  }
+  function quantileOf(a, q) {
+    var b = sortedCopy(a), n = b.length;
+    if (!n) { return 0; }
+    var pos = (n - 1) * Math.max(0, Math.min(1, q));
+    var lo = Math.floor(pos), hi = Math.ceil(pos);
+    return b[lo] + (b[hi] - b[lo]) * (pos - lo);
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — one dataset, resampled with replacement into a histogram
+  // ------------------------------------------------------------------
+  var boot = { data: [], stat: 'mean', draws: [], indices: [], reveal: 0, seed: 20260914, rng: null, raf: null };
+  var dataView = null, histPlot = null;
+
+  function makeDataset() {
+    var r = Prob.rng(boot.seed), a = [], i;
+    for (i = 0; i < 30; i++) { a.push(10 + 4 * r.normal() + (i % 6 === 0 ? 6 : 0)); }
+    return a;
+  }
+
+  function resampleIndices() {
+    var n = boot.data.length, out = new Array(n), i;
+    for (i = 0; i < n; i++) { out[i] = Math.floor(boot.rng.uniform() * n); }
+    return out;
+  }
+
+  function valsFrom(idx, upto) {
+    var out = new Array(upto), k;
+    for (k = 0; k < upto; k++) { out[k] = boot.data[idx[k]]; }
+    return out;
+  }
+
+  function drawData() {
+    if (!dataView) { return; }
+    var ctx = dataView.ctx, W = 640, H = 250;
+    ctx.clearRect(0, 0, W, H);
+    var data = boot.data, n = data.length;
+    if (!n) { return; }
+    var lo = Math.min.apply(null, data) - 1.5, hi = Math.max.apply(null, data) + 1.5;
+    if (hi - lo < 1e-6) { hi = lo + 1; }
+    var padL = 26, padR = 26;
+    function X(v) { return padL + (v - lo) / (hi - lo) * (W - padL - padR); }
+    var base = H - 56, i, k;
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, base); ctx.lineTo(W - padR, base); ctx.stroke();
+
+    ctx.fillStyle = 'rgba(32,30,29,0.4)';
+    for (i = 0; i < n; i++) {
+      ctx.beginPath(); ctx.arc(X(data[i]), base + 12, 2.2, 0, Math.PI * 2); ctx.fill();
+    }
+
+    var counts = new Array(n);
+    for (i = 0; i < n; i++) { counts[i] = 0; }
+    var revealed = Math.min(boot.reveal, boot.indices.length);
+    for (k = 0; k < revealed; k++) { counts[boot.indices[k]]++; }
+    for (i = 0; i < n; i++) {
+      for (k = 0; k < counts[i]; k++) {
+        ctx.fillStyle = 'rgba(43,95,255,0.8)';
+        ctx.beginPath(); ctx.arc(X(data[i]), base - 11 - k * 8.5, 3.5, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    var theta = statOf(data, boot.stat);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6; ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(X(theta), 18); ctx.lineTo(X(theta), base); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('observed ' + boot.stat + ' = ' + theta.toFixed(2), X(theta), 13);
+
+    ctx.textAlign = 'left';
+    if (revealed > 0) {
+      var cur = statOf(valsFrom(boot.indices, revealed), boot.stat);
+      ctx.fillStyle = c.accent;
+      ctx.beginPath(); ctx.arc(X(cur), base - 4, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = 'bold 11px ' + c.font;
+      ctx.fillText('this resample: ' + boot.stat + ' = ' + cur.toFixed(2), padL, base + 34);
+    } else {
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+      ctx.fillText('press "Draw one resample" to resample the data with replacement', padL, base + 34);
+    }
+  }
+
+  function bootInterval(kind) {
+    var d = boot.draws, theta = statOf(boot.data, boot.stat);
+    if (d.length < 2) { return [theta, theta]; }
+    var q025 = quantileOf(d, 0.025), q975 = quantileOf(d, 0.975);
+    if (kind === 'percentile') { return [q025, q975]; }
+    if (kind === 'basic') { return [2 * theta - q975, 2 * theta - q025]; }
+    var below = 0, i;
+    for (i = 0; i < d.length; i++) { if (d[i] < theta) { below++; } }
+    var p0 = Math.max(0.001, Math.min(0.999, below / d.length));
+    var z0 = nd.quantile(p0);
+    var a1 = nd.cdf(2 * z0 + nd.quantile(0.025));
+    var a2 = nd.cdf(2 * z0 + nd.quantile(0.975));
+    return [quantileOf(d, Math.min(0.999, Math.max(0.001, a1))),
+            quantileOf(d, Math.min(0.999, Math.max(0.001, a2)))];
+  }
+
+  function renderBootReadout() {
+    var theta = statOf(boot.data, boot.stat), d = boot.draws, rows = [];
+    rows.push('<div><span class="k">dataset</span> n = ' + boot.data.length + '</div>');
+    rows.push('<div><span class="k">observed ' + boot.stat + '</span> <span class="hi">' + fmt(theta, 3) + '</span></div>');
+    rows.push('<div><span class="k">resamples drawn</span> ' + d.length + '</div>');
+    if (d.length >= 2) {
+      rows.push('<div><span class="k">bootstrap standard error</span> <span class="hi">' + fmt(sdOf(d), 4) + '</span></div>');
+    }
+    if (d.length >= 40) {
+      var p = bootInterval('percentile'), b = bootInterval('basic'), bc = bootInterval('bca');
+      rows.push('<div style="margin-top:6px;"><span class="k">percentile 95%</span> [' + fmt(p[0], 3) + ', ' + fmt(p[1], 3) + ']</div>');
+      rows.push('<div><span class="k">basic 95%</span> [' + fmt(b[0], 3) + ', ' + fmt(b[1], 3) + ']</div>');
+      rows.push('<div><span class="k">BCa-style 95%</span> [' + fmt(bc[0], 3) + ', ' + fmt(bc[1], 3) + ']</div>');
+    } else {
+      rows.push('<div style="margin-top:6px;">Draw a few dozen more resamples before the intervals mean anything.</div>');
+    }
+    el('boot-readout').innerHTML = rows.join('');
+  }
+
+  function drawHist() {
+    if (!histPlot) { return; }
+    var pl = histPlot, d = boot.draws, theta = statOf(boot.data, boot.stat);
+    var lo, hi;
+    if (d.length >= 2) { lo = quantileOf(d, 0.004); hi = quantileOf(d, 0.996); }
+    else { lo = theta - 1.2; hi = theta + 1.2; }
+    if (hi - lo < 1e-6) { hi = lo + 1; }
+    var pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+    var hist = Prob.hist(d.length ? d : [theta], { bins: 32, range: [lo, hi] });
+    var maxY = 1, i;
+    for (i = 0; i < hist.bins.length; i++) { maxY = Math.max(maxY, hist.bins[i].count); }
+    pl.xRange[0] = lo; pl.xRange[1] = hi;
+    pl.yRange[0] = 0; pl.yRange[1] = maxY * 1.2;
+    pl.clear();
+    pl.grid({ step: (hi - lo) / 5 });
+    if (d.length >= 20) {
+      var pi = bootInterval('percentile');
+      pl.band(pi[0], pi[1], { color: 'rgba(214,0,108,0.09)' });
+    }
+    pl.bars(hist.bins, { color: 'rgba(43,95,255,0.8)' });
+    pl.vline(theta, { color: c.accent2, dash: [6, 4], label: 'observed' });
+    pl.axes({ xLabel: 'resampled ' + boot.stat, yLabel: 'count' });
+    pl.legend();
+    renderBootReadout();
+  }
+
+  function pushResample() {
+    var vals = valsFrom(boot.indices, boot.indices.length);
+    boot.draws.push(statOf(vals, boot.stat));
+  }
+
+  function startAnim() {
+    var idx = resampleIndices();
+    boot.indices = idx;
+    boot.reveal = 0;
+    if (boot.raf) { window.cancelAnimationFrame(boot.raf); }
+    var t0 = null;
+    function frame(ts) {
+      if (t0 === null) { t0 = ts; }
+      var frac = (ts - t0) / 550;
+      if (frac > 1) { frac = 1; }
+      boot.reveal = Math.floor(frac * idx.length);
+      drawData();
+      if (frac < 1) {
+        boot.raf = window.requestAnimationFrame(frame);
+      } else {
+        boot.reveal = idx.length;
+        pushResample();
+        drawData(); drawHist();
+      }
+    }
+    boot.raf = window.requestAnimationFrame(frame);
+  }
+
+  function setStat(kind) {
+    if (boot.stat === kind) { return; }
+    boot.stat = kind;
+    boot.draws = []; boot.indices = []; boot.reveal = 0;
+    el('boot-mean').className = kind === 'mean' ? 'active' : '';
+    el('boot-median').className = kind === 'median' ? 'active' : '';
+    drawData(); drawHist();
+  }
+
+  boot.data = makeDataset();
+  boot.rng = Prob.rng(boot.seed + 1);
+  dataView = Guide.setupCanvas(el('boot-data-canvas'), 640, 250, drawData);
+  var t0 = statOf(boot.data, 'mean');
+  histPlot = Prob.plot(el('boot-hist-canvas'), {
+    W: 640, H: 260, xRange: [t0 - 1, t0 + 1], yRange: [0, 1], onResize: drawHist
+  });
+
+  el('boot-one').addEventListener('click', startAnim);
+  el('boot-many').addEventListener('click', function () {
+    var i;
+    for (i = 0; i < 1000; i++) {
+      boot.indices = resampleIndices();
+      pushResample();
+    }
+    boot.indices = resampleIndices();
+    boot.reveal = boot.indices.length;
+    drawData(); drawHist();
+  });
+  el('boot-reset').addEventListener('click', function () {
+    boot.draws = []; boot.indices = []; boot.reveal = 0;
+    boot.rng = Prob.rng(boot.seed + 1);
+    drawData(); drawHist();
+  });
+  el('boot-mean').addEventListener('click', function () { setStat('mean'); });
+  el('boot-median').addEventListener('click', function () { setStat('median'); });
+  drawData();
+  drawHist();
+
+  // ------------------------------------------------------------------
+  // Demo B — the bootstrap of a maximum against an oracle
+  // ------------------------------------------------------------------
+  var fail = { n: 8, seed: 424242, sample: [], bootMax: [], bootMean: [], orcMax: [], orcMean: [] };
+  var failView = null;
+
+  function regenFail() {
+    var n = fail.n, i, j;
+    var r = Prob.rng(fail.seed);
+    var s = new Array(n);
+    for (i = 0; i < n; i++) { s[i] = r.normal(); }
+    fail.sample = s;
+    var reps = 3000;
+    var rb = Prob.rng(fail.seed + 7), ro = Prob.rng(fail.seed + 99);
+    var bm = new Array(reps), bn = new Array(reps), om = new Array(reps), on = new Array(reps);
+    for (i = 0; i < reps; i++) {
+      var bs = new Array(n), os = new Array(n);
+      for (j = 0; j < n; j++) { bs[j] = s[Math.floor(rb.uniform() * n)]; os[j] = ro.normal(); }
+      bm[i] = maxOf(bs); bn[i] = meanOf(bs);
+      om[i] = maxOf(os); on[i] = meanOf(os);
+    }
+    fail.bootMax = bm; fail.bootMean = bn; fail.orcMax = om; fail.orcMean = on;
+  }
+
+  function binCounts(arr, lo, hi, k) {
+    var counts = new Array(k), i;
+    for (i = 0; i < k; i++) { counts[i] = 0; }
+    var w = (hi - lo) / k;
+    for (i = 0; i < arr.length; i++) {
+      var idx = Math.floor((arr[i] - lo) / w);
+      if (idx < 0) { idx = 0; }
+      if (idx >= k) { idx = k - 1; }
+      counts[idx]++;
+    }
+    return counts;
+  }
+
+  function drawFailPanel(ctx, x0, y0, w, h, mode, title) {
+    var bootArr = mode === 'max' ? fail.bootMax : fail.bootMean;
+    var orcArr = mode === 'max' ? fail.orcMax : fail.orcMean;
+    var lo, hi, i;
+    if (mode === 'max') {
+      lo = Math.min(Math.min.apply(null, orcArr), Math.min.apply(null, fail.sample));
+      hi = Math.max(Math.max.apply(null, orcArr), Math.max.apply(null, fail.sample));
+    } else {
+      lo = Math.min(Math.min.apply(null, orcArr), Math.min.apply(null, bootArr));
+      hi = Math.max(Math.max.apply(null, orcArr), Math.max.apply(null, bootArr));
+    }
+    if (hi - lo < 1e-6) { hi = lo + 1; }
+    var loPad = lo - (hi - lo) * 0.04, hiPad = hi + (hi - lo) * 0.04;
+    lo = loPad; hi = hiPad;
+    var k = 18;
+    var bc = binCounts(bootArr, lo, hi, k), oc = binCounts(orcArr, lo, hi, k);
+    var maxC = 1;
+    for (i = 0; i < k; i++) { maxC = Math.max(maxC, bc[i], oc[i]); }
+    var bw = w / k;
+    function Y(cnt) { return y0 + h - (cnt / maxC) * h; }
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+
+    for (i = 0; i < k; i++) {
+      var bx = x0 + i * bw;
+      ctx.fillStyle = 'rgba(214,0,108,0.34)';
+      ctx.fillRect(bx, Y(oc[i]), bw * 0.5, y0 + h - Y(oc[i]));
+      ctx.fillStyle = 'rgba(43,95,255,0.72)';
+      ctx.fillRect(bx + bw * 0.5, Y(bc[i]), bw * 0.5, y0 + h - Y(bc[i]));
+    }
+
+    var theta = mode === 'max' ? maxOf(fail.sample) : meanOf(fail.sample);
+    var tx = x0 + (theta - lo) / (hi - lo) * w;
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(tx, y0); ctx.lineTo(tx, y0 + h); ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = c.text; ctx.font = 'bold 12px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText(title, x0 + w / 2, y0 - 8);
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'left'; ctx.fillText(lo.toFixed(2), x0, y0 + h + 14);
+    ctx.textAlign = 'right'; ctx.fillText(hi.toFixed(2), x0 + w, y0 + h + 14);
+    if (mode === 'max') {
+      ctx.fillStyle = c.accent2; ctx.textAlign = 'center';
+      ctx.fillText('bootstrap cannot pass the observed max', x0 + w / 2, y0 + h + 28);
+    }
+  }
+
+  function renderFailReadout() {
+    var bMax = meanOf(fail.bootMax), sMax = sdOf(fail.bootMax);
+    var oMax = meanOf(fail.orcMax), tMax = sdOf(fail.orcMax);
+    var bMean = meanOf(fail.bootMean), sMean = sdOf(fail.bootMean);
+    var oMean = meanOf(fail.orcMean), tMean = sdOf(fail.orcMean);
+    el('fail-readout').innerHTML =
+      '<div><span class="k">sample size</span> ' + fail.n +
+        ' &nbsp;|&nbsp; <span class="k">observed max</span> ' + fmt(maxOf(fail.sample), 3) +
+        ' &nbsp;|&nbsp; <span class="k">observed mean</span> ' + fmt(meanOf(fail.sample), 3) + '</div>' +
+      '<div style="margin-top:6px;"><b>maximum</b>: bootstrap mean ' + fmt(bMax, 3) + ', SE ' + fmt(sMax, 3) +
+        ' &nbsp;vs oracle mean ' + fmt(oMax, 3) + ', SE ' + fmt(tMax, 3) + '</div>' +
+      '<div><b>mean</b>: bootstrap mean ' + fmt(bMean, 3) + ', SE ' + fmt(sMean, 3) +
+        ' &nbsp;vs oracle mean ' + fmt(oMean, 3) + ', SE ' + fmt(tMean, 3) + '</div>' +
+      '<div style="margin-top:6px;">For the maximum the bootstrap SE is too small and its mean sits below the oracle; for the mean the two columns agree.</div>';
+  }
+
+  function drawFail() {
+    if (!failView) { return; }
+    var ctx = failView.ctx, W = 640, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    drawFailPanel(ctx, 16, 34, 292, 208, 'max', 'max of ' + fail.n);
+    drawFailPanel(ctx, 332, 34, 292, 208, 'mean', 'mean of ' + fail.n);
+    renderFailReadout();
+  }
+
+  Guide.bindSliders([el('fail-n')], function (s) {
+    fail.n = parseInt(s.value, 10);
+    regenFail();
+    drawFail();
+  });
+  regenFail();
+  failView = Guide.setupCanvas(el('fail-canvas'), 640, 300, drawFail);
+  drawFail();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'bootstrap-resample',
+      kind: 'choice',
+      prompt: 'What is a bootstrap resample of a dataset of size <var>n</var>?',
+      options: [
+        { label: 'A new set of <var>n</var> values drawn from the data with replacement, each original point equally likely at every draw.', correct: true },
+        { label: 'A random reordering of the original <var>n</var> values.', correct: false },
+        { label: 'A new set of <var>n/2</var> values drawn from the data without replacement.', correct: false }
+      ],
+      explanation: 'Resampling is with replacement, at the same size as the original sample. Reordering changes nothing about the statistic, and sampling without replacement would just return the data.'
+    },
+    {
+      id: 'bootstrap-basic-interval',
+      kind: 'numeric',
+      prompt: 'For a statistic with observed value <var>$\\hat\\theta = 10.0$</var>, the bootstrap 2.5th and 97.5th percentiles are 8.0 and 13.0. What is the <em>upper</em> endpoint of the 95% basic interval, <var>$2\\hat\\theta - \\hat\\theta^{*}_{(0.025)}$</var>?',
+      answer: 12,
+      tolerance: 0.01,
+      explanation: 'The basic interval reflects the bootstrap error distribution, so its upper end is 2(10.0) − 8.0 = 12.0. Note it need not equal the upper percentile, 13.0.'
+    },
+    {
+      id: 'bootstrap-percentile-meaning',
+      kind: 'choice',
+      prompt: 'The 95% percentile interval is built by taking which quantities from the bootstrap distribution?',
+      options: [
+        { label: 'The 2.5th and 97.5th percentiles of the resampled statistics.', correct: true },
+        { label: 'The mean plus and minus two bootstrap standard errors.', correct: false },
+        { label: 'The smallest and largest resampled statistics observed.', correct: false }
+      ],
+      explanation: 'The percentile method reads the ordered bootstrap cloud directly. Mean ± 2 SE is a normal-approximation interval, and the min/max depend on how many resamples were drawn.'
+    },
+    {
+      id: 'bootstrap-max-fails',
+      kind: 'choice',
+      prompt: 'Why does the bootstrap badly underestimate the uncertainty of the maximum of a small sample?',
+      options: [
+        { label: 'Every resampled value is a copy of an observed value, so the bootstrap max can never exceed the observed max and its upper tail is missing.', correct: true },
+        { label: 'The maximum is not a statistic, so the bootstrap cannot be applied to it.', correct: false },
+        { label: 'Too few resamples are usually taken for the maximum to converge.', correct: false }
+      ],
+      explanation: 'The flaw is structural, not a matter of more computing: the empirical distribution has no mass beyond the largest observation, so the resampling world has a hard ceiling the real world does not. The same argument applies to minima and extreme order statistics.'
+    },
+    {
+      id: 'bootstrap-dependence',
+      kind: 'choice',
+      prompt: 'You bootstrap the mean of a strongly autocorrelated daily series by resampling individual days. What usually goes wrong, and what is the standard repair?',
+      options: [
+        { label: 'Independent resampling destroys the autocorrelation and the error bar is too narrow; resample contiguous blocks instead.', correct: true },
+        { label: 'The resamples are too smooth, so the error bar is too wide; resample single days with a larger <var>B</var>.', correct: false },
+        { label: 'Nothing goes wrong; the bootstrap is assumption-free by construction.', correct: false }
+      ],
+      explanation: 'The bootstrap needs independent draws from a common distribution. For dependent data, independent resampling removes the dependence that carries much of the variability, so a block or cluster bootstrap is used to preserve it.'
+    },
+    {
+      id: 'bootstrap-max-bound',
+      kind: 'numeric',
+      prompt: 'A sample has maximum 17.3. What is the largest possible value of the bootstrap maximum, no matter how many resamples you draw?',
+      answer: 17.3,
+      tolerance: 0.01,
+      explanation: 'A resample only ever contains copies of observed values, so its largest element is at most the largest observed value, 17.3. The bootstrap distribution of the maximum is capped there — which is exactly why it underestimates the uncertainty.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

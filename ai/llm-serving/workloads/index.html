@@ -1,0 +1,704 @@
+---
+title: "LLM Serving, Interactively — Part 18: Reasoning, agents and multimodal"
+description: "Workload shape as a first-class serving parameter: thinking-token budgets, agent turns with long tool gaps, image tokens that invert the prefill:decode ratio, and the 200 ms realtime voice budget."
+permalink: "/ai/llm-serving/workloads/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .wl-col { flex-direction: column; }
+  .wl-note { font-size: 12px; opacity: 0.7; margin: 0 0 8px; }
+  .wl-legend { display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 12px; margin-top: 8px; }
+  .wl-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .wl-legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 18 of 20</span>
+    <h1>Reasoning, agents and multimodal</h1>
+    <p>Two systems with the same model and the same RPS can need eight times different GPU fleets, because the workload shape — how many tokens come in, how many go out, how often, and whether an image arrives with them — is a serving parameter in its own right. This part makes shape measurable: output-length distributions, thinking budgets, agent turns with tool gaps, image tokens, and the hard 200&nbsp;ms wall of realtime voice.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="shape">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Workload shape is a serving parameter</h2></div>
+    <p class="g-eyebrow">RPS is the least useful number on the slide</p>
+    <p>Part 3 defined the four output metrics — TTFT, TPOT, end-to-end latency and goodput — and the training guide's <a href="{{ '/ai/llm-training/inference/' | relative_url }}">inference page</a> defined prefill versus decode. What that recap does not give you is the demand side. A request is not a unit: it is a prompt of some length, an output of some length, an arrival pattern, and a share of a shared prefix with everything around it. Two workloads can agree on 50 requests per second and disagree by an order of magnitude on every resource the fleet cares about. Decode cost scales with output tokens, prefill cost with input tokens, KV residency with input tokens times how long the request lives, and cache value with how much prefix is reused. Shape turns RPS into those four quantities, and shape is what this page models.</p>
+    <div class="g-math g-katex">$$\text{GPUs}\;\propto\;\text{rate}\times\Big(\underbrace{\frac{E[\text{prompt}]}{v_{\text{prefill}}}}_{\text{prefill seconds}}+\underbrace{\frac{E[\text{output}]}{v_{\text{decode}}}}_{\text{decode seconds}}\Big)$$</div>
+    <p>The rest of this page is five shapes that each break that arithmetic in a different place: reasoning moves <span class="k">E[output]</span>, agents multiply turns and add idle KV, vision moves <span class="k">E[prompt]</span> by thousands of tokens, and voice fixes the latency budget so tightly that only TTFT and the first audio chunk fit inside it.</p>
+  </section>
+
+  <section class="g-step" id="reasoning">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Reasoning blows up the output-length distribution</h2></div>
+    <p class="g-eyebrow">Same RPS, eight times the GPUs</p>
+    <p>Chain-of-thought and test-time compute scale a model's quality by letting it generate more tokens before it answers; the training guide's <a href="{{ '/ai/llm-training/reasoning/' | relative_url }}">reasoning page</a> covers why the technique works. The serving consequence is blunt: the output distribution stops being a short chat response and becomes a long, heavy-tailed one. A chat turn of 200 tokens and a reasoning turn of 2,000 tokens are the same request count and the same concurrency cost at admission, but the reasoning turn holds a decode slot — and a KV block — ten times as long. Because decode throughput is memory-bandwidth-bound and shared, that extra residency directly multiplies the fleet.</p>
+    <p>The demo below runs the same discrete-event engine on three output distributions at the same arrival rate, and sizes the fleet from the simulated per-request service time. Nothing changes but the shape.</p>
+    <div class="g-demo mt-col wl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="wl-profiles" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">GPUs needed at the slider's RPS, from simulated service time at 70% target utilisation.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Arrival rate (req/s) <span class="val">3</span></label><input type="range" id="wl-rate" min="0.5" max="10" step="0.5" value="3"></div>
+        <div class="g-readout" id="wl-profiles-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="wl-src"></p>
+    <div class="g-goal">💡 <span><b>The number to remember:</b> at the same RPS, chat→reasoning is roughly an 8× fleet multiplier. Capacity planning that starts from requests per second and a single "average" output length will under-provision reasoning by almost an order of magnitude.</span></div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Thinking-token budgets</h2></div>
+    <p class="g-eyebrow">Saturating quality, linear cost, one knee</p>
+    <p>If reasoning helps, why not let every request think for 50,000 tokens? Because quality saturates while cost does not. On most verifiable tasks the accuracy curve is concave in thinking budget: the first few hundred tokens buy most of the gain, and beyond a knee each further block of tokens buys nearly nothing. Cost, meanwhile, is exactly linear in tokens generated: it is decode time, and decode time is GPU-seconds. The economically correct budget is not the model's maximum but the point where the marginal quality per token collapses — and that point is different for a math problem than for a support reply. A budget is therefore a per-route policy, and it belongs in the gateway next to the rate limit.</p>
+    <p>The demo models quality as a saturating exponential and adds a rework penalty for wrong answers, so the effective cost per task has a minimum — that minimum is the knee you would actually configure.</p>
+    <div class="g-demo mt-col wl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="wl-budget" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Quality (blue) and effective cost per task (pink) against the thinking budget.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Thinking budget (tokens) <span class="val">2000</span></label><input type="range" id="wl-budget-b" min="100" max="8000" step="100" value="2000"></div>
+        <div class="g-field"><label>Output price (USD / M tokens) <span class="val">15</span></label><input type="range" id="wl-budget-price" min="1" max="40" step="1" value="15"></div>
+        <div class="g-field"><label>Rework cost per wrong task (USD) <span class="val">0.40</span></label><input type="range" id="wl-budget-rework" min="0.05" max="1.5" step="0.05" value="0.4"></div>
+        <div class="g-readout" id="wl-budget-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="agents">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Agents: many turns, long gaps, enormous shared prefixes</h2></div>
+    <p class="g-eyebrow">The request is not the unit of work — the session is</p>
+    <p>An agentic session is a loop: send a context, get a tool call, execute the tool for a while, append the result, repeat. That changes three quantities at once. First, a single user action becomes many model turns, so the gateway's RPM budget and the engine's admission both see a burst. Second, the turns are separated by tool gaps of hundreds of milliseconds to many seconds, during which the sequence is alive but idle — its KV is resident or evicted, but it is not decoding. Third, every turn resends a prefix that grows monotonically: system prompt, tool schemas, prior turns, tool outputs. The shared prefix is the same bytes on every hop, which is exactly what prefix caching was built for; the training guide's <a href="{{ '/ai/llm-training/tools-agents/' | relative_url }}">tools-and-agents page</a> covers the loop itself. On realistic agent traces, KV cache hit rate is the difference between a system that works and one that thrashes — vLLM with Mooncake reported P50 TTFT falling 46× on agentic traces as hit rate rose from 1.7% to 92.2% (Part 8).</p>
+    <p>So the agent workload's defining resource is not FLOPs but <em>KV residency across gaps</em>. Hold it, and you pay memory for idle time; evict it, and you pay recompute on resume; offload it, and you pay transfer. Which is correct is a function of gap length, and that is the next demo.</p>
+  </section>
+
+  <section class="g-step" id="residency">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>KV residency across tool calls</h2></div>
+    <p class="g-eyebrow">Hold in HBM, evict and recompute, or offload</p>
+    <p>A 70B-class model with GQA carries about 0.33&nbsp;MB of KV per token, so a 16K-token agent context is a little over 5&nbsp;GB of resident state — real HBM that another session could be decoding into. Holding it across a 2.5&nbsp;s tool gap costs about 13&nbsp;GB·s of occupancy and buys a zero-cost resume. Evicting frees the state but makes the next turn re-prefill 16K tokens at maybe 8,000 tokens/s, a 2&nbsp;s stall added to that turn's TTFT. Offloading to host DRAM frees HBM and avoids recompute, but pays a copy out and back over PCIe at ~25&nbsp;GB/s, about 0.4&nbsp;s round trip. The crossover is short: hold is clearly right for sub-second gaps and wrong for gaps of many seconds under memory pressure, which is why production systems tier KV rather than pick one policy globally.</p>
+    <div class="g-demo mt-col wl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="wl-agent" width="640" height="260"></canvas>
+        <p class="g-canvas-hint">One agent turn: prefill, decode, tool gap, repeat. Policy buttons change the gap.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="wl-cross" width="640" height="240"></canvas>
+        <p class="g-canvas-hint">Resource-seconds per turn against gap length; the crossover is where hold stops winning.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="wl-policy-row">
+          <button data-pol="hold" class="g-primary">Hold KV</button>
+          <button data-pol="recompute">Evict + recompute</button>
+          <button data-pol="offload">Offload to DRAM</button>
+        </div>
+        <div class="g-btnrow"><button id="wl-agent-play">Play</button></div>
+        <div class="g-field"><label>Context length (tokens) <span class="val">16000</span></label><input type="range" id="wl-ctx" min="1000" max="32000" step="1000" value="16000"></div>
+        <div class="g-field"><label>Tool gap (seconds) <span class="val">2.5</span></label><input type="range" id="wl-gap" min="0.1" max="30" step="0.1" value="2.5"></div>
+        <div class="g-readout" id="wl-agent-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="vision">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Image tokens and the prefill:decode inversion</h2></div>
+    <p class="g-eyebrow">A picture is thousands of prompt tokens</p>
+    <p>Vision enters the transformer as tokens. A ViT-style encoder patchifies the image — commonly 14-pixel patches pooled to a 28-pixel effective token — so a 1024×1024 image is on the order of 1,400 visual tokens before any tiling, and a zoomed crop scheme can push that past 5,000. Those tokens join the prompt: they are prefill, they are compute-bound on the way in, and they are KV resident for the rest of the request. The output, meanwhile, is often short — a caption, a Yes/No answer, a bounding box. That inverts the usual ratio. Text chat might be one prefill token per eight decode tokens; a high-resolution image question can be thirty prefill tokens per decode token, and the request's cost profile flips from decode-heavy to prefill-heavy. How a vision transformer turns pixels into those tokens at all, and how patch size, tiling and token merging set the budget, is built from zero in <a href="{{ '/ai/multimodal/resolution/' | relative_url }}">Multimodal Models, Part 6</a> and its predecessor on the ViT.</p>
+    <div class="g-demo mt-col wl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="wl-vision" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Prefill (blue) versus decode (pink) work for a text baseline and the current image.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Image side (pixels) <span class="val">1024</span></label><input type="range" id="wl-img-r" min="224" max="2048" step="32" value="1024"></div>
+        <div class="g-field"><label>Zoom tiles <span class="val">1</span></label><input type="range" id="wl-img-t" min="1" max="4" step="1" value="1"></div>
+        <div class="g-field"><label>Text prompt tokens <span class="val">300</span></label><input type="range" id="wl-img-text" min="0" max="2000" step="50" value="300"></div>
+        <div class="g-field"><label>Output tokens <span class="val">200</span></label><input type="range" id="wl-img-out" min="50" max="1000" step="50" value="200"></div>
+        <div class="g-readout" id="wl-vision-readout"></div>
+      </div>
+    </div>
+    <p>The pool-sizing consequence is direct and is the subject of <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a>: if prefill work dominates, disaggregating a fixed ratio of prefill to decode workers is wrong — the vision traffic wants a much larger prefill pool, and because the encoder itself is a separate compute stage, it can be its own pool entirely.</p>
+  </section>
+
+  <section class="g-step" id="encoder">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Encoder disaggregation and caching</h2></div>
+    <p class="g-eyebrow">The image is often shared; the question is not</p>
+    <p>The vision encoder — patch embedding, the ViT stack, the projector into the language model's embedding space — is a self-contained compute stage that produces a fixed set of image tokens for a given image. That has two useful properties. It can be disaggregated: run encoders on their own pool, sized for image throughput, and pass the projected embeddings to the language prefill pool so the LLM GPUs never hold encoder weights. And it can be cached: the same image appearing in many requests (a product photo, a dashboard screenshot, a document page) encodes identically, so the embedding is a cache key. A vision cache keyed on the image hash collapses the encoder cost of repeated images to a lookup, and the language-side prefix cache then reuses the projected tokens for free. The two caches compose, and on image-heavy traffic the encoder is the stage where caching pays first because the encoder has no decode phase at all. For the from-scratch version of that stage — what the encoder computes, why its output is a cache key, and how the cost model is built — see <a href="{{ '/ai/multimodal/serving-and-open-problems/' | relative_url }}">Multimodal Models, Part 16</a>.</p>
+    <div class="g-goal">💡 <span><b>Rule of thumb:</b> cache the image embedding, not the pixels. Two requests that hash to the same image but ask different questions share the entire encoder output and the entire image-token prefix; only the question differs.</span></div>
+  </section>
+
+  <section class="g-step" id="voice">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Realtime audio is full-duplex and budget-bound</h2></div>
+    <p class="g-eyebrow">Everything must fit in 200 milliseconds</p>
+    <p>Realtime speech is the tightest latency shape in the catalogue. A conversation feels natural when the gap between the user finishing and the assistant starting is under roughly 200&nbsp;ms; past that, turn-taking breaks down. Inside that budget sits automatic speech recognition streaming a partial transcript, the network hop to the model, TTFT for the reply, and the text-to-speech first audio chunk. The budget is per direction and the system is full-duplex — the assistant may be speaking while it listens — so ASR and TTS run concurrently and share the GPU with decode. This is the shape that most strongly punishes a monolithic pool: a long text generation queued alongside a voice session will blow the 200&nbsp;ms budget even if the average load is low, because the voice session's deadline is not a percentile target, it is a hard interaction constraint. The models inside that budget — CTC, RNN-T, Whisper, and the two-pass fix that makes them stream — are built from scratch in <a href="{{ '/ai/generative-media/asr-and-duplex/' | relative_url }}">Generative Media, Part 19</a>.</p>
+    <div class="g-demo mt-col wl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="wl-voice" width="640" height="240"></canvas>
+        <p class="g-canvas-hint">The 200 ms budget, filled with ASR, network, TTFT and TTS first chunk.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="wl-voice-play">Play</button></div>
+        <div class="g-field"><label>ASR (ms) <span class="val">60</span></label><input type="range" id="wl-v-asr" min="20" max="120" step="5" value="60"></div>
+        <div class="g-field"><label>Network (ms) <span class="val">30</span></label><input type="range" id="wl-v-net" min="10" max="80" step="5" value="30"></div>
+        <div class="g-field"><label>TTFT (ms) <span class="val">60</span></label><input type="range" id="wl-v-ttft" min="20" max="150" step="5" value="60"></div>
+        <div class="g-field"><label>TTS first chunk (ms) <span class="val">40</span></label><input type="range" id="wl-v-tts" min="20" max="120" step="5" value="40"></div>
+        <div class="g-field"><label>GPU work per turn (ms) <span class="val">90</span></label><input type="range" id="wl-v-gpu" min="30" max="300" step="10" value="90"></div>
+        <div class="g-field"><label>Turn interval (ms) <span class="val">1500</span></label><input type="range" id="wl-v-interval" min="800" max="3000" step="100" value="1500"></div>
+        <div class="g-readout" id="wl-voice-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="pools">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>What each shape does to pool sizing</h2></div>
+    <p class="g-eyebrow">One fleet, four different bottlenecks</p>
+    <p>Put the shapes side by side and the pool-sizing answer stops being a single number. Reasoning is decode-bound: the prefill pool is small, the decode pool is large, and the binding constraint is decode batch slots and KV bandwidth. Agents are <em>residency</em>-bound: decode throughput matters, but the pool must also be sized for the KV of idle sessions and for the prefill spikes when caches miss, and the right architecture is prefix-cache-aware routing plus a KV tier. Vision is prefill-bound and encoder-heavy: it wants a large prefill pool, a separate encoder pool, and image-embedding cache in front of both. Voice is latency-bound: it wants a small dedicated pool with strict admission, because mixing it into a shared decode pool trades away the one guarantee its users can feel. The same accelerator, four different shapes, four different ratios — and the disaggregation ratio from Part 13 is the parameter you retune per route, not per cluster.</p>
+    <div class="g-warn">⚠ <span><b>Sizing rule:</b> split traffic into these four classes before you size anything. A blended average across them is the single most common capacity-planning error in serving, and it fails in exactly the direction of the loudest workload.</span></div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Shape to bottleneck to pool</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Shape</th><th>What moves</th><th>Binding resource</th><th>Pool response</th></tr></thead>
+      <tbody>
+        <tr><td>Chat</td><td>Short output, short prompt</td><td>Decode slots at low TPOT</td><td>Balanced pools; the baseline</td></tr>
+        <tr><td>Code</td><td>Medium output, tighter TPOT SLO</td><td>Decode bandwidth; speculative value</td><td>Large decode pool; speculation on</td></tr>
+        <tr><td>Reasoning</td><td>Output mean ×8, heavy tail</td><td>Decode slots and KV residency</td><td>~8× decode fleet; hard token budgets</td></tr>
+        <tr><td>Agents</td><td>Many turns; long idle gaps; huge shared prefix</td><td>KV residency + prefix hit rate</td><td>Cache-aware routing; KV tiering; prefill headroom</td></tr>
+        <tr><td>Vision</td><td>Prompt ×10<sup>3</sup> tokens per image</td><td>Prefill and encoder compute</td><td>Large prefill pool; separate encoder pool; embedding cache</td></tr>
+        <tr><td>Realtime voice</td><td>Fixed 200 ms end-to-end budget</td><td>Latency, full-duplex GPU sharing</td><td>Small dedicated pool; strict admission</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Wei et al., <a href="https://arxiv.org/abs/2201.11903">Chain-of-Thought Prompting Elicits Reasoning in Large Language Models</a>, NeurIPS 2022.</li>
+      <li>Pope et al., "Efficiently Scaling Transformer Inference" (MLSys 2023) — the service-time model behind the fleet arithmetic.</li>
+      <li>Dosovitskiy et al., <a href="https://arxiv.org/abs/2010.11929">An Image is Worth 16x16 Words</a>, ICLR 2021 — patchification and the visual-token count.</li>
+      <li><a href="https://vllm.ai/blog/2026-05-06-mooncake-store">vLLM x Mooncake: Serving Agentic Workloads at Scale</a> — prefix-cache hit rate and TTFT on agentic traces.</li>
+      <li>The <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">disaggregation part</a> for sizing prefill and decode pools, and <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">prefix caching</a> for the KV hierarchy agent traffic depends on.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Shape tells you what to run. The next part is how to keep it running: gateways, autoscaling, cold starts and routing.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__WL_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, SS = window.ServingSim, c = G.colors();
+
+  var FALLBACK = {
+    workloads: {
+      source: "Reasoning, agent and multimodal figures: reasoning output lengths and test-time-compute scaling are from the training guide's reasoning page and the chain-of-thought literature; agent prefix-cache numbers (P50 TTFT down 46x as hit rate rose from 1.7% to 92.2%, and 3.8x throughput) are from the vLLM x Mooncake agentic-workload benchmark (vllm.ai/blog/2026-05-06-mooncake-store, 6 May 2026) and the Mooncake paper (arXiv:2407.00079). KV bytes per token for a 70B-class GQA model (~0.33 MB) are computed from the model configs in this project's llm-serving-numbers.json (80 layers, 8 KV heads, head_dim 128, FP16). Vision token counts assume 14-pixel patches pooled to a 28-pixel effective token, per the ViT patchification scheme (Dosovitskiy et al., arXiv:2010.11929); real token counts vary by encoder, pooling and tiling. The 200 ms realtime-voice budget is the widely used conversational turn-taking target; stage splits are illustrative. Recode/recompute latency assumes ~8,000 prefill tokens/s/GPU and PCIe Gen4 at ~25 GB/s. These are order-of-magnitude, guide-friendly values, not a single published benchmark."
+    }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function applyData(d) {
+    if (d) DATA.shared = d;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+
+  var SRC = document.getElementById("wl-src");
+  if (SRC) SRC.textContent = FALLBACK.workloads.source;
+
+  var PREFILL_TPS = 20000, DECODE_TPS = 1200, UTIL = 0.7;
+
+  // ---- Demo 1: chat vs code vs reasoning ---------------------------------
+  (function () {
+    var canvas = document.getElementById("wl-profiles");
+    if (!canvas) return;
+    var rateS = document.getElementById("wl-rate");
+    var readout = document.getElementById("wl-profiles-readout");
+    var W = 640, H = 340, ctx = null;
+    var PROFILES = [
+      { name: "Chat", promptMean: 600, promptCV: 0.7, decodeMean: 220, decodeCV: 0.6 },
+      { name: "Code", promptMean: 900, promptCV: 0.7, decodeMean: 600, decodeCV: 0.8 },
+      { name: "Reasoning", promptMean: 700, promptCV: 0.7, decodeMean: 2000, decodeCV: 1.2 }
+    ];
+    var cache = null;
+
+    function build() {
+      return PROFILES.map(function (p, i) {
+        var wl = SS.workload({
+          seed: 11 + i, rate: 2, promptMean: p.promptMean, promptCV: p.promptCV,
+          decodeMean: p.decodeMean, decodeCV: p.decodeCV, horizon: 30000
+        });
+        var run = SS.run({
+          requests: wl.requests, policy: "fcfs", capacity: 256, kvBlocks: 16384,
+          blockSize: 16, chunkedPrefill: true, prefillTokBudget: 2048,
+          stepMs: 20, preempt: "recompute", horizon: 30000
+        });
+        return { profile: p, run: run, wl: wl };
+      });
+    }
+
+    function render() {
+      if (!ctx) return;
+      if (!cache) cache = build();
+      var rate = parseFloat(rateS.value);
+      var out = cache.map(function (r, i) {
+        var service = r.profile.promptMean / PREFILL_TPS + r.profile.decodeMean / DECODE_TPS;
+        var gpus = Math.max(1, Math.ceil(rate * service / UTIL));
+        return { name: r.profile.name, gpus: gpus, service: service, r: r, idx: i };
+      });
+      var maxG = Math.max.apply(null, out.map(function (o) { return o.gpus; }));
+      var data = out.map(function (o) {
+        return {
+          label: o.name, value: o.gpus, valueLabel: o.gpus + " GPUs",
+          color: o.idx === 0 ? c.accent : (o.idx === 1 ? c.accent500 : c.accent2)
+        };
+      });
+      ctx.clearRect(0, 0, W, H);
+      G.drawBars(ctx, W, H, data, { maxV: maxG, padL: 96, padR: 96, padT: 22, padB: 16, fontSize: 13 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("GPUs at " + rate + " req/s, 70% utilisation", 8, 15);
+
+      var base = out[0].gpus || 1;
+      var lines = out.map(function (o) {
+        var reqs = o.r.run.perReq;
+        var outs = [];
+        Object.keys(reqs).forEach(function (k) { outs.push(reqs[k].outputLen); });
+        var p50 = Math.round(SS.percentile(outs, 50)), p90 = Math.round(SS.percentile(outs, 90)), p99 = Math.round(SS.percentile(outs, 99));
+        var mult = o.idx === 0 ? "" : " (<span class=\"" + (o.idx === 2 ? "bad" : "hi") + "\">" + (o.gpus / base).toFixed(1) + "×</span>)";
+        return '<span class="k">' + o.name + ":</span> " + o.gpus + " GPUs" + mult +
+          " · output p50/p90/p99 " + p50 + "/" + p90 + "/" + p99 + " tok" +
+          " · TTFT p90 " + G.fmtMs(o.r.run.stats.ttft.p90);
+      });
+      lines.push('<span class="k">service time/req:</span> ' + out.map(function (o) { return o.name + " " + o.service.toFixed(2) + "s"; }).join(" · "));
+      readout.innerHTML = lines.join("<br>");
+    }
+
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([rateS], render);
+    onData(function () { cache = null; render(); });
+  })();
+
+  // ---- Demo 2: thinking-token budget -------------------------------------
+  (function () {
+    var canvas = document.getElementById("wl-budget");
+    if (!canvas) return;
+    var bS = document.getElementById("wl-budget-b");
+    var pS = document.getElementById("wl-budget-price");
+    var rwS = document.getElementById("wl-budget-rework");
+    var readout = document.getElementById("wl-budget-readout");
+    var W = 640, H = 340, ctx = null;
+    var QMAX = 0.92, K = 600;
+
+    function quality(b) { return QMAX * (1 - Math.exp(-b / K)); }
+    function kneeB() { return K * Math.log(1 / (1 - 0.95)); }
+    function render() {
+      if (!ctx) return;
+      var b = parseInt(bS.value, 10);
+      var price = parseFloat(pS.value), rework = parseFloat(rwS.value);
+      var kb = kneeB();
+      var maxB = 8000;
+      var qPts = [], costPts = [], effPts = [], maxEff = 0, minEff = Infinity, minB = 0;
+      for (var x = 100; x <= maxB; x += 100) {
+        var q = quality(x);
+        var gen = x * price / 1e6;
+        var eff = gen + (1 - q) * rework;
+        qPts.push({ x: x, y: q });
+        costPts.push({ x: x, y: gen });
+        effPts.push({ x: x, y: eff });
+        if (eff < minEff) { minEff = eff; minB = x; }
+        if (eff > maxEff) maxEff = eff;
+      }
+      var costScale = maxEff > 0 ? 1 / maxEff : 1;
+      var qScaled = qPts.map(function (p) { return { x: p.x, y: p.y }; });
+      var cScaled = effPts.map(function (p) { return { x: p.x, y: p.y * costScale }; });
+
+      ctx.clearRect(0, 0, W, H);
+      var axes = G.drawLines(ctx, W, H, [
+        { points: qScaled, color: c.accent, width: 2.5 },
+        { points: cScaled, color: c.accent2, width: 2.5 }
+      ], [0, maxB], [0, 1], { xLabel: "thinking budget (tokens)", yLabel: "quality (0–1) / scaled cost" });
+
+      // knee line
+      var kx = axes.px(kb);
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.3;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(kx, axes.padT); ctx.lineTo(kx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent700; ctx.font = "10px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("knee ≈ " + Math.round(kb) + " tok", kx, axes.padT - 2);
+
+      // current budget
+      var bx = axes.px(b), bq = quality(b), be = b * price / 1e6 + (1 - bq) * rework;
+      var by = axes.py(bq), ey = axes.py(be * costScale);
+      ctx.strokeStyle = c.text; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(bx, axes.padT); ctx.lineTo(bx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(bx, by, 4.5, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(bx, ey, 4.5, 0, 2 * Math.PI); ctx.fill();
+
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("blue: quality   pink: effective cost per task", axes.padL + 6, axes.padT + 12);
+
+      var gen = b * price / 1e6;
+      var eff = gen + (1 - quality(b)) * rework;
+      var marginal = (quality(b + 1000) - quality(b)) * 100; // percentage points per +1000 tokens
+      readout.innerHTML =
+        '<span class="k">budget:</span> ' + b + " tok · quality <span class=\"hi\">" + (quality(b) * 100).toFixed(1) + "%</span><br>" +
+        '<span class="k">generation cost:</span> ' + gen.toFixed(4) + " USD/task<br>" +
+        '<span class="k">effective (incl. rework):</span> <span class="hi">' + eff.toFixed(4) + " USD/task</span><br>" +
+        '<span class="k">quality-optimal knee:</span> ≈' + Math.round(kb) + " tok · cost-optimal ≈" + minB + " tok<br>" +
+        '<span class="k">marginal gain near here:</span> ' + marginal.toFixed(2) + " percentage points per +1,000 tokens";
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([bS, pS, rwS], render);
+  })();
+
+  // ---- Demo 3: agent trace and KV residency ------------------------------
+  (function () {
+    var traceCanvas = document.getElementById("wl-agent");
+    var crossCanvas = document.getElementById("wl-cross");
+    if (!traceCanvas || !crossCanvas) return;
+    var ctxS = document.getElementById("wl-ctx");
+    var gapS = document.getElementById("wl-gap");
+    var readout = document.getElementById("wl-agent-readout");
+    var policyRow = document.getElementById("wl-policy-row");
+    var playBtn = document.getElementById("wl-agent-play");
+    var W = 640, Ht = 260, Hc = 240, tctx = null, cctx = null;
+    var policy = "hold", cursor = 0;
+    var PREFILL_TPS_C = 8000, PCIE_GBS = 25, KV_MB_PER_TOK = 0.327, HOLD_RATE = 0.25;
+
+    function kvGB(ctxTokens) { return ctxTokens * KV_MB_PER_TOK / 1024; }
+    function recomputeS(ctxTokens) { return ctxTokens / PREFILL_TPS_C; }
+    function offloadS(ctxTokens) { return 2 * kvGB(ctxTokens) / PCIE_GBS + 0.03; }
+    function holdS(ctxTokens, gapS) { return kvGB(ctxTokens) * gapS * HOLD_RATE; }
+    function crossover(ctxTokens) {
+      var rec = recomputeS(ctxTokens);
+      var coef = kvGB(ctxTokens) * HOLD_RATE;
+      return coef > 0 ? rec / coef : 0;
+    }
+
+    function drawTrace() {
+      if (!tctx) return;
+      var ctxTokens = parseInt(ctxS.value, 10), gap = parseFloat(gapS.value);
+      tctx.clearRect(0, 0, W, Ht);
+      var padL = 54, padR = 14, padT = 26, axisH = 22;
+      var plotW = W - padL - padR;
+      var prefill = Math.max(0.05, ctxTokens / PREFILL_TPS_C);
+      var decode = 0.9;
+      var turn = prefill + decode + gap;
+      var turns = 3;
+      var total = turn * turns;
+      var scale = plotW / total;
+      var lanes = ["Turn 1", "Turn 2", "Turn 3"];
+      var laneH = (Ht - padT - axisH) / turns;
+
+      tctx.font = "12px " + c.font; tctx.textAlign = "left"; tctx.fillStyle = c.text;
+      tctx.fillText("policy: " + policy + " · prefill " + prefill.toFixed(2) + "s · gap " + gap.toFixed(1) + "s", 8, 14);
+
+      for (var i = 0; i < turns; i++) {
+        var x = padL + i * turn * scale;
+        var y = padT + i * laneH + laneH * 0.18;
+        var h = Math.max(4, laneH * 0.62);
+        tctx.fillStyle = c.accent500;
+        tctx.fillRect(x, y, prefill * scale, h);
+        tctx.fillStyle = c.accent;
+        tctx.fillRect(x + prefill * scale, y, decode * scale, h);
+        // gap region
+        var gx = x + (prefill + decode) * scale, gw = gap * scale;
+        if (policy === "hold") {
+          tctx.fillStyle = "rgba(43,95,255,0.18)";
+          tctx.fillRect(gx, y, gw, h);
+        } else if (policy === "recompute") {
+          tctx.fillStyle = "rgba(214,0,108,0.14)";
+          tctx.fillRect(gx, y, gw, h);
+        } else {
+          tctx.fillStyle = "rgba(201,162,39,0.18)";
+          tctx.fillRect(gx, y, gw, h);
+          tctx.fillStyle = c.accent700;
+          tctx.fillRect(gx, y, Math.max(1, 0.2 * scale), h);
+          tctx.fillRect(gx + gw - Math.max(1, 0.2 * scale), y, Math.max(1, 0.2 * scale), h);
+        }
+        // resume penalty marker for non-hold policies
+        if (policy !== "hold") {
+          var penS = policy === "recompute" ? recomputeS(ctxTokens) : offloadS(ctxTokens);
+          tctx.fillStyle = c.accent2;
+          tctx.fillRect(gx + gw, y, Math.max(1, penS * scale), h * 0.5);
+        }
+        tctx.fillStyle = c.text; tctx.font = "10px " + c.mono; tctx.textAlign = "right";
+        tctx.fillText(lanes[i], padL - 6, y + h * 0.9);
+      }
+      // axis
+      var axisY = Ht - 8;
+      tctx.strokeStyle = c.divider; tctx.lineWidth = 1;
+      tctx.beginPath(); tctx.moveTo(padL, axisY); tctx.lineTo(padL + plotW, axisY); tctx.stroke();
+      tctx.fillStyle = c.text; tctx.font = "10px " + c.font; tctx.textAlign = "center";
+      for (var k = 0; k <= 4; k++) tctx.fillText((total * k / 4).toFixed(1) + "s", padL + plotW * k / 4, Ht - 1);
+      // cursor
+      var cx = padL + (cursor % total) * scale;
+      tctx.strokeStyle = c.text; tctx.lineWidth = 1.2;
+      tctx.beginPath(); tctx.moveTo(cx, padT - 4); tctx.lineTo(cx, axisY); tctx.stroke();
+    }
+
+    function drawCross() {
+      if (!cctx) return;
+      var ctxTokens = parseInt(ctxS.value, 10), gap = parseFloat(gapS.value);
+      cctx.clearRect(0, 0, W, Hc);
+      var maxGap = 30;
+      var holdP = [], recP = [], offP = [], maxY = 0;
+      for (var g = 0; g <= maxGap; g += 0.5) {
+        var h = holdS(ctxTokens, g), r = recomputeS(ctxTokens), o = offloadS(ctxTokens);
+        holdP.push({ x: g, y: h }); recP.push({ x: g, y: r }); offP.push({ x: g, y: o });
+        maxY = Math.max(maxY, h, r, o);
+      }
+      var axes = G.drawLines(cctx, W, Hc, [
+        { points: holdP, color: c.accent, width: 2.5 },
+        { points: recP, color: c.accent2, width: 2.5 },
+        { points: offP, color: c.accent700, width: 2.5 }
+      ], [0, maxGap], [0, maxY * 1.1], { xLabel: "tool gap (seconds)", yLabel: "resource-seconds per turn" });
+
+      var co = crossover(ctxTokens);
+      if (co > 0 && co < maxGap) {
+        var cox = axes.px(co);
+        cctx.strokeStyle = c.divider; cctx.lineWidth = 1.2; cctx.setLineDash([5, 4]);
+        cctx.beginPath(); cctx.moveTo(cox, axes.padT); cctx.lineTo(cox, axes.padT + axes.plotH); cctx.stroke();
+        cctx.setLineDash([]);
+        cctx.fillStyle = c.text; cctx.font = "10px " + c.font; cctx.textAlign = "center";
+        cctx.fillText("crossover " + co.toFixed(1) + "s", cox, axes.padT - 2);
+      }
+      var gx = axes.px(Math.min(gap, maxGap));
+      cctx.strokeStyle = c.accent2; cctx.lineWidth = 1.4;
+      cctx.beginPath(); cctx.moveTo(gx, axes.padT); cctx.lineTo(gx, axes.padT + axes.plotH); cctx.stroke();
+      cctx.fillStyle = c.text; cctx.font = "11px " + c.font; cctx.textAlign = "left";
+      cctx.fillText("blue hold · pink recompute · dark offload", axes.padL + 6, axes.padT + 12);
+    }
+
+    function render() {
+      drawTrace(); drawCross();
+      var ctxTokens = parseInt(ctxS.value, 10), gap = parseFloat(gapS.value);
+      var kv = kvGB(ctxTokens), co = crossover(ctxTokens);
+      var rec = recomputeS(ctxTokens), off = offloadS(ctxTokens);
+      var hold = holdS(ctxTokens, gap);
+      var curCost = policy === "hold" ? hold : (policy === "recompute" ? rec : off);
+      var addedLatency = policy === "hold" ? 0 : (policy === "recompute" ? rec * 1000 : off * 1000);
+      readout.innerHTML =
+        '<span class="k">KV for this context:</span> ' + kv.toFixed(2) + " GB<br>" +
+        '<span class="k">per-turn resource cost ("' + policy + '"):</span> <span class="hi">' + curCost.toFixed(3) + " s</span><br>" +
+        '<span class="k">added latency on resume:</span> ' + (addedLatency === 0 ? '<span class="hi">0 ms</span>' : '<span class="bad">+' + G.fmtMs(addedLatency) + "</span>") + "<br>" +
+        '<span class="k">recompute:</span> ' + G.fmtMs(rec * 1000) + " · <span class=\"k\">offload round trip:</span> " + G.fmtMs(off * 1000) + "<br>" +
+        '<span class="k">hold/recompute crossover gap:</span> <span class="hi">' + co.toFixed(1) + " s</span>";
+    }
+
+    function setPolicy(p) {
+      policy = p;
+      Array.prototype.forEach.call(policyRow.querySelectorAll("button"), function (b) {
+        b.className = b.getAttribute("data-pol") === p ? "g-primary" : "";
+      });
+      render();
+    }
+    policyRow.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-pol]"); if (!b) return;
+      setPolicy(b.getAttribute("data-pol"));
+    });
+    tctx = G.setupCanvas(traceCanvas, W, Ht, drawTrace).ctx;
+    cctx = G.setupCanvas(crossCanvas, W, Hc, drawCross).ctx;
+    render();
+    G.bindSliders([ctxS, gapS], render);
+    G.loop({
+      button: playBtn, interval: 60,
+      onStep: function () {
+        var ctxTokens = parseInt(ctxS.value, 10), gap = parseFloat(gapS.value);
+        var total = 3 * (ctxTokens / PREFILL_TPS_C + 0.9 + gap);
+        cursor += total / 90;
+        if (cursor > total) cursor = 0;
+        drawTrace();
+      }
+    });
+  })();
+
+  // ---- Demo 4: image token budget ----------------------------------------
+  (function () {
+    var canvas = document.getElementById("wl-vision");
+    if (!canvas) return;
+    var rS = document.getElementById("wl-img-r");
+    var tS = document.getElementById("wl-img-t");
+    var txS = document.getElementById("wl-img-text");
+    var oS = document.getElementById("wl-img-out");
+    var readout = document.getElementById("wl-vision-readout");
+    var W = 640, H = 300, ctx = null;
+    var PIX_PER_TOKEN = 28;
+
+    function render() {
+      if (!ctx) return;
+      var R = parseInt(rS.value, 10), T = parseInt(tS.value, 10);
+      var textTok = parseInt(txS.value, 10), outTok = parseInt(oS.value, 10);
+      var perTile = Math.pow(Math.ceil(R / PIX_PER_TOKEN), 2);
+      var imageTok = perTile * T;
+      var prefill = textTok + imageTok;
+      var ratio = prefill / Math.max(1, outTok);
+      var baselinePrefill = 100, baselineOut = 800;
+
+      ctx.clearRect(0, 0, W, H);
+      var padL = 20, padR = 20, padT = 40, barH = 46, gapY = 40;
+      var plotW = W - padL - padR;
+
+      function drawSplitBar(y, p, d, label) {
+        var total = p + d;
+        var pw = plotW * p / total, dw = plotW * d / total;
+        ctx.fillStyle = c.accent; ctx.fillRect(padL, y, pw, barH);
+        ctx.fillStyle = c.accent2; ctx.fillRect(padL + pw, y, dw, barH);
+        ctx.fillStyle = "#fff"; ctx.font = "bold 12px " + c.mono; ctx.textAlign = "center";
+        if (pw > 60) ctx.fillText("prefill " + p, padL + pw / 2, y + barH / 2 + 4);
+        ctx.fillStyle = "#fff";
+        if (dw > 60) ctx.fillText("decode " + d, padL + pw + dw / 2, y + barH / 2 + 4);
+        ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(label, padL, y - 6);
+        ctx.textAlign = "right";
+        ctx.fillText((p / d).toFixed(1) + " : 1  prefill:decode", W - padR, y + barH + 14);
+      }
+
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Text baseline (100 prompt / 800 output)", padL, 14);
+      drawSplitBar(padT, baselinePrefill, baselineOut, "text-only request");
+      drawSplitBar(padT + barH + gapY, prefill, outTok, "current request");
+
+      // ratio ruler
+      var ry = padT + 2 * barH + gapY + 34;
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("prefill:decode ratio 1:8 (text) → " + ratio.toFixed(1) + ":1 (current)", padL, ry);
+      ctx.fillStyle = ratio > 1 ? c.accent2 : c.accent;
+      ctx.fillRect(padL, ry + 6, Math.min(plotW, plotW * Math.min(ratio, 30) / 30), 8);
+      ctx.strokeStyle = c.divider;
+      ctx.strokeRect(padL, ry + 6, plotW, 8);
+
+      var prefillShare = prefill / (prefill + outTok);
+      readout.innerHTML =
+        '<span class="k">image tokens:</span> <span class="hi">' + G.fmtNum(imageTok) + "</span> (" + perTile + " per tile × " + T + ")<br>" +
+        '<span class="k">total prefill:</span> ' + G.fmtNum(prefill) + " tok · decode " + outTok + " tok<br>" +
+        '<span class="k">ratio:</span> ' + (prefill / Math.max(1, outTok)).toFixed(1) + " : 1<br>" +
+        '<span class="k">prefill share of work:</span> <span class="' + (prefillShare > 0.5 ? "bad" : "hi") + '">' + (prefillShare * 100).toFixed(0) + "%</span><br>" +
+        '<span class="k">pool implication:</span> a prefill-heavy route wants roughly ' + (prefillShare * 100).toFixed(0) + "% of its workers on prefill (Part 13)";
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([rS, tS, txS, oS], render);
+  })();
+
+  // ---- Demo 5: realtime voice budget -------------------------------------
+  (function () {
+    var canvas = document.getElementById("wl-voice");
+    if (!canvas) return;
+    var asrS = document.getElementById("wl-v-asr");
+    var netS = document.getElementById("wl-v-net");
+    var ttftS = document.getElementById("wl-v-ttft");
+    var ttsS = document.getElementById("wl-v-tts");
+    var gpuS = document.getElementById("wl-v-gpu");
+    var intS = document.getElementById("wl-v-interval");
+    var readout = document.getElementById("wl-voice-readout");
+    var playBtn = document.getElementById("wl-voice-play");
+    var W = 640, H = 240, ctx = null, fill = 0;
+
+    function parts() {
+      return [
+        { name: "ASR", val: parseInt(asrS.value, 10), color: c.accent },
+        { name: "network", val: parseInt(netS.value, 10), color: c.accent400 },
+        { name: "TTFT", val: parseInt(ttftS.value, 10), color: c.accent500 },
+        { name: "TTS", val: parseInt(ttsS.value, 10), color: c.accent2 }
+      ];
+    }
+    function render() {
+      if (!ctx) return;
+      var p = parts();
+      var total = p.reduce(function (a, x) { return a + x.val; }, 0);
+      var BUDGET = 200;
+      ctx.clearRect(0, 0, W, H);
+      var padL = 20, padR = 20, barY = 64, barH = 44;
+      var plotW = W - padL - padR;
+      var scale = plotW / Math.max(BUDGET, total);
+      var x = padL;
+      ctx.font = "12px " + c.font; ctx.textAlign = "left"; ctx.fillStyle = c.text;
+      ctx.fillText("end-to-end turn latency — budget 200 ms", padL, 20);
+      var shown = 0;
+      for (var i = 0; i < p.length; i++) {
+        var v = p[i].val;
+        var frac = Math.max(0, Math.min(1, (fill - shown) / Math.max(1, total)));
+        var w = v * scale * frac;
+        ctx.fillStyle = p[i].color;
+        ctx.fillRect(x, barY, w, barH);
+        if (w > 44) {
+          ctx.fillStyle = "#fff"; ctx.font = "11px " + c.mono; ctx.textAlign = "center";
+          ctx.fillText(p[i].name + " " + v, x + w / 2, barY + barH / 2 + 4);
+        }
+        x += v * scale; shown += v;
+      }
+      // budget marker
+      var bx = padL + BUDGET * scale;
+      ctx.strokeStyle = total > BUDGET ? c.accent2 : c.accent700;
+      ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(bx, barY - 12); ctx.lineTo(bx, barY + barH + 12); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = total > BUDGET ? c.accent2 : c.accent700; ctx.font = "11px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("200 ms", bx, barY - 18);
+      ctx.fillStyle = c.text; ctx.textAlign = "left"; ctx.font = "12px " + c.mono;
+      ctx.fillText("total " + total + " ms " + (total <= BUDGET ? "✓ within budget" : "✗ over budget by " + (total - BUDGET) + " ms"), padL, barY + barH + 34);
+
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font;
+      ctx.fillText("blue: ASR · teal: network · mid-blue: TTFT · pink: TTS first chunk", padL, barY + barH + 54);
+
+      var gpu = parseInt(gpuS.value, 10), interval = parseInt(intS.value, 10);
+      var conc = Math.floor(interval / Math.max(1, gpu));
+      var realtime = gpu <= BUDGET && total <= BUDGET;
+      readout.innerHTML =
+        '<span class="k">stage split:</span> ' + p.map(function (x) { return x.name + " " + x.val; }).join(" + ") + " ms<br>" +
+        '<span class="k">budget status:</span> <span class="' + (total <= BUDGET ? "hi" : "bad") + '">' + (total <= BUDGET ? "fits" : (total - BUDGET) + " ms over") + "</span><br>" +
+        '<span class="k">GPU work per turn:</span> ' + gpu + " ms · <span class=\"k\">turn interval:</span> " + interval + " ms<br>" +
+        '<span class="k">concurrency per GPU:</span> <span class="hi">' + conc + " sessions</span><br>" +
+        '<span class="k">200 ms budget:</span> ' + (realtime ? "met end-to-end" : '<span class="bad">' + (total > BUDGET ? "stage latency over by " + (total - BUDGET) + " ms" : "GPU work exceeds the budget") + "</span>");
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    function reset() { fill = 0; render(); }
+    G.bindSliders([asrS, netS, ttftS, ttsS, gpuS, intS], reset);
+    render();
+    G.loop({
+      button: playBtn, interval: 50,
+      onStep: function () {
+        var total = parts().reduce(function (a, x) { return a + x.val; }, 0);
+        fill += total / 24;
+        if (fill > total * 1.15) fill = 0;
+        render();
+      }
+    });
+  })();
+
+  // ---- shared data -------------------------------------------------------
+  fetch(window.__WL_DATA_URL).then(function (r) { return r.json(); }).then(applyData).catch(function () { applyData(null); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

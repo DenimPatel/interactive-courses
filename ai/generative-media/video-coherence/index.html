@@ -1,0 +1,372 @@
+---
+title: "Coherent and long"
+description: "Image and keyframe conditioning, temporal cascades, autoregressive rollout against full-sequence diffusion, drift, native audio, and the world-model claim."
+permalink: "/ai/generative-media/video-coherence/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  .g-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 14px; }
+  .g-check input { accent-color: var(--color-accent); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Coherent and long</h1>
+    <p>A clip that is cheap to generate is not the same as a clip that stays coherent as it lengthens. The temporal axis has to be anchored &mdash; to a first frame, a keyframe, or a low-resolution sketch &mdash; and the choice between generating a whole sequence at once and rolling it out frame by frame decides whether errors stay bounded or accumulate. This part follows drift over a rollout, conditions on a first frame, adds cascades, and ends on the claims about audio and world models.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="conditioning">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Conditioning on a first frame</h2></div>
+    <p class="g-eyebrow">Anchor the sequence before sampling it</p>
+    <p>Image-to-video generation conditions the model on a single frame and asks it to continue. The conditioning frame is usually handled by concatenating it, un-noised, to the latent clip at every sampling step, so the model can compare what it is generating against a fixed reference. A keyframe model does the same at both ends, or at several interior frames, which turns generation into interpolation between anchors and gives the user a timeline to control.</p>
+    <p>The strip below shows the two regimes side by side. The top row is a sequence generated with the whole clip in view, so every frame is consistent with every other. The bottom row is an autoregressive rollout, where each frame is produced from the ones before it. Toggle the conditioning switch and frame zero is pinned to the first frame: the rollout stops wandering away from its anchor, which is exactly what I2V conditioning buys.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="coh-strip-canvas" width="640" height="64"></canvas>
+        <p class="g-canvas-hint">Top row: full-sequence generation. Bottom row: autoregressive rollout. Each dot is a frame; the vertical line marks the conditioned first frame.</p>
+      </div>
+      <div class="g-controls">
+        <label class="g-check"><input type="checkbox" id="coh-i2v"> Condition on frame 0 (I2V)</label>
+        <div class="g-field"><label>Rollout frames <span class="val">48</span></label><input type="range" id="coh-frames" min="8" max="120" step="4" value="48"></div>
+        <div class="g-readout" id="coh-strip-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say why conditioning bounds drift, why autoregressive and full-sequence diffusion fail differently, what a temporal cascade adds, and what the world-model claim does and does not assert.</span></div>
+    <div class="g-toc">
+      <a href="#drift">2 · Drift and autoregression</a>
+      <a href="#cascade">3 · Cascades and long clips</a>
+      <a href="#audio">4 · Audio and the world-model claim</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="drift">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Drift and autoregression</h2></div>
+    <p class="g-eyebrow">Errors that feed themselves</p>
+    <p>An autoregressive rollout has a structural problem: each frame is generated from previous generated frames, so any error in frame $k$ becomes part of the input to frame $k+1$. If the error is damped, the rollout stays near the truth; if it is amplified, it compounds and the clip drifts. The plot models that with a decay factor, where each new frame inherits a fraction of the previous drift plus a fresh perturbation. A decay close to one grows without bound; a decay well below one stays flat.</p>
+    <p>Full-sequence diffusion does not have this failure mode, because every frame is generated with the whole clip in view and no frame is an input to another. It buys coherence by attending to all frames at once, at the cost of the quadratic attention from the previous part. This is the central trade of long video: autoregression is cheap per frame but drifts, and full-sequence generation is coherent but its cost grows with clip length. Anchoring the rollout to a conditioned first frame lowers the effective decay, which is why I2V makes long rollouts stable and why the toggle above flattens the curve below.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="coh-drift-canvas" width="620" height="300"></canvas>
+        <p class="g-canvas-hint">Per-frame drift magnitude against frame index. The autoregressive curve follows the decay factor; the full-sequence curve stays bounded.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="coh-drift-readout"></div>
+        <p class="g-mini">Drift is generated by <code>Diffusion.temporalDrift</code>, whose decay parameter is the fraction of the previous error carried forward.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>A bounded curve is not a correct clip.</b> Low drift means the rollout stays near its anchor, not that it is right. A model can be stable and consistently wrong, and a degraded rollout often looks fine frame by frame while failing the moment it is played as motion. Stability and faithfulness are separate properties.</span></div>
+  </section>
+
+  <section class="g-step" id="cascade">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Cascades and long clips</h2></div>
+    <p class="g-eyebrow">Sketch first, refine after</p>
+    <p>A temporal cascade produces a long clip by generating a low-resolution version first and then refining it with one or more super-resolution stages along the time axis. Because the expensive stages only ever see a short window of the sketch, the cost grows far more slowly than the clip length, and the base pass fixes global motion before detail is spent. This is the same idea as the spatial cascades used for high-resolution images, applied to the temporal axis; the level slider shows the trade, where each added stage lifts the output resolution and raises the total compute gently.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="coh-cascade-canvas" width="620" height="240"></canvas>
+        <p class="g-canvas-hint">Relative compute per cascade level, with the output resolution in the label. The highlighted bar is the selected level.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Cascade level <span class="val">1</span></label><input type="range" id="coh-cascade" min="1" max="4" step="1" value="1"></div>
+        <div class="g-readout" id="coh-cascade-readout"></div>
+      </div>
+    </div>
+    <p>The other long-clip strategy is to extend the context window rather than roll out. A model trained on clips of a fixed length can be run with a sliding window and a small number of overlap frames, with the overlapping latents anchored so that consecutive windows agree. The result is neither pure autoregression nor a single full-sequence pass, but a middle ground that keeps a bounded working set while still conditioning on a substantial slice of the past.</p>
+  </section>
+
+  <section class="g-step" id="audio">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Audio and the world-model claim</h2></div>
+    <p class="g-eyebrow">Native sound, and what the simulator claim means</p>
+    <p>Sound is the newest axis. Early video models produced silent clips and audio was dubbed on afterwards, which fails whenever a sound has to line up with the event that made it. Veo 3 and its contemporaries generate video and audio jointly, so a door slam lands on the frame that shows the door and speech is lip-synced to the mouth that is speaking. Joint generation is more than a convenience: synchronisation is a constraint the model can satisfy only if it is modelling both signals together, which is why native audio is treated as an architectural feature rather than a post-processing step.</p>
+    <p>The world-model claim is the boldest statement in the field. A model that predicts the next moments of a scene accurately enough to be useful for planning is behaving like a simulator of the world, and Sora's framing in those terms was explicit. The claim is worth taking seriously and worth bounding. These models have no physics engine and no persistent state; they are trained to produce plausible frames, and plausibility coincides with physical correctness only where the training distribution makes it so. Occlusion, object permanence over long spans, and causal interventions are the documented failures, and a world model whose laws change when the prompt changes is a generator with a useful prior rather than a simulator.</p>
+    <div class="g-goal">💡 <span>The honest summary is that video models learn a strong prior over how scenes evolve, and that the prior is good enough for short, in-distribution clips. The world-model claim is a research programme about extending that, not a property that follows from sample quality.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The frontier video systems</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Conditioning</div>
+        <h3 style="margin:6px 0;">I2V, keyframes and camera control</h3>
+        <p style="margin-bottom:0;">Every consumer video interface exposes a first-frame image, a keyframe timeline, or a camera path, and each is a conditioning signal on the <a href="{{ '/ai/generative-media/video-basics/' | relative_url }}">spatiotemporal latent</a>. Camera control is the structural cousin of <a href="{{ '/ai/generative-media/control/' | relative_url }}">ControlNet</a>: a pose or trajectory signal injected the same way, on the temporal axis.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Audio &amp; simulation</div>
+        <h3 style="margin:6px 0;">Native sound and worlds</h3>
+        <p style="margin-bottom:0;">Joint audio-video generation and the world-model framing are the two claims that push video beyond an image model in a loop. Audio conditioning reuses the <a href="{{ '/ai/generative-media/' | relative_url }}">generative-media toolbox</a> on a new axis, and the simulation claim is the one to hold to a strict standard rather than accept from a demo reel.</p>
+      </div>
+    </div>
+    <p>Read as a whole, the video chapters are one argument: the temporal axis imposes an ordering, that ordering forces the VAE to be causal and the attention to be factorised, and it raises a coherence problem that conditioning, cascades and the choice of rollout all address. The sampler, the schedule and the backbone from the earlier parts are unchanged underneath.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These references cover the two halves of the long-video problem: how to condition and extend a clip, and how far the resulting model can be said to simulate anything.</p>
+    <p>Ho and coauthors and Blattmann and coauthors establish conditioning and long video; Harvey and coauthors and Yin and coauthors handle long-horizon and streaming generation; and the Sora report is the primary source for the world-model framing.</p>
+    <ul class="g-refs">
+      <li>Andreas Blattmann, Tim Dockhorn, Sumith Kulal and coauthors, <a href="https://arxiv.org/abs/2311.15127">"Stable Video Diffusion: Scaling Latent Video Diffusion Models to Large Datasets"</a>, 2023 &mdash; image-to-video conditioning and the causal 3-D VAE.</li>
+      <li>William Harvey, Saeid Naderiparizi, Vaden Masrani, Christian Weilbach and Frank Wood, <a href="https://arxiv.org/abs/2209.14988">"Flexible Diffusion Modeling of Long Videos"</a>, 2022 &mdash; long-horizon generation with a bounded working set.</li>
+      <li>Tianwei Yin, Qiang Zhang, Richard Zhang and coauthors, <a href="https://arxiv.org/abs/2404.12362">"From Slow Bidirectional to Fast Autoregressive Video Diffusion Models"</a>, 2024 &mdash; the streaming and autoregressive framing.</li>
+      <li>OpenAI, <a href="https://openai.com/research/video-generation-models-as-world-simulators">"Video Generation Models as World Simulators"</a>, 2024 &mdash; the world-model claim, stated and qualified.</li>
+      <li>Google DeepMind, <a href="https://deepmind.google/models/veo/">"Veo"</a>, 2025 &mdash; native synchronised audio and video generation in one model.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>I2V conditioning</td><td>Pin a first frame, un-noised, at every sampling step</td></tr>
+        <tr><td>Keyframe conditioning</td><td>Anchor several frames; generation becomes interpolation</td></tr>
+        <tr><td>Autoregressive rollout</td><td>Each frame is generated from previous frames; errors compound</td></tr>
+        <tr><td>Full-sequence diffusion</td><td>All frames generated at once; coherent, with quadratic attention</td></tr>
+        <tr><td>Drift</td><td>Accumulated error over a rollout; <code>Diffusion.temporalDrift</code></td></tr>
+        <tr><td>Temporal cascade</td><td>Low-resolution sketch plus super-resolution stages along time</td></tr>
+        <tr><td>Sliding window</td><td>Bounded context with anchored overlap frames</td></tr>
+        <tr><td>Native audio</td><td>Video and sound generated jointly so events stay synchronised</td></tr>
+        <tr><td>World-model claim</td><td>A strong learned prior over scene evolution, not a physics engine</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the end of the guide's video arc: conditioning, drift, cascades, audio and the world-model claim. The series continues with the remaining parts on judging and shipping these systems.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var DECAY_AR = 0.97, DECAY_I2V = 0.55, DECAY_FULL = 0.0;
+  var CASCADE_COST = [1.0, 1.7, 2.6, 4.0];
+  var CASCADE_RES = [256, 512, 1024, 2048];
+
+  var frames = 48;
+  var i2v = false;
+  var cascade = 1;
+  var MINI = 20;
+
+  function driftAR() { return D.temporalDrift(frames, i2v ? DECAY_I2V : DECAY_AR, 11); }
+
+  function rollout() {
+    var decay = i2v ? 0.4 : 0.9;
+    var r = GM.rng(303);
+    return D.arRollout([0], frames, function (prev, i) {
+      var target = 5 * Math.sin(2 * Math.PI * (i + 1) / 16);
+      return [prev[0] * decay + (1 - decay) * target + 0.4 * (1 - decay) * GM.gauss(r)];
+    });
+  }
+
+  // ---- frame strip ----------------------------------------------------------
+  var CELL = 16;
+  var stripRaster = GM.raster(document.getElementById('coh-strip-canvas'), {
+    cols: MINI * CELL, rows: 2 * CELL, channels: 3, W: 640, H: 64,
+    onResize: function () { drawStrip(); }
+  });
+  function drawStrip() {
+    if (!stripRaster) return;
+    var roll = rollout();
+    var drift = driftAR();
+    var lastFr = frames - 1;
+    stripRaster.fill(function (x, y) {
+      var f = Math.floor(x / CELL);
+      var local = x - f * CELL;
+      var idx = Math.round(f * lastFr / (MINI - 1));
+      var top = y < CELL;
+      var tpos = 5 * Math.sin(2 * Math.PI * (idx + 1) / 16);
+      var pos;
+      if (top) pos = tpos;
+      else if (i2v && idx === 0) pos = tpos;
+      else pos = roll[Math.min(roll.length - 1, idx + 1)][0];
+      var cx = CELL / 2 + pos;
+      var dy = top ? (CELL - 1) / 2 : CELL + (CELL - 1) / 2;
+      var dist = Math.hypot(local - cx, y - dy);
+      var d = drift[Math.min(drift.length - 1, idx)];
+      var sharp = top ? 7 : Math.max(3.2, 7 - d * 0.14);
+      var v = Math.max(0, 1 - dist / sharp);
+      if (top) return [0.1 + 0.8 * v, 0.15 + 0.35 * v, 0.3 + 0.6 * v];
+      return [0.24 + 0.5 * v, 0.08 + 0.22 * v, 0.12 + 0.34 * v];
+    });
+    stripRaster.draw();
+    var ctx = stripRaster.ctx;
+    ctx.save();
+    ctx.strokeStyle = i2v ? c.accent : 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(CELL / 2, 0); ctx.lineTo(CELL / 2, stripRaster.H); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('full sequence', 4, CELL - 5);
+    ctx.fillText('autoregressive' + (i2v ? ' (frame 0 pinned)' : ''), 4, 2 * CELL - 5);
+    var el = document.getElementById('coh-strip-readout');
+    if (el) {
+      var d = driftAR();
+      el.innerHTML =
+        '<div><span class="k">frames</span> ' + frames + '</div>' +
+        '<div><span class="k">conditioning</span> <span class="hi">' + (i2v ? 'I2V (frame 0 fixed)' : 'none') + '</span></div>' +
+        '<div><span class="k">final drift</span> ' + d[d.length - 1].toFixed(2) + '</div>' +
+        '<div class="g-mini">Each dot is one frame of the rollout; softer dots mean more accumulated drift.</div>';
+    }
+  }
+
+  // ---- drift plot -----------------------------------------------------------
+  var driftPlot = GM.plot(document.getElementById('coh-drift-canvas'), {
+    W: 620, H: 300, xRange: [0, Math.max(1, frames - 1)], yRange: [0, 10],
+    xLabel: 'frame index', yLabel: 'drift magnitude',
+    onResize: function () { redrawDrift(); }
+  });
+  function redrawDrift() {
+    if (!driftPlot) return;
+    var ar = driftAR();
+    var full = D.temporalDrift(frames, DECAY_FULL, 11);
+    var naive = D.temporalDrift(frames, DECAY_AR, 11);
+    var maxD = 0;
+    [ar, full, naive].forEach(function (arr) { arr.forEach(function (v) { if (v > maxD) maxD = v; }); });
+    driftPlot.xRange[0] = 0;
+    driftPlot.xRange[1] = Math.max(1, frames - 1);
+    driftPlot.yRange[0] = 0;
+    driftPlot.yRange[1] = Math.max(1, maxD * 1.15);
+    driftPlot.clear();
+    driftPlot.axes({ xLabel: 'frame index', yLabel: 'drift magnitude' });
+    if (i2v) {
+      driftPlot.curve(naive.map(function (v, i) { return [i, v]; }), { color: c.divider, width: 1.4, dashed: true });
+    }
+    driftPlot.curve(full.map(function (v, i) { return [i, v]; }), { color: c.accent400, width: 2 });
+    driftPlot.curve(ar.map(function (v, i) { return [i, v]; }), { color: c.accent2, width: 2.6 });
+    var leg = [
+      { label: 'full-sequence (bounded)', color: c.accent400 },
+      { label: 'autoregressive' + (i2v ? ' (I2V)' : ''), color: c.accent2 }
+    ];
+    if (i2v) leg.push({ label: 'autoregressive, no anchor', color: c.divider, dashed: true });
+    driftPlot.legend(leg, { dy: 6 });
+    var el = document.getElementById('coh-drift-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">decay</span> <span class="hi">' + (i2v ? DECAY_I2V : DECAY_AR) + '</span></div>' +
+        '<div><span class="k">final AR drift</span> ' + ar[ar.length - 1].toFixed(2) + '</div>' +
+        '<div><span class="k">final full-sequence drift</span> ' + full[full.length - 1].toFixed(2) + '</div>' +
+        '<div><span class="k">ratio</span> ' + (full[full.length - 1] > 1e-6 ? (ar[ar.length - 1] / full[full.length - 1]).toFixed(1) : '—') + '×</div>' +
+        '<div class="g-mini">Drift compounds when the decay is near one; a pinned first frame lowers it.</div>';
+    }
+  }
+
+  // ---- cascade bars ---------------------------------------------------------
+  var cascSetup = Guide.setupCanvas(document.getElementById('coh-cascade-canvas'), 620, 240, function () { drawCascade(); });
+  function drawCascade() {
+    if (!cascSetup) return;
+    var data = CASCADE_COST.map(function (v, i) {
+      var L = i + 1;
+      return {
+        label: 'L' + L + ' · ' + CASCADE_RES[i] + 'px',
+        value: v,
+        valueLabel: v.toFixed(1) + '× compute',
+        color: L === cascade ? c.accent2 : c.accent
+      };
+    });
+    Guide.drawBars(cascSetup.ctx, 620, 240, data, { padL: 120, fontSize: 12 });
+    var el = document.getElementById('coh-cascade-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">cascade level</span> <span class="hi">' + cascade + '</span></div>' +
+        '<div><span class="k">base passes</span> 1 low-resolution sketch</div>' +
+        '<div><span class="k">refinement stages</span> ' + cascade + '</div>' +
+        '<div><span class="k">output resolution</span> ' + CASCADE_RES[cascade - 1] + 'px</div>' +
+        '<div><span class="k">relative compute</span> ' + CASCADE_COST[cascade - 1].toFixed(1) + '×</div>' +
+        '<div class="g-mini">Each stage lifts resolution and adds a little compute, which is the point of a cascade.</div>';
+    }
+  }
+
+  function redraw() { drawStrip(); redrawDrift(); drawCascade(); }
+
+  Guide.bindSliders(document.querySelectorAll('#coh-frames'), function (el) {
+    frames = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#coh-cascade'), function (el) {
+    cascade = parseInt(el.value, 10);
+    redraw();
+  });
+  var i2vBox = document.getElementById('coh-i2v');
+  if (i2vBox) i2vBox.addEventListener('change', function () { i2v = i2vBox.checked; redraw(); });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'coherence-i2v',
+      kind: 'choice',
+      prompt: 'How does image-to-video conditioning usually use the first frame?',
+      options: [
+        { label: 'It is concatenated un-noised to the latent clip at every sampling step, so it stays a fixed reference.', correct: true },
+        { label: 'It is discarded after the first sampling step.', correct: false },
+        { label: 'It replaces the text prompt entirely.', correct: false }
+      ],
+      explanation: 'Keeping the frame un-noised and present at every step lets the model compare each generated frame against a stable anchor. That is what bounds drift in a rollout and what makes the first frame exactly reproduce the input.'
+    },
+    {
+      id: 'coherence-drift',
+      kind: 'numeric',
+      prompt: 'An autoregressive rollout carries forward 90% of the previous frame\'s drift each step. Starting from a drift of 1.0, what is the drift after 2 steps if each step also adds a fresh error of 1.0?',
+      answer: 2.9,
+      tolerance: 0.05,
+      explanation: 'After one step the drift is $0.9\\cdot1.0 + 1.0 = 1.9$; after two it is $0.9\\cdot1.9 + 1.0 = 2.71$. Compounding is why a decay near one grows without bound while a lower decay stays flat.'
+    },
+    {
+      id: 'coherence-full',
+      kind: 'choice',
+      prompt: 'Why does full-sequence diffusion not suffer the drift that an autoregressive rollout does?',
+      options: [
+        { label: 'Every frame is generated with the whole clip in view, so no frame is an input to another.', correct: true },
+        { label: 'It uses fewer sampling steps than a rollout.', correct: false },
+        { label: 'It generates only the first frame and repeats it.', correct: false }
+      ],
+      explanation: 'With all frames generated jointly there is no feedback loop in which an error becomes input to the next frame. The price is attention cost that grows with clip length, which is what factorisation and cascades exist to manage.'
+    },
+    {
+      id: 'coherence-world',
+      kind: 'choice',
+      prompt: 'What is the fairest reading of the world-model claim for video generators?',
+      options: [
+        { label: 'They learn a strong prior over how scenes evolve, which coincides with physics only in-distribution.', correct: true },
+        { label: 'They contain a physics engine that guarantees conservation laws.', correct: false },
+        { label: 'They maintain persistent state about objects across clips.', correct: false }
+      ],
+      explanation: 'There is no simulator and no persistent state. Accuracy on short, in-distribution clips is real and useful, but occlusion, long-horizon object permanence and interventions are documented failures, so the claim is a research programme rather than a guaranteed property.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

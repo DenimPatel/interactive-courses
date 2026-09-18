@@ -1,0 +1,367 @@
+---
+title: "Learning to undo one step"
+description: "Epsilon-, x-zero- and v-prediction, and a real tiny denoiser trained in the browser on a two-dimensional toy dataset with a live loss curve."
+permalink: "/ai/generative-media/denoiser/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-param-note { font-size: 12.5px; opacity: 0.8; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Learning to undo one step</h1>
+    <p>The forward process is a recipe you wrote yourself, so undoing it ought to be easy. It is not, because the information the noise destroyed is gone &mdash; all a model can do is estimate what was probably there. This part trains a real neural network in your browser on a two-dimensional toy distribution, watches its loss fall, and uses it to move noisy points back toward the data. Along the way it answers a question that sounds like bookkeeping but is not: should the network predict the noise, the clean point, or something in between?</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="objective">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The denoising objective</h2></div>
+    <p class="g-eyebrow">Ask the network to name the noise</p>
+    <p>Take a clean point $x_0$, pick a random timestep $t$, and use the closed form from the previous part to jump straight to $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\varepsilon$. You know $\varepsilon$ exactly, because you generated it. So the training objective can be as blunt as this: given $x_t$ and $t$, predict $\varepsilon$, and penalise the squared error.</p>
+    <p>$$ \mathcal{L}(\theta) = \mathbb{E}_{x_0,\,t,\,\varepsilon}\!\left[\, \lVert \varepsilon - \varepsilon_\theta(x_t, t) \rVert^2 \,\right] $$</p>
+    <p>This is the simplified DDPM loss, and its elegance is that a hard probabilistic problem has become ordinary regression. There is no adversarial game and no likelihood to estimate directly: draw a batch, jump to a random noise level, and take a gradient step. The reason the shortcut is legitimate is that predicting the noise that was added is equivalent to estimating the score of the noisy distribution up to a known factor, a fact the fifth part makes precise.</p>
+    <p>The network below does not know about images. It is a tiny multilayer perceptron with two inputs, two tanh hidden layers of sixteen units, and two outputs, trained with hand-written backpropagation on a toy distribution &mdash; three Gaussian blobs in the plane. Everything true of this network is true of a billion-parameter U-Net; the only difference is scale.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> state the denoising objective, explain what the network is asked to output at each noise level, and say why ε-, x₀- and v-prediction are three parameterisations of the same information rather than three different models.</span></div>
+    <div class="g-toc">
+      <a href="#train">2 · Train a denoiser in the browser</a>
+      <a href="#params">3 · Epsilon, x₀ and v</a>
+      <a href="#why">4 · Why the parameterisation matters</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="train">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Train a denoiser in the browser</h2></div>
+    <p class="g-eyebrow">A real network, a real loss curve, one slider</p>
+    <p>The grey dots are the toy dataset: three clusters, roughly two hundred points. The blue dots are those points after the forward process at the noise level the slider selects, so at low $t$ they sit on the data and at high $t$ they are scattered almost at random. The pink arrows are the network's denoising attempt: each arrow starts at a noisy point and ends at the clean point the network believes it came from.</p>
+    <p>Press <em>Retrain</em> and watch the loss curve grow from right to left as the epochs tick past. At the start the network is guessing and the error is close to what you get from predicting zero. By the end the arrows point convincingly at the clusters. Drag the slider while the network is fixed and you will see it get worse &mdash; it was trained for one noise level, and a different one is out of distribution until you retrain.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-plot-stack">
+        <canvas id="dn-toy-canvas" width="520" height="420"></canvas>
+        <canvas id="dn-loss-canvas" width="520" height="240"></canvas>
+        <p class="g-canvas-hint">Top: the toy data in grey, the noisy points at the selected level in blue, and the network's denoised estimate as pink arrows. Bottom: the training loss, one point per epoch.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Noise level t <span class="val">700</span></label>
+          <input type="range" id="dn-level" min="20" max="999" step="1" value="700">
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="dn-retrain" class="g-primary">Retrain</button>
+        </div>
+        <div class="g-readout" id="dn-readout"></div>
+        <p class="g-mini">The network is seeded, so the same slider value and the same retrain count always produce the same curve. Nothing here uses wall-clock randomness.</p>
+        <p class="g-param-note">A full run is 300 epochs over 160 points &mdash; small enough to finish while you read this sentence, large enough to visibly learn.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The loss floor depends on $t$.</b> At high signal-to-noise ratio $\sqrt{1-\bar\alpha_t}$ is tiny, so the noise is almost invisible in $x_t$ and even a perfect model cannot do much better than guessing zero. At low signal-to-noise ratio the network can nearly read $\varepsilon$ off $x_t$. A flat-looking curve at small $t$ is not a broken network; it is an under-determined problem.</span></div>
+  </section>
+
+  <section class="g-step" id="params">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Epsilon, x₀ and v</h2></div>
+    <p class="g-eyebrow">Three ways to say the same thing</p>
+    <p>Given $x_t$ and $t$, the quantities $\varepsilon$, $x_0$ and $v$ are algebraically interchangeable. The forward equation is one linear relation between them, so once you know any one of the three you can recover the others exactly:</p>
+    <ul>
+      <li><b>$\varepsilon$-prediction</b> outputs the noise: $\varepsilon_\theta(x_t,t) \approx \varepsilon$. The target is standard normal at every timestep, which is the reason it is the default in most implementations.</li>
+      <li><b>$x_0$-prediction</b> outputs the clean point directly: $x_0 = (x_t - \sqrt{1-\bar\alpha_t}\,\varepsilon)/\sqrt{\bar\alpha_t}$. The target is data, which sounds natural but has a variance that changes with $t$ and, near $t=T$, an enormous amplification factor $1/\sqrt{\bar\alpha_t}$.</li>
+      <li><b>$v$-prediction</b> outputs a rotation-like combination, $v = \sqrt{\bar\alpha_t}\,\varepsilon - \sqrt{1-\bar\alpha_t}\,x_0$. It is the point on the angle bisector: when the signal is strong it looks like noise, when the signal is weak it looks like data.</li>
+    </ul>
+    <p>The demo's network predicts $\varepsilon$, which is why the arrows are computed by first converting its output to $x_0$. You can see that conversion in the readout: the same network output, expressed three ways.</p>
+    <table class="g-cheat">
+      <thead><tr><th>Target</th><th>Formula</th><th>Target variance across $t$</th></tr></thead>
+      <tbody>
+        <tr><td>Noise $\varepsilon$</td><td>$(x_t - \sqrt{\bar\alpha_t}x_0)/\sqrt{1-\bar\alpha_t}$</td><td>Constant: unit normal at every step</td></tr>
+        <tr><td>Clean $x_0$</td><td>$(x_t - \sqrt{1-\bar\alpha_t}\,\varepsilon)/\sqrt{\bar\alpha_t}$</td><td>Data variance, blown up as $\bar\alpha_t\to0$</td></tr>
+        <tr><td>Velocity $v$</td><td>$\sqrt{\bar\alpha_t}\,\varepsilon - \sqrt{1-\bar\alpha_t}\,x_0$</td><td>Roughly constant across the whole schedule</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="why">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Why the parameterisation matters</h2></div>
+    <p class="g-eyebrow">Same information, very different gradients</p>
+    <p>If the three targets were exactly recoverable from one another, the choice would be cosmetic. It is not, because a network is a finite approximation trained with finite precision, and the loss weights the different error scales very differently. Training on $x_0$ near the end of the schedule means multiplying the target by $1/\sqrt{\bar\alpha_t}$, which can be a hundredfold amplification of the label: a tiny absolute error becomes a huge loss, gradients explode, and the model spends its capacity on timesteps where the clean image is unrecoverable anyway.</p>
+    <p>$\varepsilon$-prediction sidesteps that by keeping the target at unit variance everywhere, at the cost of the opposite pathology at high SNR, where the noise is nearly invisible and the model's output is dominated by the prior mean. $v$-prediction splits the difference and was introduced precisely to keep the target's scale stable at both ends of the schedule; it is the default in several of the systems that produce images today.</p>
+    <p>All three can be made to work in the same architecture, and they often are: a single network can emit all three heads, and a sampler can pick whichever is numerically convenient. What changes is not what the network knows, but how hard it is to learn it. This is a general lesson about diffusion that repeats everywhere &mdash; the mathematics is elegant and the numerics decide what actually trains.</p>
+    <div class="g-warn">⚠ <span><b>The network above is trained at one noise level.</b> A real denoiser is conditioned on $t$ as well, usually through a sinusoidal embedding injected into every residual block, so one set of weights serves the whole schedule. Everything you see here happens inside a real denoiser too; it just happens a thousand times, at a thousand noise levels, with the same weights.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Denoising is gradient estimation</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Optimisation</div>
+        <h3 style="margin:6px 0;">Gradient descent with a schedule</h3>
+        <p style="margin-bottom:0;">The training loop here is plain stochastic gradient descent with a hand-written backward pass. The <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimisation guide</a> covers why the learning rate and the loss scale interact the way they do &mdash; the same reason $\varepsilon$-prediction is easier to train than $x_0$-prediction.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Probability</div>
+        <h3 style="margin:6px 0;">Regression to a conditional mean</h3>
+        <p style="margin-bottom:0;">Minimising squared error makes the network converge to $\mathbb{E}[\varepsilon\mid x_t]$, the posterior mean. The <a href="{{ '/math/statistics/regression/' | relative_url }}">linear regression chapter</a> develops the same fact for ordinary least squares: the cheapest thing to learn is always an expectation.</p>
+      </div>
+    </div>
+    <p>Once a denoiser exists, sampling is a loop: start from noise, ask the network for its noise estimate, subtract a fraction of it, and repeat. The next part runs that loop two ways &mdash; one ancestral and stochastic, one deterministic &mdash; and counts what each costs.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The denoising objective, and the parameterisation debate around it, are the subject of a small literature that is worth reading in order. The DDPM paper defines the loss; the v-prediction paper diagnoses its failure modes; and the progressive-distillation work is the first place the sampler's step count becomes a design variable.</p>
+    <p>If you read one thing, read the v-prediction paper's analysis of signal-to-noise truncation, because it explains why the same model can look excellent on one benchmark and broken on another.</p>
+    <ul class="g-refs">
+      <li>Jonathan Ho, Ajay Jain and Pieter Abbeel, <a href="https://arxiv.org/abs/2006.11239">"Denoising Diffusion Probabilistic Models"</a>, 2020 &mdash; the simplified $\varepsilon$-prediction loss.</li>
+      <li>Tim Salimans and Jonathan Ho, <a href="https://arxiv.org/abs/2202.00512">"Progressive Distillation for Fast Sampling of Diffusion Models"</a>, 2022 &mdash; introduces $v$-prediction and the signal-to-noise truncation argument.</li>
+      <li>Diederik Kingma, Tim Salimans, Ben Poole and Jonathan Ho, <a href="https://arxiv.org/abs/2107.00630">"Variational Diffusion Models"</a>, 2021 &mdash; the continuous-time objective and learned schedules.</li>
+      <li>Yang Song and Stefano Ermon, <a href="https://arxiv.org/abs/1907.05600">"Generative Modeling by Estimating Gradients of the Data Distribution"</a>, 2019 &mdash; denoising as score estimation, the bridge to the last part.</li>
+      <li>Ian Goodfellow, Yoshua Bengio and Aaron Courville, <em>Deep Learning</em>, chapter 6 &mdash; backpropagation and the multilayer perceptron, the network trained here.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Denoising loss</td><td>$\mathbb{E}\lVert\varepsilon-\varepsilon_\theta(x_t,t)\rVert^2$; ordinary regression</td></tr>
+        <tr><td>$\varepsilon$-prediction</td><td>Predict the noise; unit-variance target at every $t$</td></tr>
+        <tr><td>$x_0$-prediction</td><td>Predict the clean point; target scale blows up near $t=T$</td></tr>
+        <tr><td>$v$-prediction</td><td>Predict $\sqrt{\bar\alpha_t}\varepsilon-\sqrt{1-\bar\alpha_t}x_0$; stable scale</td></tr>
+        <tr><td>Conditioning on $t$</td><td>One network serves all noise levels via a timestep embedding</td></tr>
+        <tr><td>MLP</td><td>The toy network here: 2&rarr;16&rarr;16&rarr;2, tanh, linear output</td></tr>
+        <tr><td>Loss floor</td><td>Set by how much of $\varepsilon$ is recoverable from $x_t$ at that $t$</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A denoiser tells you which direction the data lies at one noise level. The next part turns that estimate into a loop that walks all the way from pure noise to a finished sample.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+  var TOY = D.toy2d('mixture', 160, 7);
+  var sch = D.schedule('cosine', 1000);
+  var level = 700;
+  var DATA_SEED = 11;
+  var EPOCHS = 300, CHUNK = 25, LR = 0.06;
+  var net = null;
+  var losses = [];
+  var trainGen = 0;
+  var retrainCount = 0;
+
+  var toyPlot = GM.plot(document.getElementById('dn-toy-canvas'), {
+    W: 520, H: 420, xRange: [-4, 4], yRange: [-4, 4],
+    xLabel: 'x', yLabel: 'y', onResize: redrawToy
+  });
+  var lossPlot = GM.plot(document.getElementById('dn-loss-canvas'), {
+    W: 520, H: 240, xRange: [0, EPOCHS], yRange: [0, 2.4],
+    xLabel: 'epoch', yLabel: 'MSE', onResize: redrawLoss
+  });
+
+  function datasetFor(t) {
+    var r = GM.rng(DATA_SEED + t);
+    var a = D.abAt(sch, t);
+    var sa = Math.sqrt(a), sd = Math.sqrt(Math.max(0, 1 - a));
+    var xs = [], ys = [], i;
+    for (i = 0; i < TOY.length; i++) {
+      var p = TOY[i];
+      var e = GM.gauss2(r);
+      xs.push([sa * p[0] + sd * e[0], sa * p[1] + sd * e[1]]);
+      ys.push([e[0], e[1]]);
+    }
+    return { xs: xs, ys: ys, ab: a };
+  }
+
+  function noisyCloud(t, count, seed) {
+    var r = GM.rng(seed);
+    var a = D.abAt(sch, t);
+    var sa = Math.sqrt(a), sd = Math.sqrt(Math.max(0, 1 - a));
+    var out = [], i;
+    for (i = 0; i < count; i++) {
+      var j = Math.floor(r() * TOY.length);
+      if (j >= TOY.length) j = TOY.length - 1;
+      var p = TOY[j];
+      var e = GM.gauss2(r);
+      out.push([sa * p[0] + sd * e[0], sa * p[1] + sd * e[1]]);
+    }
+    return out;
+  }
+
+  function runTraining(live) {
+    trainGen++;
+    var gen = trainGen;
+    retrainCount++;
+    var ds = datasetFor(level);
+    net = GM.net.mlp([2, 16, 16, 2], 7 + retrainCount * 17);
+    losses = [];
+    var done = 0;
+    if (!live) {
+      for (; done < EPOCHS; done++) losses.push(GM.net.sgdStep(net, ds.xs, ds.ys, LR));
+      redrawToy(); redrawLoss(); redrawReadout();
+      return;
+    }
+    function chunk() {
+      if (gen !== trainGen) return;
+      var end = Math.min(EPOCHS, done + CHUNK);
+      for (; done < end; done++) losses.push(GM.net.sgdStep(net, ds.xs, ds.ys, LR));
+      redrawToy(); redrawLoss(); redrawReadout();
+      if (done < EPOCHS) window.setTimeout(chunk, 0);
+    }
+    chunk();
+  }
+
+  function redrawLoss() {
+    if (!lossPlot) return;
+    lossPlot.clear();
+    lossPlot.yRange[0] = 0;
+    lossPlot.yRange[1] = 2.4;
+    lossPlot.axes({ xLabel: 'epoch', yLabel: 'MSE' });
+    lossPlot.hline(2, { color: c.divider, width: 1, dashed: true, label: 'predicting zero', labelX: 4 });
+    if (losses.length) {
+      var pts = [], i;
+      for (i = 0; i < losses.length; i++) pts.push([i, losses[i]]);
+      lossPlot.curve(pts, { color: c.accent, width: 2 });
+    }
+    lossPlot.legend([{ label: 'training MSE (predicting ε)', color: c.accent }], { dy: 6 });
+  }
+
+  function redrawToy() {
+    if (!toyPlot) return;
+    toyPlot.clear();
+    toyPlot.axes({ xLabel: 'x', yLabel: 'y' });
+    toyPlot.points(TOY, { color: 'rgba(120,124,130,0.3)', r: 2 });
+    var a = D.abAt(sch, level);
+    var noisy = noisyCloud(level, 70, 31337);
+    toyPlot.points(noisy, { color: c.accent400, r: 2.4 });
+    if (net) {
+      toyPlot.raw(function (ctx) {
+        for (var k = 0; k < noisy.length; k += 2) {
+          var x = noisy[k];
+          var eps = GM.net.forward(net, x);
+          var x0x = D.x0FromEps(x[0], eps[0], a);
+          var x0y = D.x0FromEps(x[1], eps[1], a);
+          Guide.drawArrow(ctx, toyPlot.px(x[0]), toyPlot.py(x[1]), toyPlot.px(x0x), toyPlot.py(x0y),
+            { color: c.accent2, width: 1.1, head: 5 });
+        }
+      });
+      toyPlot.points(TOY, { color: 'rgba(90,94,100,0.55)', r: 1.6 });
+    }
+    toyPlot.legend([
+      { label: 'data x0', color: '#9a9a9a', fill: true },
+      { label: 'noisy x_t at this level', color: c.accent400 },
+      { label: 'x_t → predicted x0', color: c.accent2 }
+    ], { dy: 6 });
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('dn-readout');
+    if (!el) return;
+    var a = D.abAt(sch, level);
+    var sd = Math.sqrt(Math.max(0, 1 - a));
+    var last = losses.length ? losses[losses.length - 1] : null;
+    var note;
+    if (!net || last == null) note = 'Training has not run yet.';
+    else if (sd < 0.2) note = 'Very high SNR: the noise is nearly invisible, so the best possible loss is close to 2.';
+    else if (sd > 1.1) note = 'Low SNR: the network can almost read ε off x_t, so the loss can fall well below 1.';
+    else note = 'Moderate SNR: the network can recover part of the noise and the loss falls clearly below 2.';
+    el.innerHTML =
+      '<div><span class="k">timestep t</span> <span class="hi">' + level + '</span> / 1000</div>' +
+      '<div><span class="k">ᾱ_t</span> ' + a.toFixed(4) + '</div>' +
+      '<div><span class="k">noise std √(1−ᾱ_t)</span> ' + sd.toFixed(4) + '</div>' +
+      '<div><span class="k">parameters</span> ' + (net ? GM.net.paramCount(net) : 0) + '</div>' +
+      '<div><span class="k">epochs run</span> ' + losses.length + '</div>' +
+      '<div><span class="k">final MSE</span> <span class="hi">' + (last == null ? '—' : last.toFixed(4)) + '</span></div>' +
+      '<div class="g-mini">' + note + '</div>';
+  }
+
+  var retrainBtn = document.getElementById('dn-retrain');
+  if (retrainBtn) retrainBtn.addEventListener('click', function () { runTraining(true); });
+
+  Guide.bindSliders(document.querySelectorAll('#dn-level'), function (el) {
+    level = parseInt(el.value, 10);
+    redrawToy();
+    redrawReadout();
+  });
+
+  var levelSlider = document.getElementById('dn-level');
+  if (levelSlider) levelSlider.addEventListener('change', function () { runTraining(true); });
+
+  runTraining(false);
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'denoiser-objective',
+      kind: 'choice',
+      prompt: 'In the simplified DDPM objective, what is the network asked to predict?',
+      options: [
+        { label: 'The noise ε that was added, given the noisy point and the timestep.', correct: true },
+        { label: 'The class label of the noisy point.', correct: false },
+        { label: 'The next noisy point in the forward chain, one step ahead.', correct: false }
+      ],
+      explanation: 'The loss is $\\mathbb{E}\\lVert\\varepsilon-\\varepsilon_\\theta(x_t,t)\\rVert^2$: predict the noise that was added. Because the closed form lets you jump to any $x_t$, this is ordinary regression and needs no rollout.'
+    },
+    {
+      id: 'denoiser-x0-from-eps',
+      kind: 'numeric',
+      prompt: 'At some timestep $\\bar\\alpha_t = 0.64$ and you observe $x_t = 1.2$ with a network noise estimate $\\varepsilon = 0.5$. Using $x_0 = (x_t - \\sqrt{1-\\bar\\alpha_t}\\,\\varepsilon)/\\sqrt{\\bar\\alpha_t}$, what is $x_0$?',
+      answer: 1.125,
+      tolerance: 0.01,
+      explanation: '$\\sqrt{0.64}=0.8$ and $\\sqrt{0.36}=0.6$, so $x_0 = (1.2 - 0.6\\times 0.5)/0.8 = (1.2-0.3)/0.8 = 0.9/0.8 = 1.125$. This is the conversion the demo performs on every arrow.'
+    },
+    {
+      id: 'denoiser-v-prediction',
+      kind: 'choice',
+      prompt: 'Why does v-prediction keep the target scale stable when x₀-prediction does not?',
+      options: [
+        { label: 'v mixes the noise and the clean point with the schedule coefficients, so it stays bounded at both ends of the schedule.', correct: true },
+        { label: 'It predicts the average of ε and x₀, which is always unit variance.', correct: false },
+        { label: 'It removes the need for a timestep embedding.', correct: false }
+      ],
+      explanation: 'v = $\\sqrt{\\bar\\alpha_t}\\,\\varepsilon - \\sqrt{1-\\bar\\alpha_t}\\,x_0$ is the point on the angle bisector. Near $t=0$ it looks like noise and near $t=T$ it looks like data, so its magnitude does not blow up the way $x_0/\\sqrt{\\bar\\alpha_t}$ does.'
+    },
+    {
+      id: 'denoiser-t-conditioning',
+      kind: 'choice',
+      prompt: 'The demo network is trained at a single noise level. What do real denoisers do instead?',
+      options: [
+        { label: 'Condition on t through a timestep embedding, so one set of weights serves the whole schedule.', correct: true },
+        { label: 'Train a separate network for every timestep.', correct: false },
+        { label: 'Ignore t, because the optimal denoiser is the same at every noise level.', correct: false }
+      ],
+      explanation: 'A single network receives a sinusoidal embedding of $t$ in every block, so it can behave differently at different noise levels. The optimal denoiser is emphatically not the same across $t$: at high SNR it should barely move, at low SNR it should pull hard toward the data.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

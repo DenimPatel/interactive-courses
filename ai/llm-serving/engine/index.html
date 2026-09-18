@@ -1,0 +1,617 @@
+---
+title: "LLM Serving, Interactively — Part 9: Inside the engine: kernels, CUDA graphs and the life of a request"
+description: "From tokenizer to sampler: the kernels, CUDA graphs and engine internals that turn one request into streamed tokens, and the batch size at which each optimisation starts to pay."
+permalink: "/ai/llm-serving/engine/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .en-note { font-size: 12.5px; opacity: 0.7; margin: 6px 0 0; }
+  .en-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+  .en-chip {
+    font-family: var(--font-mono); font-size: 12px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 5px 9px; border-radius: var(--radius-md);
+  }
+  .en-chip.on { background: var(--color-accent-100); border-color: var(--color-accent); color: var(--color-accent-800); }
+  .en-matrix { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .en-matrix th, .en-matrix td { padding: 8px 10px; border-bottom: 1px solid var(--color-divider); text-align: left; vertical-align: top; }
+  .en-matrix th { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; opacity: 0.6; white-space: nowrap; }
+  .en-matrix td.yes { color: var(--color-accent-700); font-weight: 600; }
+  .en-matrix td.no { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 9 of 20</span>
+    <h1>Inside the engine: kernels, CUDA graphs and the life of a request</h1>
+    <p>A scheduler decides what to run; an engine decides how. This part follows a single request across the process boundary into the GPU worker, then opens the worker up: the tokenizer and detokenizer on the way in and out, the FlashAttention and paged kernels in the middle, the CPU that launches them, and the CUDA graph and compilation layers that exist because at small batch the launches cost more than the maths. It ends with the landscape of engines that implement all of this — and what each one actually supports.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="path">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The end-to-end path across process boundaries</h2></div>
+    <p class="g-eyebrow">One request, six handoffs, at least two processes</p>
+    <p><a href="{{ '/ai/llm-training/inference/' | relative_url }}">The training guide's serving page</a> stops at the GPU: prefill then decode, batched continuously. A real engine has to move text across process boundaries before and after that. A gateway terminates HTTP, authenticates and enforces quotas; a tokenizer process converts text to ids; the scheduler process — vLLM V1 calls it <code>EngineCore</code> — owns the model and decides what runs each iteration; the GPU worker executes kernels; the detokenizer converts ids back; and a streaming layer flushes deltas to the client. The reason this matters at serving scale is that every handoff adds latency the GPU cannot hide, and the naive implementation serialises them. Production engines pipeline the stages and keep the model loop in a separate process precisely so a slow JSON parse or a blocking socket write cannot stall a decode iteration.</p>
+    <p>Click any stage in the strip. The batch slider at the bottom is the thread that ties the whole part together: the <em>fraction</em> of a step spent launching kernels on the CPU collapses as batch size grows, which is why the expensive machinery in the second half of this page only starts to pay at small batch.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="en-life" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Click a stage; drag the batch slider to move the CPU/GPU split.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch size (concurrent sequences) <span class="val">1</span></label><input type="range" id="en-life-batch" min="1" max="128" step="1" value="1"></div>
+        <div class="g-readout" id="en-life-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="tokenizer">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The tokenizer, the detokenizer and the streaming path</h2></div>
+    <p class="g-eyebrow">The bytes you actually stream are not tokens</p>
+    <p>Tokenization is CPU work measured in tens of microseconds for a normal prompt — irrelevant next to a prefill — but it is on the critical path, and a pathological prompt (long, emoji-heavy, or byte-fallback-heavy) can cost tens of milliseconds. The output side is subtler. A token is a byte sequence, not necessarily valid UTF-8, so a naive detokenizer that emits each token as it is sampled can split a multi-byte character across two SSE events and produce mojibake. Correct streaming detokenizers buffer until a token boundary is a valid character boundary, apply stop-string matching across deltas, and only then flush. That buffering is why "streaming" in a well-built engine is not token-by-token: it is the smallest safe text delta the client can append.</p>
+    <div class="g-goal">💡 <span><b>Where the time goes:</b> for a 2,000-token prompt the tokenizer is well under 1% of TTFT, so engines accept a slower, more correct detokenizer on the output path rather than risk corrupt text. The exception is <a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">structured output</a>, where the tokenizer's vocabulary meets a grammar and the constraint machinery can dominate the step.</span></div>
+  </section>
+
+  <section class="g-step" id="flash">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>FlashAttention tiling and online softmax</h2></div>
+    <p class="g-eyebrow">Never materialise the T×T matrix</p>
+    <p>Textbook attention computes scores <var>S = QKᵀ</var>, takes a row-wise softmax, then multiplies by <var>V</var>. For a sequence of length <var>T</var> that means writing and re-reading a <var>T×T</var> matrix in HBM — at <var>T = 8K</var> and FP16 that is 128&nbsp;MB per attention head, per layer. <a href="{{ '/ai/llm-training/architecture/' | relative_url }}#attention">FlashAttention</a> avoids it by tiling: load a block of <var>Q</var> into SRAM, stream the <var>K/V</var> blocks past it, and maintain the softmax incrementally. The trick is the <em>online softmax</em>: for each new block you track the running maximum <var>m</var> and the running denominator <var>l</var>, rescaling the accumulator by <var>e^{m_{\text{old}} - m_{\text{new}}}</var> whenever the max moves. The result is mathematically identical to the full softmax, with HBM traffic that is <var>O(T \cdot d)</var> instead of <var>O(T^2)</var>.</p>
+    <div class="g-math g-katex">$$m_i \leftarrow \max(m_{i-1},\, \tilde m_i), \qquad l_i \leftarrow l_{i-1}\,e^{\,m_{i-1}-m_i} + \tilde l_i\,e^{\,\tilde m_i-m_i}$$</div>
+    <p>The animation sweeps the <var>K/V</var> tiles for one query tile and prints the live <var>(m, l)</var> pair and the resulting HBM traffic for the sequence length you choose. Notice that <var>m</var> only ever rises and <var>l</var> only ever needs rescaling when it does — the incremental update is exact, not an approximation.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="en-flash" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Tile sweep is animated; sequence length is a slider. Press pause to inspect a tile.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="en-flash-play" class="g-primary">Play</button></div>
+        <div class="g-field"><label>Sequence length T <span class="val">2048</span></label><input type="range" id="en-flash-t" min="512" max="4096" step="512" value="2048"></div>
+        <div class="g-readout" id="en-flash-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="en-src-flash">Tiling and online-softmax formulation follow Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (NeurIPS 2022). HBM byte counts here are a per-head model that ignores L2 reuse, so treat the ratio, not the absolute figure, as the point.</p>
+  </section>
+
+  <section class="g-step" id="splitk">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>FlashDecoding and split-K</h2></div>
+    <p class="g-eyebrow">Prefill has a full grid; decode at batch 1 has almost none</p>
+    <p>FlashAttention assumes there are enough query tiles to fill the GPU. Prefill has <var>T</var> of them, so it parallelises trivially. A decode step at batch 1 has exactly one query token and hundreds of KV blocks: the attention kernel is a handful of warps long and the GPU sits idle. FlashDecoding fixes this by splitting the <var>K/V</var> axis, running a partial attention over each split with the same online-softmax state, and combining the partials in a second reduction kernel. This is the same split-K idea as a GEMM with a skinny <var>M</var> dimension, applied to attention. It buys several times the decode throughput at low batch and changes nothing about the result. At high batch there are already enough query rows to fill the grid, so engines disable the split — another crossover that runs the opposite way to the CPU-launch one below.</p>
+    <div class="g-goal">💡 <span><b>The shape of the whole page:</b> prefill is a big parallel GEMM that likes tiling and graphs are unnecessary; decode at low batch is a latency-bound scatter of tiny kernels that needs split-K and CUDA graphs to avoid starving the GPU. A serving engine is two different machines wearing one interface.</span></div>
+  </section>
+
+  <section class="g-step" id="paged">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Paged kernels and FlashInfer</h2></div>
+    <p class="g-eyebrow">Attention over a block table, not a contiguous tensor</p>
+    <p><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">PagedAttention</a> makes the KV cache a set of non-contiguous 16-token blocks, which is what allows sharing and fragmentation control in the first place. The cost is that the attention and KV-write kernels can no longer assume a dense tensor: they gather blocks through a block table, and the memory access pattern is irregular. Writing those kernels by hand is where most of an engine's low-level effort goes, and it is why engines cluster around a few kernel libraries. FlashInfer is the clearest example — paged and ragged batched kernels with customisable attention variants, JIT-compiled for the shapes the server actually sees — and it is the backend underneath more than one engine. The practical consequence for capacity planning is that paged kernels trade a small amount of throughput for a large amount of memory flexibility, and the trade is almost always worth it on real traffic.</p>
+  </section>
+
+  <section class="g-step" id="launch">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>CPU launch overhead at small batch</h2></div>
+    <p class="g-eyebrow">At batch 1 the GPU waits for the CPU</p>
+    <p>A transformer layer is not one kernel; it is a dozen or more — RMSNorm, QKV projection, RoPE, attention, output projection, MLP gate/up/down, plus sampling. A 70B model over 80 layers issues on the order of a thousand kernel launches per decode step. Each launch costs a few microseconds of host time, and the GPU cannot start work it has not been handed. At large batch each kernel runs for milliseconds, so the host is far ahead and launch overhead vanishes into the noise. At batch 1 the kernels are tiny, the host becomes the bottleneck, and the measured step time is set by the CPU rather than the GPU. The batch slider in step 1 is exactly this curve: roughly 45% of a batch-1 step is CPU launch, falling to about 4% by batch 128. This is why every serious engine has a CUDA-graph path that exists purely to delete the host from the inner loop.</p>
+  </section>
+
+  <section class="g-step" id="graphs">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>CUDA graphs and torch.compile</h2></div>
+    <p class="g-eyebrow">Record the launch stream once, replay it as one operation</p>
+    <p>A CUDA graph captures a sequence of kernels and their dependencies once, then replays the whole sequence with a single launch. The host disappears from the critical path: the GPU executes back-to-back and the inter-kernel gaps collapse. The constraints are real — graph capture needs fixed shapes and fixed memory addresses, so the engine pads and buckets sequence lengths and uses a static memory pool, and any control flow that depends on data must be turned into a branch that the graph already contains. In practice engines capture a graph per batch-size bucket and per sequence-length bucket, which is why "graph capture" is a distinct cold-start stage (Part 19) and why changing a shape can force a recapture. <code>torch.compile</code> attacks the same problem from the other side: it traces and fuses the Python-level model code into fewer, larger kernels, reducing both launch count and memory traffic, and the two compose — a compiled model is what you capture into a graph.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="en-graph" width="640" height="280"></canvas>
+        <p class="g-canvas-hint">CPU launch stream above, GPU execution below; toggle the graph and watch the gaps close.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="en-graph-row">
+          <button data-mode="kernels" class="g-primary">Kernel by kernel</button>
+          <button data-mode="graph">CUDA graph</button>
+        </div>
+        <div class="g-btnrow"><button id="en-graph-play">Play</button></div>
+        <div class="g-readout" id="en-graph-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="sampler">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Sampling kernels</h2></div>
+    <p class="g-eyebrow">A few microseconds each, until they are not</p>
+    <p>Sampling looks free next to a matmul and stops being free once you stack processors: temperature, top-k, top-p, min-p, repetition penalty, log-probability extraction, and for structured output a token mask built from a grammar automaton. The mask is the expensive one — it can be tens to hundreds of microseconds per step depending on grammar complexity — and it is the reason <a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">constrained decoding</a> has a measurable tax. The semantics of each processor are the training guide's subject; the link below goes there rather than re-deriving them. What belongs here is the cost model, because the sampler runs every single decode step and therefore competes directly with the kernels it feeds.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="en-sampler" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Toggle processors; bar height is added microseconds per decode step.</p>
+      </div>
+      <div class="g-controls">
+        <div class="en-chips" id="en-sampler-chips"></div>
+        <div class="g-readout" id="en-sampler-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">📌 <span><b>Cross-link:</b> what temperature, top-k, top-p, min-p and repetition penalty actually do to the distribution is derived interactively in <a href="{{ '/ai/llm-training/inference/' | relative_url }}#sampling">the training guide's sampler</a>; this page only counts their cost.</span></div>
+  </section>
+
+  <section class="g-step" id="v1">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>The vLLM V1 split and the engine landscape</h2></div>
+    <p class="g-eyebrow">EngineCore, AsyncLLM, and who supports what</p>
+    <p>vLLM's V1 architecture made the process split explicit: <code>AsyncLLM</code> owns the API surface, tokenization, detokenization and streaming, while <code>EngineCore</code> owns the model, the scheduler and the GPU loop, with the two communicating over ZMQ. The split exists to keep the GPU iteration tight — a slow client or a large JSON payload never blocks a step — and it is representative of where the field converged: the frontier is not the transformer, it is everything scheduled around it. TensorRT-LLM pushes the same ideas into NVIDIA's compiled stack with FP8/FP4 and in-flight batching; SGLang pairs a RadixAttention prefix tree with a strong structured-output front end; llama.cpp trades paged attention and disaggregation for portability across CPUs, Metal and consumer GPUs. The table is generated from the guide's engine dataset — select features to see who actually ships them.</p>
+    <div class="g-demo" style="flex-direction:column;">
+      <div class="en-chips" id="en-matrix-chips"></div>
+      <div style="overflow-x:auto; width:100%;">
+        <table class="en-matrix" id="en-matrix-table"></table>
+      </div>
+      <p class="g-source" id="en-src-engines"></p>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheatsheet">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">The engine in one table</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Piece</th><th>Why it exists</th><th>Number to remember</th></tr></thead>
+      <tbody>
+        <tr><td>FlashAttention tiling</td><td>Never write the T×T score matrix to HBM</td><td>HBM traffic O(T·d) vs O(T²)</td></tr>
+        <tr><td>Online softmax</td><td>Exact softmax from streamed blocks</td><td>Rescale by e^(m_old − m_new) when the max rises</td></tr>
+        <tr><td>FlashDecoding split-K</td><td>Fill the GPU when decode has one query row</td><td>Split the KV axis, reduce partials</td></tr>
+        <tr><td>Paged / FlashInfer kernels</td><td>Attention over non-contiguous blocks</td><td>16-token blocks gathered via a block table</td></tr>
+        <tr><td>CPU launch overhead</td><td>Host issues ~10³ kernels per step</td><td>~45% of a batch-1 step → ~4% at batch 128</td></tr>
+        <tr><td>CUDA graph</td><td>Replay the whole launch stream as one op</td><td>Fixed shapes, captured per bucket</td></tr>
+        <tr><td>Sampler cost</td><td>Processors run every decode step</td><td>Few µs each; grammar masks 40–150 µs</td></tr>
+        <tr><td>EngineCore / AsyncLLM</td><td>Keep the GPU loop off the API path</td><td>Scheduler + model in a separate process</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Dao et al., <a href="https://arxiv.org/abs/2205.14135">"FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"</a> (NeurIPS 2022).</li>
+      <li>Dao et al., <a href="https://arxiv.org/abs/2307.08691">"Flash-Decoding for long-context inference"</a> (2023) — split-K over the KV axis.</li>
+      <li>Ye et al., <a href="https://arxiv.org/abs/2501.01005">"FlashInfer: Efficient and Customizable Attention Engine for LLM Inference"</a> (2025).</li>
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">"Efficient Memory Management for Large Language Model Serving with PagedAttention"</a> (SOSP 2023).</li>
+      <li>vLLM project, <a href="https://docs.vllm.ai/">V1 engine architecture documentation</a> — AsyncLLM and EngineCore.</li>
+      <li>Dong et al., <a href="https://arxiv.org/abs/2411.15100">"XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models"</a> (MLSys 2025).</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The engine is built. The next part asks what happens when its weights get smaller than 16 bits.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__EN_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, SS = window.ServingSim, c = G.colors();
+
+  var FALLBACK = {
+    engines: {
+      source: "Project documentation and papers, retrieved 2026-09. Booleans indicate documented first-class support, not that every combination is production-ready.",
+      items: [
+        { name: "vLLM", pagedAttention: true, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: true, notes: "PagedAttention origin; disaggregated prefill/decode via the vLLM disaggregation connectors." },
+        { name: "SGLang", pagedAttention: true, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: true, notes: "RadixAttention prefix tree; strong EAGLE/EAGLE-3 speculative decoding and XGrammar integration." },
+        { name: "TensorRT-LLM", pagedAttention: true, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: true, notes: "NVIDIA-optimized for Hopper/Blackwell; in-flight batching; FP8/FP4." },
+        { name: "llama.cpp", pagedAttention: false, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: false, notes: "Portable CPU/Metal/consumer-GPU server; KV/prompt reuse; no paged attention or full PD disaggregation." }
+      ]
+    },
+    model_configs: {
+      source: "Official model configs and technical reports.",
+      items: [
+        { name: "Llama 3.1 8B", layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 8.03, activeParamsB: 8.03, contextLen: 131072 },
+        { name: "Llama 3.1 70B", layers: 80, hidden: 8192, heads: 64, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 70.6, activeParamsB: 70.6, contextLen: 131072 }
+      ]
+    },
+    structured_output: { maskOverheadUs: [40, 150], jumpForwardSpeedup: 1.6, engines: ["Outlines", "XGrammar", "LLGuidance"] }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function applyData(d) {
+    if (d && d.engines) DATA = d;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+  function engines() { return (DATA.engines && DATA.engines.items) || FALLBACK.engines.items; }
+  function cfg70() {
+    var items = (DATA.model_configs && DATA.model_configs.items) || FALLBACK.model_configs.items;
+    for (var i = 0; i < items.length; i++) if (items[i].layers >= 80) return items[i];
+    return items[items.length - 1];
+  }
+  function launchPct(b) { return 558 / (b + 11.4); }
+
+  // ---- Demo 1: life of a request ----------------------------------------
+  (function () {
+    var canvas = document.getElementById("en-life");
+    var ctx, W = 640, H = 300;
+    var batchS = document.getElementById("en-life-batch");
+    var readout = document.getElementById("en-life-readout");
+    var STAGES = [
+      { t: "API gateway", d: "Terminates HTTP/2, authenticates, enforces quotas, assigns a request id, opens the SSE stream." },
+      { t: "Tokenizer", d: "Text to token ids (BPE). Tens of microseconds on the CPU; runs before the scheduler sees the request." },
+      { t: "EngineCore", d: "The scheduler process. Admits the request, decides prefill vs decode, forms this iteration's batch." },
+      { t: "Prefill kernels", d: "GEMM plus FlashAttention over the whole prompt. Compute-bound; this is where a cache hit saves 2,100 ms." },
+      { t: "Decode loop", d: "One token per iteration, FlashDecoding plus paged attention. Memory-bandwidth-bound; the bulk of wall time." },
+      { t: "Sampler", d: "Logit processors plus sample. A few microseconds, or tens to hundreds with a grammar mask." },
+      { t: "Detokenizer", d: "Ids to text incrementally, buffering so a multi-byte character is never split across stream deltas." },
+      { t: "Streaming", d: "Flush safe text deltas over SSE. A slow client must never block a decode iteration." }
+    ];
+    var boxes = [], selected = 0;
+
+    function geom() {
+      boxes = [];
+      var cols = 4, bw = 148, bh = 58, gx = 10, gy = 12, padX = 8, padT = 30;
+      for (var i = 0; i < STAGES.length; i++) {
+        var r = Math.floor(i / cols), cc = i % cols;
+        boxes.push({ x: padX + cc * (bw + gx), y: padT + r * (bh + gy), w: bw, h: bh, i: i });
+      }
+    }
+    function draw() {
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) draw(w, h); }).ctx; }
+      geom();
+      ctx.clearRect(0, 0, W, H);
+      var b = parseInt(batchS.value, 10);
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Life of a request · batch " + b, 8, 16);
+      boxes.forEach(function (bx, idx) {
+        var on = idx === selected;
+        ctx.fillStyle = on ? c.accent : c.divider;
+        ctx.globalAlpha = on ? 1 : 0.16;
+        ctx.fillRect(bx.x, bx.y, bx.w, bx.h);
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = on ? c.accent700 : c.divider; ctx.lineWidth = on ? 2 : 1;
+        ctx.strokeRect(bx.x, bx.y, bx.w, bx.h);
+        ctx.fillStyle = on ? "#fff" : c.text;
+        ctx.font = "600 12px " + c.font; ctx.textAlign = "center";
+        ctx.fillText(STAGES[idx].t, bx.x + bx.w / 2, bx.y + 24);
+        ctx.font = "10px " + c.font;
+        ctx.fillText(idx === 0 ? "in" : (idx === STAGES.length - 1 ? "out" : "→"), bx.x + bx.w / 2, bx.y + 42);
+        ctx.textAlign = "left";
+      });
+      // CPU / GPU split bar
+      var pct = launchPct(b);
+      var barY = H - 26, barH = 16, barX = 120, barW = W - barX - 130;
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "right";
+      ctx.fillText("CPU launch", barX - 8, barY + 12);
+      ctx.fillStyle = c.accent2; ctx.fillRect(barX, barY, barW * pct / 100, barH);
+      ctx.fillStyle = c.accent; ctx.fillRect(barX + barW * pct / 100, barY, barW * (100 - pct) / 100, barH);
+      ctx.fillStyle = "#fff"; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      if (barW * pct / 100 > 60) ctx.fillText(pct.toFixed(1) + "%", barX + 6, barY + 12);
+      ctx.textAlign = "left"; ctx.fillStyle = c.text;
+      ctx.fillText("GPU execute " + (100 - pct).toFixed(1) + "%", barX + barW + 6, barY + 12);
+    }
+    function step(B) {
+      var m = cfg70();
+      var kv = SS.kvBytes({ layers: m.layers, kvHeads: m.n_kv_heads, headDim: m.d_head, tokens: 2048, bytesPerElem: 2, batch: B });
+      var st = SS.stepTime({ paramsB: m.activeParamsB, bytesPerParam: 2, kvBytes: kv, bwTBs: 3.35, peakTFLOPs: 989, batch: B });
+      return st.totalMs;
+    }
+    function update() {
+      draw();
+      var b = parseInt(batchS.value, 10);
+      var pct = launchPct(b);
+      var stepMs = step(b);
+      var lines = [];
+      lines.push('<span class="k">stage:</span> <span class="hi">' + STAGES[selected].t + "</span>");
+      lines.push(STAGES[selected].d);
+      lines.push('<span class="k">CPU launch share:</span> <span class="' + (pct > 20 ? "bad" : "hi") + '">' + pct.toFixed(1) + "%</span> of the step");
+      lines.push('<span class="k">est. step (70B, H100-class):</span> ' + G.fmtMs(stepMs) + " · CPU " + G.fmtMs(stepMs * pct / 100) + " · GPU " + G.fmtMs(stepMs * (1 - pct / 100)));
+      readout.innerHTML = lines.join("<br>");
+    }
+    canvas.addEventListener("click", function (ev) {
+      var p = G.hitTest(canvas, ev);
+      for (var i = 0; i < boxes.length; i++) {
+        var bx = boxes[i];
+        if (p.x >= bx.x && p.x <= bx.x + bx.w && p.y >= bx.y && p.y <= bx.y + bx.h) { selected = i; break; }
+      }
+      update();
+    });
+    G.bindSliders([batchS], update);
+    draw();
+    onData(update);
+    update();
+  })();
+
+  // ---- Demo 2: FlashAttention tiling ------------------------------------
+  (function () {
+    var canvas = document.getElementById("en-flash");
+    var ctx, W = 640, H = 320;
+    var tS = document.getElementById("en-flash-t");
+    var playBtn = document.getElementById("en-flash-play");
+    var readout = document.getElementById("en-flash-readout");
+    var BLOCK = 128, D = 128, BYTES = 2;
+    var qTile = 0, kTile = 0, m = -Infinity, l = 0, done = false;
+
+    function score(q, k) {
+      var base = Math.sin((q + 1) * 0.037) * Math.cos((k + 1) * 0.021);
+      var local = (k % 64 < 6) ? 1.4 : 0;
+      var recency = (k > q - 40) ? 0.8 : 0;
+      return base * 1.6 + local + recency;
+    }
+    function tileStats(q, kt) {
+      var lo = kt * BLOCK, hi = Math.min(lo + BLOCK, T());
+      var mx = -Infinity, sum = 0;
+      for (var k = lo; k < hi; k++) { var s = score(q, k); if (s > mx) mx = s; }
+      for (var k2 = lo; k2 < hi; k2++) sum += Math.exp(score(q, k2) - mx);
+      return { mx: mx, sum: sum };
+    }
+    function T() { return parseInt(tS.value, 10); }
+    function tiles() { return Math.ceil(T() / BLOCK); }
+    function resetRow() {
+      qTile = 0; kTile = 0; m = -Infinity; l = 0; done = false;
+      advance();
+    }
+    function advance() {
+      if (done) return;
+      var st = tileStats(qTile, kTile);
+      var mNew = Math.max(m, st.mx);
+      l = (m === -Infinity ? 0 : l) * Math.exp(m === -Infinity ? 0 : (m - mNew)) + st.sum * Math.exp(st.mx - mNew);
+      m = mNew;
+      kTile++;
+      if (kTile >= tiles()) {
+        kTile = 0; qTile++;
+        if (qTile >= Math.ceil(T() / BLOCK)) { done = true; }
+        else { m = -Infinity; l = 0; advance(); }
+      }
+    }
+    function render() {
+      var Tt = T(), nt = tiles();
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      ctx.clearRect(0, 0, W, H);
+      // tile grid
+      var padL = 40, padT = 30, gridW = W - padL - 150, gridH = H - padT - 90;
+      var cell = Math.min(gridW / nt, gridH / nt);
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Q tiles × K/V tiles · " + nt + " × " + nt + " · block " + BLOCK, 8, 16);
+      for (var r = 0; r < nt; r++) {
+        for (var q = 0; q < nt; q++) {
+          var x = padL + q * cell, y = padT + r * cell;
+          var cur = (r === qTile && q === kTile - 1);
+          ctx.fillStyle = cur ? c.accent2 : (r < qTile || (r === qTile && q < kTile)) ? c.accent400 : c.divider;
+          ctx.globalAlpha = cur ? 1 : (r === qTile ? 0.75 : 0.35);
+          ctx.fillRect(x + 1, y + 1, Math.max(1, cell - 2), Math.max(1, cell - 2));
+          ctx.globalAlpha = 1;
+        }
+      }
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      ctx.strokeRect(padL, padT + qTile * cell, cell * nt, cell);
+      // accumulator panel
+      var px = W - 138, py = padT;
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("online softmax", px, py + 4);
+      ctx.font = "12px " + c.mono;
+      ctx.fillText("m = " + (m === -Infinity ? "−∞" : m.toFixed(3)), px, py + 28);
+      ctx.fillText("l = " + l.toFixed(2), px, py + 48);
+      ctx.strokeStyle = c.divider; ctx.beginPath(); ctx.moveTo(px, py + 62); ctx.lineTo(px + 124, py + 62); ctx.stroke();
+      // attention weights for current row (last tile local)
+      var lo = Math.max(0, (kTile - 1) * BLOCK), hi = Math.min(lo + BLOCK, Tt);
+      var wsum = 0, ws = [];
+      for (var kk = lo; kk < hi; kk++) { var w = Math.exp(score(qTile, kk) - (m === -Infinity ? 0 : m)); ws.push(w); wsum += w; }
+      var bw = 120 / Math.max(1, ws.length), bbase = py + 130;
+      for (var j = 0; j < ws.length; j++) {
+        var h = 70 * (ws[j] / Math.max(1e-9, wsum));
+        ctx.fillStyle = c.accent;
+        ctx.fillRect(px + j * bw, bbase - h, Math.max(1, bw), h);
+      }
+      ctx.fillStyle = c.text; ctx.font = "10px " + c.font;
+      ctx.fillText("weights in current tile", px, bbase + 14);
+      // HBM bytes
+      var naive = (2 * Tt * Tt + 4 * Tt * D) * BYTES;
+      var flash = 4 * Tt * D * BYTES;
+      ctx.textAlign = "left"; ctx.font = "11px " + c.font;
+      ctx.fillText("HBM: naive " + G.fmtBytes(naive) + " vs tiled " + G.fmtBytes(flash), padL, H - 12);
+      readout.innerHTML =
+        '<span class="k">T:</span> ' + Tt + " · Q tile " + (qTile + 1) + "/" + nt + " · K tile " + kTile + "/" + nt + "<br>" +
+        '<span class="k">running m:</span> <span class="hi">' + (m === -Infinity ? "−∞" : m.toFixed(4)) + "</span> · <span class=\"k\">l:</span> <span class=\"hi\">" + l.toFixed(3) + "</span><br>" +
+        '<span class="k">HBM traffic / head:</span> naive ' + G.fmtBytes(naive) + " (" + (naive / flash).toFixed(1) + "×) vs tiled " + G.fmtBytes(flash) + "<br>" +
+        '<span class="k">status:</span> ' + (done ? "row complete · l/m exact" : "streaming K/V tiles");
+    }
+    G.loop({
+      button: playBtn, interval: 220,
+      onStep: function () {
+        if (done) { resetRow(); } else { advance(); }
+        render();
+      }
+    });
+    G.bindSliders([tS], function () { resetRow(); render(); });
+    resetRow();
+    render();
+  })();
+
+  // ---- Demo 3: launch overhead and CUDA graphs --------------------------
+  (function () {
+    var canvas = document.getElementById("en-graph");
+    var ctx, W = 640, H = 280;
+    var rowEl = document.getElementById("en-graph-row");
+    var readout = document.getElementById("en-graph-readout");
+    var playBtn = document.getElementById("en-graph-play");
+    var N = 20, GPU = 0.06, LAUNCH = 0.09, mode = "kernels", cursor = 0;
+    function build() {
+      var gpu = [], cpu = [], t = 0;
+      if (mode === "kernels") {
+        for (var i = 0; i < N; i++) {
+          var cs = i * LAUNCH;
+          var gs = Math.max(cs + LAUNCH, t);
+          cpu.push({ s: cs, e: cs + LAUNCH });
+          gpu.push({ s: gs, e: gs + GPU });
+          t = gs + GPU;
+        }
+      } else {
+        cpu.push({ s: 0, e: LAUNCH });
+        for (var j = 0; j < N; j++) gpu.push({ s: LAUNCH + j * GPU, e: LAUNCH + (j + 1) * GPU });
+      }
+      return { cpu: cpu, gpu: gpu, total: Math.max(cpu[cpu.length - 1].e, gpu[gpu.length - 1].e) };
+    }
+    function render() {
+      var model = build();
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      ctx.clearRect(0, 0, W, H);
+      var padL = 60, padR = 16, padT = 34, laneH = 26, gap = 30;
+      var plotW = W - padL - padR;
+      function X(ms) { return padL + plotW * (ms / model.total); }
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Step timeline · " + (mode === "graph" ? "CUDA graph replay" : "kernel by kernel"), 8, 16);
+      ctx.font = "11px " + c.font;
+      ctx.fillText("CPU", 8, padT + 17);
+      ctx.fillText("GPU", 8, padT + laneH + gap + 17);
+      model.cpu.forEach(function (k) {
+        ctx.fillStyle = c.accent2;
+        ctx.fillRect(X(k.s), padT, Math.max(1, X(k.e) - X(k.s)), laneH);
+      });
+      model.gpu.forEach(function (k) {
+        ctx.fillStyle = c.accent;
+        ctx.fillRect(X(k.s), padT + laneH + gap, Math.max(1, X(k.e) - X(k.s)), laneH);
+      });
+      var cx = X(cursor);
+      ctx.strokeStyle = c.text; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, padT - 6); ctx.lineTo(cx, padT + laneH * 2 + gap + 6); ctx.stroke();
+      var idle = 0;
+      for (var i = 1; i < model.gpu.length; i++) idle += Math.max(0, model.gpu[i].s - model.gpu[i - 1].e);
+      var graphTotal = LAUNCH + N * GPU;
+      readout.innerHTML =
+        '<span class="k">CPU launches:</span> ' + (mode === "graph" ? 1 : N) + " · <span class=\"k\">GPU kernels:</span> " + N + "<br>" +
+        '<span class="k">step wall time:</span> <span class="hi">' + model.total.toFixed(3) + " ms</span><br>" +
+        '<span class="k">GPU idle waiting on CPU:</span> <span class="' + (idle > 0.1 ? "bad" : "hi") + '">' + idle.toFixed(3) + " ms</span><br>" +
+        '<span class="k">graph replay would take:</span> ' + graphTotal.toFixed(3) + " ms (" + (model.total / graphTotal).toFixed(2) + "× at this shape)";
+    }
+    rowEl.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-mode]"); if (!b) return;
+      mode = b.getAttribute("data-mode");
+      Array.prototype.forEach.call(rowEl.querySelectorAll("button"), function (x) { x.className = x === b ? "g-primary" : ""; });
+      render();
+    });
+    var totalForLoop = 0;
+    G.loop({
+      button: playBtn, interval: 40,
+      onStep: function (dt) {
+        var model = build(); totalForLoop = model.total;
+        cursor += totalForLoop * (dt / 2200);
+        if (cursor > totalForLoop) cursor = 0;
+        render();
+      }
+    });
+    render();
+  })();
+
+  // ---- Demo 4: sampler cost ---------------------------------------------
+  (function () {
+    var canvas = document.getElementById("en-sampler");
+    var ctx, W = 640, H = 300;
+    var chips = document.getElementById("en-sampler-chips");
+    var readout = document.getElementById("en-sampler-readout");
+    var PROCS = [
+      { k: "base", label: "logits → argmax path", us: 5, fixed: true },
+      { k: "temp", label: "temperature", us: 2, on: true },
+      { k: "topk", label: "top-k", us: 8, on: true },
+      { k: "topp", label: "top-p (nucleus)", us: 15, on: true },
+      { k: "minp", label: "min-p", us: 12, on: false },
+      { k: "rep", label: "repetition penalty", us: 20, on: false },
+      { k: "logprob", label: "log-prob extraction", us: 30, on: false },
+      { k: "grammar", label: "grammar / JSON mask", us: 95, on: false }
+    ];
+    var STEP_MS = 20;
+    function buildChips() {
+      chips.innerHTML = "";
+      PROCS.forEach(function (p, i) {
+        if (p.fixed) return;
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "en-chip" + (p.on ? " on" : "");
+        b.textContent = p.label + " (+" + p.us + " µs)";
+        b.addEventListener("click", function () { p.on = !p.on; buildChips(); render(); });
+        chips.appendChild(b);
+      });
+    }
+    function render() {
+      var total = 0, data = [];
+      PROCS.forEach(function (p) {
+        if (p.fixed || p.on) { total += p.us; data.push({ label: p.label, value: p.us, valueLabel: p.us + " µs", color: p.fixed ? c.accent700 : (p.k === "grammar" ? c.accent2 : c.accent) }); }
+      });
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      G.drawBars(ctx, W, H, data, { maxV: Math.max(100, total), padL: 160, padR: 80 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Sampler cost per decode step · total " + total + " µs", 8, 14);
+      readout.innerHTML =
+        '<span class="k">total:</span> <span class="hi">' + total + " µs/step</span><br>" +
+        '<span class="k">share of a ' + STEP_MS + " ms step:</span> " + (100 * total / (STEP_MS * 1000)).toFixed(2) + "%<br>" +
+        '<span class="k">gate:</span> ' + (PROCS[PROCS.length - 1].on ? "grammar mask is the dominant term" : "grammar mask off — enable it to see the constrained-decoding tax") + "<br>" +
+        '<span class="k">at 50 tokens/s this is</span> ' + (total / 1000).toFixed(4) + " ms of CPU per token";
+    }
+    buildChips();
+    render();
+  })();
+
+  // ---- Demo 5: engine feature matrix ------------------------------------
+  (function () {
+    var table = document.getElementById("en-matrix-table");
+    var chips = document.getElementById("en-matrix-chips");
+    var srcEl = document.getElementById("en-src-engines");
+    var FEATURES = [
+      { k: "pagedAttention", label: "Paged attention" },
+      { k: "continuousBatching", label: "Continuous batching" },
+      { k: "prefixCache", label: "Prefix cache" },
+      { k: "speculative", label: "Speculative" },
+      { k: "lora", label: "LoRA" },
+      { k: "disaggregation", label: "Disaggregation" }
+    ];
+    var active = FEATURES.map(function (f) { return f.k; });
+    function buildChips() {
+      chips.innerHTML = "";
+      FEATURES.forEach(function (f) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "en-chip" + (active.indexOf(f.k) >= 0 ? " on" : "");
+        b.textContent = f.label;
+        b.addEventListener("click", function () {
+          var at = active.indexOf(f.k);
+          if (at >= 0) { if (active.length > 1) active.splice(at, 1); }
+          else active.push(f.k);
+          buildChips(); render();
+        });
+        chips.appendChild(b);
+      });
+    }
+    function render() {
+      var cols = FEATURES.filter(function (f) { return active.indexOf(f.k) >= 0; });
+      var html = "<thead><tr><th>Engine</th>";
+      cols.forEach(function (f) { html += "<th>" + f.label + "</th>"; });
+      html += "</tr></thead><tbody>";
+      engines().forEach(function (e) {
+        html += "<tr><td><b>" + e.name + "</b><br><span style=\"font-size:11.5px;opacity:0.7\">" + e.notes + "</span></td>";
+        cols.forEach(function (f) {
+          html += e[f.k] ? '<td class="yes">yes</td>' : '<td class="no">no</td>';
+        });
+        html += "</tr>";
+      });
+      html += "</tbody>";
+      table.innerHTML = html;
+      srcEl.textContent = (DATA.engines && DATA.engines.source) || FALLBACK.engines.source;
+    }
+    buildChips();
+    render();
+    onData(function () { buildChips(); render(); });
+  })();
+
+  fetch(window.__EN_DATA_URL).then(function (r) { return r.json(); }).then(applyData).catch(function () { applyData(FALLBACK); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

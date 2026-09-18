@@ -1,0 +1,627 @@
+---
+title: "LLM Serving, Interactively — Part 12: Parallelism for inference: TP, PP, EP, DP-attention, CP"
+description: "How production inference spreads one model across many GPUs — tensor, pipeline, expert, data and context parallelism — and why tensor parallelism has to stay inside the NVLink domain."
+permalink: "/ai/llm-serving/parallelism/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-topo-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; margin-top: 8px; }
+  .g-topo-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .g-topo-legend i { width: 14px; height: 4px; border-radius: 2px; display: inline-block; }
+  .g-preset { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+  .g-preset button { font-family: var(--font-mono); font-size: 11.5px; padding: 5px 9px; border-radius: var(--radius-sm); border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text); cursor: pointer; }
+  .g-preset button:hover { background: var(--color-accent-100); border-color: var(--color-accent); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 12 of 20</span>
+    <h1>Parallelism for inference: TP, PP, EP, DP-attention, CP</h1>
+    <p>A 70B model does not fit on one 80&nbsp;GB GPU, and a 671B model with a million-token KV cache does not fit on eight. Serving therefore shards a single model across devices — but the sharding that trains a model and the sharding that serves it are different problems. Training optimises time-to-convergence across a large global batch and can hide communication behind gradient accumulation; inference must hit a per-request latency SLO while every collective sits on the critical path. This part builds the five axes — tensor, pipeline, expert, data and context parallelism — and the constraint that organises all of them: keep the expensive collectives inside the NVLink domain.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <nav class="g-toc" aria-label="On this page">
+    <a href="#not-training">Not training parallelism</a>
+    <a href="#tp">Tensor parallelism</a>
+    <a href="#pp">Pipeline bubbles</a>
+    <a href="#ep">Expert parallelism</a>
+    <a href="#dp">DP and DP-attention</a>
+    <a href="#cp">Context parallelism</a>
+    <a href="#search">The search space</a>
+    <a href="#nvlink">Stay inside NVLink</a>
+  </nav>
+
+  <section class="g-step" id="not-training">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Inference parallelism is not training parallelism</h2></div>
+    <p class="g-eyebrow">Same model, opposite objective</p>
+    <p>The <a href="{{ '/ai/llm-training/inference/' | relative_url }}">training guide's inference chapter</a> established the two facts this whole series runs on: a decode step reads every active weight from HBM to produce one token, and prefill vs decode are two different bottlenecks. What that chapter did not need is the parallelism — one GPU, one model. Here we generalise.</p>
+    <p>Training parallelism exists to make a <em>global batch</em> of thousands of sequences fit and converge faster. Data parallelism (DP) with ZeRO shards optimizer states, gradients and parameters; tensor parallelism (TP) splits a layer's matrices so a single layer's compute is spread across devices; pipeline parallelism (PP) splits layers into stages. Communication is usually overlapped with compute or amortised over accumulation steps, and a few milliseconds of all-reduce is invisible against a days-long run.</p>
+    <p>Inference has no accumulation to hide behind and a latency SLO to meet <em>per token</em>. The decode step is memory-bandwidth-bound with an arithmetic intensity near 1–2 FLOPs/byte, so the way to make it faster is to read less per step — or to read the same weights while serving more sequences. That single fact explains the ranking of the axes: DP (replicate the model, split the requests) is almost free and raises throughput without touching single-request latency; TP is expensive but the only way to shrink the weight read on the critical path; PP is cheap on bandwidth but adds bubbles and stage hops; EP is a bandwidth play for sparse models; CP is a reach tool for sequences too long for one device.</p>
+    <div class="g-goal">💡 <span><b>The organising constraint:</b> every collective you put on the critical path must be cheap. On an H100, NVLink moves 900&nbsp;GB/s and an InfiniBand-class inter-node link moves roughly 50&nbsp;GB/s — an 18× cliff. Almost every real deployment layout is an attempt to keep TP (and later, hot all-to-all) on the fast side of that cliff.</span></div>
+  </section>
+
+  <section class="g-step" id="tp">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Tensor parallelism: two all-reduces per layer</h2></div>
+    <p class="g-eyebrow">The only way to cut the weight read</p>
+    <p>TP splits each weight matrix. In the Megatron scheme the attention and MLP blocks each do a column-parallel projection, a local nonlinearity, and a row-parallel projection, which needs an all-reduce of the partial sums. That makes <strong>two all-reduces per transformer layer</strong>, every step, on the critical path. A ring all-reduce moves roughly</p>
+    <div class="g-math g-katex">$$ T_{\text{AR}} \approx \underbrace{2\frac{N-1}{N}}_{\text{volume}}\frac{S}{B_{\text{link}}} + \underbrace{(N-1)\ell}_{\text{latency}}, $$</div>
+    <p>where \(S\) is the activation size, \(N\) the TP degree, \(B_{\text{link}}\) the link bandwidth and \(\ell\) the per-hop latency. Inside NVLink this is microseconds; across nodes it is tens of milliseconds. The demo below sweeps TP from 2 to 32 on a 70B-class model at batch 256 and plots <em>scaling efficiency</em> — speed-up divided by TP. Watch it flatten by TP=8, then reverse: past the NVLink domain the all-reduce cost grows faster than the weight shard shrinks, so adding GPUs makes the step <em>slower</em>.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ar-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Efficiency is speed-up ÷ TP, measured against TP=2. The dashed rule marks the 8-GPU NVLink domain.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Tensor parallel degree TP <span class="val" id="ar-tp-val">8</span></label><input type="range" id="ar-tp" min="1" max="5" step="1" value="3"></div>
+        <div class="g-readout" id="ar-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="parallel-source"></p>
+  </section>
+
+  <section class="g-step" id="pp">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Pipeline parallelism and the bubble</h2></div>
+    <p class="g-eyebrow">Cheap on bandwidth, expensive on latency</p>
+    <p>PP splits the transformer's layers into \(P\) stages and streams microbatches through them. Only activations cross a stage boundary — a point-to-point send of \(batch \times hidden\) elements, far smaller than an all-reduce — so PP is attractive across a slow link. Its cost is the <strong>pipeline bubble</strong>: while the pipe fills and drains, stages sit idle. For \(M\) microbatches and \(P\) stages the unavoidable idle fraction is</p>
+    <div class="g-math g-katex">$$ \text{bubble} = \frac{P-1}{M+P-1}. $$</div>
+    <p>Training hides the bubble with gradient accumulation. Inference's equivalent is <em>continuous batching</em>: the queue supplies a stream of sequences, so \(M\) is effectively the number of concurrent requests. With \(M=128\) and \(P=4\), the bubble is 3/131 ≈ 2.3%; with \(M=4\) it is 43%. The toggle below swaps between a thin batch and a continuously-batched pool. This is why disaggregated or high-QPS inference can afford PP across nodes, while a single interactive stream usually cannot.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pp-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Each row is a pipeline stage; each block is one microbatch's forward pass. Grey is the bubble.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="pp-play">Play</button>
+          <button id="pp-fill" class="g-primary">Continuous batching fills the bubble</button>
+        </div>
+        <div class="g-field"><label>Pipeline stages P <span class="val" id="pp-p-val">4</span></label><input type="range" id="pp-p" min="2" max="8" step="1" value="4"></div>
+        <div class="g-field"><label>Microbatches M <span class="val" id="pp-m-val">4</span></label><input type="range" id="pp-m" min="1" max="64" step="1" value="4"></div>
+        <div class="g-readout" id="pp-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="ep">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Expert parallelism (preview of Part 14)</h2></div>
+    <p class="g-eyebrow">Shard the experts, not the matrices</p>
+    <p>A mixture-of-experts layer is a router plus \(E\) independent feed-forward experts. EP places different experts on different devices, so a token's hidden state must be sent to whichever devices host its chosen experts, then sent back — an <strong>all-to-all</strong> rather than an all-reduce. DeepSeek-V3 uses 256 routed experts plus one shared expert and activates 8, and its production engine runs expert parallelism as wide as EP32 for prefill and EP144 for decode. That width is only viable because the all-to-all stays inside a rack-scale NVLink domain; over Ethernet it would dominate the step. <a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a> builds the full cost model and the EPLB rebalancer. For now: EP buys capacity without spending bandwidth on dense weights, at the price of a new collective.</p>
+    <div class="g-goal">📌 <span><b>Rule of thumb:</b> dense models parallelise with TP inside a node; sparse models parallelise with EP across a rack. The two collectives — all-reduce and all-to-all — have different scaling laws.</span></div>
+  </section>
+
+  <section class="g-step" id="dp">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>DP and DP-attention for MLA</h2></div>
+    <p class="g-eyebrow">Replicas are free until the KV cache is not</p>
+    <p>Data parallelism keeps a full model replica per group and sends each replica a different set of requests. In inference there are no gradients to synchronise, so <strong>pure DP costs no collective at all</strong> — it is the cheapest way to raise system throughput, and the first axis to spend before touching TP. A DP replica serving \(B\) sequences produces \(B\) tokens per step, so throughput scales with the replica count while single-request latency is unchanged.</p>
+    <p>The catch is memory. <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">GQA and MLA</a> shrink the per-token KV cache, but at long context it can still exceed the weights. That motivates <strong>DP-attention</strong>: instead of splitting the attention weight matrices with TP (and paying an all-reduce around attention), replicate the attention computation across DP ranks and shard the <em>KV cache</em> along the sequence or head dimension. For MLA, whose cache is a compressed latent plus a small RoPE key, the allocation across ranks is nearly free of compute cost, and decode's attention reads become a partitioned gather. The result: bigger effective batch and less KV per device, without a second TP collective per layer.</p>
+  </section>
+
+  <section class="g-step" id="cp">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Context parallelism (preview of Part 15)</h2></div>
+    <p class="g-eyebrow">When one sequence no longer fits</p>
+    <p>TP, PP and DP all leave the sequence axis intact. Context parallelism (CP) splits the <em>tokens</em> of a single sequence across devices, so a 200K-token prompt's attention is computed in pieces and combined with ring-style point-to-point communication. CP is exactly the training technique called sequence parallelism, transplanted to a workload where the "batch" may be one very long request. It is the last resort: it adds communication proportional to sequence length and is only worth it when neither KV sharding nor memory tiers can hold the context — the territory of <a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a>.</p>
+    <div class="g-warn">⚠️ <span><b>CP on the critical path is painful:</b> ring attention passes KV blocks around the ring every layer, so its cost grows with sequence length and ring width. A long-context request served with CP is faster on TTFT only if the alternative is swapping KV to host memory or recomputing.</span></div>
+  </section>
+
+  <section class="g-step" id="search">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>The search space: every way to spend 32 GPUs</h2></div>
+    <p class="g-eyebrow">Interactive topology explorer</p>
+    <p>A real deployment is a factorisation \(G = TP \times PP \times DP\) (plus EP and CP when present). Not every factorisation is legal or fast: the weights and KV cache must fit, TP must stay inside the NVLink domain, and a short batch makes the pipeline bubble large. The explorer below lays out 32 GPUs — blue edges are TP all-reduce links, magenta edges are PP activation hops, rows are DP replicas. Change TP, PP, DP or the per-replica batch and read the step time, system throughput, memory per GPU and the verdict.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="topo-canvas" width="640" height="300"></canvas>
+        <div class="g-topo-legend">
+          <span><i style="background:var(--color-accent)"></i>TP all-reduce</span>
+          <span><i style="background:var(--color-accent-2)"></i>PP activation hop</span>
+          <span><i style="background:var(--color-accent-2-700, #9c004e)"></i>TP across nodes (slow)</span>
+        </div>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>TP <span class="val" id="topo-tp-val">8</span></label><input type="range" id="topo-tp" min="1" max="8" step="1" value="8"></div>
+        <div class="g-field"><label>PP <span class="val" id="topo-pp-val">2</span></label><input type="range" id="topo-pp" min="1" max="8" step="1" value="2"></div>
+        <div class="g-field"><label>DP <span class="val" id="topo-dp-val">2</span></label><input type="range" id="topo-dp" min="1" max="32" step="1" value="2"></div>
+        <div class="g-field"><label>Batch per replica <span class="val" id="topo-b-val">64</span></label><input type="range" id="topo-b" min="1" max="256" step="1" value="64"></div>
+        <div class="g-preset" id="topo-presets"></div>
+        <div class="g-readout" id="topo-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="nvlink">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Keep TP inside NVLink; replicas before shards</h2></div>
+    <p class="g-eyebrow">Reading the search space</p>
+    <p>The Pareto sweep below evaluates every factorisation of 32 GPUs at the current batch. The horizontal axis is step time; the vertical axis is system throughput. Points up and to the left dominate. Click any legal point to load it into the explorer above.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pareto-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Circled points form the Pareto frontier. Red points fail a constraint; click a point to load it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="pareto-readout"></div>
+      </div>
+    </div>
+    <p>The shape of that cloud is the whole lesson. The best throughput usually comes from <strong>small TP (2–8), modest PP, and as much DP as fits</strong> — because DP is free and TP's all-reduce is not. When a single request must be fast, TP grows until the weight read fits the latency budget, and it stops at the node boundary. PP appears only when a model is too large for one node even with TP=8, and then only when continuous batching supplies enough microbatches to keep the bubble under a few percent. EP replaces TP for sparse layers and is the reason rack-scale domains exist.</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Axis</th><th>Splits</th><th>Collective</th><th>Use it when</th></tr></thead>
+      <tbody>
+        <tr><td>DP</td><td>Requests / replicas</td><td>None in inference</td><td>Always first — raises throughput for free</td></tr>
+        <tr><td>TP</td><td>Weight matrices</td><td>2 all-reduces / layer</td><td>Weights or latency demand it, and TP ≤ NVLink domain</td></tr>
+        <tr><td>PP</td><td>Layer blocks</td><td>Point-to-point activations</td><td>Model spans nodes; M is large so the bubble is small</td></tr>
+        <tr><td>EP</td><td>Experts</td><td>All-to-all dispatch/combine</td><td>Sparse MoE; rack-scale NVLink makes it affordable</td></tr>
+        <tr><td>DP-attention</td><td>KV cache / attention</td><td>Gather, no all-reduce</td><td>MLA/GQA cache dominates memory</td></tr>
+        <tr><td>CP</td><td>Sequence tokens</td><td>Ring point-to-point</td><td>One sequence exceeds a device's KV budget</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Concept</th><th>What to remember</th></tr></thead>
+      <tbody>
+        <tr><td>Two all-reduces per layer</td><td>TP's attention and MLP blocks each need one all-reduce of partial sums, every step</td></tr>
+        <tr><td>Ring all-reduce volume</td><td>\(2(N-1)/N \times S/B_{\text{link}}\), plus \((N-1)\ell\) latency</td></tr>
+        <tr><td>NVLink cliff</td><td>900 GB/s intra-node vs ~50 GB/s inter-node on H100-class — 18×</td></tr>
+        <tr><td>Pipeline bubble</td><td>\((P-1)/(M+P-1)\); continuous batching raises M and shrinks it</td></tr>
+        <tr><td>DP is free in inference</td><td>No gradients, so replicas need no collective; spend DP before TP</td></tr>
+        <tr><td>DP-attention</td><td>Replicate attention, shard the KV cache — avoids a TP all-reduce on MLA</td></tr>
+        <tr><td>Wide EP</td><td>EP32 prefill / EP144 decode for DeepSeek-V3, only on a rack-scale domain</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Shoeybi et al., <a href="https://arxiv.org/abs/1909.08053">"Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism"</a> (2019) — the two-all-reduce TP scheme.</li>
+      <li>Narayanan et al., <a href="https://arxiv.org/abs/2104.04473">"Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM"</a> (2021) — interleaved PP and bubble arithmetic.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2305.19370">"Ring Attention with Blockwise Transformers for Near-Infinite Context"</a> (2023) — the CP primitive.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437">"DeepSeek-V3 Technical Report"</a> (2024) — 256 routed experts, EP32/EP144 deployment.</li>
+      <li>NVIDIA, <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">GB200 NVL72</a> — 72 GPUs, ~1.8 TB/s NVLink per GPU, one 130 TB/s domain.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Splitting one model was step one. Next: splitting the two jobs it does into separate pools.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>
+  window.SERVING_NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  // ---- constants / fallback ----
+  var FALLBACK = {
+    accelerators: {
+      source: "Vendor datasheets/architecture pages, retrieved 2026-09: NVIDIA H100 SXM datasheet (dense BF16 989 TFLOP/s, 3.35 TB/s HBM3, 900 GB/s NVLink); NVIDIA B200 (192 GB HBM3e, 8 TB/s, 1.8 TB/s NVLink); NVIDIA GB200 NVL72 (72 GPUs, ~130 TB/s aggregate NVLink, single domain).",
+      items: [
+        { name: "NVIDIA H100 SXM", bwTBs: 3.35, bf16TFLOPs: 989, nvlinkGBs: 900, tdpW: 700 },
+        { name: "NVIDIA B200", bwTBs: 8.0, bf16TFLOPs: 2250, nvlinkGBs: 1800, tdpW: 1000 },
+        { name: "NVIDIA GB200 NVL72 (per rack)", bwTBs: 8.0, bf16TFLOPs: 180000, nvlinkGBs: 1800, tdpW: 120000 }
+      ]
+    },
+    model_configs: {
+      source: "Official model configs and technical reports (Llama 3.1, DeepSeek-V3 arXiv:2412.19437, Kimi K2, gpt-oss-120b).",
+      items: [
+        { name: "Llama 3.1 70B", layers: 80, hidden: 8192, n_kv_heads: 8, d_head: 128, totalParamsB: 70.6, activeParamsB: 70.6 },
+        { name: "DeepSeek-V3", layers: 61, hidden: 7168, n_kv_heads: 128, d_head: 128, totalParamsB: 671, activeParamsB: 37 },
+        { name: "Kimi K2", layers: 61, hidden: 7168, n_kv_heads: 64, d_head: 128, totalParamsB: 1000, activeParamsB: 32 }
+      ]
+    }
+  };
+  var NUM = FALLBACK;
+  var sourceEl = document.getElementById('parallel-source');
+  function apply(nums) {
+    NUM = nums || FALLBACK;
+    if (sourceEl && NUM.accelerators && NUM.accelerators.source) {
+      sourceEl.textContent = "Sources: " + NUM.accelerators.source;
+    }
+  }
+  apply(FALLBACK);
+  fetch(window.SERVING_NUMBERS_URL).then(function (r) { return r.json(); }).then(apply).catch(function () { /* offline: fallback already applied */ });
+
+  // ---- shared model ----
+  var G_TOTAL = 32, GPU_MEM = 80e9, BW = 3.35e12, PEAK = 989e12;
+  var MODEL = { paramsB: 70, layers: 80, hidden: 8192, kvPerToken: 0.33 * 1024 * 1024 };
+  var NVLINK_DOMAIN = 8;
+
+  function comboModel(tp, pp, dp, batch) {
+    if (tp * pp * dp !== G_TOTAL) return { ok: false, reason: 'TP×PP×DP = ' + (tp * pp * dp) + ' ≠ 32' };
+    var wPerGpu = MODEL.paramsB * 1e9 * 2 / (tp * pp);
+    var kvPerGpu = MODEL.kvPerToken * 4096 * batch / tp;
+    var memGpu = wPerGpu + kvPerGpu;
+    var memMs = memGpu / BW * 1000;
+    var flops = 2 * MODEL.paramsB * 1e9 * batch / (tp * pp);
+    var compMs = flops / PEAK * 1000;
+    var act = batch * MODEL.hidden * 2;
+    var crossNode = tp > NVLINK_DOMAIN;
+    var linkBW = crossNode ? 50e9 : 900e9;
+    var hop = crossNode ? 6e-6 : 1.2e-6;
+    var arPerLayer = (tp - 1) * hop + (2 * (tp - 1) / tp) * act / linkBW;
+    var tpMs = arPerLayer * 2 * (MODEL.layers / pp) * 1000;
+    var bubble = (pp - 1) / Math.max(1, batch + pp - 1);
+    var base = Math.max(memMs, compMs) + tpMs;
+    var stepMs = base / Math.max(0.2, 1 - bubble);
+    var toks = dp * batch / (stepMs / 1000);
+    return { ok: true, memGpu: memGpu, wPerGpu: wPerGpu, kvPerGpu: kvPerGpu, memMs: memMs, compMs: compMs, tpMs: tpMs,
+      bubble: bubble, stepMs: stepMs, toks: toks, fit: memGpu <= GPU_MEM, crossNode: crossNode };
+  }
+
+  function verdict(m, tp, pp, batch) {
+    if (!m.ok) return 'Illegal factorisation — ' + m.reason + '.';
+    if (!m.fit) return 'Does not fit: ' + Guide.fmtBytes(m.memGpu) + '/GPU exceeds 80 GB. Raise TP or lower the batch.';
+    if (m.crossNode) return 'TP spans nodes: the all-reduce crosses the ~50 GB/s fabric and dominates the step.';
+    if (pp > 1 && batch < 4 * pp) return 'Pipeline bubble is ' + (100 * m.bubble).toFixed(0) + '% — raise concurrent sequences or lower PP.';
+    if (tp > NVLINK_DOMAIN) return 'Keep TP within the NVLink domain.';
+    return 'Fits, TP inside NVLink, bubble ' + (100 * m.bubble).toFixed(1) + '%. This is a sound layout.';
+  }
+
+  // ---- Demo b: all-reduce scaling efficiency ----
+  (function () {
+    var canvas = document.getElementById('ar-canvas');
+    var ctx = canvas.getContext('2d');
+    var slider = document.getElementById('ar-tp');
+    var readout = document.getElementById('ar-readout');
+    var tpOptions = [2, 4, 8, 16, 32];
+    var setup = Guide.setupCanvas(canvas, 640, 340, function (W, H) { draw(W, H); });
+
+    function effPoint(tp) {
+      var m = comboModel(tp, 1, 32 / tp, 256);
+      var base = comboModel(2, 1, 16, 256);
+      return 100 * (base.stepMs / m.stepMs) / (tp / 2);
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var lo = Math.log2(2), hi = Math.log2(32);
+      var pts = tpOptions.map(function (tp) { return { x: Math.log2(tp), y: Math.max(0, effPoint(tp)) }; });
+      var axes = Guide.drawLines(ctx, W, H,
+        [{ points: pts, color: c.accent, width: 3 }],
+        [lo - 0.15, hi + 0.15], [0, 110],
+        { xLabel: 'TP degree (log₂)', yLabel: 'scaling efficiency (%)', padL: 50, padB: 34 });
+      // NVLink boundary
+      var bx = axes.px(Math.log2(NVLINK_DOMAIN));
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5;
+      if (ctx.setLineDash) ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(bx, axes.padT); ctx.lineTo(bx, axes.padT + axes.plotH); ctx.stroke();
+      if (ctx.setLineDash) ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('NVLink domain ends', bx + 5, axes.padT + 12);
+      // points
+      tpOptions.forEach(function (tp) {
+        var e = Math.max(0, effPoint(tp));
+        var x = axes.px(Math.log2(tp)), y = axes.py(e);
+        ctx.fillStyle = e < 50 ? c.accent2 : c.accent;
+        ctx.beginPath(); ctx.arc(x, y, 4.5, 0, 2 * Math.PI); ctx.fill();
+        ctx.fillStyle = c.text; ctx.textAlign = 'center'; ctx.font = '10px ' + c.mono;
+        ctx.fillText(e.toFixed(0) + '%', x, y - 9);
+      });
+      // selected point
+      var tp = tpOptions[parseInt(slider.value, 10)];
+      var e = Math.max(0, effPoint(tp));
+      var x = axes.px(Math.log2(tp)), y = axes.py(e);
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, 8, 0, 2 * Math.PI); ctx.stroke();
+    }
+    function render() {
+      var tp = tpOptions[parseInt(slider.value, 10)];
+      var m = comboModel(tp, 1, 32 / tp, 256);
+      var base = comboModel(2, 1, 16, 256);
+      var speed = base.stepMs / m.stepMs;
+      var cross = tp > NVLINK_DOMAIN;
+      readout.innerHTML =
+        '<span class="k">TP</span> <span class="hi">' + tp + '</span> &nbsp; ' +
+        '<span class="k">step</span> ' + Guide.fmtMs(m.stepMs) + '<br>' +
+        '<span class="k">speed-up vs TP=2</span> ' + speed.toFixed(2) + '×<br>' +
+        '<span class="k">efficiency</span> ' + (100 * speed / (tp / 2)).toFixed(0) + '%<br>' +
+        '<span class="k">comm share of step</span> <span class="' + (m.tpMs / m.stepMs > 0.3 ? 'bad' : '') + '">' +
+          (100 * m.tpMs / m.stepMs).toFixed(0) + '%</span><br>' +
+        '<span class="k">' + (cross ? 'cross-node all-reduce' : 'all-reduce on NVLink') + '</span>';
+      document.getElementById('ar-tp-val').textContent = tp;
+      draw(640, 340);
+    }
+    Guide.bindSliders([slider], render);
+    render();
+  })();
+
+  // ---- Demo c: pipeline bubble Gantt ----
+  (function () {
+    var canvas = document.getElementById('pp-canvas');
+    var ctx = canvas.getContext('2d');
+    var readout = document.getElementById('pp-readout');
+    var pSlider = document.getElementById('pp-p');
+    var mSlider = document.getElementById('pp-m');
+    var fillBtn = document.getElementById('pp-fill');
+    var playBtn = document.getElementById('pp-play');
+    var progress = 1, filling = false;
+    var setup = Guide.setupCanvas(canvas, 640, 320, function (W, H) { draw(W, H); });
+
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var P = parseInt(pSlider.value, 10);
+      var M = parseInt(mSlider.value, 10);
+      var cols = M + P - 1;
+      var padL = 54, padT = 16, padB = 24, padR = 8;
+      var cw = (W - padL - padR) / cols, ch = (H - padT - padB) / P;
+      ctx.font = '11px ' + c.font;
+      for (var s = 0; s < P; s++) {
+        ctx.fillStyle = c.text; ctx.textAlign = 'right';
+        ctx.fillText('stage ' + s, padL - 6, padT + s * ch + ch * 0.68);
+      }
+      var reveal = Math.max(1, Math.round(cols * progress));
+      for (var s2 = 0; s2 < P; s2++) {
+        for (var m = 0; m < M; m++) {
+          var col = m + s2;
+          var busy = col < reveal;
+          ctx.fillStyle = busy ? (progress >= 1 ? c.accent : c.accent400) : 'rgba(0,0,0,0.05)';
+          ctx.fillRect(padL + col * cw + 1, padT + s2 * ch + 1, Math.max(1, cw - 2), Math.max(1, ch - 2));
+        }
+      }
+      // time axis
+      ctx.strokeStyle = c.divider; ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + P * ch); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('time →', padL + (W - padL - padR) / 2, H - 6);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      if (progress >= 1) ctx.fillRect(padL + 2, padT + 2, 10, 10);
+      ctx.fillStyle = c.text;
+      if (progress >= 1) ctx.fillText('grey = bubble (idle stage)', padL + 18, padT + 11);
+    }
+    function stats() {
+      var P = parseInt(pSlider.value, 10), M = parseInt(mSlider.value, 10);
+      return { P: P, M: M, bubble: (P - 1) / (M + P - 1), util: M / (M + P - 1) };
+    }
+    function render() {
+      var s = stats();
+      readout.innerHTML =
+        '<span class="k">bubble fraction</span> <span class="hi">' + (100 * s.bubble).toFixed(1) + '%</span><br>' +
+        '<span class="k">stage utilisation</span> ' + (100 * s.util).toFixed(1) + '%<br>' +
+        '<span class="k">(P−1)/(M+P−1)</span> = (' + (s.P - 1) + ')/(' + s.M + '+' + (s.P - 1) + ') = ' +
+          (s.bubble).toFixed(3) + '<br>' +
+        '<span class="k">effective PP speed-up</span> ' + (s.P * s.util).toFixed(2) + '× of one stage';
+      document.getElementById('pp-p-val').textContent = s.P;
+      document.getElementById('pp-m-val').textContent = s.M;
+      draw(640, 320);
+    }
+    Guide.bindSliders([pSlider, mSlider], function () { progress = 1; filling = false; fillBtn.className = ''; render(); });
+    fillBtn.addEventListener('click', function () {
+      filling = !filling;
+      fillBtn.className = filling ? 'g-primary' : '';
+      mSlider.value = filling ? 64 : 4;
+      progress = 1;
+      render();
+    });
+    var loop = Guide.loop({
+      button: playBtn, interval: 45, playLabel: 'Play', pauseLabel: 'Pause',
+      onStep: function () {
+        progress += 0.03;
+        if (progress > 1) { progress = 1; loop.stop(); }
+        draw(640, 320);
+      }
+    });
+    render();
+  })();
+
+  // ---- Demo a: topology explorer ----
+  (function () {
+    var canvas = document.getElementById('topo-canvas');
+    var ctx = canvas.getContext('2d');
+    var readout = document.getElementById('topo-readout');
+    var tpS = document.getElementById('topo-tp'), ppS = document.getElementById('topo-pp'), dpS = document.getElementById('topo-dp'), bS = document.getElementById('topo-b');
+    var setup = Guide.setupCanvas(canvas, 640, 300, function (W, H) { draw(W, H); });
+
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var tp = parseInt(tpS.value, 10), pp = parseInt(ppS.value, 10), dp = parseInt(dpS.value, 10);
+      var valid = tp * pp * dp === G_TOTAL;
+      var cols = tp * pp, rows = dp;
+      var padL = 10, padT = 22, padR = 10, padB = 10;
+      var gw = W - padL - padR, gh = H - padT - padB;
+      var cell = Math.min(gw / cols, gh / rows, 26);
+      var ox = padL + (gw - cell * cols) / 2, oy = padT + (gh - cell * rows) / 2;
+      ctx.font = '10px ' + c.font;
+      // rows = DP replicas (background bands)
+      for (var d = 0; d < rows; d++) {
+        ctx.fillStyle = d % 2 ? 'rgba(43,95,255,0.05)' : 'rgba(214,0,108,0.05)';
+        ctx.fillRect(ox - 4, oy + d * cell - 2, cell * cols + 8, cell);
+        ctx.fillStyle = c.text; ctx.textAlign = 'right';
+        ctx.fillText('DP ' + d, ox - 8, oy + d * cell + cell * 0.7);
+      }
+      // cells
+      for (var d2 = 0; d2 < rows; d2++) {
+        for (var q = 0; q < cols; q++) {
+          var x = ox + q * cell, y = oy + d2 * cell;
+          ctx.fillStyle = valid ? c.accent400 : '#c9c4bd';
+          ctx.fillRect(x + 1, y + 1, cell - 2, cell - 2);
+        }
+      }
+      if (valid) {
+        for (var d3 = 0; d3 < rows; d3++) {
+          // TP edges within each stage block
+          for (var p = 0; p < pp; p++) {
+            for (var t = 0; t < tp - 1; t++) {
+              var a = p * tp + t, bx = p * tp + t + 1;
+              var crossTp = tp > NVLINK_DOMAIN && (t + 1) === NVLINK_DOMAIN;
+              ctx.strokeStyle = crossTp ? '#9c004e' : c.accent;
+              ctx.lineWidth = crossTp ? 3 : 2;
+              ctx.beginPath();
+              ctx.moveTo(ox + a * cell + cell, oy + d3 * cell + cell / 2);
+              ctx.lineTo(ox + bx * cell, oy + d3 * cell + cell / 2);
+              ctx.stroke();
+            }
+            // PP hop to next stage block
+            if (p < pp - 1) {
+              var e0 = p * tp + tp - 1, e1 = (p + 1) * tp;
+              ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(ox + e0 * cell + cell, oy + d3 * cell + cell * 0.5);
+              ctx.lineTo(ox + e1 * cell, oy + d3 * cell + cell * 0.5);
+              ctx.stroke();
+            }
+          }
+        }
+      } else {
+        ctx.fillStyle = c.accent2; ctx.font = 'bold 14px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('Illegal: TP×PP×DP = ' + (tp * pp * dp) + ', need 32', W / 2, H / 2);
+      }
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.mono; ctx.textAlign = 'left';
+      ctx.fillText('32 GPUs: ' + tp + ' × ' + pp + ' × ' + dp + (valid ? '' : ' (invalid)'), padL, 12);
+      if (valid) {
+        ctx.fillStyle = c.accent;
+        ctx.fillText('■', W - 150, 12);
+        ctx.fillStyle = c.text; ctx.fillText('TP', W - 138, 12);
+        ctx.fillStyle = c.accent2;
+        ctx.fillText('■', W - 108, 12);
+        ctx.fillStyle = c.text; ctx.fillText('PP', W - 96, 12);
+      }
+    }
+
+    function render() {
+      var tp = parseInt(tpS.value, 10), pp = parseInt(ppS.value, 10), dp = parseInt(dpS.value, 10), batch = parseInt(bS.value, 10);
+      document.getElementById('topo-tp-val').textContent = tp;
+      document.getElementById('topo-pp-val').textContent = pp;
+      document.getElementById('topo-dp-val').textContent = dp;
+      document.getElementById('topo-b-val').textContent = batch;
+      var m = comboModel(tp, pp, dp, batch);
+      if (!m.ok) {
+        readout.innerHTML = '<span class="bad">Illegal layout.</span><br><span class="k">' + m.reason + '</span>';
+      } else {
+        readout.innerHTML =
+          '<span class="k">step time</span> <span class="hi">' + Guide.fmtMs(m.stepMs) + '</span><br>' +
+          '<span class="k">system throughput</span> ' + Guide.fmtNum(Math.round(m.toks)) + ' tok/s<br>' +
+          '<span class="k">memory / GPU</span> ' + Guide.fmtBytes(m.memGpu) + ' <span class="k">(w </span>' + Guide.fmtBytes(m.wPerGpu) + '<span class="k"> + KV </span>' + Guide.fmtBytes(m.kvPerGpu) + '<span class="k">)</span><br>' +
+          '<span class="k">comm share</span> <span class="' + (m.tpMs / m.stepMs > 0.3 ? 'bad' : '') + '">' + (100 * m.tpMs / Math.max(1e-9, m.stepMs)).toFixed(0) + '%</span> &nbsp; ' +
+          '<span class="k">bubble</span> ' + (100 * m.bubble).toFixed(1) + '%<br>' +
+          '<span class="k">verdict:</span> ' + verdict(m, tp, pp, batch);
+      }
+      draw(640, 300);
+      window.__topoRef = { tp: tp, pp: pp, dp: dp, batch: batch };
+      if (paretoDraw) paretoDraw();
+    }
+
+    // presets
+    var presets = [[8, 2, 2], [8, 4, 1], [4, 4, 2], [4, 2, 4], [2, 4, 4], [8, 1, 4], [16, 2, 1], [4, 1, 8]];
+    var presetBox = document.getElementById('topo-presets');
+    presets.forEach(function (p) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = p[0] + '×' + p[1] + '×' + p[2];
+      b.addEventListener('click', function () { tpS.value = p[0]; ppS.value = p[1]; dpS.value = p[2]; render(); });
+      presetBox.appendChild(b);
+    });
+    Guide.bindSliders([tpS, ppS, dpS, bS], render);
+    render();
+  })();
+
+  // ---- Demo d: Pareto sweep ----
+  var paretoDraw = null;
+  (function () {
+    var canvas = document.getElementById('pareto-canvas');
+    var ctx = canvas.getContext('2d');
+    var readout = document.getElementById('pareto-readout');
+    var setup = Guide.setupCanvas(canvas, 640, 340, function (W, H) { draw(W, H); });
+    var points = [];
+
+    function factorisations() {
+      var out = [];
+      [1, 2, 4, 8, 16, 32].forEach(function (tp) {
+        [1, 2, 4, 8, 16, 32].forEach(function (pp) {
+          if (32 % (tp * pp) !== 0) return;
+          var dp = 32 / (tp * pp);
+          if (dp < 1 || dp > 32) return;
+          out.push([tp, pp, dp]);
+        });
+      });
+      return out;
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var ref = window.__topoRef || { batch: 64 };
+      var batch = ref.batch;
+      points = factorisations().map(function (f) {
+        var m = comboModel(f[0], f[1], f[2], batch);
+        var legal = m.ok && m.fit && !m.crossNode;
+        return { tp: f[0], pp: f[1], dp: f[2], step: m.ok ? m.stepMs : null, toks: m.ok ? m.toks : null, legal: legal, raw: m };
+      }).filter(function (p) { return p.step != null; });
+      var maxStep = Math.max.apply(null, points.map(function (p) { return p.step; }));
+      var maxToks = Math.max.apply(null, points.map(function (p) { return p.toks; }));
+      var axes = Guide.drawLines(ctx, W, H, [], [0, maxStep * 1.08], [0, maxToks * 1.08],
+        { xLabel: 'step time (ms)', yLabel: 'system throughput (tok/s)', padL: 56, padB: 34 });
+      // Pareto frontier
+      var legal = points.filter(function (p) { return p.legal; });
+      var frontier = legal.filter(function (p) {
+        return !legal.some(function (q) { return q !== p && q.step <= p.step && q.toks >= p.toks && (q.step < p.step || q.toks > p.toks); });
+      }).sort(function (a, b) { return a.step - b.step; });
+      ctx.strokeStyle = c.accent; ctx.lineWidth = 2; ctx.beginPath();
+      frontier.forEach(function (p, i) {
+        var X = axes.px(p.step), Y = axes.py(p.toks);
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      });
+      ctx.stroke();
+      points.forEach(function (p) {
+        var X = axes.px(p.step), Y = axes.py(p.toks);
+        p.px = X; p.py = Y;
+        ctx.fillStyle = p.legal ? c.accent : 'rgba(214,0,108,0.55)';
+        ctx.beginPath(); ctx.arc(X, Y, p.legal ? 4.5 : 3.5, 0, 2 * Math.PI); ctx.fill();
+        if (frontier.indexOf(p) >= 0) {
+          ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.arc(X, Y, 7.5, 0, 2 * Math.PI); ctx.stroke();
+        }
+      });
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('green = legal · red = violates memory/TP-domain constraint · batch ' + batch, axes.padL, axes.padT + 4);
+    }
+    function nearest(ev) {
+      var h = Guide.hitTest(canvas, ev);
+      var best = null, bd = 16 * 16;
+      points.forEach(function (p) {
+        if (p.px == null) return;
+        var d = (p.px - h.x) * (p.px - h.x) + (p.py - h.y) * (p.py - h.y);
+        if (d < bd) { bd = d; best = p; }
+      });
+      return best;
+    }
+    canvas.addEventListener('click', function (ev) {
+      var p = nearest(ev);
+      if (!p) return;
+      document.getElementById('topo-tp').value = p.tp;
+      document.getElementById('topo-pp').value = p.pp;
+      document.getElementById('topo-dp').value = p.dp;
+      document.getElementById('topo-tp').dispatchEvent(new Event('input'));
+      readout.innerHTML = '<span class="k">loaded</span> <span class="hi">TP ' + p.tp + ' · PP ' + p.pp + ' · DP ' + p.dp + '</span><br>' +
+        '<span class="k">step</span> ' + Guide.fmtMs(p.step) + ' &nbsp; <span class="k">throughput</span> ' + Guide.fmtNum(Math.round(p.toks)) + ' tok/s' +
+        (p.legal ? '' : '<br><span class="bad">this point violates a constraint</span>');
+    });
+    canvas.style.cursor = 'pointer';
+    paretoDraw = function () { draw(640, 340); };
+    draw(640, 340);
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

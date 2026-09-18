@@ -1,0 +1,636 @@
+---
+title: "Agents in Action, Interactively — Part 5: Memory and compaction"
+description: "Working, episodic, semantic and procedural memory; compaction versus context editing versus external notes; MemGPT/Letta, Mem0 and temporal graphs; compaction loss is adversarial."
+permalink: "/ai/agents-in-action/memory-compaction/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Memory and compaction</h1>
+    <p>An agent that runs for forty steps has a memory problem disguised as a context problem. The window fills with history, so something has to leave — and whatever leaves takes its knowledge with it. This part separates the four things people mean by "memory", walks through the three mechanisms that manage it, and then watches a fact get evicted from a live run and quietly re-derived three steps later. It ends on the uncomfortable property that makes compaction dangerous rather than merely lossy.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="types">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Four things called memory</h2></div>
+    <p class="g-eyebrow">Working, episodic, semantic, procedural</p>
+    <p>"Memory" in agent design is four different storage problems with four different answers, and most confusion comes from solving one while asking for another. <strong>Working memory</strong> is the live context window: everything resident and attended to right now, and by construction the smallest and most expensive store. <strong>Episodic memory</strong> is the record of what happened — the transcript of past sessions, retrievable later, useful for "what did we try last time?". <strong>Semantic memory</strong> is durable fact: the user's name, their timezone, the fact that the corpus lives under <code>/ai/</code>. <strong>Procedural memory</strong> is knowing how — a system prompt, a skill body, a fine-tuned reflex — which is behaviour rather than data.</p>
+    <p>The distinction is practical because the answers diverge. Names and preferences belong in a fact store that outlives the session and is looked up when relevant. A task in progress belongs in the working context and nowhere else. A procedure belongs in a prompt or a skill, where it costs tokens once rather than being re-derived. Pick a need below and see which store it actually belongs to.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mem-types-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The need on the left; the store that should hold it on the right. Getting this wrong is how an agent "remembers" a stale preference forever.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="mem-need-row"></div>
+        <div class="g-readout" id="mem-types-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> working memory is a <b>working set</b>; the other three are stores you consult. An agent that treats its window as its database will both forget things it needs and keep things it should not.</span></div>
+  </section>
+
+  <section class="g-step" id="mechanisms">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Compaction, context editing, external notes</h2></div>
+    <p class="g-eyebrow">Three mechanisms with three different failure modes</p>
+    <p><strong>Compaction</strong> is summarisation: replace a span of history with a shorter paraphrase so the gist survives. It is the default in most agent harnesses because it is easy, and it is the one to be most suspicious of, because the model writing the summary decides what mattered. <strong>Context editing</strong> is surgery on specific spans: drop the oldest tool results, clear the raw documents after their content has been extracted, remove a stale branch of the loop. It is cheaper and more predictable than summarisation and loses more, deliberately. <strong>External notes</strong> invert the problem: the agent writes durable structured state <em>outside</em> the window — a fact table, a scratch file, a task list — and re-reads the part it needs. Nothing is compacted, because the aggregate was never in context to begin with.</p>
+    <div class="g-code"><span class="k">// external notes: the agent writes structure, not prose</span>
+<span class="s">fact</span>: "docs live under /ai/"      <span class="s">learned_step</span>: 3   <span class="s">salience</span>: 0.9
+<span class="s">fact</span>: "eval harness runs five cases"  <span class="s">learned_step</span>: 6   <span class="s">salience</span>: 0.7
+<span class="s">fact</span>: "corpus has sixty documents"     <span class="s">learned_step</span>: 9   <span class="s">salience</span>: 0.4
+<span class="k"># the run re-reads a row by key; nothing depends on a summary's judgement</span></div>
+    <p>The research literature is largely about that third mechanism. <strong>MemGPT</strong> (Packer et al., arXiv:2310.08560) framed the context window as fast memory and the rest as slow storage, with the model itself paging material in and out through function calls — the operating-system metaphor that <strong>Letta</strong> now productises. <strong>Mem0</strong> (arXiv:2504.19413) builds a lighter pipeline: extract salient facts from a conversation, consolidate them against what is already stored, and retrieve the relevant subset later. <strong>Zep/Graphiti</strong> (arXiv:2501.13956) adds time: a temporal knowledge graph in which a fact carries a validity interval, so a superseded fact is invalidated rather than deleted and a query can be scoped to "as of last week".</p>
+    <p>The mechanisms differ in what they trust. Compaction trusts a summary. Context editing trusts a rule. Notes trust structure. When exact values matter — an order id, a price, a file path — only the last of those has an answer that is guaranteed to be the original.</p>
+    <div class="g-warn">⚠️ <span><b>The compaction tax:</b> compaction is lossy <em>and adversarial</em>. An evicted fact is indistinguishable from a fact that never existed, so the agent <b>silently redoes work</b> — there is no error, no retry, no log line, just a second retrieval of something it already knew.</span></div>
+  </section>
+
+  <section class="g-step" id="film-strip">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The context film strip</h2></div>
+    <p class="g-eyebrow">Watch a fact get dropped, then watch it get re-derived</p>
+    <p>Here is a scripted forty-step docs-assistant run with eight facts it learns along the way. Each column is one step's prompt, stacked by segment; the dashed line is the ceiling. Switch the compaction policy and scrub through the run. The triangles mark steps where a fact was evicted; the diamonds mark steps where the agent had to <em>redo</em> work because something it needed was gone.</p>
+    <p>The scenario is deliberate about which facts are fragile. <code>f3</code>, "the corpus has sixty documents", has low salience — so summarisation drops it, and eviction drops it sooner — and it is needed again later. In the default eviction run it is evicted at step 18 and re-derived at step 21. Three steps of work, paid twice, with nothing in the transcript to say so.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mem-film-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">One stacked column per step. ▼ eviction · ◆ redo. Scrub to step through and read the fact labels in the panel.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="mem-mode-none">No compaction</button>
+          <button id="mem-mode-evict" class="g-primary">Evict oldest</button>
+          <button id="mem-mode-summarize">Summarise</button>
+          <button id="mem-mode-notes">Structured notes</button>
+        </div>
+        <div class="g-field"><label>Token ceiling <span class="val">12000</span></label><input type="range" id="mem-maxtokens" min="6000" max="24000" step="1000" value="12000"></div>
+        <div class="g-field"><label>Step <span class="val">39</span></label><input type="range" id="mem-scrub" min="0" max="39" step="1" value="39"></div>
+        <div class="g-readout" id="mem-film-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mem-agents-source"></p>
+  </section>
+
+  <section class="g-step" id="compaction-tax">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The compaction tax, measured</h2></div>
+    <p class="g-eyebrow">Cheapest context is not the best answer</p>
+    <p>The four policies in the same run, at the same 12,000-token ceiling, priced three ways: total tokens sent across the whole run, the number of redos the policy caused, and a seeded task-success score. The tradeoff is not a single axis. "No compaction" wins on redos — nothing is ever evicted, so nothing is ever re-derived — and loses badly anyway, because on 28 of the 40 steps the prompt runs past the ceiling, which in a real deployment means silent truncation. Eviction sends the fewest tokens and causes the most redos. Summarisation lands in the middle. Structured notes send a little more than eviction and cause none.</p>
+    <p>Read the bars as a reminder that "how many tokens did it cost" is not the objective function. The objective is the task, and the token metric is only a good proxy when it is not buying redos.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mem-tax-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Three panels, four policies each. The best value in each panel is marked; no policy is best in all three.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="mem-tax-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mem-context-rot-source"></p>
+  </section>
+
+  <section class="g-step" id="notes-vs-summary">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Notes versus summarisation</h2></div>
+    <p class="g-eyebrow">Smaller context, zero redos — for a maintenance price</p>
+    <p>The cleanest comparison is between the two policies that both keep the run inside the ceiling: summarisation, which compresses history into prose, and structured notes, which moves facts out of history altogether. At a tight ceiling the notes run sends less and redoes nothing. Slide the ceiling up and the token totals converge — the advantage is not that notes are magically cheaper, it is that notes never make the agent re-derive something it already knew.</p>
+    <p>The price is maintenance, and it is real. Notes need a schema, a place to live, a policy for updating them, and a rule for when they are stale. A note that says the corpus has sixty documents is a liability the moment someone adds a sixty-first. Summarisation has no such bookkeeping; it just cannot be trusted with the exact value.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mem-notes-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Prompt tokens per step, same run, two policies. Ticks on the summary line are redos caused by a fact that had been compressed away.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Token ceiling <span class="val">8000</span></label><input type="range" id="mem-notes-maxtokens" min="6000" max="24000" step="1000" value="8000"></div>
+        <div class="g-readout" id="mem-notes-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mem-windows-source"></p>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> when exact facts matter, prefer <b>structure over summary</b>. Write the fact down, read it back by key, and let the summary handle only what was never going to be quoted.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What is working memory?</td><td>The live context window — resident, attended to, and the most expensive store you have.</td></tr>
+        <tr><td>What is episodic memory?</td><td>The record of what happened: past sessions, retrievable later for "what did we try last time".</td></tr>
+        <tr><td>What is semantic memory?</td><td>Durable facts about the world and the user, stored outside the window and looked up when relevant.</td></tr>
+        <tr><td>What is procedural memory?</td><td>How-to: a system prompt, a skill body, a tuned reflex. Behaviour, not data.</td></tr>
+        <tr><td>Compaction versus context editing?</td><td>Compaction paraphrases a span; context editing deletes specific spans by rule. Editing is predictable and loses more.</td></tr>
+        <tr><td>What do external notes buy?</td><td>Facts move out of history, so they are re-read by key instead of re-derived — and never depend on a summary's judgement.</td></tr>
+        <tr><td>Why is compaction adversarial?</td><td>An evicted fact is indistinguishable from a fact that never existed, so the agent silently redoes work.</td></tr>
+        <tr><td>What does MemGPT page?</td><td>Material between a fast main context and slow external storage, with the model driving the paging through function calls.</td></tr>
+        <tr><td>What does a temporal graph add?</td><td>A validity interval per fact, so a superseded fact is invalidated rather than deleted and queries can be time-scoped.</td></tr>
+        <tr><td>What should be measured?</td><td>Tokens per step, drops, redos and task success — not tokens alone.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Packer et al., <a href="https://arxiv.org/abs/2310.08560">"MemGPT: Towards LLMs as Operating Systems"</a>, 2023 — the paging metaphor, with the model managing its own memory through function calls.</li>
+      <li>Chhikara et al., <a href="https://arxiv.org/abs/2504.19413">"Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory"</a>, 2025 — extraction, consolidation and retrieval of salient facts, with a graph variant.</li>
+      <li>Rasmussen et al., <a href="https://arxiv.org/abs/2501.13956">"Zep: A Temporal Knowledge Graph Architecture for Agent Memory"</a>, 2025 — validity intervals so facts are superseded rather than deleted.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/news/context-management">"Managing context on the Claude Developer Platform"</a>, 2025 — context editing and a file-based memory tool: the external-notes mechanism as a platform feature.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — write/select/compress/isolate, and why "write" is listed first.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2307.03172">"Lost in the Middle: How Language Models Use Long Contexts"</a>, TACL 2024 — why a larger window does not remove the need to curate it.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A single agent with code execution and notes gets far. But some tasks look parallel — search many sources at once and combine. Next: the multi-agent argument, and the coupling at which it flips.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    agents: {
+      source: "Anthropic, 'Effective context engineering for AI agents' (2025-09-29) for the write/select/compress/isolate taxonomy. Harness design: context folding, step budgets, loop detection, sandboxing and permission gates are now as load-bearing as the model. Offline fallback constants.",
+      compactionTax: "Compaction is lossy and adversarial: an evicted fact is indistinguishable from a fact that never existed, so the agent silently redoes work.",
+      compactionTax: "Compaction is lossy and adversarial: an evicted fact is indistinguishable from a fact that never existed, so the agent silently redoes work."
+    },
+    context_rot: {
+      source: "Liu et al., 'Lost in the Middle' (arXiv:2307.03172, TACL 2024) shows a U-shaped accuracy curve across a long context; Chroma's 'Context Rot' report (2025-07) measured degradation beginning well below the advertised window. Offline fallback constants.",
+      bands: [
+        { position: "start (primacy)", relativeAccuracy: 1.0 },
+        { position: "middle", relativeAccuracy: 0.62 },
+        { position: "end (recency)", relativeAccuracy: 0.95 }
+      ]
+    },
+    context_windows: {
+      source: "Vendor model cards and API docs, retrieved 2026-09. Offline fallback constants.",
+      items: [{ model: "GPT-4o", tokens: 128000 }, { model: "Claude 3.7 Sonnet / 4.x", tokens: 200000 }]
+    }
+  };
+
+  var SEG_NAMES = ['system', 'tools', 'task', 'history', 'summary', 'facts', 'notes', 'retrieved'];
+  var SEG_COLORS = [c.accent, c.accent2, c.accent400, c.accent700, '#c9a227', '#7a5c9e', '#5f8a3a', '#b0552d'];
+  function palette() { return SEG_COLORS; }
+
+  // ------------------------------------------------------------------
+  // Demo B — which store does this need belong to?
+  // ------------------------------------------------------------------
+  var NEEDS = [
+    { need: 'Remember the user\'s name across sessions', type: 'semantic', where: 'fact store outside the window', read: 'looked up at session start', note: 'A durable fact about the user, not about this run. Long-lived, small, and expensive to get wrong.' },
+    { need: 'Recall what we tried in yesterday\'s session', type: 'episodic', where: 'transcript log, retrieved on demand', read: 'searched when the question is historical', note: 'An event, not a fact: "we tried that and it failed" is episodic, and the transcript is the evidence.' },
+    { need: 'Track the sub-task from three tool calls ago in this run', type: 'working', where: 'the live context window', read: 'already resident', note: 'In-flight state with no value beyond the run. Persisting it is a leak, not a feature.' },
+    { need: 'Apply our citation format to every draft', type: 'procedural', where: 'system prompt or skill body', read: 'loaded once, applied every turn', note: 'Behaviour, not data. It belongs in the prompt or a skill — asking a fact store for it is a category error.' },
+    { need: 'Know that the pricing changed last week', type: 'semantic', where: 'temporal fact store (validity intervals)', read: 'scoped to a point in time', note: 'Semantic memory with time attached: the old value is invalidated, not deleted, so "as of last week" still resolves.' }
+  ];
+  var TYPES = [
+    { id: 'working', label: 'Working', sub: 'the live context', mechanism: 'the context window, rebuilt every turn' },
+    { id: 'episodic', label: 'Episodic', sub: 'what happened', mechanism: 'transcript log + retrieval' },
+    { id: 'semantic', label: 'Semantic', sub: 'durable facts', mechanism: 'fact store (optionally temporal)' },
+    { id: 'procedural', label: 'Procedural', sub: 'how to', mechanism: 'prompt, SKILL.md, tuned weights' }
+  ];
+  var B = { sel: 0 };
+  var setupB = Guide.setupCanvas(el('mem-types-canvas'), 640, 340, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var pick = NEEDS[B.sel];
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the need', 18, 20);
+    ctx.fillStyle = c.accent100 || 'rgba(43,95,255,0.08)';
+    ctx.fillRect(18, 30, 210, 120);
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 1.2; ctx.strokeRect(18, 30, 210, 120);
+    ctx.fillStyle = c.text; ctx.font = '12px ' + c.font;
+    var words = pick.need.split(' '), line = '', ln = 0;
+    words.forEach(function (w) {
+      var t = line ? line + ' ' + w : w;
+      if (ctx.measureText(t).width > 186 && line) { ctx.fillText(line, 30, 56 + ln * 17); line = w; ln++; }
+      else { line = t; }
+    });
+    if (line) ctx.fillText(line, 30, 56 + ln * 17);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('→ ' + pick.type + ' memory', 30, 138);
+
+    var gx = 254, gy = 30, bw = 176, bh = 128, gap = 12;
+    TYPES.forEach(function (t, i) {
+      var col = i % 2, row = Math.floor(i / 2);
+      var x = gx + col * (bw + gap), y = gy + row * (bh + gap);
+      var active = t.id === pick.type;
+      ctx.fillStyle = active ? 'rgba(214,0,108,0.10)' : 'rgba(120,120,120,0.05)';
+      ctx.fillRect(x, y, bw, bh);
+      ctx.strokeStyle = active ? c.accent2 : c.divider; ctx.lineWidth = active ? 2 : 1;
+      ctx.strokeRect(x, y, bw, bh);
+      ctx.fillStyle = active ? c.accent2 : c.text;
+      ctx.font = '600 13px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(t.label, x + 10, y + 22);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(t.sub, x + 10, y + 37);
+      ctx.fillStyle = active ? c.accent700 : 'rgba(120,120,120,0.9)';
+      var mw = t.mechanism.split(' '), ml = '', mn = 0;
+      mw.forEach(function (w) {
+        var tt = ml ? ml + ' ' + w : w;
+        if (ctx.measureText(tt).width > bw - 20 && ml) { ctx.fillText(ml, x + 10, y + 58 + mn * 13); ml = w; mn++; }
+        else { ml = tt; }
+      });
+      if (ml) ctx.fillText(ml, x + 10, y + 58 + mn * 13);
+    });
+
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('read pattern: ' + pick.read, 18, 196);
+    var noteWords = pick.note.split(' '), nline = '', nl = 0;
+    ctx.fillStyle = c.accent700;
+    noteWords.forEach(function (w) {
+      var t = nline ? nline + ' ' + w : w;
+      if (ctx.measureText(t).width > 600 && nline) { ctx.fillText(nline, 18, 216 + nl * 15); nline = w; nl++; }
+      else { nline = t; }
+    });
+    if (nline) ctx.fillText(nline, 18, 216 + nl * 15);
+
+    el('mem-types-readout').innerHTML =
+      '<div><span class="k">need</span> ' + pick.need + '</div>' +
+      '<div><span class="k">store</span> <span class="hi">' + pick.type + ' memory</span>' +
+      ' &nbsp; <span class="k">lives in</span> ' + pick.where + '</div>' +
+      '<div class="k">' + pick.note + '</div>';
+  }
+  NEEDS.forEach(function (n, i) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = n.need.length > 34 ? n.need.slice(0, 32) + '…' : n.need;
+    btn.className = i === 0 ? 'g-primary' : '';
+    btn.addEventListener('click', function () {
+      B.sel = i;
+      Array.prototype.forEach.call(el('mem-need-row').children, function (b, j) {
+        b.className = j === i ? 'g-primary' : '';
+      });
+      drawB();
+    });
+    el('mem-need-row').appendChild(btn);
+  });
+
+  // ------------------------------------------------------------------
+  // Demo A — the context film strip
+  // ------------------------------------------------------------------
+  var A = { mode: 'evict', maxTokens: el('mem-maxtokens'), sel: 39 };
+  var setupA = Guide.setupCanvas(el('mem-film-canvas'), 640, 380, drawA);
+  var MODE_LABEL = { none: 'no compaction', evict: 'evict oldest turns', summarize: 'summarise as you go', notes: 'structured notes' };
+  function runFor(mode, maxTokens) {
+    return AppSim.agentRun('docs', { compaction: mode, maxTokens: maxTokens, steps: 40, seed: 5 });
+  }
+  function factInContext(run, fid, i) {
+    var f = run.facts.filter(function (x) { return x.id === fid; })[0];
+    var events = [{ step: f.learnAt, add: true }];
+    run.drops.forEach(function (d) { if (d.fact === fid) events.push({ step: d.step, add: false }); });
+    run.redos.forEach(function (d) { if (d.fact === fid) events.push({ step: d.step, add: true }); });
+    events.sort(function (a, b) { return (a.step - b.step) || (a.add ? 1 : -1); });
+    var last = null;
+    events.forEach(function (e) { if (e.step <= i) last = e; });
+    return last ? last.add : false;
+  }
+  function drawA() {
+    if (!setupA) return;
+    var maxTokens = parseInt(A.maxTokens.value, 10);
+    var run = runFor(A.mode, maxTokens);
+    var sel = Math.max(0, Math.min(39, isFinite(A.sel) ? A.sel : 0));
+    var pal = palette();
+    var columns = run.steps.map(function (st) {
+      return {
+        label: String(st.i),
+        segments: st.segments.map(function (sg, i) { return { value: sg.tokens, color: pal[i % pal.length] }; })
+      };
+    });
+    var geo = Guide.drawStackedColumns(setupA.ctx, 640, 380, columns, {
+      maxTotal: Math.max(maxTokens, run.maxTotal) * 1.06, padL: 54, padR: 14, padT: 58, padB: 40, gap: 1
+    });
+    var ctx = setupA.ctx;
+
+    SEG_NAMES.forEach(function (nm, i) {
+      var col = i % 4, row = Math.floor(i / 4);
+      var lx = 16 + col * 156, ly = 10 + row * 14;
+      ctx.fillStyle = pal[i % pal.length]; ctx.fillRect(lx, ly, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(nm, lx + 12, ly + 9);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('per-step prompt composition · ' + MODE_LABEL[A.mode] + ' · ceiling ' + Guide.fmtNum(maxTokens), 16, 44);
+
+    var cy = geo.py(maxTokens);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(geo.padL, cy); ctx.lineTo(628, cy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.textAlign = 'left';
+    ctx.fillText('ceiling', geo.padL + 2, cy - 3);
+
+    run.drops.forEach(function (d) {
+      var x = geo.px(Math.min(39, d.step));
+      ctx.fillStyle = c.accent2;
+      ctx.beginPath();
+      ctx.moveTo(x - 4, geo.padT - 9); ctx.lineTo(x + 4, geo.padT - 9); ctx.lineTo(x, geo.padT - 2);
+      ctx.closePath(); ctx.fill();
+    });
+    run.redos.forEach(function (d) {
+      var x = geo.px(Math.min(39, d.step));
+      ctx.fillStyle = c.accent700;
+      ctx.beginPath();
+      ctx.moveTo(x, geo.padT - 9); ctx.lineTo(x + 4, geo.padT - 5.5); ctx.lineTo(x, geo.padT - 2); ctx.lineTo(x - 4, geo.padT - 5.5);
+      ctx.closePath(); ctx.fill();
+    });
+
+    var selX = geo.px(sel);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.35; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(selX, geo.padT); ctx.lineTo(selX, geo.padT + geo.plotH); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+
+    ctx.fillStyle = c.accent2;
+    ctx.beginPath();
+    ctx.moveTo(446, 38); ctx.lineTo(454, 38); ctx.lineTo(450, 46);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('fact evicted', 458, 46);
+    ctx.fillStyle = c.accent700;
+    ctx.beginPath();
+    ctx.moveTo(534, 38); ctx.lineTo(538, 42); ctx.lineTo(534, 46); ctx.lineTo(530, 42);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = c.text;
+    ctx.fillText('work redone', 546, 46);
+
+    var st = run.steps[sel];
+    var here = [];
+    run.drops.forEach(function (d) { if (d.step === sel) here.push('evicted “' + d.label + '”'); });
+    run.redos.forEach(function (d) { if (d.step === sel) here.push('redid “' + d.label + '”'); });
+    var inCtx = run.facts.filter(function (f) { return factInContext(run, f.id, sel); });
+    var gone = run.facts.filter(function (f) { return !factInContext(run, f.id, sel); });
+
+    var fragility = '';
+    var target = run.facts.filter(function (f) { return f.label === 'the corpus has sixty documents'; })[0];
+    var drop = run.drops.filter(function (d) { return d.fact === target.id; })[0];
+    var redo = drop ? run.redos.filter(function (r) { return r.fact === target.id && r.step >= drop.step; })[0] : null;
+    if (drop && redo) {
+      fragility = 'watch “' + target.label + '”: evicted at step ' + drop.step +
+        ', re-derived at step ' + redo.step + ' — ' + (redo.step - drop.step) + ' steps of work paid twice';
+    }
+
+    el('mem-film-readout').innerHTML =
+      '<div><span class="k">step</span> <span class="hi">' + sel + '</span>' +
+      ' &nbsp; <span class="k">action</span> ' + st.action +
+      ' &nbsp; <span class="k">prompt</span> ' + Guide.fmtNum(st.total) + ' tok</div>' +
+      '<div><span class="k">policy</span> ' + MODE_LABEL[A.mode] +
+      ' &nbsp; <span class="k">evictions</span> ' + run.drops.length +
+      ' &nbsp; <span class="k">redos</span> ' + run.redos.length +
+      ' &nbsp; <span class="k">overflows</span> ' + run.overflows + '</div>' +
+      '<div><span class="k">in context here</span> ' + (inCtx.length ? inCtx.map(function (f) { return f.id; }).join(' ') : 'none') +
+      ' &nbsp; <span class="k">gone</span> ' + (gone.length ? gone.map(function (f) { return f.id; }).join(' ') : 'none') + '</div>' +
+      '<div>' + (here.length ? '<span class="bad">this step: ' + here.join(' · ') + '</span>' : '<span class="k">this step changes no memory</span>') + '</div>' +
+      (fragility ? '<div class="bad">' + fragility + '</div>' : '') +
+      '<div class="k">' + st.segments.map(function (s) { return s.name + ' ' + Guide.fmtNum(s.tokens); }).join(' · ') + '</div>';
+  }
+  Guide.bindSliders([A.maxTokens, el('mem-scrub')], function () {
+    A.maxTokens = el('mem-maxtokens');
+    A.sel = parseInt(el('mem-scrub').value, 10);
+    drawA();
+  });
+  ['none', 'evict', 'summarize', 'notes'].forEach(function (m) {
+    el('mem-mode-' + m).addEventListener('click', function () {
+      A.mode = m;
+      ['none', 'evict', 'summarize', 'notes'].forEach(function (x) {
+        el('mem-mode-' + x).className = x === m ? 'g-primary' : '';
+      });
+      drawA();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo C — the compaction tax
+  // ------------------------------------------------------------------
+  var setupC = Guide.setupCanvas(el('mem-tax-canvas'), 640, 340, drawC);
+  var TAX_CEILING = 12000;
+  function taxRows() {
+    return ['none', 'evict', 'summarize', 'notes'].map(function (m, i) {
+      var run = runFor(m, TAX_CEILING);
+      var tokens = run.steps.reduce(function (a, s) { return a + s.total; }, 0);
+      var redos = run.redos.length, drops = run.drops.length, overflows = run.overflows;
+      var success = 0.98 - 0.02 * redos - 0.012 * overflows;
+      success += (AppSim.rng(4100 + i * 97)() - 0.5) * 0.012;
+      success = Math.max(0.05, Math.min(0.99, success));
+      return { mode: m, label: MODE_LABEL[m], tokens: tokens, redos: redos, drops: drops, overflows: overflows, success: success };
+    });
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var rows = taxRows();
+    var panels = [
+      { title: 'tokens sent across the run', get: function (r) { return r.tokens; }, fmt: function (v) { return Guide.fmtNum(v); }, lowerBetter: true, color: c.accent },
+      { title: 'redos caused', get: function (r) { return r.redos; }, fmt: function (v) { return v + ''; }, lowerBetter: true, color: c.accent2 },
+      { title: 'seeded task success', get: function (r) { return r.success; }, fmt: function (v) { return (v * 100).toFixed(0) + '%'; }, lowerBetter: false, color: c.accent700 }
+    ];
+    var panelW = 194, gap = 20, x0 = 16;
+    panels.forEach(function (p, pi) {
+      var px = x0 + pi * (panelW + gap);
+      var vals = rows.map(p.get);
+      var maxV = Math.max.apply(null, vals) || 1;
+      var bestIdx = 0;
+      rows.forEach(function (r, i) {
+        if (p.lowerBetter ? vals[i] < vals[bestIdx] : vals[i] > vals[bestIdx]) bestIdx = i;
+      });
+      ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(p.title, px, 20);
+      var baseY = H - 44, topY = 42, maxH = baseY - topY;
+      rows.forEach(function (r, i) {
+        var h = Math.max(2, maxH * (vals[i] / maxV));
+        var bw = panelW / rows.length - 10;
+        var bx = px + i * (bw + 10);
+        ctx.fillStyle = i === bestIdx ? p.color : 'rgba(120,120,120,0.35)';
+        ctx.fillRect(bx, baseY - h, bw, h);
+        ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText(p.fmt(vals[i]), bx + bw / 2, baseY - h - 4);
+        ctx.fillStyle = i === bestIdx ? c.accent700 : c.text; ctx.font = '10px ' + c.font;
+        ctx.fillText(r.mode === 'summarize' ? 'sum' : r.mode, bx + bw / 2, baseY + 14);
+      });
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px, baseY); ctx.lineTo(px + panelW, baseY); ctx.stroke();
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('same 40-step run, ceiling ' + Guide.fmtNum(TAX_CEILING) + ' — highlights mark the best policy per panel', 16, H - 12);
+
+    var none = rows[0], evict = rows[1], notes = rows[3];
+    el('mem-tax-readout').innerHTML =
+      rows.map(function (r) {
+        return '<div><span class="k">' + r.label + '</span> ' + Guide.fmtNum(r.tokens) + ' tok · ' +
+          r.redos + ' redos · ' + r.drops + ' evictions · ' + (r.success * 100).toFixed(0) + '% success' +
+          (r.overflows ? ' · <span class="bad">' + r.overflows + ' over budget</span>' : '') + '</div>';
+      }).join('') +
+      '<div class="k">no compaction causes no redos and still loses: ' + none.overflows +
+      ' of 40 steps run past the ceiling, which in a real deployment is silent truncation. ' +
+      'Eviction sends the fewest tokens (' + Guide.fmtNum(evict.tokens) + ') and pays in ' + evict.redos +
+      ' redos; notes send ' + Guide.fmtNum(notes.tokens - evict.tokens) + ' tok more than eviction and redo nothing.</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo D — notes versus summarisation
+  // ------------------------------------------------------------------
+  var D = { maxTokens: el('mem-notes-maxtokens') };
+  var setupD = Guide.setupCanvas(el('mem-notes-canvas'), 640, 320, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var maxTokens = parseInt(D.maxTokens.value, 10);
+    var notes = runFor('notes', maxTokens), summ = runFor('summarize', maxTokens);
+    var notesPts = notes.steps.map(function (s) { return { x: s.i, y: s.total }; });
+    var summPts = summ.steps.map(function (s) { return { x: s.i, y: s.total }; });
+    var maxY = Math.max(notes.maxTotal, summ.maxTotal, maxTokens) * 1.06;
+    var geo = Guide.drawLines(setupD.ctx, 640, 320,
+      [{ points: summPts, color: c.accent2, width: 2.2 }, { points: notesPts, color: c.accent, width: 2.2 }],
+      [0, 39], [0, maxY], { xLabel: 'step', yLabel: 'prompt tokens', padL: 60, padB: 30 });
+    var ctx = setupD.ctx;
+
+    ctx.fillStyle = c.accent; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('structured notes', geo.padL + 8, geo.padT + 14);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('summarise', geo.padL + 8, geo.padT + 28);
+
+    summ.redos.forEach(function (r) {
+      var X = geo.px(Math.min(39, r.step)), Y = geo.py(summ.steps[Math.min(39, r.step)].total);
+      ctx.fillStyle = c.accent2;
+      ctx.beginPath(); ctx.arc(X, Y, 4, 0, 2 * Math.PI); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2; ctx.stroke();
+    });
+    ctx.fillStyle = c.accent2; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('● redo', geo.padL + 8, geo.padT + 42);
+
+    var notesTokens = notes.steps.reduce(function (a, s) { return a + s.total; }, 0);
+    var summTokens = summ.steps.reduce(function (a, s) { return a + s.total; }, 0);
+    el('mem-notes-readout').innerHTML =
+      '<div><span class="k">ceiling</span> ' + Guide.fmtNum(maxTokens) + ' tok' +
+      ' &nbsp; <span class="k">peak</span> notes ' + Guide.fmtNum(notes.maxTotal) + ' · summarise ' + Guide.fmtNum(summ.maxTotal) + '</div>' +
+      '<div><span class="k">total sent</span> notes <span class="hi">' + Guide.fmtNum(notesTokens) + '</span> · summarise ' + Guide.fmtNum(summTokens) +
+      ' (' + (100 * (summTokens - notesTokens) / Math.max(1, summTokens)).toFixed(0) + '% more)</div>' +
+      '<div><span class="k">redos</span> notes <span class="hi">' + notes.redos.length + '</span> · summarise <span class="' + (summ.redos.length ? 'bad' : '') + '">' + summ.redos.length + '</span>' +
+      ' &nbsp; <span class="k">evictions</span> ' + notes.drops.length + ' · ' + summ.drops.length + '</div>' +
+      '<div class="k">' + (summTokens - notesTokens > 0
+        ? 'notes send less and redo nothing at this ceiling; slide it up and the token totals converge — the redo count is the durable difference'
+        : 'at this ceiling the token totals converge; notes still redo nothing, which is the point') + '</div>' +
+      '<div class="k">caveat: notes need a schema, a home, an update rule and a staleness policy — that maintenance is the price</div>';
+  }
+  Guide.bindSliders([D.maxTokens], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var agents = (data && data.agents) || FALLBACK.agents;
+    el('mem-agents-source').textContent = (agents.source || FALLBACK.agents.source) +
+      (agents.compactionTax ? ' ' + agents.compactionTax : '');
+    if (data && data.context_rot && data.context_rot.source) {
+      el('mem-context-rot-source').textContent = data.context_rot.source;
+    } else {
+      el('mem-context-rot-source').textContent = FALLBACK.context_rot.source;
+    }
+    if (data && data.context_windows && data.context_windows.source) {
+      el('mem-windows-source').textContent = data.context_windows.source;
+    } else {
+      el('mem-windows-source').textContent = FALLBACK.context_windows.source;
+    }
+    drawB(); drawA(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawB(); drawA(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'memory-compaction-types',
+      kind: 'choice',
+      prompt: '"Remember that the user\'s name is Denim, across every future session." Which store should hold that?',
+      options: [
+        { label: 'Semantic memory — a durable fact about the user, looked up when relevant.', correct: true },
+        { label: 'Working memory — keep it in the context window so it is always visible.', correct: false },
+        { label: 'Episodic memory — store the session transcript and search it each time.', correct: false },
+        { label: 'Procedural memory — encode it as a skill the agent can invoke.', correct: false }
+      ],
+      explanation: 'A durable, long-lived fact belongs in a fact store outside the window. Keeping it resident is working memory doing semantic memory\'s job; retrieving it from a transcript is episodic storage doing it badly.'
+    },
+    {
+      id: 'memory-compaction-mechanisms',
+      kind: 'choice',
+      prompt: 'What distinguishes context editing from compaction?',
+      options: [
+        { label: 'Context editing deletes or edits specific spans by rule; compaction replaces a span with a paraphrase a model wrote.', correct: true },
+        { label: 'Context editing keeps everything and compaction keeps nothing.', correct: false },
+        { label: 'Context editing is only available with external vector stores.', correct: false },
+        { label: 'Compaction edits raw tool output; context editing summarises it.', correct: false }
+      ],
+      explanation: 'Editing is a deterministic rule — drop the oldest tool results, clear extracted documents. Compaction is a judgement call delegated to a summariser, which is why it is harder to audit and why it is the operation to be most suspicious of.'
+    },
+    {
+      id: 'memory-compaction-notes',
+      kind: 'choice',
+      prompt: 'Why do external structured notes beat lossy summarisation when exact facts matter?',
+      options: [
+        { label: 'A note is re-read by key and is guaranteed to be the original value; a summary is one model\'s judgement about what mattered.', correct: true },
+        { label: 'Notes are always smaller than summaries.', correct: false },
+        { label: 'Notes do not consume context when re-read.', correct: false },
+        { label: 'Summaries cannot represent numbers.', correct: false }
+      ],
+      explanation: 'Notes do cost tokens when read, and can be larger than a summary. The difference is fidelity: the key-value row is the original fact, while the summary has already decided what to keep.'
+    },
+    {
+      id: 'memory-compaction-redo-step',
+      kind: 'numeric',
+      prompt: 'In the film strip\'s default run (eviction, 12,000-token ceiling), the fact "the corpus has sixty documents" is evicted at step 18. At which step is it first redone?',
+      answer: 21,
+      unit: "step",
+      tolerance: 0,
+      explanation: 'It is re-derived at step 21 — three steps after it was evicted. Nothing in the transcript flagged the loss: the run simply paid for the same knowledge twice, which is exactly why the redo count belongs in your metrics.'
+    },
+    {
+      id: 'memory-compaction-redos-count',
+      kind: 'numeric',
+      prompt: 'In the compaction-tax panel at the 12,000-token ceiling, how many redos does the eviction policy cause across the 40-step run?',
+      answer: 7,
+      unit: "redos",
+      tolerance: 0,
+      explanation: 'Seven. Each is a step where a fact that had been evicted became necessary again. Structured notes cause zero at the same ceiling, and summarisation causes two — the three policies sit on a real curve between context size and repeated work.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

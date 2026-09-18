@@ -1,0 +1,552 @@
+---
+title: "Statistics, Interactively — Part 32: Estimating causal effects"
+description: "One simulated dataset with a known effect: matching, inverse-probability weighting and difference-in-differences move toward the truth as you adjust for the confounder."
+permalink: "/math/statistics/causal-effects/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Estimating causal effects</h1>
+    <p>Everything so far has described what the data look like. This part asks a different kind of question: what would have happened if we had done something else? On one simulated dataset where the true effect is known, a covariate drives both who gets treated and how they turn out, so the plain difference in means is wrong. Three estimators &mdash; nearest-neighbour propensity matching, inverse-probability weighting, and difference-in-differences on a before-and-after panel &mdash; attack the same bias from different directions, and their estimates move toward the truth as you adjust for the covariate. Watching which method recovers the effect, and which does not, is the clearest way to see what a causal claim actually rests on.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">What would have happened otherwise?</p>
+    <p>Prediction asks what goes with what. A causal question asks what would change if you intervened &mdash; if this patient took the drug, if this reader saw the new layout, if this policy generated the response. The trouble is that you never get to see both worlds. For any single unit you observe the outcome under the treatment it actually received, and the outcome under the treatment it did not receive is a counterfactual that is missing by construction.</p>
+    <p>That missing half is the whole subject. Causal inference is a collection of strategies for replacing it with something you can estimate, and every strategy buys its answer with an assumption you have to be willing to defend. When the treatment is assigned by a coin flip the assumption is almost free, which is why randomized experiments are the gold standard. When the treatment is assigned by people, by circumstance, or by a model, the assumption is doing real work and can be wrong.</p>
+    <p>This part makes the machinery concrete. A simulator builds one dataset from a known causal model, so the true effect sits on the screen as a dashed line that no real analyst would ever see. Around it sit four estimates: the naive difference in means, and three adjustments. Adjust nothing and the estimate misses; adjust correctly and it moves back to the truth. The distance between the two is confounding, made visible.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a comparison of outcomes is not automatically a comparison of causes, how matching and inverse-probability weighting use a propensity score to undo selection on covariates, how difference-in-differences removes a confounder by differencing it away, and which assumptions &mdash; ignorability, positivity, consistency, parallel trends &mdash; each method silently relies on.</span></div>
+    <div class="g-toc">
+      <a href="#potential">2 · Potential outcomes and one dataset</a>
+      <a href="#adjust">3 · Matching and weighting</a>
+      <a href="#did">4 · Difference-in-differences</a>
+      <a href="#assumptions">5 · What identification needs</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="potential">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Potential outcomes and one dataset</h2></div>
+    <p class="g-eyebrow">The Rubin causal model, and the problem it names</p>
+    <p>Give every unit two potential outcomes. Let $Y_i(1)$ be the outcome unit $i$ would have if treated and $Y_i(0)$ the outcome if not treated. The <em>individual treatment effect</em> is their difference, $Y_i(1) - Y_i(0)$, and the average treatment effect &mdash; the <em>ATE</em> &mdash; is the mean of that difference over the population:</p>
+    <div class="g-math g-katex">$$\text{ATE} = E\big[Y_i(1) - Y_i(0)\big] = E[Y_i(1)] - E[Y_i(0)].$$</div>
+    <p>This notation is called the Rubin causal model, or the potential-outcomes framework, and it immediately exposes the <em>fundamental problem of causal inference</em>: for each unit you observe only $Y_i = T_i\,Y_i(1) + (1-T_i)\,Y_i(0)$, where $T_i$ marks the treatment. One of the two potential outcomes is always missing, so the individual effect is never observed. You cannot compare a unit to itself; you can only compare the group that was treated to the group that was not, and hope the two groups are alike in every way that matters.</p>
+    <p>In a randomized experiment they are alike, in expectation, because the coin decides $T$ independently of everything else. Then the difference in group means estimates the ATE honestly. In observational data the treatment is chosen, and the units differ in ways that affect the outcome. The demo below builds that situation deliberately. A covariate $X$ raises the outcome and also raises the probability of treatment, so treated units would have had higher outcomes even without treatment. That is a <em>confounder</em>, and it is the reason the naive comparison is biased.</p>
+    <p>The generator is short enough to state: $X \sim \mathcal{N}(0,1)$; treatment is a logistic coin, $P(T=1 \mid X) = \sigma(\beta_0 + \beta\,X)$; and the potential outcomes are $Y(0) = \mu_0 + \tau X + \varepsilon$ and $Y(1) = Y(0) + \text{ATE}$, with the same ATE for every unit. Because we build the world, the ATE is a known number, here $2.0$. The estimate you see is computed from the data alone; only the dashed line knows the answer.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="prop-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Every simulated unit is a dot: covariate X across, fitted propensity $P(T=1\mid X)$ down. Treated units cluster to the right because X drives both the treatment and the outcome.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Confounding strength &beta; <span class="val">1.2</span></label><input type="range" id="beta-slider" min="0" max="2.5" step="0.05" value="1.2"></div>
+        <div class="g-field"><label>Sample size n <span class="val">180</span></label><input type="range" id="n-slider" min="60" max="400" step="10" value="180"></div>
+        <div class="g-readout" id="prop-readout"></div>
+      </div>
+    </div>
+    <p>Slide &beta; to zero and the treatment becomes a fair coin: the two groups overlap completely, propensity is flat near one half, and the naive gap lands on the truth. Push &beta; up and the groups separate along X. The fitted propensity curve steepens, the treated dots slide up and to the right, and the naive gap drifts away from the dashed truth. Nothing about the outcome model changed; only who got treated changed, and that was enough to break the comparison.</p>
+    <div class="g-warn">⚠ <span><b>The propensity score is a model, not a fact.</b> Nothing in the data tells you the true $P(T=1\mid X)$; the page fits it. If important confounders are missing from $X$, or the model is wrong, matching and weighting inherit that error and can be more misleading than the naive comparison they were meant to fix. The logistic fit here is by gradient descent on the treatment indicator &mdash; a small, honest reminder that adjustment is only ever as good as the covariates and the model you bring.</span></div>
+  </section>
+
+  <section class="g-step" id="adjust">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Matching and weighting</h2></div>
+    <p class="g-eyebrow">Three estimates, one dashed truth</p>
+    <p>The naive estimate is just the difference in group means, $\bar Y_{T=1} - \bar Y_{T=0}$. Its bias is exactly the difference in the non-treatment potential outcomes between the groups: the treated were already different, and the naive comparison credits treatment with a gap that existed before it. Both adjustments below try to reconstruct the missing counterfactual by making the treated and control groups comparable on $X$.</p>
+    <p><b>Matching.</b> For each treated unit, find the control unit with the closest propensity score and use its outcome as the counterfactual. This estimates the average effect on the treated, the <em>ATT</em>, because the treated group is the one being matched. The <em>caliper</em> is the largest propensity gap you will accept; tighten it and you throw away treated units whose counterfactual would have been a poor match, trading a smaller, better-matched sample for coverage. Matching is transparent and assumption-light, but it uses only part of the control pool and degrades when propensities overlap poorly.</p>
+    <p><b>Inverse-probability weighting.</b> Rather than pairing units, reweight them. Weight a treated unit by $1/p(X)$ and a control by $1/(1-p(X))$, so that a unit which was unlikely to receive its treatment counts for more. The weighted groups then mimic the whole population and the weighted difference estimates the <em>ATE</em>:</p>
+    <div class="g-math g-katex">$$\hat{\text{ATE}}_{\text{IPW}} = \frac{\sum_i T_i\,y_i/p_i}{\sum_i T_i/p_i} - \frac{\sum_i (1-T_i)\,y_i/(1-p_i)}{\sum_i (1-T_i)/(1-p_i)}.$$</div>
+    <p>IPW is efficient because it uses every unit, and fragile because it does: a unit with a propensity near zero or one gets an enormous weight and can dominate the estimate. That is the positivity problem, and it shows up directly in the readout as the largest weight. When overlap is good, matching and IPW agree; when it is poor, they disagree, and neither is trustworthy. Combining them gives the <em>doubly robust</em> estimators, which stay consistent if either the outcome model or the propensity model is correct &mdash; a useful safety net, though not a licence to skip the assumptions.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="est-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Each row is one estimator on the same dataset; the dashed line is the truth. Points are estimates and bars are approximate standard errors.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Matching caliper <span class="val">0.3</span></label><input type="range" id="caliper-slider" min="0.05" max="0.6" step="0.01" value="0.3"></div>
+        <div class="g-btnrow"><button type="button" id="adjust-btn" class="active">Adjust for X: on</button></div>
+        <div class="g-readout" id="est-readout"></div>
+      </div>
+    </div>
+    <p>Toggle <b>Adjust for X</b> off and only the naive row remains, sitting far from the dashed truth. Toggle it on and three adjusted estimates appear and move back toward the line: matching recovers the effect by pairing like-with-like, IPW recovers it by reweighting, and difference-in-differences &mdash; the next step &mdash; recovers it by subtraction. Push the confounding slider in the previous demo and watch the naive estimate walk away while the adjusted ones stay put. That stability is what it means for an estimator to be robust to a particular confounder.</p>
+  </section>
+
+  <section class="g-step" id="did">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Difference-in-differences</h2></div>
+    <p class="g-eyebrow">When you have a before and an after</p>
+    <p>Sometimes you do not need to model $X$ at all, because you observe the same units before and after. Suppose a treated group and a control group are each measured in two periods. Each group's change from before to after combines a common time trend with the treatment effect, if any. Subtract the control group's change from the treated group's change and the common trend cancels:</p>
+    <div class="g-math g-katex">$$\hat{\tau}_{\text{DiD}} = \big(\bar y_{1,\text{post}} - \bar y_{1,\text{pre}}\big) - \big(\bar y_{0,\text{post}} - \bar y_{0,\text{pre}}\big).$$</div>
+    <p>The identifying assumption is <em>parallel trends</em>: absent treatment, the two groups would have moved in parallel. It is not the same as the groups being identical &mdash; a fixed difference in $X$ between them is fine, because differencing removes any confounder that does not change over time. What breaks the method is a confounder that moves differently in the two groups, which is precisely the assumption you cannot test from the data you have. The demo's control group is the untreated version of the treated group, so the trends really are parallel and DiD lands on the truth.</p>
+    <p>On the same simulated dataset, the pre-period outcome is the untreated potential outcome $Y(0)$ and the post-period outcome adds a common trend plus the effect for treated units. Because every unit is measured twice, the fixed elevation that $X$ gives the treated group appears in both periods and cancels in the subtraction &mdash; the same confounding that defeated the naive cross-section is harmless here.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="did-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Group means before and after. The dashed continuation is what the treated group would have done without treatment; the gap at the right is the DiD estimate.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="did-readout"></div>
+        <div class="g-mini">DiD and the cross-sectional estimators are computed from the same simulated units, so the four numbers in the previous chart are directly comparable.</div>
+      </div>
+    </div>
+    <p>DiD is the workhorse of policy evaluation for a reason: it is credible, it is easy to explain, and it needs no propensity model. Its weakness is equally easy to state. If the treated group was already on a different trajectory &mdash; if a new technology was spreading faster among the treated, or a concurrent policy hit them harder &mdash; the parallel-trends assumption fails and the estimate absorbs that divergence as if it were the effect. The honest response is to plot the pre-trends, look for a placebo effect before treatment, and treat a parallel-looking history as evidence rather than proof.</p>
+  </section>
+
+  <section class="g-step" id="assumptions">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>What identification needs</h2></div>
+    <p class="g-eyebrow">The price of the counterfactual</p>
+    <p>Every adjusted estimator in this part is trading one assumption for another, and it is worth naming them once. <b>Consistency</b> (with the related <b>SUTVA</b>) says a unit's observed outcome is the potential outcome for the treatment it actually got, and that one unit's treatment does not change another's outcome &mdash; no interference, no hidden versions of the treatment. <b>Ignorability</b>, or unconfoundedness, says that conditional on the covariates you measured, treatment is as good as randomly assigned: $\{Y(0), Y(1)\} \perp T \mid X$. That is what lets matching and weighting work, and it is untestable &mdash; it is a claim about the confounders you did not measure. <b>Positivity</b> says every unit had a nonzero chance of either treatment, which is what keeps the weights finite and the matches available.</p>
+    <p>There is also the question of <em>which</em> effect you want. The ATE averages over everyone; the ATT averages over the treated only. They coincide when the effect is constant, as in this simulation, but in general a program can help the people who choose it more than it would help the population, or the reverse. Matching naturally targets the ATT, IPW can target either by choice of weights, and DiD targets the treated group's post-period change. Reporting "the effect" without saying which estimand is a common and consequential slippage.</p>
+    <p>Randomization is the cleanest identification strategy because it satisfies ignorability and positivity by construction: the coin makes treatment independent of the potential outcomes, and with any reasonable allocation probability everybody can go either way. That is the subject of <a href="{{ '/math/statistics/ab-testing/' | relative_url }}">the randomized-experiment part</a>, where the remaining danger is not confounding but the human urge to peek at a running experiment. The honest comparison of two policies is an experiment; when you cannot run one, you are estimating a causal effect from observational data with a model of the assignment mechanism standing in for the coin. Reading a causal claim is therefore reading its assumptions: what was conditioned on, what was assumed to be parallel, and what could have moved quietly underneath the estimate.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The same question, two more worlds</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Did the model change help?</h3>
+        <p style="margin-bottom:0;">Shipping a new model and comparing its logged scores to the old model's is an observational comparison: traffic, time of day, and prompt mix all differ between the two. The <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation chapter</a> is where this becomes a causal question, and the answer is an experiment &mdash; randomized traffic, a fixed analysis, and no peeking. The same logic governs comparing two reward models trained on <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">logged human preferences</a>, which are observational by nature.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Comparing controllers from logs</h3>
+        <p style="margin-bottom:0;">A robot's recorded runs are a biased sample: harder terrain, a different operator, or a calibration drift can coincide with whichever controller was installed. The <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry chapter</a> lives with exactly this, and the fix has the same shape as everything here &mdash; match runs on terrain and speed, weight by how likely each run was under each controller, or difference before-and-after segments to cancel a fixed bias. Metrics that ignore assignment are confounded by it, as the <a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">serving metrics chapter</a> warns from the systems side.</p>
+      </div>
+    </div>
+    <p>The pattern recurs wherever numbers are compared across groups that were not assigned by chance. Regression adjustment is the simplest special case: if the outcome is linear in the confounders, adding those confounders to the model <a href="{{ '/math/linear-algebra/least-squares/' | relative_url }}">estimates the effect holding them fixed</a>, which is what the propensity score does nonparametrically. And because causal claims are ultimately claims about a probability model, they inherit the discipline of the whole series: a parameter, an estimate, and an interval that says how much the estimate would move if the data were redrawn &mdash; the same wobble the guide opened with, now attached to a counterfactual.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>If you take away one thing, take away the potential-outcomes frame: two outcomes per unit, one of them always missing, and every method an assumption about how to fill it in. The references below are the standard entry points, ordered from the gentle to the formal.</p>
+    <p>Imbens and Rubin is the modern textbook; Hern&aacute;n and Robins builds the whole subject on a single tool, the g-formula, and is unusually clear about the assumptions; Angrist and Pischke is the econometric counterpart where DiD and instrumental variables live. Morgan and Winship is a good bridge for social scientists.</p>
+    <ul class="g-refs">
+      <li>Guido Imbens and Donald Rubin, <em>Causal Inference for Statistics, Social, and Biomedical Sciences</em>, 2015 &mdash; potential outcomes, ignorability, the propensity score, and matching.</li>
+      <li>Miguel Hern&aacute;n and James Robins, <em>Causal Inference: What If</em>, 2020 &mdash; free online; the g-formula, IPW, doubly robust estimation, and target trials.</li>
+      <li>Joshua Angrist and J&ouml;rn-Steffen Pischke, <em>Mostly Harmless Econometrics</em>, 2009 &mdash; difference-in-differences, parallel trends, and instrumental variables.</li>
+      <li>Paul Rosenbaum and Donald Rubin, <a href="https://www.jstor.org/stable/2335942">"The central role of the propensity score in observational studies for causal effects"</a>, <em>Biometrika</em>, 1983 &mdash; the paper that introduced propensity matching.</li>
+      <li>Judea Pearl, <em>Causality: Models, Reasoning, and Inference</em>, 2009 &mdash; the graphical view of confounding and the back-door criterion.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Potential outcomes</td><td>$Y_i(1)$ and $Y_i(0)$: the outcomes under each treatment, one of them always unobserved</td></tr>
+        <tr><td>Fundamental problem</td><td>Only one potential outcome per unit is ever observed, so individual effects are unidentifiable</td></tr>
+        <tr><td>ATE / ATT</td><td>Average effect over everyone / over the treated only; they differ unless the effect is constant</td></tr>
+        <tr><td>Ignorability</td><td>$\{Y(0),Y(1)\} \perp T \mid X$ &mdash; treatment is as good as random given the covariates</td></tr>
+        <tr><td>Positivity</td><td>Every unit has a nonzero chance of each treatment; keeps weights finite and matches available</td></tr>
+        <tr><td>Consistency / SUTVA</td><td>The observed outcome is the potential outcome for the treatment received, with no interference</td></tr>
+        <tr><td>Matching</td><td>Pair each treated unit with a similar control; estimates the ATT; the caliper bounds the match quality</td></tr>
+        <tr><td>IPW</td><td>Weight by $1/p(X)$ or $1/(1-p(X))$ so the groups resemble the population; estimates the ATE</td></tr>
+        <tr><td>Difference-in-differences</td><td>Treated change minus control change; needs parallel trends, not identical groups</td></tr>
+        <tr><td>Doubly robust</td><td>Consistent if either the outcome model or the propensity model is right</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the last part of the series. The glossary collects the terms and formula cards from every chapter into one place you can return to.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) {
+    d = d == null ? 2 : d;
+    if (x == null || !isFinite(x)) return '\u2014';
+    var s = x.toFixed(d);
+    if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s === '-0' ? '0' : s;
+  }
+
+  // The known data-generating process. X confounds: it raises Y and raises the
+  // chance of treatment. The true effect is the same for every unit, so the ATT
+  // and the ATE coincide and one dashed line serves all methods.
+  var TRUE_ATE = 2.0, MU0 = 1.0, TAU_X = 1.0, SIG_Y = 1.5, TREND = 0.8, INT = -0.3;
+  var state = { beta: 1.2, n: 180, caliper: 0.3, adjust: true };
+  var DATA = null, EST = null;
+
+  function genData() {
+    var r = S.rng(20260914);
+    var n = state.n, beta = state.beta;
+    var X = [], T = [], Y = [], PRE = [], POST = [];
+    for (var i = 0; i < n; i++) {
+      var x = S.sample.normal(r, 0, 1);
+      var z = INT + beta * x;
+      var pr = 1 / (1 + Math.exp(-z));
+      var t = S.sample.bernoulli(r, pr);
+      var e0 = SIG_Y * S.sample.normal(r, 0, 1);
+      var e1 = SIG_Y * S.sample.normal(r, 0, 1);
+      var y0 = MU0 + TAU_X * x + e0;
+      X.push(x); T.push(t);
+      Y.push(y0 + TRUE_ATE * t);                       // cross-sectional outcome
+      PRE.push(y0);                                    // before period: untreated potential outcome
+      POST.push(MU0 + TAU_X * x + TREND + TRUE_ATE * t + e1); // after period
+    }
+    DATA = { n: n, X: X, T: T, Y: Y, PRE: PRE, POST: POST };
+  }
+
+  // Propensity model: logistic regression, fitted here by gradient descent on the
+  // treatment indicator (the spec's alternative was Stats.est.ols on a linear
+  // probability model; the logistic fit is the one used).
+  function fitLogistic(X, T) {
+    var b0 = 0, b1 = 0, n = X.length, lr = 0.6, iters = 1500;
+    for (var it = 0; it < iters; it++) {
+      var g0 = 0, g1 = 0;
+      for (var i = 0; i < n; i++) {
+        var z = b0 + b1 * X[i];
+        if (z > 30) z = 30; else if (z < -30) z = -30;
+        var p = 1 / (1 + Math.exp(-z));
+        var e = p - T[i];
+        g0 += e; g1 += e * X[i];
+      }
+      b0 -= lr * g0 / n; b1 -= lr * g1 / n;
+    }
+    return { b0: b0, b1: b1 };
+  }
+  function plogit(fit, x) {
+    var z = fit.b0 + fit.b1 * x;
+    if (z > 30) z = 30; else if (z < -30) z = -30;
+    return 1 / (1 + Math.exp(-z));
+  }
+
+  function matchDiffs(y, t, ps, caliper) {
+    var treated = [], control = [];
+    for (var i = 0; i < y.length; i++) (t[i] === 1 ? treated : control).push({ y: y[i], ps: ps[i] });
+    var diffs = [];
+    for (var a = 0; a < treated.length; a++) {
+      var best = -1, bd = Infinity;
+      for (var b = 0; b < control.length; b++) {
+        var d = Math.abs(treated[a].ps - control[b].ps);
+        if (d < bd) { bd = d; best = b; }
+      }
+      if (best >= 0 && (caliper == null || bd <= caliper)) diffs.push(treated[a].y - control[best].y);
+    }
+    return diffs;
+  }
+
+  function ipwSE(y, t, ps) {
+    var s1 = 0, w1 = 0, s0 = 0, w0 = 0, i;
+    for (i = 0; i < y.length; i++) {
+      if (t[i] === 1) { s1 += y[i] / ps[i]; w1 += 1 / ps[i]; }
+      else { s0 += y[i] / (1 - ps[i]); w0 += 1 / (1 - ps[i]); }
+    }
+    var m1 = s1 / w1, m0 = s0 / w0, v1 = 0, v0 = 0;
+    for (i = 0; i < y.length; i++) {
+      if (t[i] === 1) { var wa = 1 / ps[i]; v1 += wa * wa * (y[i] - m1) * (y[i] - m1); }
+      else { var wb = 1 / (1 - ps[i]); v0 += wb * wb * (y[i] - m0) * (y[i] - m0); }
+    }
+    v1 = v1 / (w1 * w1); v0 = v0 / (w0 * w0);
+    return Math.sqrt(v1 + v0);
+  }
+
+  function didSE() {
+    var t = DATA.T, pre = DATA.PRE, post = DATA.POST, n = DATA.n;
+    function vals(g, p) { var o = [], i; for (i = 0; i < n; i++) if (t[i] === g) o.push(p === 0 ? pre[i] : post[i]); return o; }
+    function v(x) { return x.length > 1 ? S.summary.variance(x, 1) / x.length : 0; }
+    return Math.sqrt(v(vals(1, 1)) + v(vals(1, 0)) + v(vals(0, 1)) + v(vals(0, 0)));
+  }
+
+  function recompute() {
+    var fit = fitLogistic(DATA.X, DATA.T);
+    var ps = [], i;
+    for (i = 0; i < DATA.n; i++) {
+      var p = plogit(fit, DATA.X[i]);
+      if (p < 0.02) p = 0.02; if (p > 0.98) p = 0.98;
+      ps.push(p);
+    }
+    DATA.ps = ps; DATA.fit = fit;
+
+    var y1 = [], y0 = [];
+    for (i = 0; i < DATA.n; i++) (DATA.T[i] === 1 ? y1 : y0).push(DATA.Y[i]);
+    var naive = S.summary.mean(y1) - S.summary.mean(y0);
+    var naiveSe = Math.sqrt(S.summary.variance(y1, 1) / y1.length + S.summary.variance(y0, 1) / y0.length);
+
+    var match = S.causal.matchNearest(DATA.Y, DATA.T, ps, state.caliper);
+    var diffs = matchDiffs(DATA.Y, DATA.T, ps, state.caliper);
+    var matchSe = diffs.length > 1 ? S.summary.sd(diffs, 1) / Math.sqrt(diffs.length) : NaN;
+
+    var ipw = S.causal.ipw(DATA.Y, DATA.T, ps);
+    var ipwSe = ipwSE(DATA.Y, DATA.T, ps);
+
+    var yPanel = DATA.PRE.concat(DATA.POST);
+    var grp = DATA.T.concat(DATA.T);
+    var post = [];
+    for (i = 0; i < DATA.n; i++) post.push(0);
+    for (i = 0; i < DATA.n; i++) post.push(1);
+    var didOut = S.causal.did(yPanel, grp, post);
+
+    EST = {
+      ps: ps, fit: fit,
+      naive: naive, naiveSe: naiveSe,
+      match: match, diffs: diffs, matchSe: matchSe,
+      ipw: ipw, ipwSe: ipwSe,
+      did: didOut, didSe: didSE()
+    };
+  }
+
+  var propPlot = S.plot(el('prop-canvas'), {
+    W: 640, H: 300, xRange: [-3, 3], yRange: [0, 1],
+    xLabel: 'covariate X', yLabel: 'propensity P(T=1|X)', padL: 62, onResize: drawPropensity
+  });
+  var estPlot = S.plot(el('est-canvas'), {
+    W: 640, H: 320, xRange: [1, 4], yRange: [0.5, 4.5],
+    xLabel: 'estimated effect', padL: 152, onResize: drawEstimates
+  });
+  var didPlot = S.plot(el('did-canvas'), {
+    W: 640, H: 320, xRange: [-0.35, 1.35], yRange: [0, 6],
+    xLabel: 'period', yLabel: 'mean outcome', onResize: drawDid
+  });
+
+  function drawPropensity() {
+    if (!propPlot || !DATA || !EST) return;
+    var xs = DATA.X, t = DATA.T, ps = EST.ps, fit = EST.fit, i;
+    var lo = Infinity, hi = -Infinity;
+    for (i = 0; i < xs.length; i++) { if (xs[i] < lo) lo = xs[i]; if (xs[i] > hi) hi = xs[i]; }
+    propPlot.xRange[0] = lo - 0.3; propPlot.xRange[1] = hi + 0.3;
+    propPlot.clear();
+    propPlot.axes({ xLabel: 'covariate X', yLabel: 'propensity P(T=1|X)' });
+    propPlot.curve(function (x) { return plogit(fit, x); }, { color: c.text, width: 2, dashed: true });
+    propPlot.hline(0.5, { color: c.divider, width: 1, dashed: true });
+    var treated = [], control = [];
+    for (i = 0; i < xs.length; i++) {
+      var pt = [xs[i], ps[i]];
+      if (t[i] === 1) treated.push(pt); else control.push(pt);
+    }
+    propPlot.points(control, { color: c.accent400, r: 2.8 });
+    propPlot.points(treated, { color: c.accent2, r: 2.8 });
+    propPlot.legend([
+      { label: 'control (T=0)', color: c.accent400 },
+      { label: 'treated (T=1)', color: c.accent2 },
+      { label: 'fitted propensity', color: c.text, dashed: true }
+    ], { dy: 6 });
+    writePropensity();
+  }
+
+  function writePropensity() {
+    var t = DATA.T, ps = EST.ps, i, n1 = 0, n0 = 0, mw1 = 0, mw0 = 0, pmin = 1, pmax = 0;
+    for (i = 0; i < ps.length; i++) {
+      if (ps[i] < pmin) pmin = ps[i];
+      if (ps[i] > pmax) pmax = ps[i];
+      if (t[i] === 1) { n1++; var w1 = 1 / ps[i]; if (w1 > mw1) mw1 = w1; }
+      else { n0++; var w0 = 1 / (1 - ps[i]); if (w0 > mw0) mw0 = w0; }
+    }
+    el('prop-readout').innerHTML =
+      '<div><span class="k">n</span> ' + DATA.n + ' &nbsp; <span class="k">treated</span> ' + n1 + ' &nbsp; <span class="k">control</span> ' + n0 + '</div>' +
+      '<div><span class="k">propensity model</span> logit = ' + fmt(EST.fit.b0, 2) + ' + ' + fmt(EST.fit.b1, 2) + ' X</div>' +
+      '<div><span class="k">overlap of P(T=1|X)</span> ' + fmt(pmin, 2) + ' to ' + fmt(pmax, 2) + '</div>' +
+      '<div><span class="k">largest IPW weight</span> treated ' + fmt(mw1, 1) + ', control ' + fmt(mw0, 1) + '</div>' +
+      '<div><span class="k">naive difference</span> <span class="bad">' + fmt(EST.naive, 2) + '</span></div>' +
+      '<div class="g-mini">True ATE is ' + fmt(TRUE_ATE, 2) + '. The naive gap is biased because X raises Y and also raises the chance of treatment.</div>';
+  }
+
+  function estimateRows() {
+    var rows = [];
+    rows.push({ label: 'Naive difference', est: EST.naive, se: EST.naiveSe, color: c.accent2 });
+    if (state.adjust) {
+      rows.push({ label: 'Matching (ATT)', est: EST.match.att, se: EST.matchSe, color: c.accent });
+      rows.push({ label: 'IPW (ATE)', est: EST.ipw.ate, se: EST.ipwSe, color: c.accent700 });
+      rows.push({ label: 'Difference-in-differences', est: EST.did.estimate, se: EST.didSe, color: c.accent500 });
+    }
+    return rows;
+  }
+
+  function drawEstimates() {
+    if (!estPlot || !EST) return;
+    var rows = estimateRows(), i;
+    var lo = TRUE_ATE, hi = TRUE_ATE;
+    for (i = 0; i < rows.length; i++) {
+      if (!isFinite(rows[i].est)) continue;
+      var s = isFinite(rows[i].se) ? rows[i].se : 0;
+      if (rows[i].est - s < lo) lo = rows[i].est - s;
+      if (rows[i].est + s > hi) hi = rows[i].est + s;
+    }
+    var span = Math.max(0.4, hi - lo);
+    estPlot.xRange[0] = lo - span * 0.25; estPlot.xRange[1] = hi + span * 0.25;
+    estPlot.yRange[0] = 0.5; estPlot.yRange[1] = rows.length + 0.5;
+    estPlot.clear();
+    estPlot.axes({ xLabel: 'estimated effect', yTicks: [] });
+    estPlot.vline(TRUE_ATE, { color: c.text, dashed: true, width: 1.6, label: 'true ATE', labelY: 0.55, labelColor: c.text });
+    for (i = 0; i < rows.length; i++) {
+      var r = rows[i], y = rows.length - i;
+      if (!isFinite(r.est)) continue;
+      if (isFinite(r.se)) estPlot.errorbars([{ x: r.est, y: y, lo: r.est - r.se, hi: r.est + r.se }], { color: r.color, width: 1.5, cap: 5, alpha: 0.65 });
+      estPlot.points([[r.est, y]], { color: r.color, r: 5.5, stroke: 'rgba(255,255,255,0.9)', width: 1.5 });
+    }
+    estPlot.raw(function (ctx) {
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      for (var k = 0; k < rows.length; k++) ctx.fillText(rows[k].label, estPlot.padL - 8, estPlot.py(rows.length - k));
+    });
+    writeEstimates(rows);
+  }
+
+  function writeEstimates(rows) {
+    var html = '', i;
+    for (i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var ci = isFinite(r.se) ? '\u00b1 ' + fmt(r.se, 2) : '';
+      var cls = isFinite(r.est) && Math.abs(r.est - TRUE_ATE) < 0.6 ? 'hi' : 'bad';
+      var name = r.label.replace(/</g, '&lt;');
+      html += '<div><span class="k">' + name + '</span> <span class="' + cls + '">' + fmt(r.est, 2) + '</span> ' + ci + '</div>';
+    }
+    html += '<div class="g-mini">True ATE = ' + fmt(TRUE_ATE, 2) + '. ' +
+      (state.adjust ? 'Matching pairs on the propensity score, IPW reweights, DiD differences the panel.' :
+        'Only the unadjusted comparison is shown; switch "Adjust for X" on to add the adjusted estimators.') + '</div>';
+    if (state.adjust && isFinite(EST.match.att) && EST.match.of) {
+      html += '<div class="g-mini">Matching used ' + EST.match.matched + ' of ' + EST.match.of +
+        ' treated units within caliper ' + fmt(state.caliper, 2) + '.</div>';
+    }
+    el('est-readout').innerHTML = html;
+  }
+
+  function drawDid() {
+    if (!didPlot || !DATA) return;
+    var t = DATA.T, pre = DATA.PRE, post = DATA.POST, n = DATA.n, i;
+    function m(g, p) {
+      var s = 0, k = 0;
+      for (i = 0; i < n; i++) if (t[i] === g) { s += (p === 0 ? pre[i] : post[i]); k++; }
+      return k ? s / k : NaN;
+    }
+    var c00 = m(0, 0), c01 = m(0, 1), t10 = m(1, 0), t11 = m(1, 1);
+    var cf = t10 + (c01 - c00);
+    var vals = [c00, c01, t10, t11, cf];
+    var lo = Infinity, hi = -Infinity;
+    for (i = 0; i < vals.length; i++) { if (vals[i] < lo) lo = vals[i]; if (vals[i] > hi) hi = vals[i]; }
+    var pad = (hi - lo) * 0.25 || 1;
+    didPlot.yRange[0] = lo - pad; didPlot.yRange[1] = hi + pad;
+    didPlot.clear();
+    didPlot.axes({
+      xLabel: 'period', yLabel: 'mean outcome', xTicks: [0, 1],
+      xFormat: function (v) { return v === 0 ? 'pre' : 'post'; }
+    });
+    didPlot.curve([[0, c00], [1, c01]], { color: c.accent400, width: 2 });
+    didPlot.curve([[0, t10], [1, t11]], { color: c.accent2, width: 2.4 });
+    didPlot.curve([[0, t10], [1, cf]], { color: c.accent2, width: 1.6, dashed: true });
+    didPlot.errorbars([{ x: 1, y: (cf + t11) / 2, lo: Math.min(cf, t11), hi: Math.max(cf, t11) }], { color: c.accent700, width: 3, cap: 7 });
+    didPlot.points([[0, c00], [1, c01], [0, t10], [1, t11], [1, cf]], { color: c.text, r: 4 });
+    didPlot.text('counterfactual', 1, cf, { align: 'right', dx: -6, color: c.accent2 });
+    didPlot.text('effect', 1, (cf + t11) / 2, { align: 'left', dx: 8, color: c.accent700 });
+    didPlot.legend([
+      { label: 'control', color: c.accent400 },
+      { label: 'treated', color: c.accent2 },
+      { label: 'parallel-trend counterfactual', color: c.accent2, dashed: true }
+    ], { dy: 6 });
+    writeDid(c00, c01, t10, t11);
+  }
+
+  function writeDid(c00, c01, t10, t11) {
+    el('did-readout').innerHTML =
+      '<div><span class="k">control pre / post</span> ' + fmt(c00, 2) + ' / ' + fmt(c01, 2) + '</div>' +
+      '<div><span class="k">treated pre / post</span> ' + fmt(t10, 2) + ' / ' + fmt(t11, 2) + '</div>' +
+      '<div><span class="k">control trend</span> ' + fmt(c01 - c00, 2) + '</div>' +
+      '<div><span class="k">DiD estimate</span> <span class="hi">' + fmt((t11 - t10) - (c01 - c00), 2) + '</span></div>' +
+      '<div class="g-mini">True ATE = ' + fmt(TRUE_ATE, 2) + '. DiD subtracts the control group\'s change from the treated group\'s, so the fixed difference in X between the groups cancels.</div>';
+  }
+
+  function redraw() { drawPropensity(); drawEstimates(); drawDid(); }
+  function regen() { genData(); recompute(); redraw(); }
+
+  Guide.bindSliders([el('beta-slider')], function (sl) { state.beta = parseFloat(sl.value); regen(); });
+  Guide.bindSliders([el('n-slider')], function (sl) { state.n = parseInt(sl.value, 10); regen(); });
+  Guide.bindSliders([el('caliper-slider')], function (sl) {
+    state.caliper = parseFloat(sl.value);
+    if (DATA) { recompute(); drawEstimates(); drawDid(); }
+  });
+
+  var adjBtn = el('adjust-btn');
+  adjBtn.addEventListener('click', function () {
+    state.adjust = !state.adjust;
+    if (state.adjust) adjBtn.classList.add('active'); else adjBtn.classList.remove('active');
+    adjBtn.textContent = state.adjust ? 'Adjust for X: on' : 'Adjust for X: off';
+    if (EST) { drawEstimates(); }
+  });
+
+  regen();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'causal-effects-fundamental',
+      kind: 'choice',
+      prompt: 'Why is the individual treatment effect $Y_i(1) - Y_i(0)$ never directly observed?',
+      options: [
+        { label: 'Each unit is observed under only one treatment, so one of its two potential outcomes is always missing.', correct: true },
+        { label: 'Because the treatment effect is genuinely random and differs on every measurement of the same unit.', correct: false },
+        { label: 'Because the ATE is defined only for groups, so individual effects do not exist.', correct: false }
+      ],
+      explanation: 'The fundamental problem of causal inference is missing data, not randomness: a unit receives one treatment, so you see one potential outcome and must infer the other. Every method in this part is a rule for filling in that missing value.'
+    },
+    {
+      id: 'causal-effects-ipw-weight',
+      kind: 'numeric',
+      prompt: 'In the ATE estimator, a treated unit has an estimated propensity score of 0.25. What inverse-probability weight does it receive?',
+      answer: 4,
+      tolerance: 0.001,
+      explanation: 'A treated unit is weighted by 1/p(X), so its weight is 1 / 0.25 = 4. That unit was unlikely to be treated, so it counts four times to represent the many similar units that were not treated — and it is exactly this large weight that makes positivity matter.'
+    },
+    {
+      id: 'causal-effects-confounder',
+      kind: 'choice',
+      prompt: 'A covariate X raises the outcome and also makes treatment more likely. The naive difference in means is larger than the true effect. What does adjusting for X do?',
+      options: [
+        { label: 'It removes the part of the gap that existed before treatment, so the estimate moves toward the true effect.', correct: true },
+        { label: 'It shrinks the sample until the two groups have identical means on X, which removes all bias including unmeasured confounding.', correct: false },
+        { label: 'It cannot help, because confounding is a fact about the data rather than the analysis.', correct: false }
+      ],
+      explanation: 'Because X drives both treatment and outcome, the treated group would have had higher outcomes even without treatment. Matching on X or weighting by the propensity score makes the groups comparable on X and subtracts that pre-existing gap — provided X is the confounder and the model of treatment is right.'
+    },
+    {
+      id: 'causal-effects-parallel-trends',
+      kind: 'choice',
+      prompt: 'Difference-in-differences compares the change in the treated group to the change in the control group. What is the assumption that makes this valid?',
+      options: [
+        { label: 'Parallel trends: without treatment, the two groups would have changed by the same amount.', correct: true },
+        { label: 'The two groups have identical levels of every confounder before treatment.', correct: false },
+        { label: 'The treatment effect is the same for every unit in both groups.', correct: false }
+      ],
+      explanation: 'DiD differences away any fixed difference between the groups, so their levels need not match. What it cannot tolerate is a confounder that moves differently in the two groups over time, because that divergence would be counted as the effect. Constant treatment effects are convenient but not required.'
+    }
+  ];
+  GuideQuiz.init(el('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,402 @@
+---
+title: "What audio is, numerically"
+description: "A waveform, its sample rate, the short-time Fourier transform and the mel scale, and why generating a raw twenty-four-kilohertz waveform one sample at a time is hopeless."
+permalink: "/ai/generative-media/audio-basics/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>What audio is, numerically</h1>
+    <p>A sound is a pressure wave, and a microphone turns it into a list of numbers. That is the whole of the representation problem: the wave is one-dimensional, so it seems simpler than an image, but the list is enormous. At twenty-four kilohertz a single second is twenty-four thousand floats, and a model that emits them one at a time is emitting twenty-four thousand tokens for one second of sound. This part builds the picture the rest of the sound chapter depends on: the waveform, the sample rate and the Nyquist limit, the short-time Fourier transform with its window-and-hop trade, the mel scale that compresses frequency by ear rather than by hertz, and the token arithmetic that makes a raw waveform language model untenable.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="numbers">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A sound is a list of numbers</h2></div>
+    <p class="g-eyebrow">One axis, sampled fast</p>
+    <p>A waveform is a function of time: at each instant the microphone reports the air pressure, positive or negative relative to the ambient level. To store it on a computer you sample that function at regular intervals and keep the values. The number of samples per second is the <em>sample rate</em>, written $f_s$, and the time between samples is $1/f_s$. Speech telephony uses eight kilohertz, wideband speech sixteen, music and high-fidelity speech forty-four point one or forty-eight, and the models in this chapter usually work at twenty-four. The demo below draws a sum of three tones &mdash; a fundamental and two partials, which is what makes it read as a chord rather than a beep &mdash; and lets you change its pitch and its length.</p>
+    <p>Nothing about the picture is digital yet: the list is a faithful-enough approximation to a continuous wave, provided we sampled fast enough, which is the subject of the next step. What matters here is only that the signal is an array of scalar values with a single index. A colormap of it would be a one-pixel-wide image; a spectrogram of it will be a two-dimensional picture, and that is the representation every audio model actually consumes.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="aud-wave-canvas" width="660" height="220"></canvas>
+        <p class="g-canvas-hint">A chord of three tones sampled at 24 kHz and drawn with <code>Guide.drawLines</code>. Amplitude is normalised to the range &minus;1 to 1.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Fundamental <span class="val">220</span> Hz</label><input type="range" id="aud-freq" min="80" max="880" step="5" value="220"></div>
+        <div class="g-field"><label>Duration <span class="val">400</span> ms</label><input type="range" id="aud-dur" min="100" max="1000" step="20" value="400"></div>
+        <div class="g-readout" id="aud-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say what a waveform, a sample rate and a Nyquist limit are, read a spectrogram and a mel spectrogram, choose a window and hop for the STFT trade, and compute the token rate that a raw-waveform model would need against a codec's.</span></div>
+    <div class="g-toc">
+      <a href="#sampling">2 · Sampling and the spectrum</a>
+      <a href="#stft">3 · Windowing and the STFT</a>
+      <a href="#mel">4 · Mel and what it throws away</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="sampling">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Sampling and the spectrum</h2></div>
+    <p class="g-eyebrow">The one theorem you cannot skip</p>
+    <p>Sampling at $f_s$ can only represent frequencies up to the <em>Nyquist frequency</em> $f_s/2$. A component above that limit is not lost cleanly; it folds back and appears as a lower frequency, an artefact called aliasing, the same way a wagon wheel on film can appear to spin backwards. This is why a real pipeline low-pass filters before it downsamples. It is also why the sample rate is a hard ceiling on what a model can ever represent: at 24 kHz nothing above 12 kHz exists in the data, and most of the perceptual detail above that ceiling is inaudible to adults anyway.</p>
+    <p>The spectrum is the other view of the same signal. A discrete Fourier transform of one window of samples reports, for each frequency bin, how much of that frequency is present. The canvas below takes a single short window of the chord and plots its magnitude against frequency, with a dashed marker at the fundamental. The peaks are the partials; the rest is leakage and the tail of the window. Almost every idea in audio generation is a statement about this picture rather than about the waveform, because the spectrum is where the structure lives.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="aud-spec-canvas" width="660" height="240"></canvas>
+        <p class="g-canvas-hint">Magnitude spectrum of one window, from <code>GenMedia.dsp.stft</code>. The dashed line marks the fundamental.</p>
+      </div>
+      <div class="g-controls">
+        <p class="g-mini">The right edge is the Nyquist frequency, half the sample rate. Everything a model can learn about this sound is summarised by peaks like these, tracked frame by frame.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Sample rate is not quality.</b> Raising $f_s$ buys bandwidth, not fidelity for its own sake; a 48 kHz recording of a muffled source still contains nothing above a few kilohertz. The reason the models here use 24 kHz is that it is the smallest rate that keeps speech and most music sounding natural, which keeps the raw token count as small as it can be before any codec.</span></div>
+  </section>
+
+  <section class="g-step" id="stft">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Windowing and the STFT</h2></div>
+    <p class="g-eyebrow">A trade you cannot avoid</p>
+    <p>A single Fourier transform of the whole signal tells you which frequencies are present but not when. The <em>short-time Fourier transform</em> fixes that by transforming overlapping short windows and stacking the results: each window gives one column of a two-dimensional picture whose axes are time and frequency. The window is not rectangular &mdash; a smooth taper such as a Hann window reduces the spectral leakage that a hard cut would create &mdash; and the amount of overlap is the <em>hop</em>.</p>
+    <p>Window length sets a trade with no free side. A long window resolves frequency finely but smears time, so a plosive or a note onset is blurred; a short window pins down the moment but blurs neighbouring frequencies. The hop sets the frame rate independently: hop equals window over two is the usual starting point, and smaller hops oversample time at the cost of more frames. The readout tracks both, and you can drag the sliders to watch the number of frames and the frequency resolution move in opposite directions.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="aud-stft-canvas" width="660" height="150"></canvas>
+        <p class="g-canvas-hint">The same spectrum at the chosen window and hop, redrawn with <code>Guide.drawLines</code>: a short window broadens every peak, a long window sharpens it and smears the frame in time.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Window <span class="val">512</span> samples</label><input type="range" id="aud-win" min="128" max="1024" step="128" value="512"></div>
+        <div class="g-field"><label>Hop <span class="val">128</span> samples</label><input type="range" id="aud-hop" min="32" max="512" step="32" value="128"></div>
+        <div class="g-readout" id="aud-stft-readout"></div>
+      </div>
+    </div>
+    <p class="g-mini">Frequency resolution is $f_s/\text{win}$ hertz per bin; time resolution is $\text{hop}/f_s$ milliseconds per frame. Their product is fixed by the sampling, which is the uncertainty principle wearing engineering clothes.</p>
+  </section>
+
+  <section class="g-step" id="mel">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Mel and what it throws away</h2></div>
+    <p class="g-eyebrow">Compress frequency the way an ear does</p>
+    <p>Hertz are linear, but hearing is not. We resolve a few hertz near the bottom of the range and hundreds of hertz at the top, so a linear frequency axis spends most of its bins on detail nobody can hear. The <em>mel scale</em> rescales frequency so that equal distances sound equal: it is roughly linear below a kilohertz and logarithmic above. A mel filterbank is a bank of overlapping triangles spaced evenly on that scale, and applying it collapses hundreds of FFT bins into a few dozen bands. The heatmap below is the result &mdash; a mel spectrogram, the standard input to a speech recogniser and a common intermediate for a synthesiser.</p>
+    <p>What it throws away is resolution in the high frequencies and all phase. For recognition that is fine, indeed helpful, because it matches the ear and shrinks the input. For generation it is a loss you have to undo: a vocoder or a diffusion decoder has to invent the fine structure and the phase back from the compressed representation, which is exactly why the neural codec in the next part keeps a learned latent rather than a plain mel spectrogram.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="aud-mel-canvas" width="660" height="280"></canvas>
+        <p class="g-canvas-hint">Mel spectrogram of the chord, computed with <code>GenMedia.dsp.melSpectrogram</code> and drawn as a heatmap. Darker means more energy.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Mel bands <span class="val">24</span></label><input type="range" id="aud-mels" min="8" max="40" step="4" value="24"></div>
+        <p class="g-mini">Compare with the linear spectrum above: the low partials still show, but the high region is pooled into a handful of wide bands.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The token-rate argument.</b> A raw model at 24 kHz emits one token per sample &mdash; twenty-four thousand tokens per second. A neural codec at 75 frames per second with eight residual codebooks emits 75 × 8 = 600 tokens per second of sound, forty times fewer. That factor is the entire reason the rest of this chapter speaks in codec tokens, not samples.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every audio model starts from these four pictures</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Codecs</div>
+        <h3 style="margin:6px 0;">From samples to tokens</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/generative-media/audio-codecs/' | relative_url }}">neural codec</a> is a learned front end that replaces the mel filterbank. It maps a waveform to a low-rate sequence of discrete codes and back, and it keeps the fine structure the mel scale discards, which is why it can drive a vocoder convincingly.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Speech</div>
+        <h3 style="margin:6px 0;">Alignment sits on the spectrogram</h3>
+        <p style="margin-bottom:0;">Text-to-speech <a href="{{ '/ai/generative-media/tts/' | relative_url }}">alignment and duration models</a> and speech-to-text <a href="{{ '/ai/generative-media/asr-and-duplex/' | relative_url }}">CTC and RNN-T alignment</a> are both statements about how a sequence of text symbols lines up with the frames of a spectrogram. The window and hop chosen here set the frame rate both of them operate at.</p>
+      </div>
+    </div>
+    <p>The same machinery reappears outside speech. Music generation, audio editing and environmental-sound models all consume a spectrogram or a learned codec latent, and all of them are constrained by the sample rate and the STFT trade you can see above. The next part takes the one step this one left out: how a network learns its own front end instead of using a fixed filterbank.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The sources below cover the classical signal processing first and the learned front ends second. If you take away one idea, take away the token-rate arithmetic: it explains why audio generation is a codec problem before it is a language-model problem.</p>
+    <p>Smith's <em>Mathematics of the Discrete Fourier Transform</em> is the free, careful treatment of the transform; Oppenheim and Schafer is the standard reference for the STFT and windowing; and the mel-scale original is worth reading once for the motivation rather than the constants. The EnCodec paper is the bridge into the next part.</p>
+    <ul class="g-refs">
+      <li>Julius O. Smith III, <a href="https://ccrma.stanford.edu/~jos/mdft/">Mathematics of the Discrete Fourier Transform</a>, online book &mdash; the DFT, the window and the leakage it controls.</li>
+      <li>Alan Oppenheim and Ronald Schafer, <em>Discrete-Time Signal Processing</em> &mdash; sampling, aliasing and the short-time Fourier transform.</li>
+      <li>Stevens, Volkmann and Newman, <a href="https://doi.org/10.1121/1.1915893">"A Scale for the Psychological Magnitude of Pitch"</a>, 1937 &mdash; the mel scale on which the filterbank is built.</li>
+      <li>D&eacute;fossez, Copet, Synnaeve and Adi, <a href="https://arxiv.org/abs/2210.13438">"High Fidelity Neural Audio Compression"</a>, 2022 &mdash; EnCodec, the codec of the next part.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Waveform</td><td>The signal as amplitude against time; one scalar per sample</td></tr>
+        <tr><td>Sample rate $f_s$</td><td>Samples per second; 24 kHz for the models in this chapter</td></tr>
+        <tr><td>Nyquist frequency</td><td>$f_s/2$; the highest frequency the samples can represent</td></tr>
+        <tr><td>Aliasing</td><td>Energy above Nyquist folding back to a false lower frequency</td></tr>
+        <tr><td>Spectrum</td><td>Magnitude per frequency bin, from a DFT of one window</td></tr>
+        <tr><td>STFT</td><td>Overlapping windowed transforms stacked into time &times; frequency</td></tr>
+        <tr><td>Window length</td><td>Trades frequency resolution against time resolution</td></tr>
+        <tr><td>Hop</td><td>Samples between windows; sets the frame rate</td></tr>
+        <tr><td>Mel scale</td><td>Perceptual frequency, roughly linear then logarithmic</td></tr>
+        <tr><td>Mel spectrogram</td><td>Filterbank output: a few dozen bands, phase discarded</td></tr>
+        <tr><td>Raw token rate</td><td>$f_s$ tokens per second at one token per sample</td></tr>
+        <tr><td>Codec token rate</td><td>frame rate &times; codebooks; 75 &times; 8 = 600 per second</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Twenty-four thousand tokens a second is not a language-model problem; it is a compression problem. The next part is the codec that turns sound into a few hundred discrete tokens per second.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia;
+  var dsp = GM.dsp;
+  var c = Guide.colors();
+
+  var SR = 24000;
+  var CODEC_HZ = 75, CODEC_BOOKS = 8, CODEC_BITS = 10;
+
+  var freq = 220, durMs = 400, winSize = 512, hop = 128, nMels = 24;
+
+  var WAVE_W = 660, WAVE_H = 220;
+  var SPEC_W = 660, SPEC_H = 240;
+  var STFT_W = 660, STFT_H = 150;
+  var MEL_W = 660, MEL_H = 280;
+
+  function signal() {
+    var n = Math.max(128, Math.round(SR * durMs / 1000));
+    var a = dsp.tone(freq, SR, n, 0.7);
+    var b = dsp.tone(freq * 3, SR, n, 0.22);
+    var d = dsp.tone(freq * 1.5, SR, n, 0.16);
+    return dsp.normalize(dsp.add(dsp.add(a, b), d));
+  }
+
+  function wavePoints(x, target) {
+    var n = x.length, step = Math.max(1, Math.floor(n / target));
+    var pts = [];
+    for (var i = 0; i < n; i += step) pts.push({ x: i / SR * 1000, y: x[i] });
+    return pts;
+  }
+
+  var waveSetup = Guide.setupCanvas(document.getElementById('aud-wave-canvas'), WAVE_W, WAVE_H, function () { redraw(); });
+  var specSetup = Guide.setupCanvas(document.getElementById('aud-spec-canvas'), SPEC_W, SPEC_H, function () { redraw(); });
+  var stftSetup = Guide.setupCanvas(document.getElementById('aud-stft-canvas'), STFT_W, STFT_H, function () { redraw(); });
+  var melSetup = Guide.setupCanvas(document.getElementById('aud-mel-canvas'), MEL_W, MEL_H, function () { redraw(); });
+
+  function buildState() {
+    var x = signal();
+    var st = dsp.stft(x, { winSize: winSize, hop: hop, sr: SR });
+    var ms = dsp.melSpectrogram(x, { winSize: winSize, hop: hop, sr: SR, nMels: nMels });
+    return { x: x, st: st, ms: ms, n: x.length };
+  }
+
+  function drawWave(s) {
+    if (!waveSetup) return;
+    var ctx = waveSetup.ctx;
+    Guide.drawLines(ctx, WAVE_W, WAVE_H, [
+      { points: wavePoints(s.x, 900), color: c.accent, width: 1.4 }
+    ], [0, durMs], [-1.05, 1.05], { xLabel: 'time (ms)', yLabel: 'amplitude', padL: 42 });
+  }
+
+  function drawSpec(s) {
+    if (!specSetup) return;
+    var ctx = specSetup.ctx;
+    var st = s.st;
+    var mid = Math.max(0, Math.floor(st.frames / 2));
+    var mag = st.mag[mid] || [];
+    var pts = [], mx = 1e-9;
+    for (var b = 0; b < mag.length; b++) { pts.push({ x: st.freqs[b], y: mag[b] }); if (mag[b] > mx) mx = mag[b]; }
+    var map = Guide.drawLines(ctx, SPEC_W, SPEC_H, [
+      { points: pts, color: c.accent400, width: 1.4 }
+    ], [0, SR / 2], [0, mx * 1.12], { xLabel: 'frequency (Hz)', yLabel: 'magnitude', padL: 46 });
+    var X = map.px(freq);
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.4; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(X, map.padT); ctx.lineTo(X, map.padT + map.plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('fundamental ' + Math.round(freq) + ' Hz', Math.min(X + 6, SPEC_W - 130), map.padT + 12);
+    ctx.restore();
+  }
+
+  function drawStft(s) {
+    if (!stftSetup) return;
+    var ctx = stftSetup.ctx;
+    var st = s.st;
+    var mid = Math.max(0, Math.floor(st.frames / 2));
+    var mag = st.mag[mid] || [];
+    var pts = [], mx = 1e-9;
+    for (var b = 0; b < mag.length; b++) { pts.push({ x: st.freqs[b], y: mag[b] }); if (mag[b] > mx) mx = mag[b]; }
+    Guide.drawLines(ctx, STFT_W, STFT_H, [
+      { points: pts, color: c.accent2, width: 1.4 }
+    ], [0, SR / 2], [0, mx * 1.12], { xLabel: 'frequency (Hz)', yLabel: 'magnitude', padL: 46 });
+  }
+
+  function drawMel(s) {
+    if (!melSetup) return;
+    var ctx = melSetup.ctx;
+    var ms = s.ms;
+    var rows = ms.nMels, frames = ms.frames, cols = frames.length;
+    var matrix = [], mx = 1e-9, m, t;
+    for (m = 0; m < rows; m++) {
+      var row = [];
+      for (t = 0; t < cols; t++) {
+        var v = Math.log(1 + (frames[t] ? frames[t][m] : 0));
+        row.push(v);
+        if (v > mx) mx = v;
+      }
+      matrix.push(row);
+    }
+    var colLabels = [], rowLabels = [];
+    var colEvery = Math.max(1, Math.ceil(cols / 8));
+    var rowEvery = Math.max(1, Math.ceil(rows / 6));
+    for (t = 0; t < cols; t++) colLabels.push(t % colEvery === 0 ? Math.round(t * hop / SR * 1000) + ' ms' : '');
+    var melLo = dsp.hzToMel(80), melHi = dsp.hzToMel(SR / 2);
+    for (m = 0; m < rows; m++) {
+      rowLabels.push(m % rowEvery === 0 ? Math.round(dsp.melToHz(melLo + (melHi - melLo) * (m + 1) / (rows + 1))) + ' Hz' : '');
+    }
+    Guide.drawHeatmap(ctx, MEL_W, MEL_H, matrix, {
+      rowLabels: rowLabels, colLabels: colLabels, padL: 56, padB: 24,
+      colorLow: [240, 244, 255], colorHigh: [20, 50, 160]
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('mel filterbank: ' + rows + ' bands × ' + cols + ' frames', 4, 12);
+  }
+
+  function redrawReadout(s) {
+    var el = document.getElementById('aud-readout');
+    if (!el) return;
+    var rawRate = dsp.tokenRate(SR, 1);
+    var codecRate = dsp.tokenRate(CODEC_HZ, CODEC_BOOKS);
+    var bits = dsp.bitrateKbps(CODEC_HZ, CODEC_BOOKS, CODEC_BITS);
+    el.innerHTML =
+      '<div><span class="k">sample rate</span> <span class="hi">' + Guide.fmtNum(SR, 0) + ' Hz</span></div>' +
+      '<div><span class="k">samples</span> ' + Guide.fmtNum(s.n, 0) + ' (' + durMs + ' ms)</div>' +
+      '<div><span class="k">raw waveform</span> <span class="bad">' + Guide.fmtNum(rawRate, 0) + ' tokens/s</span></div>' +
+      '<div><span class="k">codec</span> <span class="hi">' + Guide.fmtNum(codecRate, 0) + ' tokens/s</span> (' + CODEC_HZ + ' Hz × ' + CODEC_BOOKS + ' books)</div>' +
+      '<div><span class="k">bitrate</span> ' + bits.toFixed(1) + ' kbps at ' + CODEC_BITS + ' bits/book</div>' +
+      '<div><span class="k">advantage</span> ' + (rawRate / codecRate).toFixed(0) + '× fewer tokens</div>' +
+      '<div><span class="k">Nyquist</span> ' + Guide.fmtNum(SR / 2, 0) + ' Hz</div>';
+  }
+
+  function redrawStftReadout(s) {
+    var el = document.getElementById('aud-stft-readout');
+    if (!el) return;
+    el.innerHTML =
+      '<div><span class="k">window</span> ' + winSize + ' samples (' + (winSize / SR * 1000).toFixed(1) + ' ms)</div>' +
+      '<div><span class="k">hop</span> ' + hop + ' samples (' + (hop / SR * 1000).toFixed(1) + ' ms)</div>' +
+      '<div><span class="k">frames</span> <span class="hi">' + s.st.frames + '</span></div>' +
+      '<div><span class="k">freq resolution</span> ' + (SR / winSize).toFixed(0) + ' Hz/bin</div>' +
+      '<div><span class="k">overlap</span> ' + Math.round(100 * (1 - hop / winSize)) + '%</div>';
+  }
+
+  function redraw() {
+    var s = buildState();
+    drawWave(s);
+    drawSpec(s);
+    drawStft(s);
+    drawMel(s);
+    redrawReadout(s);
+    redrawStftReadout(s);
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#aud-freq'), function (el) {
+    freq = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#aud-dur'), function (el) {
+    durMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#aud-win'), function (el) {
+    winSize = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#aud-hop'), function (el) {
+    hop = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#aud-mels'), function (el) {
+    nMels = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'audio-basics-nyquist',
+      kind: 'choice',
+      prompt: 'A signal is sampled at 16 kHz. What is the highest frequency the samples can represent without aliasing?',
+      options: [
+        { label: '8 kHz, half the sample rate.', correct: true },
+        { label: '16 kHz, one full sample rate.', correct: false },
+        { label: '32 kHz, twice the sample rate.', correct: false }
+      ],
+      explanation: 'The Nyquist frequency is fs/2. Anything above it folds back to a lower frequency, which is why a real pipeline low-pass filters before downsampling.'
+    },
+    {
+      id: 'audio-basics-tokens',
+      kind: 'numeric',
+      prompt: 'A neural codec runs at 75 frames per second and uses 8 residual codebooks per frame. How many tokens does it emit for one second of audio?',
+      answer: 600,
+      tolerance: 0.5,
+      explanation: 'Token rate is frame rate times codebooks: 75 × 8 = 600 tokens per second. A raw 24 kHz waveform would need 24,000 tokens per second, so the codec is forty times smaller.'
+    },
+    {
+      id: 'audio-basics-window',
+      kind: 'choice',
+      prompt: 'You lengthen the STFT window while holding the sample rate fixed. What happens to the trade?',
+      options: [
+        { label: 'Frequency resolution improves, but time resolution smears.', correct: true },
+        { label: 'Both frequency and time resolution improve together.', correct: false },
+        { label: 'Nothing changes; the window only affects volume.', correct: false }
+      ],
+      explanation: 'A longer window resolves neighbouring frequencies more finely but blurs the moment an event occurs. Their product is bounded, which is the uncertainty principle in engineering form.'
+    },
+    {
+      id: 'audio-basics-mel',
+      kind: 'choice',
+      prompt: 'What does the mel filterbank discard relative to the linear spectrogram?',
+      options: [
+        { label: 'Fine high-frequency detail and phase; it pools frequencies by perceived pitch.', correct: true },
+        { label: 'All low frequencies, keeping only the treble.', correct: false },
+        { label: 'Nothing at all; it is a lossless reparametrisation.', correct: false }
+      ],
+      explanation: 'Mel bands are narrow where the ear is sensitive and wide where it is not, so high-frequency detail is pooled. Phase is dropped entirely, which is why a vocoder must reconstruct it.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

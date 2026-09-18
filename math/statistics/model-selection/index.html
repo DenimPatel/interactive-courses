@@ -1,0 +1,585 @@
+---
+title: "Statistics, Interactively — Part 23: Cross-validation, AIC and BIC"
+description: "A k-fold animation, and the optimism of training error made visible as a gap that grows with capacity."
+permalink: "/math/statistics/model-selection/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-ic-wrap { max-height: 340px; overflow: auto; margin-top: 6px; }
+  .g-cheat td.best { color: var(--color-accent-700); font-weight: 600; }
+  .g-cheat tr.cur { background: var(--color-surface); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Cross-validation, AIC and BIC</h1>
+    <p>Every fitted model reports a number for how well it did: the loss on the data you just fitted. That number is too small, and systematically so. This part is about the gap between the error a model shows you and the error it will actually make, the two honest ways to close it &mdash; holding data back, and paying for complexity analytically &mdash; and the moment more capacity buys a better-looking fit and a worse model.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">How well will this model do on data it has never seen?</p>
+    <p>A model turns inputs into predictions, and fitting chooses its parameters so that its predictions match the data. The trouble is that the data used for choosing are the same data used for judging. A flexible model can reduce its apparent error by learning the pattern or by memorising the noise in this sample; only the first transfers to a fresh sample.</p>
+    <p>The quantity you want is the <em>test error</em>: the expected loss on new observations from the same population. You never observe it directly. What you have is a <em>training error</em> on the sample you fitted, and some way of estimating the test error from it &mdash; which is the whole of model selection.</p>
+    <p>This part builds the two standard answers. One holds data out: fit on part of the sample, score on the rest, and rotate the held-out block. The other stays on the training data and adds a penalty for complexity, which is what AIC and BIC do.</p>
+    <div class="g-goal"> <span><b>By the end of this part you'll see why</b> training error is optimistic and by how much, how k-fold cross-validation turns held-out data into a stable estimate, and how AIC and BIC replace the held-out set with a penalty on the likelihood &mdash; with different appetites for complexity.</span></div>
+    <div class="g-toc">
+      <a href="#optimistic">2 · Training error is optimistic</a>
+      <a href="#kfold">3 · K-fold cross-validation</a>
+      <a href="#optimism">4 · The optimism curve</a>
+      <a href="#ic">5 · AIC and BIC</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="optimistic">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Training error is optimistic</h2></div>
+    <p class="g-eyebrow">The gap between the number you see and the number you get</p>
+    <p>Write $\mathrm{Err}_{\text{train}}$ for the average loss over the fitted sample and $\mathrm{Err}_{\text{test}}$ for the expected loss on a fresh draw from the same population. Both are random, because the sample is random. But $\mathrm{Err}_{\text{train}}$ is systematically smaller, and the difference is called the <em>optimism</em>:</p>
+    <div class="g-math g-katex">$$\text{optimism} = \mathbb{E}\big[\mathrm{Err}_{\text{test}}\big] - \mathbb{E}\big[\mathrm{Err}_{\text{train}}\big] \;\ge\; 0$$</div>
+    <p>The reason is almost tautological. Fitting minimises the training loss, so the fitted parameters sit at the bottom of that particular valley. Some of the reduction came from fitting quirks of this sample that will not reappear in a fresh draw. With many parameters there are many directions in which to chase them, so training error keeps falling after the real structure has been captured, while held-out points never received that flattering treatment.</p>
+    <p>The simplest honest estimate is a held-out set: split the sample, fit on one part, and compute the loss on the other. Because the validation points were not used to choose the parameters, their loss is unbiased for the test error <em>of that fitted model</em>. The price is variance: a small validation set is noisy, while a large one leaves less data for training.</p>
+    <p>A second subtlety matters enormously. The moment you use the validation score to choose among models, the score stops being unbiased for the winner, because the winner was selected partly for how well it happened to do on those points. That <em>selection bias</em> is why a single split is dangerous, and it is what cross-validation controls.</p>
+  </section>
+
+  <section class="g-step" id="kfold">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>K-fold cross-validation</h2></div>
+    <p class="g-eyebrow">Every point is held out exactly once</p>
+    <p>One split wastes data and wobbles with the luck of the split. Cross-validation fixes both by rotating the held-out block. Partition the sample into $k$ roughly equal <em>folds</em>. For each fold in turn, fit the model on the other $k-1$ folds and score it on the fold that was left out. Average the $k$ held-out scores, so that every point is used for validation exactly once and for training $k-1$ times.</p>
+    <p>In the demo below the points are partitioned into folds, shown as the coloured blocks. The current validation fold is highlighted, and its points are drawn in warning colour on the fit canvas &mdash; the model is fitted without them and then asked to predict them. Press <em>Step fold</em> to move the held-out block along and watch the error accumulate; press <em>Run all folds</em> for a complete pass. The readout pools the held-out errors into the cross-validation estimate.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="fit-canvas" width="640" height="360"></canvas>
+        <canvas id="folds-canvas" width="640" height="150"></canvas>
+        <p class="g-canvas-hint">Above: the current polynomial fit (solid), all points (light), and the held-out fold (warning colour). Below: the fold partition and each fold's held-out error.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Folds k <span class="val">5</span></label><input type="range" id="k-slider" min="2" max="10" step="1" value="5"></div>
+        <div class="g-field"><label>Polynomial degree <span class="val">3</span></label><input type="range" id="deg-slider" min="1" max="12" step="1" value="3"></div>
+        <div class="g-btnrow">
+          <button type="button" id="step-fold" class="g-primary">Step fold</button>
+          <button type="button" id="run-folds">Run all folds</button>
+          <button type="button" id="reset-folds">Reset</button>
+        </div>
+        <div class="g-readout" id="fold-readout"></div>
+      </div>
+    </div>
+    <p>The choice of $k$ is itself a bias&ndash;variance trade-off. Each model is trained on a fraction $(k-1)/k$ of the data, so a small $k$ trains on much less data than the final model will see and therefore <em>overestimates</em> the error &mdash; it is pessimistic. A large $k$ trains on nearly the whole sample, so the bias shrinks; but the training sets overlap heavily, the fitted models become similar, and the average inherits their correlation. Computation grows with $k$ too.</p>
+    <p>The extreme is <em>leave-one-out</em> cross-validation, $k = n$: each fit uses all but one point, so it is almost unbiased for the full-data model and involves no random split, at the cost of $n$ fits. For ordinary least squares there is a shortcut that avoids refitting: the leave-one-out residual for point $i$ is the ordinary residual divided by $1 - h_{ii}$, its leverage. In practice $k = 5$ or $k = 10$ is the usual compromise.</p>
+    <div class="g-warn">⚠ <span><b>Cross-validation estimates the error of a procedure, not the final model.</b> Each fold's model trained on less data than you will eventually use. For choosing among models that is fine; for the winner's error, re-estimate on fresh data or an outer loop &mdash; the nesting in nested cross-validation.</span></div>
+  </section>
+
+  <section class="g-step" id="optimism">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The optimism curve</h2></div>
+    <p class="g-eyebrow">Two curves, one gap that grows</p>
+    <p>Let capacity grow while the data stay fixed. For each polynomial degree $d = 1$ to $12$, fit on all points and record the training error, then estimate the same model by cross-validation. Training error falls monotonically, because a flexible polynomial can always get closer to the points it was fitted to. Validation error is U-shaped: it falls while capacity captures real structure, then turns up once capacity starts chasing noise.</p>
+    <p>The vertical gap between the curves <em>is</em> the optimism, and it widens with capacity. The degree where the validation curve bottoms out is the degree cross-validation would choose &mdash; and training error would happily pick a far more flexible model.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="opt-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Training error (solid) and cross-validation error (warning colour) against polynomial degree. The dashed line marks the CV minimum; the faint line marks the degree you have selected.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Highlight degree d <span class="val">3</span></label><input type="range" id="deg-slider2" min="1" max="12" step="1" value="3"></div>
+        <div class="g-readout" id="opt-readout"></div>
+      </div>
+    </div>
+    <p>There is an analytic version of the same picture. For least squares with $p$ parameters and noise variance $\sigma^2$, the expected optimism is about $2\sigma^2 p / n$: each extra parameter buys roughly two units of flattering. That factor of two reappears in Mallows' $C_p$ and in AIC below.</p>
+    <p>Two cautions about reading the curve. First, the cross-validation curve is itself an estimate with noise, and on a small sample that noise can move the apparent minimum; the common remedy is the <em>one-standard-error rule</em>, choosing the simplest model within one standard error of the minimum. Second, the curve is specific to the training size: change $k$ or $n$ and the shape shifts.</p>
+  </section>
+
+  <section class="g-step" id="ic">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>AIC and BIC</h2></div>
+    <p class="g-eyebrow">Complexity as a line item on the likelihood</p>
+    <p>Cross-validation needs many fits. An alternative needs one: correct the training criterion itself. Fit each candidate by maximum likelihood, let $L$ be the maximised likelihood and $k$ the number of free parameters, and compute</p>
+    <div class="g-math g-katex">$$\mathrm{AIC} = 2k - 2\ln L, \qquad \mathrm{BIC} = k\ln n - 2\ln L$$</div>
+    <p>Here $-2\ln L$ is the deviance, a measure of how badly the model fits; larger is worse. The second term is a toll charged per parameter, and smaller values are better. The toll is what stops a flexible model from winning simply by fitting harder: the likelihood improves as parameters are added, and the penalty must be worth it.</p>
+    <p>The criteria differ only in the price of a parameter. AIC charges a flat $2$ regardless of sample size; BIC charges $\ln n$, which exceeds $2$ once $n \ge 8$ and grows slowly forever. BIC is therefore the stricter accountant and tends to pick simpler models. The table scores every degree on the same data, with the best AIC and BIC highlighted; compare them with the cross-validation minimum.</p>
+    <div id="ic-table" class="g-table-wrap g-ic-wrap"></div>
+    <p>Where do these formulae come from? AIC estimates the expected Kullback&ndash;Leibler divergence between the fitted model and the truth, with a bias correction of one unit per parameter, doubled to $2k$ by convention. BIC approximates the marginal likelihood under a default prior, which is why it behaves like Bayesian model selection: as $n$ grows, BIC is <em>consistent</em> and selects the true model with probability tending to one, while AIC targets predictive accuracy and can keep some excess parameters forever.</p>
+    <p>For Gaussian regression, with $\hat\sigma^2 = \mathrm{SSE}/n$, the deviance is $n\ln(\mathrm{SSE}/n) + \text{const}$, so AIC is the residual sum of squares plus $2k$ &mdash; Mallows' $C_p$ in different notation.</p>
+    <p>Neither criterion is strictly better. AIC aims at prediction; BIC aims at parsimony and at identifying the true model, which is why it is consistent. Both assume maximum-likelihood fits to the same data with the same response and a meaningful parameter count; for regularised models, use <em>effective</em> degrees of freedom. Use cross-validation when the loss is not a likelihood or the model is a pipeline; use AIC or BIC when one fit must do &mdash; AIC for prediction, BIC for a sparser answer. When they disagree the extra complexity is marginal, and the simpler model is safer.</p>
+    <div class="g-warn">⚠ <span><b>The nested cross-validation caveat.</b> If you use cross-validation both to choose a hyperparameter and to report the chosen model's error, the reported number is optimistic, because the held-out points helped select the winner. Nested cross-validation separates the jobs: an inner loop chooses on each outer training set, and an outer loop scores the chosen procedure on data it never saw. Believe the outer estimate.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The same gap, at two scales</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Choosing a model size</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/llm-training/scaling/' | relative_url }}">scaling chapter</a> is this part's picture at industrial scale: training loss keeps falling with parameters and compute while held-out loss bottoms out and then rises. Scaling laws fit the held-out curve, and picking a size depends on never confusing the two.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Held-out evaluation</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation chapter</a> is held-out validation written large. A benchmark score is a validation estimate, and the instant you tune against it &mdash; a checkpoint, a prompt, a decoding setting &mdash; it acquires the selection bias cross-validation was invented to avoid. Contaminated test sets are optimism that escaped the lab.</p>
+      </div>
+    </div>
+    <p>The same discipline appears whenever many models share a single score. In the <a href="{{ '/math/linear-algebra/least-squares/' | relative_url }}">least-squares part</a> the fitted coefficients minimise the residual on the data at hand, and the leave-one-out identity is a one-line consequence of the hat matrix; in a language-model run the held-out loss is the only number that survives contact with new text. The rule never changes: separate the data that <em>scores</em> from the data that <em>chooses</em>.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>If you take away one thing, take the picture of two curves &mdash; one that always improves, one that turns &mdash; and the discipline of never letting the same data choose and judge. The references below treat model assessment as central rather than a step tacked onto fitting.</p>
+    <ul class="g-refs">
+      <li>Trevor Hastie, Robert Tibshirani and Jerome Friedman, <em>The Elements of Statistical Learning</em>, 2nd ed., chapter 7 &mdash; model assessment and selection, the $1$-SE rule, and the LOO/leverage identity.</li>
+      <li>Sylvain Arlot and Alain Celisse, <a href="https://projecteuclid.org/journals/statistics-surveys/volume-4/10.1214/09-SS051.full">"A survey of cross-validation procedures for model selection"</a>, <em>Statistics Surveys</em>, 2010 &mdash; the bias&ndash;variance of $k$ in detail.</li>
+      <li>Hirotugu Akaike, <a href="https://ieeexplore.ieee.org/document/1100705">"A new look at the statistical model identification"</a>, 1974 &mdash; where AIC comes from.</li>
+      <li>Gideon Schwarz, <a href="https://projecteuclid.org/journals/annals-of-statistics/volume-6/issue-2/Estimating-the-Dimension-of-a-Model/10.1214/aos/1176344136.full">"Estimating the dimension of a model"</a>, 1978 &mdash; the BIC penalty and its Bayesian reading.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Training error</td><td>Loss on the data used to fit the model; systematically too small</td></tr>
+        <tr><td>Test error</td><td>Expected loss on a fresh draw from the same population; the target</td></tr>
+        <tr><td>Optimism</td><td>$\mathbb{E}[\mathrm{Err}_{\text{test}}] - \mathbb{E}[\mathrm{Err}_{\text{train}}]$, about $2\sigma^2 p/n$ for OLS</td></tr>
+        <tr><td>Validation error</td><td>Loss on held-out points; honest for one model</td></tr>
+        <tr><td>$k$-fold CV</td><td>Average held-out error over $k$ disjoint folds; every point held out once</td></tr>
+        <tr><td>Choice of $k$</td><td>Small $k$ is pessimistic and cheap; large $k$ is near-unbiased and correlated; $5$&ndash;$10$ is usual</td></tr>
+        <tr><td>Leave-one-out</td><td>$k = n$: no split randomness, $n$ fits, low bias and correlated errors</td></tr>
+        <tr><td>AIC</td><td>$2k - 2\ln L$: flat penalty per parameter; tuned for prediction</td></tr>
+        <tr><td>BIC</td><td>$k\ln n - 2\ln L$: penalty grows with $n$; favours parsimony and is consistent</td></tr>
+        <tr><td>Nested CV</td><td>Outer loop scores, inner loop selects; the only honest report after tuning</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Cross-validation tells you how well a model generalises; the next part turns a generalising model's scores into decisions &mdash; thresholds, ROC and PR curves, and calibration.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) {
+    d = d == null ? 2 : d;
+    if (!isFinite(x)) return '\u2014';
+    var s = x.toFixed(d);
+    if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s === '-0' ? '0' : s;
+  }
+
+  // ------------------------------------------------------------------
+  // Fixed dataset: a smooth signal plus noise, drawn with a seeded RNG.
+  // ------------------------------------------------------------------
+  var N = 60;
+  var xs = [], ys = [], allIdx = [];
+  (function () {
+    var r = S.rng(20261123);
+    for (var i = 0; i < N; i++) {
+      var x = S.sample.uniform(r, 0, 1);
+      xs.push(x);
+      ys.push(Math.sin(2 * Math.PI * x) + S.sample.normal(r, 0, 0.3));
+      allIdx.push(i);
+    }
+  })();
+
+  // Polynomial design [1, t, t^2, ...] with t = 2x-1 in [-1,1] for conditioning.
+  function design(x, d) {
+    var t = 2 * x - 1, row = [1];
+    for (var j = 1; j <= d; j++) row.push(row[j - 1] * t);
+    return row;
+  }
+  function fitIdx(d, idx) {
+    var X = [], y = [];
+    for (var i = 0; i < idx.length; i++) { X.push(design(xs[idx[i]], d)); y.push(ys[idx[i]]); }
+    return S.est.ols(X, y);
+  }
+  function evalBeta(beta, x) {
+    var row = design(x, beta.length - 1), s = 0;
+    for (var j = 0; j < row.length; j++) s += row[j] * beta[j];
+    return s;
+  }
+
+  // ------------------------------------------------------------------
+  // State
+  // ------------------------------------------------------------------
+  var K = 5, deg = 3, fold = 0;
+  var foldOf = [], visited = [], visitedCount = 0, runTimer = null;
+  var foldSSE = [], foldN = [], foldRMSE = [], foldTrainRMSE = [];
+  var trainRMSE = [], cvRMSE = [], deviance = [];
+  var MAXD = 12;
+
+  function resetProgress() {
+    visited = [];
+    for (var i = 0; i < K; i++) visited.push(false);
+    visitedCount = 0;
+    fold = 0;
+  }
+  function stopRun() {
+    if (runTimer) { window.clearInterval(runTimer); runTimer = null; }
+    var b = el('run-folds'); if (b) b.textContent = 'Run all folds';
+  }
+
+  function rebuildFolds() {
+    foldSSE = []; foldN = []; foldRMSE = []; foldTrainRMSE = [];
+    for (var i = 0; i < N; i++) foldOf[i] = i % K;
+    for (var f = 0; f < K; f++) {
+      var tr = [], va = [];
+      for (i = 0; i < N; i++) { if (foldOf[i] === f) va.push(i); else tr.push(i); }
+      var m = fitIdx(deg, tr);
+      if (!m || !va.length) {
+        foldSSE.push(0); foldN.push(va.length); foldRMSE.push(NaN); foldTrainRMSE.push(NaN);
+        continue;
+      }
+      var sse = 0;
+      for (var q = 0; q < va.length; q++) {
+        var e = ys[va[q]] - evalBeta(m.beta, xs[va[q]]);
+        sse += e * e;
+      }
+      foldSSE.push(sse);
+      foldN.push(va.length);
+      foldRMSE.push(Math.sqrt(sse / va.length));
+      foldTrainRMSE.push(Math.sqrt(m.sse / tr.length));
+    }
+  }
+
+  function computeCurves() {
+    trainRMSE = []; cvRMSE = []; deviance = [];
+    for (var d = 1; d <= MAXD; d++) {
+      var mAll = fitIdx(d, allIdx);
+      trainRMSE[d] = mAll ? Math.sqrt(mAll.sse / N) : NaN;
+      var sse = 0, n = 0, bad = false;
+      for (var f = 0; f < K && !bad; f++) {
+        var tr = [], va = [];
+        for (var i = 0; i < N; i++) { if (foldOf[i] === f) va.push(i); else tr.push(i); }
+        var m = fitIdx(d, tr);
+        if (!m) { bad = true; break; }
+        for (var q = 0; q < va.length; q++) {
+          var e = ys[va[q]] - evalBeta(m.beta, xs[va[q]]);
+          sse += e * e; n++;
+        }
+      }
+      cvRMSE[d] = bad ? NaN : Math.sqrt(sse / n);
+      deviance[d] = mAll ? N * Math.log(mAll.sse / N) + N : NaN;
+    }
+  }
+
+  function cumulCV() {
+    var sse = 0, n = 0;
+    for (var f = 0; f < K; f++) if (visited[f]) { sse += foldSSE[f]; n += foldN[f]; }
+    return n ? Math.sqrt(sse / n) : NaN;
+  }
+  function cvMinDegree() {
+    var bi = 1;
+    for (var d = 2; d <= MAXD; d++) if (isFinite(cvRMSE[d]) && (!isFinite(cvRMSE[bi]) || cvRMSE[d] < cvRMSE[bi])) bi = d;
+    return bi;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the fit canvas and the fold strip
+  // ------------------------------------------------------------------
+  var fitPlot = null, optPlot = null, fctx = null;
+
+  function drawFit() {
+    if (!fitPlot) return;
+    fitPlot.clear();
+    fitPlot.axes({ xLabel: 'x', yLabel: 'y' });
+    var trainIdx = [], valIdx = [];
+    for (var i = 0; i < N; i++) { if (foldOf[i] === fold) valIdx.push(i); else trainIdx.push(i); }
+    var m = fitIdx(deg, trainIdx);
+    var trPts = [], vaPts = [];
+    for (i = 0; i < trainIdx.length; i++) trPts.push([xs[trainIdx[i]], ys[trainIdx[i]]]);
+    for (i = 0; i < valIdx.length; i++) vaPts.push([xs[valIdx[i]], ys[valIdx[i]]]);
+    fitPlot.points(trPts, { color: c.accent400, r: 2.4 });
+    if (m) fitPlot.curve(function (x) { return evalBeta(m.beta, x); }, { color: c.accent, width: 2.2 });
+    fitPlot.points(vaPts, { color: c.accent2, r: 3.4, stroke: '#ffffff', width: 1.2 });
+    fitPlot.legend([
+      { label: 'training points', color: c.accent400 },
+      { label: 'held-out fold', color: c.accent2 },
+      { label: 'fitted degree ' + deg, color: c.accent }
+    ], { dy: 6 });
+
+    var cv = cumulCV();
+    var trainRMSEnow = m ? Math.sqrt(m.sse / trainIdx.length) : NaN;
+    var out = el('fold-readout');
+    if (out) {
+      out.innerHTML =
+        '<div><span class="k">fold</span> ' + (fold + 1) + ' of ' + K + '</div>' +
+        '<div><span class="k">held out</span> ' + valIdx.length + ' points</div>' +
+        '<div><span class="k">training RMSE</span> ' + fmt(trainRMSEnow, 3) + '</div>' +
+        '<div><span class="k">this fold RMSE</span> <span class="hi">' + fmt(foldRMSE[fold], 3) + '</span></div>' +
+        '<div><span class="k">CV so far</span> ' + fmt(cv, 3) + ' (' + visitedCount + '/' + K + ' folds scored)</div>' +
+        '<div class="g-mini">' + (visitedCount >= K
+          ? 'All folds scored: the cross-validation estimate is ' + fmt(cv, 3) + '.'
+          : 'Step through the folds to accumulate the held-out error.') + '</div>';
+    }
+  }
+
+  function drawFolds() {
+    if (!fctx) return;
+    var W = 640, H = 150, pad = 10;
+    fctx.clearRect(0, 0, W, H);
+    var cc = Guide.colors();
+    var gap = 4, bw = (W - 2 * pad - gap * (K - 1)) / K;
+    var baseY = H - 16, barMax = 58;
+    var maxE = 1e-6;
+    for (var i = 0; i < K; i++) if (isFinite(foldRMSE[i]) && foldRMSE[i] > maxE) maxE = foldRMSE[i];
+
+    fctx.font = '11px ' + cc.font;
+    fctx.textAlign = 'left'; fctx.textBaseline = 'middle';
+    fctx.globalAlpha = 0.6; fctx.fillStyle = cc.text;
+    fctx.fillText('fold partition \u2014 one validation block at a time; bars show each fold\u2019s held-out error', pad, 9);
+    fctx.globalAlpha = 1; fctx.textAlign = 'center';
+
+    for (i = 0; i < K; i++) {
+      var x = pad + i * (bw + gap);
+      var isCur = (i === fold), isVis = visited[i];
+      fctx.globalAlpha = isCur ? 0.9 : (isVis ? 0.55 : 0.25);
+      fctx.fillStyle = isCur ? cc.accent2 : (isVis ? cc.accent400 : cc.divider);
+      fctx.fillRect(x, 22, bw, 24);
+      fctx.globalAlpha = 1;
+      fctx.strokeStyle = isCur ? cc.accent2 : cc.divider;
+      fctx.lineWidth = isCur ? 2 : 1;
+      fctx.strokeRect(x + 0.5, 22.5, bw - 1, 23);
+      fctx.fillStyle = cc.text;
+      fctx.globalAlpha = isCur ? 1 : 0.7;
+      fctx.fillText('f' + (i + 1), x + bw / 2, 34);
+      fctx.globalAlpha = 1;
+
+      var e = foldRMSE[i];
+      if (isFinite(e)) {
+        var h = Math.max(1, barMax * (e / maxE));
+        fctx.globalAlpha = isCur ? 0.85 : 0.45;
+        fctx.fillStyle = isCur ? cc.accent2 : cc.accent;
+        fctx.fillRect(x + bw * 0.2, baseY - h, bw * 0.6, h);
+        fctx.globalAlpha = 1;
+        fctx.fillStyle = cc.text;
+        fctx.fillText(fmt(e, 2), x + bw / 2, baseY + 9);
+      }
+    }
+    fctx.strokeStyle = cc.divider; fctx.lineWidth = 1;
+    fctx.beginPath(); fctx.moveTo(pad, baseY); fctx.lineTo(W - pad, baseY); fctx.stroke();
+  }
+
+  // ------------------------------------------------------------------
+  // Demo B — the optimism curve
+  // ------------------------------------------------------------------
+  function drawOptimism() {
+    if (!optPlot) return;
+    optPlot.clear();
+    var yMax = 0;
+    for (var d = 1; d <= MAXD; d++) {
+      if (isFinite(trainRMSE[d])) yMax = Math.max(yMax, trainRMSE[d]);
+      if (isFinite(cvRMSE[d])) yMax = Math.max(yMax, cvRMSE[d]);
+    }
+    if (!(yMax > 0)) yMax = 1;
+    yMax *= 1.15;
+    optPlot.yRange[0] = 0; optPlot.yRange[1] = yMax;
+    optPlot.axes({ xLabel: 'polynomial degree d', yLabel: 'RMSE' });
+
+    var trPts = [], cvPts = [];
+    for (d = 1; d <= MAXD; d++) {
+      trPts.push([d, trainRMSE[d]]);
+      cvPts.push([d, cvRMSE[d]]);
+    }
+    optPlot.curve(trPts, { color: c.accent, width: 2.2 });
+    optPlot.curve(cvPts, { color: c.accent2, width: 2.2 });
+    optPlot.points(trPts, { color: c.accent, r: 2.6 });
+    optPlot.points(cvPts, { color: c.accent2, r: 2.6 });
+    optPlot.vline(cvMinDegree(), { color: c.accent700, width: 1.6, dash: [2, 3], label: 'CV min d=' + cvMinDegree(), labelY: yMax * 0.86, labelColor: c.accent700 });
+    optPlot.vline(deg, { color: c.text, dashed: true, width: 1.2, label: 'd=' + deg, labelY: yMax * 0.99, labelColor: c.text });
+    optPlot.legend([
+      { label: 'training error', color: c.accent },
+      { label: 'cross-validation error', color: c.accent2 }
+    ], { dy: 6 });
+
+    var out = el('opt-readout');
+    if (out) {
+      var gap = cvRMSE[deg] - trainRMSE[deg];
+      out.innerHTML =
+        '<div><span class="k">training RMSE</span> ' + fmt(trainRMSE[deg], 3) + '</div>' +
+        '<div><span class="k">CV RMSE</span> <span class="hi">' + fmt(cvRMSE[deg], 3) + '</span></div>' +
+        '<div><span class="k">optimism (gap)</span> <span class="bad">' + fmt(gap, 3) + '</span></div>' +
+        '<div><span class="k">CV minimum</span> degree ' + cvMinDegree() + '</div>' +
+        '<div class="g-mini">The gap widens with capacity; the CV minimum is the degree the data actually supports.</div>';
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // The AIC / BIC table on the same data
+  // ------------------------------------------------------------------
+  function drawIC() {
+    var host = el('ic-table');
+    if (!host) return;
+    var aic = [], bic = [], bestA = -1, bestB = -1;
+    for (var d = 1; d <= MAXD; d++) {
+      var m = fitIdx(d, allIdx);
+      if (!m) continue;
+      var p = d + 2;                       // coefficients + noise variance
+      var logL = -0.5 * N * (Math.log(2 * Math.PI * (m.sse / N)) + 1);
+      aic[d] = 2 * p - 2 * logL;
+      bic[d] = p * Math.log(N) - 2 * logL;
+      if (bestA < 0 || aic[d] < aic[bestA]) bestA = d;
+      if (bestB < 0 || bic[d] < bic[bestB]) bestB = d;
+    }
+    var html = '<table class="g-cheat"><thead><tr><th>degree d</th><th>params k</th><th>&minus;2 ln L</th><th>AIC</th><th>BIC</th></tr></thead><tbody>';
+    for (d = 1; d <= MAXD; d++) {
+      if (aic[d] == null) continue;
+      html += '<tr' + (d === deg ? ' class="cur"' : '') + '>' +
+        '<td>' + d + '</td><td>' + (d + 2) + '</td>' +
+        '<td>' + fmt(deviance[d], 1) + '</td>' +
+        '<td' + (d === bestA ? ' class="best"' : '') + '>' + fmt(aic[d], 1) + '</td>' +
+        '<td' + (d === bestB ? ' class="best"' : '') + '>' + fmt(bic[d], 1) + '</td></tr>';
+    }
+    html += '</tbody></table><p class="g-mini">Lower is better. AIC charges 2 per parameter and favours the more flexible fit; BIC charges ln n &asymp; ' + fmt(Math.log(N), 2) + ' here, so it settles on a simpler degree.</p>';
+    host.innerHTML = html;
+  }
+
+  function drawAll() { drawFit(); drawFolds(); drawOptimism(); drawIC(); }
+
+  // ------------------------------------------------------------------
+  // Fold animation
+  // ------------------------------------------------------------------
+  function stepFold() {
+    if (visitedCount >= K) { resetProgress(); rebuildFolds(); drawAll(); return; }
+    visited[fold] = true;
+    visitedCount++;
+    if (visitedCount < K) fold++;
+    drawAll();
+  }
+  function startRun() {
+    stopRun();
+    if (visitedCount >= K) { resetProgress(); rebuildFolds(); drawAll(); }
+    var b = el('run-folds'); if (b) b.textContent = 'Running\u2026';
+    runTimer = window.setInterval(function () {
+      stepFold();
+      if (visitedCount >= K) stopRun();
+    }, 800);
+  }
+
+  // ------------------------------------------------------------------
+  // Build plots, wire controls
+  // ------------------------------------------------------------------
+  fitPlot = S.plot(el('fit-canvas'), {
+    W: 640, H: 360, xRange: [0, 1], yRange: [-2, 2],
+    xLabel: 'x', yLabel: 'y', onResize: drawFit
+  });
+  optPlot = S.plot(el('opt-canvas'), {
+    W: 640, H: 360, xRange: [0.4, 12.6], yRange: [0, 1],
+    xLabel: 'polynomial degree d', yLabel: 'RMSE', onResize: drawOptimism
+  });
+  var foldsSetup = Guide.setupCanvas(el('folds-canvas'), 640, 150, drawFolds);
+  fctx = foldsSetup.ctx;
+
+  resetProgress();
+  rebuildFolds();
+  computeCurves();
+  drawAll();
+
+  function setSpan(slider, v) {
+    var s = slider && slider.parentElement ? slider.parentElement.querySelector('.val') : null;
+    if (s) s.textContent = v;
+  }
+  function syncDegSliders() {
+    var a = el('deg-slider'), b = el('deg-slider2');
+    if (a) { a.value = deg; setSpan(a, deg); }
+    if (b) { b.value = deg; setSpan(b, deg); }
+  }
+
+  Guide.bindSliders([el('k-slider')], function (sl) {
+    K = parseInt(sl.value, 10);
+    stopRun(); resetProgress(); rebuildFolds(); computeCurves(); drawAll();
+  });
+  Guide.bindSliders([el('deg-slider')], function (sl) {
+    deg = parseInt(sl.value, 10);
+    stopRun(); resetProgress(); rebuildFolds(); syncDegSliders(); drawAll();
+  });
+  Guide.bindSliders([el('deg-slider2')], function (sl) {
+    deg = parseInt(sl.value, 10);
+    stopRun(); resetProgress(); rebuildFolds(); syncDegSliders(); drawAll();
+  });
+
+  el('step-fold').addEventListener('click', function () { stopRun(); stepFold(); });
+  el('run-folds').addEventListener('click', function () { startRun(); });
+  el('reset-folds').addEventListener('click', function () {
+    stopRun(); resetProgress(); rebuildFolds(); drawAll();
+  });
+
+  drawAll();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'model-selection-optimism',
+      kind: 'choice',
+      prompt: 'You fit a flexible model and read off its training error. Why is that number an optimistic estimate of how it will do on new data?',
+      options: [
+        { label: 'Fitting minimises the training loss, so some of the apparent improvement comes from fitting noise in this sample that will not reappear.', correct: true },
+        { label: 'Because the training set is always smaller than the test set, so the error is measured on fewer points.', correct: false },
+        { label: 'Because training error is always exactly zero for a correctly fitted model.', correct: false }
+      ],
+      explanation: 'The model was chosen to reduce the loss on exactly those points, so any sample-specific quirk it captured inflates its apparent quality. Validation error has no such incentive because those points never participated in the fit.'
+    },
+    {
+      id: 'model-selection-pooled-cv',
+      kind: 'numeric',
+      prompt: 'Four equally sized folds give held-out MSE values 0.25, 0.36, 0.16 and 0.09. What is the pooled cross-validation MSE?',
+      answer: 0.215,
+      tolerance: 0.002,
+      explanation: 'With equally sized folds the pooled CV MSE is the plain average: (0.25 + 0.36 + 0.16 + 0.09) / 4 = 0.86 / 4 = 0.215. (Averaging the fold errors works only because every fold holds the same number of points; the general rule pools the squared errors and the counts.)'
+    },
+    {
+      id: 'model-selection-loo-fits',
+      kind: 'numeric',
+      prompt: 'You run leave-one-out cross-validation on a dataset of 120 examples. How many model fits does one complete pass require?',
+      answer: 120,
+      tolerance: 0.001,
+      explanation: 'Leave-one-out sets k = n, so each of the n points is held out in turn and the model is refitted each time: 120 fits. It is nearly unbiased but linear in the sample size, which is why k = 5 or 10 is the usual compromise.'
+    },
+    {
+      id: 'model-selection-nested',
+      kind: 'choice',
+      prompt: 'You tune a hyperparameter with cross-validation and then report the best cross-validation error as the model\u2019s performance. What is wrong with the reported number?',
+      options: [
+        { label: 'It is optimistic: the held-out data helped choose the winner, so it is no longer a fair estimate of the chosen model.', correct: true },
+        { label: 'Nothing is wrong; cross-validation always gives an unbiased estimate of test error.', correct: false },
+        { label: 'It is too pessimistic, because the folds train on less data than the final model.', correct: false }
+      ],
+      explanation: 'Selecting on a score bends that score in the winner\u2019s favour, the same selection bias a single split suffers. Nested cross-validation separates the jobs \u2014 an inner loop selects, an outer loop scores on data never used for the choice \u2014 so the outer estimate is the one to report.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

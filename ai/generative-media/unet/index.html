@@ -1,0 +1,333 @@
+---
+title: "The U-Net backbone"
+description: "The resolution pyramid and its skips, residual blocks, where self- and cross-attention sit, the timestep embedding, and interactive parameter counts."
+permalink: "/ai/generative-media/unet/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>The U-Net backbone</h1>
+    <p>The denoiser for a latent diffusion model is a U-Net: an encoder that shrinks the spatial grid while widening the channels, a bottleneck, and a decoder that reverses the trip. Skip connections carry the fine detail across the middle so the decoder is not forced to reinvent it, and attention is bolted in at the coarse levels where a global view is affordable. This part draws the architecture to scale and lets you change its width and depth, with the parameter bill updating as you do.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="pyramid">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The resolution pyramid</h2></div>
+    <p class="g-eyebrow">Shrink the grid, widen the channels</p>
+    <p>A pyramid is the natural shape for a denoiser because the two quantities move in opposite directions. Early layers need to resolve fine spatial detail but can afford few channels; deep layers have lost most of the spatial resolution and compensate with many channels, so each position summarises a large region of the image. Three downsample stages take a 64&times;64 latent to 8&times;8 while the channel count climbs from 320 to 1280, and the decoder runs the same schedule backwards.</p>
+    <p>The schematic below is drawn to scale: the width of each block is proportional to its channel count, and the two columns are the encoder and decoder. Change the base channel count and the blocks per level and watch the U widen, then read the parameter totals underneath. The counts are an envelope from <code>Diffusion.unetBreakdown</code> &mdash; a realistic order of magnitude rather than a specific checkpoint.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="un-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">A four-level U-Net. Dashed horizontal arrows are skip connections from encoder to decoder; the curved connector at the bottom is the bottleneck. Block width scales with channels.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>base channels <span class="val">320</span></label>
+          <input type="range" id="un-base" min="64" max="512" step="32" value="320">
+        </div>
+        <div class="g-field">
+          <label>residual blocks per level <span class="val">2</span></label>
+          <input type="range" id="un-blocks" min="1" max="4" step="1" value="2">
+        </div>
+        <div class="g-readout" id="un-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> read a U-Net diagram as a table of resolutions and channels, say what each skip connection carries, explain why self-attention lives at the bottom of the U, and estimate where the parameters actually sit.</span></div>
+    <div class="g-toc">
+      <a href="#skips">2 · Skips and why they matter</a>
+      <a href="#attention">3 · Where attention sits</a>
+      <a href="#conditioning">4 · Conditioning and time</a>
+      <a href="#params">5 · Counting parameters</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="skips">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Skips and why they matter</h2></div>
+    <p class="g-eyebrow">The wire that keeps the detail</p>
+    <p>Downsampling is lossy. By the time the signal reaches the bottleneck it is an 8&times;8 grid with 1280 channels, which is a fine summary of global structure and a hopeless record of where an edge was. A plain autoencoder would have to regenerate the missing detail from that summary. The U-Net's trick is to bypass the loss: at every level, the encoder's feature map is copied across and concatenated onto the decoder's feature map at the same resolution. The decoder therefore has both the coarse content coming up from below and the sharp, local features coming from the left.</p>
+    <p>This is why the denoiser can be so good at the fine-grained part of the job. At high signal-to-noise the answer is mostly a small cleanup of the input, and the skip connections hand the decoder exactly the input's detail to clean. At low signal-to-noise the skips are nearly noise and the network leans on the bottleneck's global view instead. The same wires serve both regimes, which is part of why one architecture covers the whole trajectory.</p>
+    <div class="g-warn">⚠ <span><b>Skips are not free.</b> Concatenating an encoder map onto a decoder map doubles the decoder's input channels at that level, so the first convolution after each skip is the expensive one. The wider blocks in the schematic's right column are that cost made visible.</span></div>
+  </section>
+
+  <section class="g-step" id="attention">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Where attention sits</h2></div>
+    <p class="g-eyebrow">Convolution sees locally; attention sees the whole grid</p>
+    <p>A convolution mixes information only within its kernel, so a stack of them has an effective receptive field that grows slowly with depth. Self-attention has no such limit: every position attends to every other position in one layer, which is exactly what is needed to keep a face consistent with a body or a horizon straight across the frame. The catch is cost. Attention is quadratic in the number of positions, so it is ruinous at 64&times;64 and cheap at 8&times;8.</p>
+    <p>The U-Net resolves the tension by placing self-attention only at the coarse levels, where the sequence is short enough that the quadratic term stays small. A typical layout puts a self-attention block after the residual blocks at the two deepest resolutions, which is why the schematic tags those levels. Everything above stays purely convolutional, spending its budget on local detail at a resolution where attention could not fit anyway.</p>
+    <p>This is the design decision that the DiT architecture eventually inverts. A U-Net keeps the pyramid and sprinkles attention where it fits; a transformer runs attention everywhere and replaces the pyramid with a single-resolution sequence of patches. The next part makes that comparison concrete.</p>
+  </section>
+
+  <section class="g-step" id="conditioning">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Conditioning and time</h2></div>
+    <p class="g-eyebrow">Two extra inputs: which step, and which prompt</p>
+    <p>A denoiser is asked to do different jobs at different times. At $t$ near zero it removes a whisper of noise; at large $t$ it must invent structure from almost nothing. The network is told which regime it is in by a <em>timestep embedding</em>: a fixed sinusoidal encoding of $t$ is projected through a small MLP and then injected into every residual block, usually by predicting a scale and a shift that modulate the block's normalisation. So the same weights behave very differently at different noise levels, cheaply.</p>
+    <p>Text conditioning arrives by a second mechanism. Prompt tokens are encoded once by a text encoder, and then each spatial position of the U-Net <em>attends</em> to those tokens with <em>cross-attention</em>: queries come from the image features and keys and values come from the text. A patch representing fur can attend to the word "cat" and pull in the relevant direction, which is how a class or caption steers generation without retraining the denoiser. Cross-attention is inserted at the same coarse levels as self-attention, for the same cost reason.</p>
+    <p>Two knobs therefore coexist inside the network: a scalar clock that says how much noise remains, and a set of token features that say what to draw. Keeping them separate is what lets one model serve a thousand noise levels and an unbounded space of prompts.</p>
+  </section>
+
+  <section class="g-step" id="params">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Counting parameters</h2></div>
+    <p class="g-eyebrow">Where the weights actually live</p>
+    <p>A residual block is two $3\times3$ convolutions, and a convolution from $c_\text{in}$ to $c_\text{out}$ channels costs $c_\text{in}\cdot c_\text{out}\cdot 9$ weights. That product is why the deep levels dominate: the spatial grid shrinks by four at each downsample, but the channel count doubles, so the parameter count of a block grows even as its feature map shrinks. Attention adds a further $2c^2$ per block at the levels that carry it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="un-params-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Parameters per resolution level from <code>Diffusion.unetBreakdown</code>, at the base channels and blocks-per-level set by the sliders above.</p>
+      </div>
+      <div class="g-controls">
+        <p>The bars are the same numbers the readout prints, drawn at the same scale as the schematic: the wide blocks at the bottom of the U are the expensive ones. Increase the blocks slider and every level grows together; increase the base channels and the deep levels grow fastest, because the channel counts there are multiples of the base.</p>
+        <p class="g-mini">Doubling the base channels roughly quadruples most of the parameter count, which is why width is a blunt instrument and depth a cheaper one.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">A decade of image and video denoisers</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">Stable Diffusion and Imagen</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/generative-media/latent-diffusion/' | relative_url }}">latent diffusion</a> U-Net and the pixel-space Imagen stack are both this architecture with different widths. Dhariwal and Nichol's ablation is the reference for where attention and how many residual blocks to place.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Video &amp; audio</div>
+        <h3 style="margin:6px 0;">Inflated and 1-D U-Nets</h3>
+        <p style="margin-bottom:0;">Video U-Nets inflate every 2-D block into a spatio-temporal one, adding a temporal axis only at the coarse levels to keep the cost down. Audio models flatten a spectrogram into a 1-D sequence and run a U-Net along time with the same skip structure.</p>
+      </div>
+    </div>
+    <p>The U-Net is the workhorse that made diffusion practical, and its inductive biases &mdash; locality, translation equivariance, a resolution pyramid &mdash; are exactly what the DiT gives up in exchange for scale. Which of those two bets wins is the subject of the next part.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The U-Net predates diffusion by years and was borrowed almost unchanged. The two papers that matter most for the diffusion variant are the DDPM architecture and the Dhariwal&ndash;Nichol ablation, which together fix where attention goes and how many blocks each level carries.</p>
+    <p>Ronneberger and coauthors introduce the shape for biomedical segmentation; Ho and coauthors bring it into diffusion; Dhariwal and Nichol tune its width, depth and attention placement against a GAN baseline; and Rombach and coauthors move it into the latent space.</p>
+    <ul class="g-refs">
+      <li>Olaf Ronneberger, Philipp Fischer and Thomas Brox, <a href="https://arxiv.org/abs/1505.04597">"U-Net: Convolutional Networks for Biomedical Image Segmentation"</a>, 2015 &mdash; the original encoder&ndash;decoder with skips.</li>
+      <li>Jonathan Ho, Ajay Jain and Pieter Abbeel, <a href="https://arxiv.org/abs/2006.11239">"Denoising Diffusion Probabilistic Models"</a>, 2020 &mdash; the U-Net as a noise predictor.</li>
+      <li>Prafulla Dhariwal and Alex Nichol, <a href="https://arxiv.org/abs/2105.05233">"Diffusion Models Beat GANs on Image Synthesis"</a>, 2021 &mdash; the architecture ablation: width, depth and attention at coarse resolutions.</li>
+      <li>Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser and Björn Ommer, <a href="https://arxiv.org/abs/2112.10752">"High-Resolution Image Synthesis with Latent Diffusion Models"</a>, 2022 &mdash; cross-attention for text conditioning.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Resolution pyramid</td><td>Grid shrinks by 2 per stage; channels double in compensation</td></tr>
+        <tr><td>Skip connection</td><td>Concatenates an encoder map onto the decoder at the same resolution</td></tr>
+        <tr><td>Residual block</td><td>Two $3\times3$ convs; $c_\text{in}c_\text{out}\cdot 9$ weights per conv</td></tr>
+        <tr><td>Self-attention</td><td>Every position sees every position; placed at the coarse levels only</td></tr>
+        <tr><td>Cross-attention</td><td>Image positions attend to prompt tokens; how text steers generation</td></tr>
+        <tr><td>Timestep embedding</td><td>Sinusoidal encoding of $t$ projected and injected into every block</td></tr>
+        <tr><td>Bottleneck</td><td>Lowest resolution, most channels; holds the global summary</td></tr>
+        <tr><td>Parameter mass</td><td>Concentrated at the deep levels, where channels are widest</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The U-Net's pyramid and its carefully placed attention are inductive biases borrowed from vision. A transformer makes the opposite bet: cut the image into tokens, drop the pyramid, and let attention do everything. The next part patches the latent and puts adaLN-Zero in charge of conditioning.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var baseCh = 320, blocks = 2;
+  var channels = [baseCh, baseCh * 2, baseCh * 4, baseCh * 4];
+
+  var unSetup = Guide.setupCanvas(document.getElementById('un-canvas'), 640, 380, function () { drawUnet(); });
+  var barSetup = Guide.setupCanvas(document.getElementById('un-params-canvas'), 640, 220, function () { drawParams(); });
+
+  function blockRect(ctx, x, y, w, h, color) {
+    ctx.fillStyle = color; ctx.globalAlpha = 0.22; ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = 0.9; ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.strokeRect(x, y, w, h);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawUnet() {
+    if (!unSetup) return;
+    var ctx = unSetup.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var n = channels.length;
+    var topPad = 40, gap = 68, halfH = 20;
+    var encRight = 250, decLeft = 390;
+    var maxC = channels[n - 1] || 1;
+    function lvlY(i) { return topPad + i * gap; }
+    function bw(i) { return 34 + 92 * (channels[i] / maxC); }
+
+    ctx.fillStyle = c.text; ctx.font = '12px ' + c.font;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('encoder · down', 140, 20);
+    ctx.fillText('decoder · up', 500, 20);
+
+    for (var i = 0; i < n; i++) {
+      Guide.drawArrow(ctx, encRight + 4, lvlY(i), decLeft - 4, lvlY(i),
+        { color: c.accent400, width: 1.6, head: 8, dashed: true });
+    }
+
+    for (i = 0; i < n; i++) {
+      var y = lvlY(i), w = bw(i);
+      blockRect(ctx, encRight - w, y - halfH, w, halfH * 2, c.accent400);
+      blockRect(ctx, decLeft, y - halfH, w, halfH * 2, c.accent2);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(channels[i]), encRight - w / 2, y);
+      ctx.fillText(String(channels[i]), decLeft + w / 2, y);
+      ctx.textBaseline = 'alphabetic';
+      ctx.globalAlpha = 0.65; ctx.textAlign = 'right';
+      ctx.fillText('L' + i + ' · ' + (64 >> i) + '×' + (64 >> i), encRight - w - 10, y + 4);
+      ctx.globalAlpha = 1;
+      if (i >= n - 2) {
+        ctx.fillStyle = c.accent2; ctx.textAlign = 'left';
+        ctx.fillText('self-attn', decLeft + w + 8, y + 4);
+      }
+    }
+
+    for (i = 0; i + 1 < n; i++) {
+      Guide.drawArrow(ctx, encRight - bw(i) / 2, lvlY(i) + halfH, encRight - bw(i + 1) / 2, lvlY(i + 1) - halfH,
+        { color: c.text, width: 1.4, head: 6 });
+      Guide.drawArrow(ctx, decLeft + bw(i + 1) / 2, lvlY(i + 1) - halfH, decLeft + bw(i) / 2, lvlY(i) + halfH,
+        { color: c.text, width: 1.4, head: 6 });
+    }
+
+    var bex = encRight - bw(n - 1) / 2, bdx = decLeft + bw(n - 1) / 2, byb = lvlY(n - 1) + halfH;
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(bex, byb); ctx.lineTo(bex, byb + 22); ctx.lineTo(bdx, byb + 22); ctx.stroke();
+    Guide.drawArrow(ctx, bdx, byb + 22, bdx, byb, { color: c.text, width: 1.4, head: 6 });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('bottleneck · ' + channels[n - 1] + 'ch', (bex + bdx) / 2, byb + 40);
+
+    ctx.textAlign = 'left';
+    ctx.fillText('block width ∝ channels', 24, H - 30);
+    ctx.fillText('dashed = skip connection (concat)', 24, H - 12);
+    ctx.fillText('attention at the two coarsest levels', 300, H - 12);
+  }
+
+  function drawParams() {
+    if (!barSetup) return;
+    var b = D.unetBreakdown({ channels: channels, blocks: blocks });
+    var data = b.levels.map(function (l) {
+      return {
+        label: 'L' + l.level + ' · ' + l.channels + 'ch',
+        value: l.params,
+        valueLabel: Guide.fmtNum(l.params),
+        color: c.accent400
+      };
+    });
+    Guide.drawBars(barSetup.ctx, 640, 220, data, { padL: 120, fontSize: 12 });
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('un-readout');
+    if (!el) return;
+    var b = D.unetBreakdown({ channels: channels, blocks: blocks });
+    var rows = b.levels.map(function (l) {
+      return '<div><span class="k">L' + l.level + '</span> ' + l.channels + 'ch · ' + Guide.fmtNum(l.params) + ' params</div>';
+    }).join('');
+    el.innerHTML =
+      '<div><span class="k">blocks / level</span> ' + blocks + '</div>' +
+      '<div><span class="k">total</span> <span class="hi">' + Guide.fmtNum(b.params) + '</span> params</div>' +
+      rows +
+      '<div class="g-mini">Envelope counts from Diffusion.unetBreakdown, not one checkpoint.</div>';
+  }
+
+  function refresh() { drawUnet(); drawParams(); redrawReadout(); }
+
+  Guide.bindSliders(document.querySelectorAll('#un-base'), function (el) {
+    baseCh = parseInt(el.value, 10);
+    channels = [baseCh, baseCh * 2, baseCh * 4, baseCh * 4];
+    refresh();
+  });
+  Guide.bindSliders(document.querySelectorAll('#un-blocks'), function (el) {
+    blocks = parseInt(el.value, 10);
+    refresh();
+  });
+
+  refresh();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'unet-param-count',
+      kind: 'numeric',
+      prompt: 'A level has 2 residual blocks, each with two $3\\times3$ convolutions, and $c_\\text{in} = c_\\text{out} = 128$. Using $9\\,c_\\text{in}c_\\text{out}$ weights per convolution, how many parameters do the two blocks hold?',
+      answer: 589824,
+      tolerance: 1,
+      explanation: 'Each convolution is $9 \\times 128 \\times 128 = 147{,}456$ parameters. Four convolutions (two per block, two blocks) give $4 \\times 147{,}456 = 589{,}824$. This is why parameter counts are dominated by the wide, deep levels.'
+    },
+    {
+      id: 'unet-skips',
+      kind: 'choice',
+      prompt: 'What do the skip connections in a U-Net carry from encoder to decoder?',
+      options: [
+        { label: 'Feature maps at the same resolution, concatenated onto the decoder so fine detail survives the bottleneck.', correct: true },
+        { label: 'The current timestep, so the decoder knows the noise level.', correct: false },
+        { label: 'The text prompt, so the decoder knows what to draw.', correct: false }
+      ],
+      explanation: 'Downsampling discards spatial detail, so the encoder maps are copied across and concatenated at matching resolutions. The timestep arrives as an embedding and the prompt arrives through cross-attention; neither is what the skips carry.'
+    },
+    {
+      id: 'unet-attention',
+      kind: 'choice',
+      prompt: 'Why does the U-Net place self-attention at the coarse resolutions rather than everywhere?',
+      options: [
+        { label: 'Attention cost is quadratic in the number of positions, so it is only affordable where the grid is small.', correct: true },
+        { label: 'Attention cannot mix information across channels, so it only works on wide layers.', correct: false },
+        { label: 'Convolution is exact at fine resolutions and attention is not.', correct: false }
+      ],
+      explanation: 'Self-attention gives every position a global view, which is valuable, but its cost grows with the square of the sequence length. At 8&times;8 the sequence is short, so the global view is nearly free; at 64&times;64 it is not.'
+    },
+    {
+      id: 'unet-conditioning',
+      kind: 'choice',
+      prompt: 'How does a text prompt reach the middle of a U-Net denoiser?',
+      options: [
+        { label: 'Prompt tokens are encoded once, then image positions attend to them through cross-attention.', correct: true },
+        { label: 'The prompt is concatenated to the input image as extra channels at every step.', correct: false },
+        { label: 'The prompt replaces the timestep embedding inside the residual blocks.', correct: false }
+      ],
+      explanation: 'Cross-attention supplies keys and values from the encoded prompt while queries come from the image features, so a patch can attend to the word relevant to it. The timestep embedding remains a separate scalar clock injected into every block.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

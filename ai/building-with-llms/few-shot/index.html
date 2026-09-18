@@ -1,0 +1,588 @@
+---
+title: "Building with LLMs, Interactively — Part 7: Few-shot: examples as specification"
+description: "Selection, ordering, and format contagion — the model copies your examples' mistakes."
+permalink: "/ai/building-with-llms/few-shot/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Few-shot: examples as specification</h1>
+    <p>A description says what you want; an example shows it, and the model is far better at copying than at inferring. That is the whole power of few-shot prompting, and its whole hazard: everything you put in the example block becomes specification — the format, the label distribution, the tone, and every typo. This part covers selection and ordering, recency bias, format contagion, and the point where more examples stop helping and start costing.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="zero-vs-few">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Zero-shot, few-shot, and what examples specify</h2></div>
+    <p class="g-eyebrow">Show, do not only tell</p>
+    <p><b>Zero-shot</b> prompting gives the model the instruction alone: "classify the intent of this message as refund, shipping, account or other." <b>Few-shot</b> prompting adds worked examples — labelled inputs the model can pattern-match against. The difference is not that examples teach the task from scratch; the model already understands the task. It is that examples specify the parts description is bad at: the exact output format, the treatment of ambiguous edge cases, the level of detail, and where the boundary between two similar labels falls.</p>
+    <p>An instruction says "be concise"; an example <em>is</em> concise, and the model will match it. That makes the example block the highest-leverage part of the prompt — and the most dangerous, because everything in it is treated as specification whether you meant it or not.</p>
+    <p>The builder below assembles a prompt from a small labelled pool. Choose how many examples to include, and whether the labels are balanced and the format consistent; the mock accuracy responds the way a real eval set would.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fs-builder-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The assembled example block (each chip is one example, coloured by label), with the seeded mock accuracy and the prompt token cost below.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Examples in the prompt (k) <span class="val">4</span></label><input type="range" id="fs-k" min="0" max="8" step="1" value="4"></div>
+        <div class="g-btnrow">
+          <button id="fs-balanced" class="g-primary">Balanced labels</button>
+          <button id="fs-consistent" class="g-primary">Consistent format</button>
+        </div>
+        <div class="g-readout" id="fs-builder-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> an example is a specification with a sample attached. Curate the block the way you would curate a schema — every example earns its tokens by pinning down something the description leaves ambiguous.</span></div>
+  </section>
+
+  <section class="g-step" id="ordering">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Ordering and recency</h2></div>
+    <p class="g-eyebrow">The last example is copied hardest</p>
+    <p>Examples are not a set; they are a sequence, and position carries weight. The strongest and best-documented effect is <b>recency</b>: the example nearest the query has the largest influence on the answer, so the format and label of the final example are the ones the model is most likely to imitate. This is the same primacy-and-recency shape that makes the middle of a long context weak, applied inside your example block.</p>
+    <p>The practical consequences are concrete. Put your canonical, cleanest example last, not first. Do not end on an edge case unless you want that edge case's format generalised. And when a task has several acceptable output formats, expect the ordering to pick one for you. The chart below holds three examples fixed and reorders them; the mock output distribution over four formats follows whichever example sits last.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fs-order-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded mock distribution over output formats for three orderings of the same three examples (each group is one format).</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Recency strength <span class="val">70</span></label><input type="range" id="fs-recency" min="0" max="100" step="5" value="70"></div>
+        <div class="g-btnrow">
+          <button id="fs-ord-a" class="g-primary">Order A · C first</button>
+          <button id="fs-ord-b">Order B · C last</button>
+          <button id="fs-ord-c">Order C · A last</button>
+        </div>
+        <div class="g-readout" id="fs-order-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> appending a new example at the end of an existing block. That is exactly where it will be copied from, so a hasty last example silently rewrites the output format of every answer.</span></div>
+  </section>
+
+  <section class="g-step" id="contagion">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Format contagion</h2></div>
+    <p class="g-eyebrow">The model copies your mistakes</p>
+    <p>If the last example is copied hardest, then <em>everything</em> about it is copied: not only the format you intended but the label typo, the inconsistent quoting, the stray capitalisation, and a genuinely wrong label. This is format contagion, and it is the most common way a few-shot prompt fails quietly. A single malformed example in a block of five can move the whole output distribution, because the model is doing its job — matching the pattern you gave it, noise included.</p>
+    <p>Three artefacts are worth checking for before you ship an example block: a typo in a label (<code>POSITVE</code> for <code>positive</code>), an inconsistent format (one JSON example among plain-text ones), and a wrong label on an example whose input is similar to the query. Toggle each below and watch the mock outputs copy it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fs-contagion-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">The example block at the top, three mock outputs below. The copied artefact is highlighted wherever it reappears.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="fs-c-typo">Label typo</button>
+          <button id="fs-c-format">Inconsistent format</button>
+          <button id="fs-c-wrong">Wrong label</button>
+        </div>
+        <div class="g-readout" id="fs-contagion-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Curation rule:</b> treat the example block as production data. The same proofreading, label review and format linting you would apply to a training set applies here — because to the model, it is one.</span></div>
+  </section>
+
+  <section class="g-step" id="selection">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Selection, balance and k-shot saturation</h2></div>
+    <p class="g-eyebrow">Which examples, how many, and when more hurts</p>
+    <p>Selection is a search problem with a small budget. Given a pool of labelled examples and room for <var>k</var> of them, the useful heuristics are all about coverage rather than quantity: pick examples that cover the decision boundary (the ambiguous cases), keep the labels balanced so the block does not imply a prior the task does not have, and prefer examples that pin down the output contract. A retrieval step that selects examples <em>per query</em> — the nearest labelled cases to this input — is usually better than a fixed block, for the same reason a reranker beats a static top-five.</p>
+    <p>How many is a curve, not a number. Accuracy rises steeply for the first few examples, flattens once the format and the boundary are pinned down, and then declines as the block bloats the context, dilutes attention and starts to overfit to the examples' incidental details. The knee is usually lower than people expect — often three to eight examples — and the decline is real enough to place with an eval.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fs-saturation-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded mock accuracy against k. The curve plateaus once the format is pinned, then falls as context bloat outweighs the marginal example.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Context-bloat sensitivity <span class="val">45</span></label><input type="range" id="fs-bloat" min="0" max="100" step="5" value="45"></div>
+        <div class="g-btnrow">
+          <button id="fs-sat-reroll">Draw a new eval set</button>
+        </div>
+        <div class="g-readout" id="fs-sat-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="fs-source"></p>
+  </section>
+
+  <section class="g-step" id="spec-vs-training">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Specification, not training</h2></div>
+    <p class="g-eyebrow">Prompting examples and training data are different artefacts</p>
+    <p>It is worth separating two things that look alike. Examples in a prompt are a <b>specification</b>: they are read on every call, they shape this one answer, and they cost input tokens forever. Examples in a fine-tuning set are <b>training data</b>: they are read once, their influence is baked into weights, and they change what the model does without occupying the context at all. Same labelled inputs, opposite economics.</p>
+    <p>The decision rule follows from that. If the behaviour is a format, a label scheme or a boundary the model can be shown at inference time, put it in the prompt — it is free to change, inspectable and versionable. If you are spending a thousand tokens on examples that never change and the task is stable, that is a signal to consider tuning instead, where the same examples cost context once. The trade-off, and the reasons "just fine-tune it" is usually the wrong first move, are the subject of <a href="{{ '/ai/agents-in-action/when-not-to-tune/' | relative_url }}">Agents in Action, Part 13</a> and <a href="{{ '/ai/agents-in-action/tuning-in-practice/' | relative_url }}">Part 14</a>.</p>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> everything in this part is a testable claim about a prompt — balance, ordering, k. Each one should move a number on the golden set from Part 5. Few-shot choice is engineering precisely when it is measured, and superstition when it is not.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes everything</th></tr></thead>
+      <tbody>
+        <tr><td>Why do examples work?</td><td>The model copies patterns; an example specifies format and edge cases better than prose.</td></tr>
+        <tr><td>Which example matters most?</td><td>The last one — recency bias makes it the strongest template.</td></tr>
+        <tr><td>What should go last?</td><td>Your canonical, cleanest example. Never end on an edge case by accident.</td></tr>
+        <tr><td>What is format contagion?</td><td>Typos, inconsistent formatting and wrong labels are copied along with the intended pattern.</td></tr>
+        <tr><td>How do I choose examples?</td><td>Cover the boundary, balance the labels, pin the output contract.</td></tr>
+        <tr><td>How many examples?</td><td>Three to eight typically; find the knee with an eval, not by vibes.</td></tr>
+        <tr><td>Why does accuracy fall at large k?</td><td>Context bloat and overfitting to the examples' incidental details.</td></tr>
+        <tr><td>Few-shot vs fine-tuning?</td><td>Prompt examples are a per-call specification; a training set bakes the same labels into weights.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Brown et al., <a href="https://arxiv.org/abs/2005.14165">"Language Models are Few-Shot Learners"</a>, NeurIPS 2020 — the GPT-3 paper that established in-context learning and the few-shot framing.</li>
+      <li>Min et al., <a href="https://arxiv.org/abs/2202.12837">"Rethinking the Role of Demonstrations: What Makes In-Context Learning Work?"</a>, EMNLP 2022 — the surprising result that label correctness matters less than the demonstration's format and label space.</li>
+      <li>Lu et al., <a href="https://arxiv.org/abs/2104.08773">"Fantastically Ordered Prompts and Where to Find Them: Overcoming Few-Shot Prompt Order Sensitivity"</a>, ACL 2022 — ordering effects and the variance they introduce.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2307.03172">"Lost in the Middle: How Language Models Use Long Contexts"</a>, TACL 2024 — the primacy-and-recency curve that explains why the last example dominates.</li>
+      <li>Rubin, Herzig & Berant, <a href="https://arxiv.org/abs/2112.08633">"Learning To Retrieve Prompts for In-Context Learning"</a>, NAACL 2022 — per-query example selection instead of a fixed block.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Examples pin the format. The next lever is getting the model to spend tokens on thinking before it answers — and knowing when that helps and when it hurts.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024), SWE-bench Verified (OpenAI, 2024-08), τ-bench (Yao et al., arXiv:2406.12045, 2024), GAIA (Mialon et al., arXiv:2311.12983, 2023) and HELM (Liang et al., arXiv:2211.09110, 2022). Public scores are contaminated by training-data leakage and harness drift; the same saturation applies to your own example sets. Offline fallback."
+    }
+  };
+
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+  // ------------------------------------------------------------------
+  // Demo A — the few-shot builder
+  // ------------------------------------------------------------------
+  var POOL = [
+    { text: 'it arrived two days late', label: 'shipping' },
+    { text: 'I want my money back', label: 'refund' },
+    { text: 'how do I merge two logins', label: 'account' },
+    { text: 'where is my parcel', label: 'shipping' },
+    { text: 'the refund never landed', label: 'refund' },
+    { text: 'can I change the email on file', label: 'account' },
+    { text: 'do you price match', label: 'other' },
+    { text: 'why was I charged twice', label: 'refund' }
+  ];
+  var LABELCOL = { refund: c.accent700, shipping: c.accent, account: c.accent2, other: '#7a5c9e' };
+  var A = { k: el('fs-k'), balanced: true, consistent: true, seed: 8 };
+  var setupA = Guide.setupCanvas(el('fs-builder-canvas'), 640, 340, drawA);
+
+  function balancedOrder() {
+    var groups = {};
+    POOL.forEach(function (ex) { (groups[ex.label] = groups[ex.label] || []).push(ex); });
+    var keys = ['refund', 'shipping', 'account', 'other'];
+    var out = [], idx = 0, more = true;
+    while (more) {
+      more = false;
+      keys.forEach(function (key) {
+        var g = groups[key] || [];
+        if (idx < g.length) { out.push(g[idx]); more = true; }
+      });
+      idx++;
+    }
+    return out;
+  }
+  function selectExamples(k, balanced, consistent) {
+    var list = balanced ? balancedOrder() : POOL.slice();
+    return list.slice(0, k).map(function (ex, i) {
+      return { text: ex.text, label: ex.label, badFormat: !consistent && i === 1 };
+    });
+  }
+  function assembleExamples(k, balanced, consistent) {
+    return selectExamples(k, balanced, consistent).map(function (ex, i) {
+      if (!consistent && i === 1) return '{"input": "' + ex.text + '", "label": "' + ex.label + '"}';
+      return 'Input: ' + ex.text + '\nLabel: ' + ex.label;
+    }).join('\n\n');
+  }
+  function builderAcc(k, balanced, consistent, seed) {
+    var base = k === 0 ? 0.52 : 0.52 + 0.42 * (1 - Math.exp(-k / 2.6));
+    if (!balanced) base -= 0.10;
+    if (!consistent) base -= 0.14;
+    var r = AppSim.rng(seed * 53 + k * 11 + 1);
+    return clamp(base + (r() - 0.5) * 0.05, 0.05, 0.98);
+  }
+
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, H = 340;
+    ctx.clearRect(0, 0, 640, H);
+    var k = parseInt(A.k.value, 10);
+    var acc = builderAcc(k, A.balanced, A.consistent, A.seed);
+    var toks = k === 0 ? 0 : AppSim.countTokens(assembleExamples(k, A.balanced, A.consistent));
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('assembled example block · k=' + k + (k === 0 ? ' (zero-shot)' : '') + ' · ' + Guide.fmtNum(toks) + ' tokens', 14, 16);
+    var exs = selectExamples(k, A.balanced, A.consistent);
+    for (var i = 0; i < exs.length; i++) {
+      var col = 14 + (i % 2) * 306, row = Math.floor(i / 2), y = 30 + row * 36;
+      ctx.fillStyle = c.divider; ctx.fillRect(col, y, 296, 30);
+      ctx.fillStyle = LABELCOL[exs[i].label] || c.accent; ctx.fillRect(col, y, 4, 30);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(exs[i].text.slice(0, 34), col + 10, y + 12);
+      ctx.fillStyle = LABELCOL[exs[i].label] || c.accent;
+      ctx.fillText('label: ' + exs[i].label + (exs[i].badFormat ? '   [inconsistent format]' : ''), col + 10, y + 25);
+    }
+    if (k === 0) {
+      ctx.fillStyle = c.accent2; ctx.font = '11px ' + c.font;
+      ctx.fillText('no examples: the model has the instruction but no format to copy', 14, 44);
+    }
+    var barY = 210;
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('seeded mock accuracy', 14, barY - 5);
+    ctx.fillStyle = c.divider; ctx.fillRect(150, barY - 16, 476, 18);
+    ctx.fillStyle = c.accent; ctx.fillRect(150, barY - 16, 476 * acc, 18);
+    ctx.fillStyle = c.text; ctx.fillText(Guide.fmtPct(acc, 0), 150 + 476 * acc + 6, barY - 3);
+    ctx.fillText('prompt tokens from examples', 14, barY + 40 - 5);
+    ctx.fillStyle = c.divider; ctx.fillRect(150, barY + 24, 476, 18);
+    ctx.fillStyle = c.accent400; ctx.fillRect(150, barY + 24, 476 * Math.min(1, toks / 900), 18);
+    ctx.fillStyle = c.text; ctx.fillText(Guide.fmtNum(toks), 150 + 476 * Math.min(1, toks / 900) + 6, barY + 37);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('balanced + consistent is the best case; skew or a mixed format costs points', 14, 320);
+
+    el('fs-builder-readout').innerHTML =
+      '<div><span class="k">k</span> <span class="hi">' + k + '</span> · ' + (A.balanced ? 'balanced' : 'skewed') + ' labels · ' + (A.consistent ? 'consistent' : 'mixed') + ' format</div>' +
+      '<div><span class="k">mock accuracy</span> <span class="hi">' + Guide.fmtPct(acc, 0) + '</span></div>' +
+      '<div><span class="k">example tokens</span> ' + Guide.fmtNum(toks) + (k ? '' : ' — zero-shot') + '</div>' +
+      '<div class="k">accuracy saturates around k=5–8; the block is a format specification</div>';
+  }
+  Guide.bindSliders([A.k], drawA);
+  function toggleBtn(id, key, onLabel, offLabel) {
+    var btn = el(id);
+    btn.addEventListener('click', function () {
+      A[key] = !A[key];
+      btn.className = A[key] ? 'g-primary' : '';
+      btn.textContent = A[key] ? onLabel : offLabel;
+      drawA();
+    });
+  }
+  toggleBtn('fs-balanced', 'balanced', 'Balanced labels', 'Skewed labels');
+  toggleBtn('fs-consistent', 'consistent', 'Consistent format', 'Mixed format');
+
+  // ------------------------------------------------------------------
+  // Demo B — ordering and recency
+  // ------------------------------------------------------------------
+  var FORMATS = ['json', 'csv', 'bullets', 'prose'];
+  var EX = [{ pref: 'json' }, { pref: 'csv' }, { pref: 'prose' }];
+  var ORDERS = [
+    { name: 'A', order: [0, 1, 2], label: 'C first' },
+    { name: 'B', order: [2, 1, 0], label: 'C last' },
+    { name: 'C', order: [1, 2, 0], label: 'A last' }
+  ];
+  var B = { recency: el('fs-recency'), selected: 1, seed: 4 };
+  var setupB = Guide.setupCanvas(el('fs-order-canvas'), 640, 340, drawB);
+
+  function dist(order, recency) {
+    var scores = FORMATS.map(function () { return 0.2; });
+    order.forEach(function (ei, pos) {
+      var w;
+      if (pos === order.length - 1) w = 1 + 1.5 * recency;
+      else if (pos === 0) w = 0.6;
+      else w = 0.8;
+      scores[FORMATS.indexOf(EX[ei].pref)] += w;
+    });
+    return Guide.softmax(scores, 1.0);
+  }
+
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, H = 340;
+    ctx.clearRect(0, 0, 640, H);
+    var rec = parseInt(B.recency.value, 10) / 100;
+    var padL = 54, padR = 16, padT = 42, padB = 42, plotH = H - padT - padB, plotW = 640 - padL - padR;
+    var groupW = plotW / FORMATS.length, barW = groupW / 4;
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('mock output distribution by format · the last example pulls hardest', 14, 16);
+    var colors = [c.accent700, c.accent, c.accent2];
+    ORDERS.forEach(function (o, i) {
+      ctx.fillStyle = colors[i]; ctx.fillRect(padL + i * 150, 28, 10, 10);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText('order ' + o.name + ' · ' + o.label, padL + 14 + i * 150, 37);
+    });
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    var baseY = padT + plotH;
+    for (var f = 0; f < FORMATS.length; f++) {
+      var gx = padL + f * groupW;
+      for (var oi = 0; oi < ORDERS.length; oi++) {
+        var p = dist(ORDERS[oi].order, rec)[f];
+        var h = plotH * p;
+        var x = gx + 8 + oi * (barW - 2);
+        ctx.globalAlpha = (oi === B.selected) ? 1 : 0.42;
+        ctx.fillStyle = colors[oi];
+        ctx.fillRect(x, baseY - h, Math.max(2, barW - 6), h);
+        ctx.globalAlpha = 1;
+      }
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(FORMATS[f], gx + groupW / 2, baseY + 16);
+    }
+    var sel = ORDERS[B.selected];
+    var d = dist(sel.order, rec);
+    var top = 0;
+    d.forEach(function (p, i) { if (p > d[top]) top = i; });
+    var lastEx = EX[sel.order[sel.order.length - 1]];
+    el('fs-order-readout').innerHTML =
+      '<div><span class="k">order ' + sel.name + '</span> ' + sel.order.map(function (ei) { return EX[ei].pref; }).join(' → ') + '</div>' +
+      '<div><span class="k">last example</span> <span class="hi">' + lastEx.pref + '</span> · copied hardest</div>' +
+      '<div><span class="k">top format</span> ' + FORMATS[top] + ' at ' + Guide.fmtPct(d[top], 0) + '</div>' +
+      '<div class="k">change the recency strength: at 0 the examples compete; at 100 the last one dominates</div>';
+  }
+  Guide.bindSliders([B.recency], drawB);
+  ['fs-ord-a', 'fs-ord-b', 'fs-ord-c'].forEach(function (id, i) {
+    el(id).addEventListener('click', function () {
+      B.selected = i;
+      ['fs-ord-a', 'fs-ord-b', 'fs-ord-c'].forEach(function (bid, j) { el(bid).className = (j === i) ? 'g-primary' : ''; });
+      drawB();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo C — format contagion
+  // ------------------------------------------------------------------
+  var T = { typo: false, format: false, wrong: false, seed: 6 };
+  var setupC = Guide.setupCanvas(el('fs-contagion-canvas'), 640, 360, drawC);
+
+  function cLabel() { return T.wrong ? 'negative' : (T.typo ? 'POSITVE' : 'positive'); }
+  function exampleLines() {
+    var l = cLabel();
+    if (T.format) return ['Input: "arrived early, love it"', '{"label": "' + l + '"}'];
+    return ['Input: "arrived early, love it"', 'label: ' + l];
+  }
+  function outputLines() {
+    var l = cLabel();
+    if (T.format) {
+      return ['{"label": "' + l + '"}', '{"label": "' + l + '", "confidence": 0.92}', '{"label": "' + l + '"}'];
+    }
+    return ['Sentiment: ' + l + '.', 'This review is ' + l + '.', 'label: ' + l];
+  }
+  function artifacts() {
+    var out = [];
+    if (T.typo) out.push({ text: 'POSITVE', color: c.accent2 });
+    if (T.format) out.push({ text: '{"label":', color: '#c9a227' });
+    if (T.wrong) out.push({ text: 'negative', color: c.accent700 });
+    return out;
+  }
+  function copyCount() {
+    var r = AppSim.rng(T.seed * 17 + 5);
+    return 2 + Math.floor(r() * 2);
+  }
+  function drawSegmented(ctx, line, x, y, arts) {
+    var match = null;
+    arts.forEach(function (a) {
+      var idx = line.indexOf(a.text);
+      if (idx >= 0 && (!match || idx < match.idx)) match = { idx: idx, a: a };
+    });
+    ctx.textAlign = 'left';
+    if (!match) { ctx.fillStyle = c.text; ctx.fillText(line, x, y); return; }
+    var pre = line.slice(0, match.idx), mid = match.a.text, post = line.slice(match.idx + mid.length);
+    ctx.fillStyle = c.text; ctx.fillText(pre, x, y);
+    var wPre = ctx.measureText(pre).width;
+    ctx.fillStyle = match.a.color; ctx.fillText(mid, x + wPre, y);
+    var wMid = ctx.measureText(mid).width;
+    ctx.fillStyle = c.text; ctx.fillText(post, x + wPre + wMid, y);
+  }
+
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, H = 360;
+    ctx.clearRect(0, 0, 640, H);
+    var arts = artifacts();
+    ctx.textAlign = 'left';
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font;
+    ctx.fillText('prompt example (the pattern the model will copy)', 14, 16);
+    ctx.fillStyle = c.divider; ctx.fillRect(12, 26, 616, 44);
+    ctx.font = '11px ' + c.mono;
+    var exLines = exampleLines();
+    for (var i = 0; i < exLines.length; i++) drawSegmented(ctx, exLines[i], 20, 44 + i * 15, arts);
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font;
+    ctx.fillText('mock outputs', 14, 96);
+    var outs = outputLines();
+    var copies = 0;
+    for (var o = 0; o < outs.length; o++) {
+      var y = 108 + o * 44;
+      var has = arts.length > 0;
+      ctx.fillStyle = has ? 'rgba(214,0,108,0.06)' : c.divider;
+      ctx.fillRect(12, y, 616, 36);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(12, y, 616, 36);
+      ctx.font = '11px ' + c.mono;
+      drawSegmented(ctx, outs[o], 20, y + 23, arts);
+      if (has) {
+        ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'right';
+        ctx.fillText('copied', 620, y + 16);
+        copies++;
+      }
+      ctx.textAlign = 'left';
+    }
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText(copies ? (copies + ' of 3 mock outputs carry the artefact' + (arts.length > 1 ? 's' : '') + ' · seeded') : 'no artefacts: the block specifies the intended format', 14, 348);
+
+    var names = [];
+    if (T.typo) names.push('label typo "POSITVE"');
+    if (T.format) names.push('inconsistent JSON format');
+    if (T.wrong) names.push('wrong label "negative"');
+    el('fs-contagion-readout').innerHTML =
+      '<div><span class="k">artefacts active</span> <span class="' + (names.length ? 'bad' : 'hi') + '">' + (names.length ? names.join(' · ') : 'none') + '</span></div>' +
+      '<div><span class="k">copied into</span> <span class="hi">' + (names.length ? (copyCount() + ' of 3') : '0 of 3') + '</span> mock outputs</div>' +
+      '<div class="k">' + (names.length ? 'the model is matching the pattern you gave it, noise included' : 'a clean block is a clean specification') + '</div>';
+  }
+  ['fs-c-typo', 'fs-c-format', 'fs-c-wrong'].forEach(function (id, i) {
+    var key = ['typo', 'format', 'wrong'][i];
+    el(id).addEventListener('click', function () {
+      T[key] = !T[key];
+      el(id).className = T[key] ? 'g-primary' : '';
+      drawC();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — k-shot saturation
+  // ------------------------------------------------------------------
+  var S = { bloat: el('fs-bloat'), seed: 10 };
+  var setupS = Guide.setupCanvas(el('fs-saturation-canvas'), 640, 340, drawS);
+
+  function satAcc(k, bloat, seed) {
+    var gain = 0.42 * (1 - Math.exp(-k / 2.8));
+    var penalty = (bloat / 100) * Math.max(0, k - 10) * 0.028;
+    var r = AppSim.rng(seed * 71 + k * 7 + 2);
+    return clamp(0.52 + gain - penalty + (r() - 0.5) * 0.03, 0.08, 0.98);
+  }
+
+  function drawS() {
+    if (!setupS) return;
+    var bloat = parseInt(S.bloat.value, 10);
+    var pts = [];
+    for (var k = 0; k <= 24; k++) pts.push({ x: k, y: satAcc(k, bloat, S.seed) });
+    var axes = Guide.drawLines(setupS.ctx, 640, 340,
+      [{ points: pts, color: c.accent, width: 2.4 }],
+      [0, 24], [0, 1],
+      { xLabel: 'examples in the prompt (k)', yLabel: 'mock pass rate', padL: 54, padB: 34, padT: 30 });
+    var ctx = setupS.ctx;
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(axes.px(10), axes.padT); ctx.lineTo(axes.px(10), axes.padT + axes.plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('knee ≈ 10', axes.px(10) + 4, axes.padT + 12);
+    var best = { k: 0, v: -1 };
+    for (var kk = 0; kk <= 24; kk++) { var v = satAcc(kk, bloat, S.seed); if (v > best.v) { best = { k: kk, v: v }; } }
+    ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(axes.px(best.k), axes.py(best.v), 4.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('optimum k=' + best.k, axes.px(best.k), axes.py(best.v) - 9);
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('seeded mock accuracy vs k · bloat sensitivity ' + bloat + '%', 14, 16);
+
+    el('fs-sat-readout').innerHTML =
+      '<div><span class="k">zero-shot (k=0)</span> ' + Guide.fmtPct(satAcc(0, bloat, S.seed), 0) + ' · examples (k=8) <span class="hi">' + Guide.fmtPct(satAcc(8, bloat, S.seed), 0) + '</span></div>' +
+      '<div><span class="k">overshoot (k=24)</span> ' + Guide.fmtPct(satAcc(24, bloat, S.seed), 0) + ' · ' + (satAcc(24, bloat, S.seed) < satAcc(8, bloat, S.seed) ? 'below the plateau' : 'still holding') + '</div>' +
+      '<div><span class="k">best k on this curve</span> <span class="hi">' + best.k + '</span> at ' + Guide.fmtPct(best.v, 0) + '</div>' +
+      '<div class="k">raise the bloat sensitivity to see saturation turn into decline</div>';
+  }
+  Guide.bindSliders([S.bloat], drawS);
+  el('fs-sat-reroll').addEventListener('click', function () { S.seed = (S.seed + 23) % 401; drawS(); });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    data = data || FALLBACK;
+    if (data.evals && data.evals.source) el('fs-source').textContent = data.evals.source;
+    drawA(); drawB(); drawC(); drawS();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawS();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'few-shot-why-examples',
+      kind: 'choice',
+      prompt: 'What do few-shot examples specify that a description usually does not?',
+      options: [
+        { label: 'The model weights for the task.', correct: false },
+        { label: 'The exact format, the treatment of edge cases, and where a label boundary falls.', correct: true },
+        { label: 'The context window size.', correct: false },
+        { label: 'The sampling temperature the model should use.', correct: false }
+      ],
+      explanation: 'The model already knows the task; examples pin down the parts prose is bad at — output format, ambiguous boundary cases and the level of detail — which is why the model copies them so faithfully.'
+    },
+    {
+      id: 'few-shot-recency',
+      kind: 'choice',
+      prompt: 'Three examples are in the prompt and one is added at the end just before the query. What is the likely effect?',
+      options: [
+        { label: 'None — all examples are weighted equally.', correct: false },
+        { label: 'The new example has the strongest influence and its format is copied hardest.', correct: true },
+        { label: 'The first example becomes more influential.', correct: false },
+        { label: 'The model ignores examples that come after the instruction.', correct: false }
+      ],
+      explanation: 'Recency bias means the example nearest the query carries the most weight, so the last example is the strongest template. Append deliberately: a hasty final example can silently rewrite every answer\'s format.'
+    },
+    {
+      id: 'few-shot-token-cost',
+      kind: 'numeric',
+      prompt: 'You add four examples to a prompt and each example costs 35 tokens, before any separators. How many tokens do the examples add in total?',
+      answer: 140,
+      unit: 'tokens',
+      tolerance: 1,
+      explanation: 'Four examples at 35 tokens each is 4 × 35 = 140 tokens, and those tokens are re-sent on every call. That recurring cost is what makes the k-shot curve a real trade rather than a free accuracy knob.'
+    },
+    {
+      id: 'few-shot-spec-vs-training',
+      kind: 'choice',
+      prompt: 'What is the difference between examples in a prompt and examples in a fine-tuning set?',
+      options: [
+        { label: 'There is none; they are the same artefacts used differently.', correct: false },
+        { label: 'Prompt examples are a per-call specification that costs context tokens every call; training examples change weights and cost context once.', correct: true },
+        { label: 'Prompt examples are always more accurate than tuned weights.', correct: false },
+        { label: 'Training examples cannot include labels.', correct: false }
+      ],
+      explanation: 'Same labelled inputs, opposite economics. A prompt example is read on every call and shapes this answer; a training example is read once and baked into the weights. Choose a specification when the behaviour is showable at inference time.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

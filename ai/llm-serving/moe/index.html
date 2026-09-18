@@ -1,0 +1,598 @@
+---
+title: "LLM Serving, Interactively — Part 14: Serving mixture-of-experts at scale"
+description: "Why sparse models read a fraction of their weights per token, how all-to-all dispatch dominates wide expert parallelism, and how EPLB and rack-scale NVLink make MoE serving work."
+permalink: "/ai/llm-serving/moe/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-preset { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+  .g-preset button { font-family: var(--font-heading); font-weight: 600; font-size: 11.5px; padding: 5px 9px; border-radius: var(--radius-sm); border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text); cursor: pointer; }
+  .g-preset button:hover { background: var(--color-accent-100); border-color: var(--color-accent); }
+  .g-preset button.active { background: var(--color-accent-200); border-color: var(--color-accent-500); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 14 of 20</span>
+    <h1>Serving mixture-of-experts at scale</h1>
+    <p>A mixture-of-experts model is a bet that you can buy quality with <em>capacity</em> rather than compute. DeepSeek-V3 holds 671&nbsp;billion parameters but reads only 37&nbsp;billion per token; Kimi K2 holds a trillion and reads 32&nbsp;billion. On paper that is a dense-quality model at a fraction of the FLOPs. In practice it breaks the two assumptions every dense serving stack is built on: that the weights you hold are the weights you read, and that a batch of tokens does the same work as one token. This part is about the machinery that makes the bet pay — routing, all-to-all, hot experts, EPLB — and the rack-scale interconnect it demands.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <nav class="g-toc" aria-label="On this page">
+    <a href="#active-total">Active vs total</a>
+    <a href="#paradox">The memory paradox</a>
+    <a href="#routing">Routing and top-k</a>
+    <a href="#alltoall">All-to-all</a>
+    <a href="#hot">Hot experts</a>
+    <a href="#eplb">EPLB</a>
+    <a href="#wide">Wide EP and DeepEP</a>
+    <a href="#batch">Batch changes everything</a>
+    <a href="#rack">Why rack-scale exists</a>
+  </nav>
+
+  <section class="g-step" id="active-total">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Active vs total parameters</h2></div>
+    <p class="g-eyebrow">Two numbers, not one</p>
+    <p>A dense model has one parameter count because every parameter participates in every token. An MoE has two: the <strong>total</strong> parameters you must store, and the <strong>active</strong> parameters the router actually reads for a given token. DeepSeek-V3 activates 8 of 256 routed experts plus one shared expert, so 37B of its 671B parameters move per token — 5.5%. Pick a model below and compare its compute against two hypothetical dense baselines: one with the same total parameters (same capacity, 18× the FLOPs) and one with the same active parameters (same FLOPs, a fraction of the capacity). The <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">training guide's transformer chapter</a> introduced the router and top-k; this page is about the cost of running them.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="avt-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Bars are FLOPs per token. The two dense baselines bracket the MoE's trade.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-preset" id="avt-models"></div>
+        <div class="g-readout" id="avt-readout"></div>
+        <p class="g-source" id="moe-source"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="paradox">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The memory paradox</h2></div>
+    <p class="g-eyebrow">Capacity-bound, not bandwidth-bound</p>
+    <p>A dense 70B model in BF16 needs ~140&nbsp;GB of weights and reads ~140&nbsp;GB per token. DeepSeek-V3 needs ~1,342&nbsp;GB to <em>hold</em> but reads only ~74&nbsp;GB per token. That inverts the usual deficit: MoE serving is limited first by the <em>capacity</em> to keep every expert resident — across many GPUs — and only second by the bandwidth to stream the active subset. It also removes the clean roofline: a decode step's arithmetic intensity depends on the batch (next section), and the cost of an expert being cold (not resident, fetched from host or disk) is a stall, not a slow read. The practical consequence is that MoE deployments are laid out for <strong>capacity first</strong>: they pile experts into as many GPUs as the model needs, then optimise communication.</p>
+  </section>
+
+  <section class="g-step" id="routing">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Routing and top-k</h2></div>
+    <p class="g-eyebrow">A token picks a few experts</p>
+    <p>The router is a learned linear layer that scores all \(E\) experts for a token; the top \(k\) are selected, their outputs are combined by a softmax-weighted sum, and the rest are not computed. DeepSeek-V3 uses \(E=256\), \(k=8\), plus one always-on shared expert; Kimi K2 uses 384 routed experts, 8 active plus 1 shared. Routing is <em>token</em>-level and per-layer, so a sequence's tokens fan out across different experts every layer. Two serving consequences follow immediately. First, the per-token FLOPs are roughly \(2 \times \text{active}\) while the weights held are \(2 \times \text{total}\), which is why quantization of experts buys capacity more than it buys speed. Second, routing quality and routing <em>balance</em> are separate problems: a router can be accurate and still send a disproportionate share of tokens to a handful of experts, which is the subject of the next two sections.</p>
+  </section>
+
+  <section class="g-step" id="alltoall">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>All-to-all dispatch and combine</h2></div>
+    <p class="g-eyebrow">The collective that replaces all-reduce</p>
+    <p>With expert parallelism, each device holds a subset of experts. For every MoE layer a token's hidden state is <strong>dispatched</strong> to the \(k\) devices holding its chosen experts, the expert MLPs run locally, and the results are <strong>combined</strong> back. That is an all-to-all — every device sends to every other — not the ring all-reduce of tensor parallelism. Its volume per layer is \(k\) sends and \(k\) receives of the hidden state per token, plus index and scale metadata. Across 61 layers at batch 256 with hidden 7,168, the round trip is several gigabytes per step. On NVLink that is a few milliseconds; on Ethernet it is the majority of the step, and the wider the EP, the more nodes the traffic crosses. Toggle the fabric to see the crossover that motivates Epoxy/DeepEP's use of NVLink and RDMA directly.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="a2a-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Stacked step time: compute plus the dispatch/combine all-to-all. The share is what wide EP forces you to care about.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Expert parallel width EP <span class="val" id="a2a-ep-val">32</span></label><input type="range" id="a2a-ep" min="0" max="3" step="1" value="1"></div>
+        <div class="g-field"><label>Link bandwidth <span class="val" id="a2a-link-val">900 GB/s NVLink</span></label><input type="range" id="a2a-link" min="0" max="1" step="1" value="1"></div>
+        <div class="g-readout" id="a2a-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="hot">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Hot experts</h2></div>
+    <p class="g-eyebrow">Load is never uniform</p>
+    <p>Routing is learned from data, and data has structure: some experts specialise in punctuation, code, numbers or a language, and they are chosen far more often than the rest. DeepSeek notes "inherently high-load experts," and the widely repeated rule of thumb is that <strong>the top 3–5% of experts absorb 30–50% of tokens</strong>. The heatmap below routes 2,000 seeded tokens through a 256-expert top-8 router and plots load per expert over time. Two facts matter operationally. The distribution is skewed (the Gini coefficient and the top-10 share are computed live), and the step time is set by the <em>busiest</em> expert, not the average — a straggler stalls every other device waiting for the combine. Perfectly balanced routing is not a goal you reach by training alone; it is an inference-time scheduling problem.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hot-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Rows are experts sorted by total load; columns are 50-token time bins. Play to reveal the timeline.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="hot-play">Play</button></div>
+        <div class="g-readout" id="hot-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="eplb">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>EPLB: expert-parallel load balancing</h2></div>
+    <p class="g-eyebrow">Replicate the hot ones</p>
+    <p>DeepSeek's open-sourced expert-parallel load balancer takes a different route from changing the router: it observes per-expert load and <strong>replicates the hot experts</strong> onto devices that have spare capacity, so the same expert runs on two or more GPUs and the router can split its traffic. The cost is memory — each replica is a full expert — and the benefit is a lower maximum per-device load and a shorter step. The commonly cited recovery is around 20%. Toggle replication below: watch the per-device load bars flatten and the extra expert memory appear.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="eplb-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Per-device load. The height of the tallest bar is the step time.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>EP width <span class="val" id="eplb-ep-val">32</span></label><input type="range" id="eplb-ep" min="0" max="2" step="1" value="1"></div>
+        <div class="g-btnrow"><button id="eplb-toggle" class="g-primary">EPLB off</button></div>
+        <div class="g-readout" id="eplb-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="wide">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Wide EP and DeepEP</h2></div>
+    <p class="g-eyebrow">Scaling the collective, not the model</p>
+    <p>DeepSeek's production decode runs <strong>EP144</strong> — experts spread across 144 GPUs, which is 18 nodes of 8. At that width the all-to-all crosses node boundaries constantly, so the communication library matters more than the model. DeepEP is a communication library built for exactly this: high-throughput kernels for dispatch and combine, low-latency kernels for decode, group-limited routing to cap how far a token can travel, and direct RDMA over NVLink and InfiniBand to avoid a copy through host memory. This is the same pattern <a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a> described for tensor parallelism, pushed to a different collective: keep the communication on the fastest fabric you have, and make the fabric one big domain. The economics only work because wide EP serves a huge batch with a fixed set of weights — the <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">disaggregated pools of Part 13</a> are the natural home for it.</p>
+  </section>
+
+  <section class="g-step" id="batch">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Batch size changes everything</h2></div>
+    <p class="g-eyebrow">Sparse at batch 1, dense at batch 512</p>
+    <p>At batch 1 a token touches 8 of 256 experts — about 6% of the weights, once attention, the shared expert and the router are counted. At batch 512 the union of chosen experts is almost every expert, so the step reads ~100% of them even though each token still computes only 8. Sparsity is a <em>per-token</em> property; at serving batch sizes the system is effectively doing dense reads of all the expert weights, just with a smaller per-token compute bill. That has three consequences: arithmetic intensity rises with batch, so MoE decode is less bandwidth-starved than dense decode; capacity still has to cover all experts; and the crossover batch at which the union saturates is the batch you want to run at, because below it you are paying the communication of EP without amortising the weight reads. Drag the slider to see the union grow.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="batch-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Fraction of total expert weights read per step as the batch of routed tokens grows.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch (tokens routed together) <span class="val" id="batch-val">1</span></label><input type="range" id="batch-slider" min="0" max="9" step="1" value="0"></div>
+        <div class="g-readout" id="batch-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="rack">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Why rack-scale exists</h2></div>
+    <p class="g-eyebrow">The interconnect is the design</p>
+    <p>Put the previous sections together and the rack is not a packaging choice — it is the algorithm. Wide EP needs a collective that is cheap at 100+ participants; hot-expert replication needs spare capacity next door; batch saturation needs a big enough domain to route hundreds of tokens without crossing a slow link. GB200 NVL72 puts 72 GPUs in a single NVLink domain at ~1.8&nbsp;TB/s per GPU and ~130&nbsp;TB/s aggregate, which is roughly the scale at which all-to-all stops being the bottleneck. That is why MoE serving and rack-scale NVLink appeared together, and why a MoE deployment's first infrastructure question is not "how many GPUs" but "how big is one domain."</p>
+    <div class="g-goal">📌 <span><b>The MoE serving checklist:</b> experts resident (capacity) → router balanced (EPLB) → all-to-all on the fast fabric (wide EP + DeepEP) → batch large enough to amortise (continuous batching). Miss any one and the density advantage evaporates.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Concept</th><th>What to remember</th></tr></thead>
+      <tbody>
+        <tr><td>Two parameter counts</td><td>Total = capacity you hold; active = weights read per token. DeepSeek-V3: 671B / 37B</td></tr>
+        <tr><td>Memory paradox</td><td>MoE is capacity-bound first: holds 1,342 GB, reads ~74 GB/token</td></tr>
+        <tr><td>Top-k routing</td><td>256 experts, top-8 + 1 shared for DeepSeek-V3; Kimi K2 uses 384 routed, 8 + 1</td></tr>
+        <tr><td>All-to-all</td><td>Dispatch + combine replaces all-reduce; volume ∝ k × hidden × layers × batch</td></tr>
+        <tr><td>Hot experts</td><td>Top 3–5% absorb 30–50% of tokens; step time is the max load, not the mean</td></tr>
+        <tr><td>EPLB</td><td>Replicate hot experts; ~20% recovery at the cost of expert-sized memory</td></tr>
+        <tr><td>Wide EP</td><td>EP144 decode for DeepSeek-V3; DeepEP for NVLink/RDMA all-to-all</td></tr>
+        <tr><td>Batch effect</td><td>~6% of weights at B=1, ~100% at B=512 — sparsity is per-token, not per-step</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437">"DeepSeek-V3 Technical Report"</a> (2024) — 256 routed + 1 shared expert, top-8, auxiliary-loss-free balancing.</li>
+      <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/open-infra-index">"DeepSeek-V3/R1 Inference System Overview"</a> (2025-02-28) — EP32 prefill, EP144 decode.</li>
+      <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/EPLB">EPLB: Expert Parallel Load Balancer</a> (2025).</li>
+      <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a> — high-throughput and low-latency expert-parallel communication.</li>
+      <li>Lepikhin et al., <a href="https://arxiv.org/abs/2006.16668">"GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding"</a> (2020) — the top-k MoE serving pattern.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Experts solved the compute bill; context length is the next bill, and it grows quadratically.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>
+  window.SERVING_NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  var FALLBACK = {
+    moe: {
+      source: "DeepSeek-V3 Technical Report (arXiv:2412.19437) for the 256 routed + 1 shared expert and 8 active. DeepSeek-V3/R1 Inference System Overview (open-infra-index, 2025-02-28) for large-scale expert parallelism and EPLB. The 'top 3-5% of experts absorb 30-50% of tokens' statistic is an approximate rule of thumb; the ~20% EPLB gain is likewise approximate.",
+      hotExpertTokenShare: "top 3-5% of experts absorb 30-50% of tokens",
+      eplbGainPct: 20,
+      deepseekExperts: { total: 256, active: 8, shared: 1 }
+    },
+    model_configs: {
+      source: "Official model configs and technical reports (DeepSeek-V3 arXiv:2412.19437, Kimi K2, gpt-oss-120b).",
+      items: [
+        { name: "DeepSeek-V3", layers: 61, hidden: 7168, totalParamsB: 671, activeParamsB: 37, contextLen: 163840 },
+        { name: "Kimi K2", layers: 61, hidden: 7168, totalParamsB: 1000, activeParamsB: 32, contextLen: 131072 },
+        { name: "gpt-oss-120b", layers: 36, hidden: 2880, totalParamsB: 117, activeParamsB: 5.1, contextLen: 131072 }
+      ]
+    },
+    accelerators: {
+      source: "NVIDIA GB200 NVL72: 72 Blackwell GPUs, ~130 TB/s aggregate NVLink, single domain, ~120 kW rack. H100 SXM: 900 GB/s NVLink.",
+      items: [
+        { name: "NVIDIA H100 SXM", nvlinkGBs: 900, bwTBs: 3.35 },
+        { name: "NVIDIA B200", nvlinkGBs: 1800, bwTBs: 8.0 },
+        { name: "NVIDIA GB200 NVL72 (per rack)", nvlinkGBs: 1800, bwTBs: 8.0 }
+      ]
+    }
+  };
+  var NUM = FALLBACK;
+  var srcEl = document.getElementById('moe-source');
+  function apply(nums) {
+    NUM = nums || FALLBACK;
+    if (srcEl && NUM.moe && NUM.moe.source) srcEl.textContent = "Sources: " + NUM.moe.source;
+  }
+  apply(FALLBACK);
+  fetch(window.SERVING_NUMBERS_URL).then(function (r) { return r.json(); }).then(apply).catch(function () { /* fallback already applied */ });
+
+  // ---- deterministic routing model ----
+  var E = 256, TOPK = 8;
+  var expertWeights = [];
+  (function () {
+    for (var i = 0; i < E; i++) expertWeights.push(1 + (i < 10 ? 23 * (1 - i / 12) : 0));
+  })();
+  // Weighted sampling without replacement (Efraimidis-Spirakis) via seeded RNG.
+  function routeTokens(n, seed) {
+    var rng = Guide.seededRandom(seed == null ? 20250314 : seed);
+    var out = [];
+    for (var t = 0; t < n; t++) {
+      var keys = [];
+      for (var e = 0; e < E; e++) {
+        var u = rng();
+        if (u <= 0) u = 1e-12;
+        keys.push({ e: e, k: Math.pow(u, 1 / expertWeights[e]) });
+      }
+      keys.sort(function (a, b) { return b.k - a.k; });
+      var pick = [];
+      for (var j = 0; j < TOPK; j++) pick.push(keys[j].e);
+      out.push(pick);
+    }
+    return out;
+  }
+  function countsFrom(tokens) {
+    var cnt = new Array(E);
+    for (var i = 0; i < E; i++) cnt[i] = 0;
+    tokens.forEach(function (p) { p.forEach(function (e) { cnt[e]++; }); });
+    return cnt;
+  }
+  function gini(vals) {
+    var a = vals.slice().sort(function (x, y) { return x - y; });
+    var n = a.length, cum = 0, weighted = 0;
+    for (var i = 0; i < n; i++) { cum += a[i]; weighted += (i + 1) * a[i]; }
+    if (cum === 0) return 0;
+    return (2 * weighted) / (n * cum) - (n + 1) / n;
+  }
+  function topShare(cnt, frac) {
+    var sorted = cnt.slice().sort(function (a, b) { return b - a; });
+    var k = Math.max(1, Math.round(frac * E));
+    var top = 0, all = 0;
+    sorted.forEach(function (v, i) { all += v; if (i < k) top += v; });
+    return { k: k, share: all ? top / all : 0 };
+  }
+
+  var ROUTE_2000 = routeTokens(2000, 20250314);
+
+  // ---- Demo a: active vs total ----
+  (function () {
+    var canvas = document.getElementById('avt-canvas');
+    var ctx = canvas.getContext('2d');
+    var readout = document.getElementById('avt-readout');
+    var box = document.getElementById('avt-models');
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 300, function (W, H) { if (ready) draw(W, H); });
+    var selected = 0;
+
+    function moeModels() {
+      var items = (NUM.model_configs && NUM.model_configs.items) || FALLBACK.model_configs.items;
+      return items.filter(function (m) { return m.activeParamsB < m.totalParamsB; });
+    }
+    function draw(W, H) {
+      var m = moeModels()[selected];
+      var moeFlops = 2 * m.activeParamsB * 1e9;
+      var denseTotal = 2 * m.totalParamsB * 1e9;
+      var denseActive = 2 * m.activeParamsB * 1e9;
+      Guide.drawBars(ctx, W, H, [
+        { label: m.name + ' (MoE)', value: moeFlops / 1e12, valueLabel: (moeFlops / 1e12).toFixed(1) + ' TFLOP/tok', color: c.accent },
+        { label: 'Dense @ ' + m.totalParamsB + 'B', value: denseTotal / 1e12, valueLabel: (denseTotal / 1e12).toFixed(0) + ' TFLOP/tok', color: c.accent2 },
+        { label: 'Dense @ ' + m.activeParamsB + 'B', value: denseActive / 1e12, valueLabel: (denseActive / 1e12).toFixed(1) + ' TFLOP/tok', color: c.accent400 }
+      ], { maxV: denseTotal / 1e12 * 1.05, padL: 150, padB: 14 });
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('FLOPs per token (2 × params)', 8, 12);
+    }
+    function render() {
+      var m = moeModels()[selected];
+      var holdGB = m.totalParamsB * 2, readGB = m.activeParamsB * 2;
+      readout.innerHTML =
+        '<span class="k">total / active</span> <span class="hi">' + m.totalParamsB + 'B / ' + m.activeParamsB + 'B</span><br>' +
+        '<span class="k">weights held (BF16)</span> ' + Guide.fmtBytes(holdGB * 1e9) + '<br>' +
+        '<span class="k">weights read / token</span> ' + Guide.fmtBytes(readGB * 1e9) + ' (' + (100 * m.activeParamsB / m.totalParamsB).toFixed(1) + '% of held)<br>' +
+        '<span class="k">dense at equal total</span> ' + (m.totalParamsB / m.activeParamsB).toFixed(1) + '× the compute per token<br>' +
+        '<span class="k">at equal active</span> same compute, ' + (m.totalParamsB / m.activeParamsB).toFixed(1) + '× less capacity to draw on';
+      draw(640, 300);
+    }
+    moeModels().forEach(function (m, i) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.textContent = m.name;
+      b.className = i === 0 ? 'active' : '';
+      b.addEventListener('click', function () {
+        selected = i;
+        Array.prototype.forEach.call(box.children, function (ch) { ch.className = ''; });
+        b.className = 'active';
+        render();
+      });
+      box.appendChild(b);
+    });
+    ready = true;
+    render();
+  })();
+
+  // ---- Demo b: routing heatmap ----
+  (function () {
+    var canvas = document.getElementById('hot-canvas');
+    var ctx = canvas.getContext('2d');
+    var readout = document.getElementById('hot-readout');
+    var playBtn = document.getElementById('hot-play');
+    var BINS = 40, PER = 50, reveal = BINS;
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 360, function (W, H) { if (ready) draw(W, H); });
+    var cnt = countsFrom(ROUTE_2000);
+    // matrix sorted by expert total load
+    var order = cnt.map(function (v, i) { return { v: v, i: i }; }).sort(function (a, b) { return b.v - a.v; });
+    var matrix = order.map(function (o) {
+      var row = [];
+      for (var b = 0; b < BINS; b++) {
+        var s = 0;
+        for (var t = b * PER; t < (b + 1) * PER; t++) if (ROUTE_2000[t].indexOf(o.i) >= 0) s++;
+        row.push(s);
+      }
+      return row;
+    });
+    function draw(W, H) {
+      var m = matrix.map(function (row) { return row.map(function (v, b) { return b < reveal ? v : 0; }); });
+      Guide.drawHeatmap(ctx, W, H, m, {
+        colorLow: [238, 245, 249], colorHigh: [0, 110, 150],
+        rowLabels: order.map(function (o, i) { return i % 11 === 0 ? '#' + o.i : ''; }),
+        colLabels: (function () { var a = []; for (var b = 0; b < BINS; b++) a.push((b * PER / 1000).toFixed(0) + 'k'); return a; })(),
+        padL: 44, fontSize: 9
+      });
+    }
+    function render() {
+      var g = gini(cnt);
+      var ts = topShare(cnt, 0.04);
+      var maxTotal = Math.max.apply(null, cnt), meanTotal = cnt.reduce(function (a, b) { return a + b; }, 0) / E;
+      readout.innerHTML =
+        '<span class="k">tokens routed</span> 2,000 &nbsp; <span class="k">experts</span> ' + E + ' &nbsp; <span class="k">top-k</span> ' + TOPK + '<br>' +
+        '<span class="k">Gini of expert load</span> <span class="hi">' + g.toFixed(3) + '</span><br>' +
+        '<span class="k">top ' + ts.k + ' of ' + E + ' (' + (100 * ts.k / E).toFixed(0) + '%) absorb</span> <span class="hi">' + (100 * ts.share).toFixed(0) + '%</span> of tokens<br>' +
+        '<span class="k">straggler penalty (max/mean expert)</span> <span class="bad">' + (maxTotal / meanTotal).toFixed(2) + '×</span> — the step waits for the busiest expert';
+      draw(640, 360);
+    }
+    var loop = Guide.loop({
+      button: playBtn, interval: 70, playLabel: 'Play', pauseLabel: 'Pause',
+      onStep: function () {
+        reveal += 1;
+        if (reveal > BINS) { reveal = BINS; loop.stop(); }
+        draw(640, 360);
+      }
+    });
+    ready = true;
+    render();
+  })();
+
+  // ---- Demo c: EPLB ----
+  (function () {
+    var canvas = document.getElementById('eplb-canvas');
+    var ctx = canvas.getContext('2d');
+    var epS = document.getElementById('eplb-ep');
+    var toggle = document.getElementById('eplb-toggle');
+    var readout = document.getElementById('eplb-readout');
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 320, function (W, H) { if (ready) draw(W, H); });
+    var EPS = [16, 32, 64];
+    var eplb = false;
+    var cnt = countsFrom(ROUTE_2000);
+    var EXPERT_MB = 80; // ~BF16 expert size, DeepSeek-V3 class
+
+    function loads(ep) {
+      var dev = new Array(ep);
+      for (var d = 0; d < ep; d++) dev[d] = 0;
+      for (var e = 0; e < E; e++) dev[e % ep] += cnt[e];
+      return dev;
+    }
+    function balanced(ep) {
+      var dev = loads(ep).slice();
+      var replicas = 0, guard = 0;
+      while (guard++ < 400) {
+        var max = Math.max.apply(null, dev), mean = dev.reduce(function (a, b) { return a + b; }, 0) / ep;
+        if (max <= mean * 1.03) break;
+        var hi = dev.indexOf(max), lo = dev.indexOf(Math.min.apply(null, dev));
+        if (hi === lo) break;
+        // replicate the hottest expert on hi onto lo, moving half its load
+        var bestE = -1, bestV = -1;
+        for (var e = 0; e < E; e++) if (e % ep === hi && cnt[e] > bestV) { bestV = cnt[e]; bestE = e; }
+        var move = bestV * 0.5;
+        dev[hi] -= move; dev[lo] += move; replicas++;
+      }
+      return { dev: dev, replicas: replicas };
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var ep = EPS[parseInt(epS.value, 10)];
+      var before = loads(ep);
+      var res = eplb ? balanced(ep) : { dev: before, replicas: 0 };
+      var maxV = Math.max.apply(null, before.concat(res.dev)) * 1.08;
+      var padL = 40, padB = 26, padT = 22, padR = 10;
+      var bw = (W - padL - padR) / ep;
+      var plotH = H - padT - padB;
+      for (var d = 0; d < ep; d++) {
+        var x = padL + d * bw;
+        if (eplb) {
+          ctx.fillStyle = c.accent; // after
+          ctx.fillRect(x + 1, padT + plotH * (1 - res.dev[d] / maxV), Math.max(1, bw - 2), plotH * res.dev[d] / maxV);
+          ctx.fillStyle = 'rgba(214,0,108,0.35)'; // before ghost
+          ctx.fillRect(x + Math.max(1, bw * 0.6), padT + plotH * (1 - before[d] / maxV), Math.max(1, bw * 0.38), plotH * before[d] / maxV);
+        } else {
+          ctx.fillStyle = c.accent;
+          ctx.fillRect(x + 1, padT + plotH * (1 - before[d] / maxV), Math.max(1, bw - 2), plotH * before[d] / maxV);
+        }
+      }
+      // mean line
+      var mean = (eplb ? res.dev : before).reduce(function (a, b) { return a + b; }, 0) / ep;
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5;
+      if (ctx.setLineDash) ctx.setLineDash([5, 4]);
+      var my = padT + plotH * (1 - mean / maxV);
+      ctx.beginPath(); ctx.moveTo(padL, my); ctx.lineTo(W - padR, my); ctx.stroke();
+      if (ctx.setLineDash) ctx.setLineDash([]);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('device load across ' + ep + ' EP ranks', padL, 12);
+      ctx.fillStyle = c.accent2; ctx.textAlign = 'right';
+      ctx.fillText('mean', W - padR, my - 4);
+    }
+    function render() {
+      var ep = EPS[parseInt(epS.value, 10)];
+      var before = loads(ep);
+      var res = eplb ? balanced(ep) : { dev: before, replicas: 0 };
+      var bmax = Math.max.apply(null, before), bmean = before.reduce(function (a, b) { return a + b; }, 0) / ep;
+      var amax = Math.max.apply(null, res.dev), amean = res.dev.reduce(function (a, b) { return a + b; }, 0) / ep;
+      document.getElementById('eplb-ep-val').textContent = ep;
+      toggle.textContent = eplb ? 'EPLB on' : 'EPLB off';
+      toggle.className = eplb ? 'g-primary' : '';
+      readout.innerHTML =
+        '<span class="k">imbalance before</span> ' + (bmax / bmean).toFixed(2) + '× &nbsp; <span class="k">after</span> <span class="hi">' + (amax / amean).toFixed(2) + '×</span><br>' +
+        '<span class="k">step-time reduction</span> ' + (100 * (1 - (amax / amean) / (bmax / bmean))).toFixed(0) + '%<br>' +
+        '<span class="k">replicas added</span> ' + res.replicas + ' &nbsp; <span class="k">extra expert memory</span> ' + Guide.fmtBytes(res.replicas * EXPERT_MB * 1e6) + '<br>' +
+        '<span class="k">' + (eplb ? 'replicating the busiest experts flattens the tail' : 'without replication the busiest device sets the step') + '</span>';
+      draw(640, 320);
+    }
+    toggle.addEventListener('click', function () { eplb = !eplb; render(); });
+    ready = true;
+    Guide.bindSliders([epS], render);
+    render();
+  })();
+
+  // ---- Demo d: all-to-all cost ----
+  (function () {
+    var canvas = document.getElementById('a2a-canvas');
+    var ctx = canvas.getContext('2d');
+    var epS = document.getElementById('a2a-ep');
+    var linkS = document.getElementById('a2a-link');
+    var readout = document.getElementById('a2a-readout');
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 320, function (W, H) { if (ready) draw(W, H); });
+    var EPS = [8, 32, 64, 144];
+    var LINKS = [{ name: '900 GB/s NVLink', bw: 900e9 }, { name: '50 GB/s Ethernet/IB', bw: 50e9 }];
+    var L = 61, HID = 7168, BATCH = 256, PEAK = 989e12, ACTIVE = 37;
+
+    function model() {
+      var ep = EPS[parseInt(epS.value, 10)];
+      var link = LINKS[parseInt(linkS.value, 10)];
+      var computeMs = 2 * ACTIVE * 1e9 * BATCH / PEAK * 1000;
+      // dispatch + combine: k sends + k receives of hidden per token per layer
+      var bytes = L * BATCH * 2 * TOPK * HID * 2 * 2;
+      var a2aMs = bytes / link.bw * 1000;
+      return { ep: ep, link: link, computeMs: computeMs, a2aMs: a2aMs, step: computeMs + a2aMs, bytes: bytes };
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var m = model();
+      var maxV = m.step * 1.15;
+      var padL = 120, padR = 60, padT = 24, barH = 66;
+      function bar(y, label, mm) {
+        var plotW = W - padL - padR;
+        ctx.fillStyle = c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'right';
+        ctx.fillText(label, padL - 8, y + barH * 0.62);
+        var wc = plotW * mm.computeMs / maxV, wa = plotW * mm.a2aMs / maxV;
+        ctx.fillStyle = c.accent400; ctx.fillRect(padL, y, wc, barH);
+        ctx.fillStyle = c.accent2; ctx.fillRect(padL + wc, y, wa, barH);
+        ctx.fillStyle = c.text; ctx.font = '11px ' + c.mono; ctx.textAlign = 'left';
+        ctx.fillText(Guide.fmtMs(mm.computeMs) + ' compute', padL + 6, y + barH * 0.4);
+        ctx.fillStyle = '#fff';
+        if (wa > 60) ctx.fillText(Guide.fmtMs(mm.a2aMs) + ' all-to-all', padL + wc + 6, y + barH * 0.62);
+      }
+      bar(padT, 'EP8 on NVLink', { computeMs: m.computeMs, a2aMs: L * BATCH * 2 * TOPK * HID * 2 * 2 / 900e9 * 1000 });
+      bar(padT + barH + 60, 'EP' + m.ep + ' on ' + (m.link.bw === 900e9 ? 'NVLink' : 'Ethernet'), { computeMs: m.computeMs, a2aMs: m.a2aMs });
+      ctx.fillStyle = c.accent400; ctx.fillRect(padL, H - 18, 12, 10);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('compute', padL + 18, H - 9);
+      ctx.fillStyle = c.accent2; ctx.fillRect(padL + 90, H - 18, 12, 10);
+      ctx.fillStyle = c.text; ctx.fillText('all-to-all', padL + 108, H - 9);
+      ctx.textAlign = 'right'; ctx.fillText(Guide.fmtBytes(m.bytes) + ' moved / step', W - padR, H - 9);
+    }
+    function render() {
+      var m = model();
+      document.getElementById('a2a-ep-val').textContent = m.ep;
+      document.getElementById('a2a-link-val').textContent = m.link.name;
+      var share = 100 * m.a2aMs / m.step;
+      readout.innerHTML =
+        '<span class="k">all-to-all volume</span> ' + Guide.fmtBytes(m.bytes) + ' / step<br>' +
+        '<span class="k">compute</span> ' + Guide.fmtMs(m.computeMs) + ' &nbsp; <span class="k">all-to-all</span> ' + Guide.fmtMs(m.a2aMs) + '<br>' +
+        '<span class="k">all-to-all share of step</span> <span class="' + (share > 50 ? 'bad' : 'hi') + '">' + share.toFixed(0) + '%</span><br>' +
+        '<span class="k">' + (share > 50 ? 'the collective dominates — this is why rack-scale NVLink exists' : 'communication stays hidden behind compute') + '</span>';
+      draw(640, 320);
+    }
+    ready = true;
+    Guide.bindSliders([epS, linkS], render);
+    render();
+  })();
+
+  // ---- Demo e: batch effect ----
+  (function () {
+    var canvas = document.getElementById('batch-canvas');
+    var ctx = canvas.getContext('2d');
+    var bS = document.getElementById('batch-slider');
+    var readout = document.getElementById('batch-readout');
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 320, function (W, H) { if (ready) draw(W, H); });
+    var BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+    var ROUTE_512 = routeTokens(512, 20250315);
+    var DENSE_FRAC = 0.03; // attention + shared + router always read
+
+    function touched(B) {
+      var seen = {};
+      for (var t = 0; t < B; t++) ROUTE_512[t].forEach(function (e) { seen[e] = 1; });
+      return Object.keys(seen).length;
+    }
+    function frac(B) { return DENSE_FRAC + (1 - DENSE_FRAC) * touched(B) / E; }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var sel = BS[parseInt(bS.value, 10)];
+      var pts = BS.map(function (b) { return { x: Math.log2(b), y: 100 * frac(b) }; });
+      var axes = Guide.drawLines(ctx, W, H, [{ points: pts, color: c.accent, width: 3 }],
+        [0, 9], [0, 105], { xLabel: 'batch size (log₂)', yLabel: '% of expert weights read / step', padL: 52, padB: 34 });
+      BS.forEach(function (b) {
+        var X = axes.px(Math.log2(b)), Y = axes.py(100 * frac(b));
+        ctx.fillStyle = b === sel ? c.accent2 : c.accent;
+        ctx.beginPath(); ctx.arc(X, Y, b === sel ? 6 : 3.5, 0, 2 * Math.PI); ctx.fill();
+      });
+      // annotate endpoints
+      var x1 = axes.px(0), y1 = axes.py(100 * frac(1));
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('B=1: ' + (100 * frac(1)).toFixed(0) + '%', x1 + 6, y1 + 4);
+      var x2 = axes.px(9), y2 = axes.py(100 * frac(512));
+      ctx.textAlign = 'right'; ctx.fillText('B=512: ' + (100 * frac(512)).toFixed(0) + '%', x2 - 4, y2 - 8);
+    }
+    function render() {
+      var b = BS[parseInt(bS.value, 10)];
+      var f = frac(b), t = touched(b);
+      document.getElementById('batch-val').textContent = b;
+      var holdGB = 671 * 2;
+      readout.innerHTML =
+        '<span class="k">batch</span> ' + b + ' &nbsp; <span class="k">distinct experts touched</span> ' + t + ' / ' + E + '<br>' +
+        '<span class="k">expert weights read</span> <span class="hi">' + (100 * f).toFixed(0) + '%</span> of held<br>' +
+        '<span class="k">bytes read / step</span> ' + Guide.fmtBytes(f * holdGB * 1e9) + '<br>' +
+        '<span class="k">' + (b < 32 ? 'below saturation: paying EP communication without amortising weight reads' : 'near saturation: reads are effectively dense, compute is still sparse') + '</span>';
+      draw(640, 320);
+    }
+    ready = true;
+    Guide.bindSliders([bS], render);
+    render();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

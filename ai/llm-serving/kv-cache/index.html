@@ -1,0 +1,647 @@
+---
+title: "LLM Serving, Interactively — Part 4: The KV cache: sizing, GQA, MQA and MLA"
+description: "The bytes-per-token formula run against real model configs, the MHA-to-MQA design ladder, MLA's latent, sliding windows, KV quantization, and the concurrency a cache buys."
+permalink: "/ai/llm-serving/kv-cache/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .kv-scheme-note { font-size: 12.5px; line-height: 1.55; margin-top: 10px; padding: 10px 12px; background: var(--color-bg); border-radius: var(--radius-sm); }
+  .kv-scheme-note b { color: var(--color-accent-800); }
+  .kv-eq { font-family: var(--font-mono); font-size: 12px; opacity: 0.75; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 4 of 20</span>
+    <h1>The KV cache: sizing, GQA, MQA and MLA</h1>
+    <p>The cache is the single largest allocation in a serving node once weights are fixed, and it is the thing that decides how many users a GPU can hold at once. This part turns it into arithmetic: one formula, run against real model configs, then attacked with every architectural lever — grouped heads, a learned latent, sliding windows — until the number moves by an order of magnitude.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="why">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Why the cache exists, and why it dominates serving</h2></div>
+    <p class="g-eyebrow">From a training-time trick to the binding constraint</p>
+    <p>Autoregressive decoding needs every earlier token's key and value vectors to attend to them, so recomputing them at each step would make generation quadratic for no reason. Instead the K and V tensors are cached once and reused, and each step computes only the newest token's — <a href="{{ '/ai/llm-training/inference/#kvcache' | relative_url }}">the LLM Training guide introduced the mechanism</a>. What that page does not quantify is the serving consequence: the cache is per-sequence, grows linearly with context, and must be resident for every concurrent request, so it competes directly with the weights for HBM.</p>
+    <p>At production scale the cache stops being an optimization and becomes the system. DeepSeek reported that over one 24-hour window, 342&nbsp;billion of 608&nbsp;billion input tokens — 56.3% — were served from a cache rather than recomputed, which is why the rest of this series treats KV as a first-class, paged, routed, quantized resource. Before any of that machinery helps, you have to know how many bytes one token costs.</p>
+    <div class="g-goal">💡 <span><b>Where this is going:</b> the cache is the reason Part 5 needs paged memory, Part 8 needs prefix caching, and Part 13 needs to ship KV across a network. Every one of those costs is measured in bytes per token, so get the formula right first.</span></div>
+  </section>
+
+  <section class="g-step" id="formula">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The formula, term by term</h2></div>
+    <p class="g-eyebrow">One multiplication decides the whole budget</p>
+    <p>For standard attention the cache holds a key and a value tensor for every KV head of every layer, at the model's head dimension, for every token in the sequence, at the chosen element width, for every sequence in the batch.</p>
+    <div class="g-math g-katex">$$\text{KV bytes} = 2 \times L \times n_{kv} \times d_{head} \times T \times b \times \text{batch}$$</div>
+    <p class="g-eyebrow" style="margin-left:0;">2 · K and V &nbsp;|&nbsp; L · layers &nbsp;|&nbsp; n_kv · KV heads &nbsp;|&nbsp; d_head · head dim &nbsp;|&nbsp; T · tokens &nbsp;|&nbsp; b · bytes per element &nbsp;|&nbsp; batch · concurrent sequences</p>
+    <p>Every term is a lever. The 2 is fixed by attention. L and d_head are architectural and expensive to change. <code>n_kv</code> is the lever GQA and MQA pull. T is the context you agreed to serve. <code>b</code> is the lever KV quantization pulls. Batch is the consequence — the number you are solving for, not a knob. Change any term below and watch bytes per token move.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="kv-calc" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Total cache for the whole batch, and how it splits.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Model preset <span class="val" id="kv-calc-scheme">GQA</span></label>
+          <select id="kv-calc-model"></select>
+        </div>
+        <div class="g-field"><label>Layers L <span class="val">80</span></label><input type="range" id="kv-calc-layers" min="1" max="128" step="1" value="80"></div>
+        <div class="g-field"><label>KV heads n<sub>kv</sub> <span class="val">8</span></label><input type="range" id="kv-calc-heads" min="1" max="128" step="1" value="8"></div>
+        <div class="g-field"><label>Head dim d<sub>head</sub> <span class="val">128</span></label><input type="range" id="kv-calc-dhead" min="32" max="256" step="16" value="128"></div>
+        <div class="g-field"><label>Context T <span class="val">8192</span></label><input type="range" id="kv-calc-ctx" min="512" max="131072" step="512" value="8192"></div>
+        <div class="g-field"><label>Batch (sequences) <span class="val">8</span></label><input type="range" id="kv-calc-batch" min="1" max="64" step="1" value="8"></div>
+        <div class="g-btnrow" id="kv-calc-prow">
+          <button data-p="2" class="g-primary">KV FP16</button>
+          <button data-p="1">KV FP8</button>
+          <button data-p="0.5">KV INT4</button>
+        </div>
+        <div class="g-readout" id="kv-calc-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="real">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Bytes per token for real models</h2></div>
+    <p class="g-eyebrow">The configs everyone actually runs</p>
+    <p>The table below computes the formula from each model's published config at FP16. Two things jump out. First, a 405B dense model with 8 KV heads costs about the same per token as a 70B — the cache is a function of layers and heads, not parameter count. Second, the MoE models look enormous by weights but cheap by cache, because their KV cost is set by layer count and attention heads while most of their parameters live in experts that never touch the cache.</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat" id="kv-real-table">
+      <thead><tr><th>Model</th><th>Scheme</th><th>Layers</th><th>KV heads</th><th>Bytes/token (FP16)</th><th>Cache at full context</th></tr></thead>
+      <tbody id="kv-real-body"></tbody>
+    </table>
+    </div>
+    <p class="g-source" id="kv-src-models"></p>
+    <div class="g-goal">💡 <span><b>Read the third column, not the first:</b> Llama 3.1 405B and 70B share 8 KV heads and differ by 1.6× in layers, so their caches differ by roughly that much — not by the 5.7× that separates their parameter counts.</span></div>
+  </section>
+
+  <section class="g-step" id="schemes">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>MHA, GQA, MQA</h2></div>
+    <p class="g-eyebrow">Trading a little quality for a lot of cache</p>
+    <p>Multi-head attention caches a K and V for every query head. Grouped-query attention gives several query heads a single shared K/V, and multi-query attention shares one K/V across all of them. The mechanism — several query heads reading the same subspace — is drawn in <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">the architecture page</a>; what this page owns is the accounting. GQA with 8 groups is an 8× cache reduction at negligible quality cost and is now the default in Llama 3.1, Mistral and gpt-oss. MQA is a 64× reduction but can hurt quality, which is why frontier models rarely ship it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="kv-scheme" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Each line is a query head reading from its KV head.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="kv-scheme-row">
+          <button data-scheme="MHA">MHA</button>
+          <button data-scheme="GQA" class="g-primary">GQA</button>
+          <button data-scheme="MQA">MQA</button>
+          <button data-scheme="MLA">MLA</button>
+        </div>
+        <div class="g-readout" id="kv-scheme-readout"></div>
+        <div class="kv-scheme-note" id="kv-scheme-note"></div>
+      </div>
+    </div>
+    <p class="g-source" id="kv-src-schemes"></p>
+  </section>
+
+  <section class="g-step" id="mla">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>MLA's latent</h2></div>
+    <p class="g-eyebrow">Cache the compression, not the heads</p>
+    <p>Multi-head latent attention takes a different route: instead of caching per-head K and V, it caches a single low-rank latent per layer and reconstructs the per-head keys and values on the fly during attention. At DeepSeek-V3's geometry that is a 512-element latent plus a 64-element decoupled RoPE key — 576 elements per layer per token, or about 70&nbsp;KB per token in FP16 across 61 layers. The MHA equivalent at the same depth and 128 heads would be roughly 4.0&nbsp;MB/token, so the compression is on the order of 57×, achieved by moving work from memory into compute. The cache stops being a per-head array and becomes one compact vector per layer, which is exactly what makes long-context serving tractable for these models.</p>
+    <div class="g-math g-katex">$$\text{MLA bytes/token} = L \times (d_c + d_{rope}) \times b = 61 \times (512 + 64) \times 2 \approx 70\,\text{KB}$$</div>
+  </section>
+
+  <section class="g-step" id="sliding">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Sliding windows and hybrid layers</h2></div>
+    <p class="g-eyebrow">Making the cache flat instead of linear</p>
+    <p>A sliding-window layer attends only to the most recent <var>W</var> tokens, so its cache stops growing once the sequence passes <var>W</var> — peak memory becomes bounded rather than linear in context. Mistral 7B ships a 4,096-token window natively; gpt-oss alternates sliding and full layers, so only a fraction of layers grow with the sequence. State-space and hybrid SSM layers (Mamba-style) go further and keep a constant-size recurrent state instead of a per-token cache at all, at the cost of losing exact long-range retrieval. The trade is always the same: you buy bounded memory with a bounded attention horizon.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="kv-window" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">KV per sequence as the sequence grows. Play to sweep the length.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="kv-window-play">Play</button></div>
+        <div class="g-field">
+          <label>Model <span class="val" id="kv-window-scheme">SWA-hybrid</span></label>
+          <select id="kv-window-model"></select>
+        </div>
+        <div class="g-field"><label>Sliding window W <span class="val">4096</span></label><input type="range" id="kv-window-w" min="512" max="32768" step="512" value="4096"></div>
+        <div class="g-readout" id="kv-window-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>The weights / KV / activations budget</h2></div>
+    <p class="g-eyebrow">Concurrency is what is left after everything else</p>
+    <p>A node's HBM has to hold three things at once: the sharded weights, one KV cache per resident sequence, and a working set of activations. Weights are a fixed cost paid once. Activations are small per sequence in decode. The KV cache is the term that scales with load, so it is the term that converts HBM into concurrency: the maximum number of sequences a GPU can hold is whatever capacity remains after weights, divided by the per-sequence cache. Halving cache bytes per token doubles concurrency; doubling context halves it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="kv-budget" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Total resident GB versus concurrency; the dashed line is HBM capacity.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Model <span class="val" id="kv-budget-param">70.6B</span></label>
+          <select id="kv-budget-model"></select>
+        </div>
+        <div class="g-field"><label>Context T <span class="val">8192</span></label><input type="range" id="kv-budget-ctx" min="1024" max="131072" step="1024" value="8192"></div>
+        <div class="g-field">
+          <label>Accelerator <span class="val" id="kv-budget-accel-val">H100 80 GB</span></label>
+          <select id="kv-budget-accel"></select>
+        </div>
+        <div class="g-btnrow" id="kv-budget-wrow">
+          <button data-w="2" class="g-primary">Weights BF16</button>
+          <button data-w="1">FP8</button>
+          <button data-w="0.5">INT4</button>
+        </div>
+        <div class="g-btnrow" id="kv-budget-krow">
+          <button data-k="2" class="g-primary">KV FP16</button>
+          <button data-k="1">KV FP8</button>
+        </div>
+        <div class="g-readout" id="kv-budget-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Which lever moves it most:</b> at long context the KV term dwarfs everything, so KV quantization beats a bigger GPU almost every time. At short context the weights dominate and only capacity or weight precision helps. The readout names the winner for the current setting.</span></div>
+  </section>
+
+  <section class="g-step" id="quant">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>KV quantization</h2></div>
+    <p class="g-eyebrow">The cheapest bandwidth win in serving</p>
+    <p>Because the cache is read once per token per sequence, quantizing it to FP8 halves both the memory it occupies and the bytes decode has to stream — often a near-free win, since FP8 KV typically costs little quality when keys and values are scaled per group. INT4 KV is more aggressive: it can cut the cache four-fold, but keys are unusually sensitive to outliers, so quality damage is far more visible than the nearly-lossless INT4 <em>weights</em> that Part 10 discusses. The practical ranking is FP16 baseline, FP8 broadly safe, INT4 only with per-group scales and task-level evaluation. Every byte removed here is a byte of concurrency added back, which is why KV precision is the first knob a serving engineer reaches for.</p>
+    <div class="g-warn">⚠️ <span><b>The asymmetry:</b> weight quantization changes what the model knows; KV quantization changes what it can still attend to. Damage from INT4 KV often shows up as long-range recall failures that a short benchmark never sees.</span></div>
+  </section>
+
+  <section class="g-step" id="concurrency">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>From bytes to concurrency</h2></div>
+    <p class="g-eyebrow">The one number to carry into capacity planning</p>
+    <p>Putting the pieces together, the concurrency a single GPU supports is:</p>
+    <div class="g-math g-katex">$$N_{\max} = \left\lfloor \frac{\text{HBM}_{\text{usable}} - \text{weights}}{\text{bytes/token} \times T + \text{activations per sequence}} \right\rfloor$$</div>
+    <p>Everything else in this series — paging, prefix sharing, admission control — is about making the effective numerator larger or the denominator smaller. Paging removes fragmentation so the numerator is actually usable; prefix caching makes shared tokens in the denominator cost nothing; quantization shrinks bytes/token; sliding windows cap T. The rest of the guide is the machinery around this one division. Next, Part 5 shows how the numerator is managed in fixed-size blocks instead of one contiguous reservation.</p>
+    <div class="g-goal">📌 <span><b>Cross-link:</b> the weights term here is the inference-time cost; its training-time twin (optimizer state, gradients, master weights) is worked through in <a href="{{ '/ai/llm-training/scaling/' | relative_url }}">the scaling page's memory accounting</a>. Same parameters, roughly 8× the bytes.</span></div>
+  </section>
+
+  <section class="g-step" id="cheatsheet">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">The cache in six lines</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Quantity</th><th>Formula / value</th><th>Lever</th></tr></thead>
+      <tbody>
+        <tr><td>Bytes per token</td><td>2 · L · n<sub>kv</sub> · d<sub>head</sub> · b</td><td>The master equation</td></tr>
+        <tr><td>MHA vs GQA vs MQA</td><td>2.62 MB → 0.33 MB → 0.04 MB per token (FP16, 70B geometry)</td><td>Share K/V across query heads</td></tr>
+        <tr><td>MLA</td><td>L · (d_c + d_rope) · b ≈ 70 KB/token (61 layers, 576)</td><td>Cache a latent</td></tr>
+        <tr><td>Sliding window</td><td>Cache flat at W instead of linear in T</td><td>Bound the attention horizon</td></tr>
+        <tr><td>KV FP8</td><td>Half the bytes, near-free quality</td><td>Element width b</td></tr>
+        <tr><td>Max concurrency</td><td>(HBM − weights) ÷ (bytes/token · T + activations)</td><td>The planning number</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Ainslie et al., "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints" (EMNLP 2023).</li>
+      <li>Shazeer, "Fast Transformer Decoding: One Write-Head is All You Need" (2019) — multi-query attention.</li>
+      <li>DeepSeek-AI, "DeepSeek-V3 Technical Report" (arXiv:2412.19437) — multi-head latent attention.</li>
+      <li>Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023) — why cache bytes become blocks.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Bytes per token in hand, the next question is how to allocate them without fragmentation.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__KV_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, SS = window.ServingSim, c = G.colors();
+
+  var FALLBACK = {
+    model_configs: {
+      source: "Official model configs and technical reports. Llama 3.1 8B/70B/405B (32/80/126 layers, 32/64/128 heads, 8 KV heads, head_dim 128, GQA); DeepSeek-V3 (61 layers, 128 heads, MLA, kv_lora_rank 512, 671B total / 37B active); Kimi K2 (61 layers, 64 heads, MLA, ~1T total / 32B active); Mistral 7B (32 layers, 8 KV heads, sliding_window 4096); gpt-oss-120b (36 layers, 8 KV heads, head_dim 64, alternating sliding/full).",
+      items: [
+        { name: "Llama 3.1 8B", layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 8.03, activeParamsB: 8.03, contextLen: 131072 },
+        { name: "Llama 3.1 70B", layers: 80, hidden: 8192, heads: 64, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 70.6, activeParamsB: 70.6, contextLen: 131072 },
+        { name: "Llama 3.1 405B", layers: 126, hidden: 16384, heads: 128, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 405, activeParamsB: 405, contextLen: 131072 },
+        { name: "DeepSeek-V3", layers: 61, hidden: 7168, heads: 128, n_kv_heads: 128, d_head: 128, kvScheme: "MLA", totalParamsB: 671, activeParamsB: 37, contextLen: 163840 },
+        { name: "Kimi K2", layers: 61, hidden: 7168, heads: 64, n_kv_heads: 64, d_head: 128, kvScheme: "MLA", totalParamsB: 1000, activeParamsB: 32, contextLen: 131072 },
+        { name: "Mistral 7B (sliding-window)", layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: "SWA-hybrid", totalParamsB: 7.24, activeParamsB: 7.24, contextLen: 32768 },
+        { name: "gpt-oss-120b", layers: 36, hidden: 2880, heads: 64, n_kv_heads: 8, d_head: 64, kvScheme: "GQA", totalParamsB: 117, activeParamsB: 5.1, contextLen: 131072 }
+      ]
+    },
+    kv_scheme_savings: {
+      source: "Computed from the official configs in model_configs (formula: bytes/token = 2 x layers x n_kv_heads x d_head x 2 bytes for FP16 K and V). MHA/GQA/MQA/SWA use Llama-3-70B geometry (80 layers, 64 query heads, head_dim 128, 8 KV heads for GQA); MLA uses DeepSeek-V3 geometry (61 layers, kv_lora_rank 512 + qk_rope_head_dim 64 = 576 cached elements per layer per token).",
+      items: [
+        { scheme: "MHA", bytesPerTokenFP16: 2621440, savingVsMHA: "1x (baseline)", note: "Llama-3-70B-class geometry: 80 layers x 64 KV heads x 128 dim x 2 (K,V) x 2 bytes = 2.62 MB/token." },
+        { scheme: "GQA", bytesPerTokenFP16: 327680, savingVsMHA: "8x", note: "8 KV heads instead of 64; used by Llama 3.1, Mistral 7B and gpt-oss-120b." },
+        { scheme: "MQA", bytesPerTokenFP16: 40960, savingVsMHA: "64x", note: "Single KV head; 0.04 MB/token. Rare in frontier models because quality can suffer." },
+        { scheme: "MLA", bytesPerTokenFP16: 70272, savingVsMHA: "about 57x vs MHA at the same 61-layer/128-head geometry", note: "DeepSeek-V3 caches a 512-element latent plus a 64-element RoPE key per layer." },
+        { scheme: "SWA-hybrid", bytesPerTokenFP16: 131072, savingVsMHA: "8x per token, plus a hard cap from the sliding window", note: "Mistral 7B geometry, cache stops growing past the 4,096-token window." }
+      ]
+    }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function applyData(d) {
+    if (d && d.model_configs && d.model_configs.items && d.model_configs.items.length) DATA = d;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+  function models() { return DATA.model_configs.items; }
+  function schemeItem(name) {
+    var items = (DATA.kv_scheme_savings && DATA.kv_scheme_savings.items) || FALLBACK.kv_scheme_savings.items;
+    for (var i = 0; i < items.length; i++) if (items[i].scheme === name) return items[i];
+    return items[0];
+  }
+  function pick(list, idx) { return list[Math.max(0, Math.min(list.length - 1, idx))]; }
+  function isMla(m) { return m.kvScheme === "MLA"; }
+  function bytesPerToken(m, b) {
+    if (isMla(m)) return m.layers * 576 * b;
+    return 2 * m.layers * m.n_kv_heads * m.d_head * b;
+  }
+  function fmtBytes(n) { return G.fmtBytes(n); }
+
+  // ---- Demo 1: bytes-per-token calculator -------------------------------
+  (function () {
+    var canvas = document.getElementById("kv-calc");
+    var ctx, W = 640, H = 320;
+    var modelSel = document.getElementById("kv-calc-model");
+    var L = document.getElementById("kv-calc-layers");
+    var Hk = document.getElementById("kv-calc-heads");
+    var Dh = document.getElementById("kv-calc-dhead");
+    var T = document.getElementById("kv-calc-ctx");
+    var B = document.getElementById("kv-calc-batch");
+    var pRow = document.getElementById("kv-calc-prow");
+    var readout = document.getElementById("kv-calc-readout");
+    var schemeVal = document.getElementById("kv-calc-scheme");
+    var b = 2, modelIdx = 1, mlaMode = false;
+
+    function buildSelect() {
+      modelSel.innerHTML = "";
+      models().forEach(function (m, i) {
+        var o = document.createElement("option"); o.value = String(i); o.textContent = m.name; modelSel.appendChild(o);
+      });
+      modelSel.value = String(modelIdx);
+    }
+    function applyPreset() {
+      var m = pick(models(), modelIdx);
+      L.value = String(m.layers);
+      Hk.value = String(m.n_kv_heads);
+      Dh.value = String(m.d_head);
+      mlaMode = isMla(m);
+      if (mlaMode) { Hk.value = "1"; Dh.value = "128"; }
+      schemeVal.textContent = m.kvScheme;
+      Hk.disabled = mlaMode;
+      [L, Hk, Dh].forEach(function (el) { el.dispatchEvent(new Event("input")); });
+      render();
+    }
+    function render() {
+      if (!ctx) return;
+      var m = pick(models(), modelIdx);
+      var layers = parseInt(L.value, 10);
+      var heads = parseInt(Hk.value, 10);
+      var dhead = parseInt(Dh.value, 10);
+      var tokens = parseInt(T.value, 10);
+      var batch = parseInt(B.value, 10);
+      var perToken = mlaMode ? layers * 576 * b : 2 * layers * heads * dhead * b;
+      var total = perToken * tokens * batch;
+
+      var rows = [{
+        label: "per sequence @T",
+        segments: [
+          { value: perToken * tokens, color: c.accent, name: "one sequence" },
+          { value: perToken * tokens * (batch - 1), color: c.accent400, name: "other sequences" }
+        ]
+      }];
+      ctx.clearRect(0, 0, W, H);
+      G.drawStacked(ctx, W, H, rows, { maxTotal: Math.max(perToken * tokens * batch, 1), padB: 38, padT: 16, showSegmentLabels: false, axisLabel: "total batch KV (log-free linear scale)" });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Batch KV cache: " + fmtBytes(total), 8, 14);
+
+      readout.innerHTML =
+        '<span class="k">bytes/token (single sequence):</span> <span class="hi">' + fmtBytes(perToken) + "</span><br>" +
+        '<span class="k">formula:</span> ' + (mlaMode ? "L × (512+64) × b" : "2 × L × n_kv × d_head × b") + " = " + (mlaMode ? layers + " × 576 × " + b : "2 × " + layers + " × " + heads + " × " + dhead + " × " + b) + "<br>" +
+        '<span class="k">one sequence at T tokens:</span> ' + fmtBytes(perToken * tokens) + "<br>" +
+        '<span class="k">whole batch:</span> <span class="hi">' + fmtBytes(total) + "</span> (" + batch + " sequences)";
+    }
+    modelSel.addEventListener("change", function () { modelIdx = parseInt(modelSel.value, 10) || 0; applyPreset(); });
+    pRow.addEventListener("click", function (e) {
+      var btn = e.target.closest("button[data-p]"); if (!btn) return;
+      b = parseFloat(btn.getAttribute("data-p"));
+      Array.prototype.forEach.call(pRow.querySelectorAll("button"), function (x) { x.className = x === btn ? "g-primary" : ""; });
+      render();
+    });
+    G.bindSliders([L, Hk, Dh, T, B], render);
+    buildSelect();
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    onData(function () { buildSelect(); applyPreset(); });
+    applyPreset();
+  })();
+
+  // ---- Demo 2: bytes/token table ----------------------------------------
+  (function () {
+    var body = document.getElementById("kv-real-body");
+    var src = document.getElementById("kv-src-models");
+    function render() {
+      var html = "";
+      models().forEach(function (m) {
+        var perTok = bytesPerToken(m, 2);
+        var total = perTok * m.contextLen;
+        html += "<tr><td>" + m.name + "</td><td>" + m.kvScheme + "</td><td>" + m.layers + "</td><td>" +
+          (isMla(m) ? "latent 576" : m.n_kv_heads) + "</td><td>" + fmtBytes(perTok) + "</td><td>" + fmtBytes(total) + "</td></tr>";
+      });
+      body.innerHTML = html;
+      src.textContent = DATA.model_configs.source;
+    }
+    onData(render);
+    render();
+  })();
+
+  // ---- Demo 3: attention-scheme visualiser ------------------------------
+  (function () {
+    var canvas = document.getElementById("kv-scheme");
+    var ctx, W = 640, H = 360;
+    var row = document.getElementById("kv-scheme-row");
+    var readout = document.getElementById("kv-scheme-readout");
+    var note = document.getElementById("kv-scheme-note");
+    var scheme = "GQA";
+    var NQ = 64, DH = 128, LAYERS = 80;
+
+    function kvHeads(s) { return s === "MHA" ? 64 : s === "GQA" ? 8 : s === "MQA" ? 1 : 1; }
+    function perToken(s) {
+      if (s === "MLA") return 61 * 576 * 2;
+      return 2 * LAYERS * kvHeads(s) * DH * 2;
+    }
+    function render() {
+      if (!ctx) return;
+      var base = perToken("MHA");
+      var pt = perToken(scheme);
+      var nkv = kvHeads(scheme);
+      ctx.clearRect(0, 0, W, H);
+      var padT = 30, padB = 20, xQ = 110, xK = 520;
+      var rowH = (H - padT - padB) / NQ;
+      ctx.font = "11px " + c.font;
+      ctx.fillStyle = c.text; ctx.textAlign = "center";
+      ctx.fillText("query heads", xQ, 16); ctx.fillText(scheme === "MLA" ? "latent per layer" : "KV heads", xK, 16);
+
+      if (scheme === "MLA") {
+        for (var i = 0; i < NQ; i++) {
+          var qy = padT + i * rowH + rowH / 2;
+          ctx.strokeStyle = c.accent400; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(xQ + 8, qy); ctx.lineTo(xK - 12, H / 2); ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = c.accent; ctx.fillRect(xQ - 8, qy - 3, 16, 6);
+        }
+        ctx.fillStyle = c.accent2; ctx.fillRect(xK - 40, H / 2 - 70, 44, 140);
+        ctx.fillStyle = "#fff"; ctx.textAlign = "center";
+        ctx.save(); ctx.translate(xK - 18, H / 2); ctx.rotate(-Math.PI / 2);
+        ctx.fillText("c_KV 512 + k_rope 64", 0, 4); ctx.restore();
+      } else {
+        for (var j = 0; j < NQ; j++) {
+          var y = padT + j * rowH + rowH / 2;
+          var kIdx = Math.floor(j / (NQ / nkv));
+          var ky = padT + (kIdx + 0.5) * ((H - padT - padB) / nkv);
+          ctx.strokeStyle = nkv === 1 ? c.accent2 : (nkv === 8 ? c.accent : c.accent400);
+          ctx.globalAlpha = 0.4; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(xQ + 8, y); ctx.lineTo(xK - 8, ky); ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = c.accent; ctx.fillRect(xQ - 8, y - 3, 16, 6);
+        }
+        for (var k = 0; k < nkv; k++) {
+          var yy = padT + (k + 0.5) * ((H - padT - padB) / nkv);
+          ctx.fillStyle = c.accent2; ctx.fillRect(xK - 8, yy - 4, 18, 8);
+        }
+      }
+      var saving = base / pt;
+      var item = schemeItem(scheme === "MHA" ? "MHA" : scheme);
+      readout.innerHTML =
+        '<span class="k">scheme:</span> <span class="hi">' + scheme + "</span><br>" +
+        '<span class="k">bytes/token (FP16):</span> ' + fmtBytes(pt) + "<br>" +
+        '<span class="k">saving vs MHA:</span> <span class="hi">' + (scheme === "MLA" ? "≈57× (at DeepSeek geometry)" : saving.toFixed(0) + "×") + "</span>";
+      note.innerHTML = "<b>" + scheme + ":</b> " + (item ? item.note : "") +
+        (scheme === "MHA" ? " Baseline quality, largest cache." : "") +
+        (scheme === "GQA" ? " Little measurable quality loss; the modern default." : "") +
+        (scheme === "MQA" ? " Quality can suffer; used mainly for speed." : "") +
+        (scheme === "MLA" ? " Compresses by caching a latent and reconstructing K/V in compute." : "");
+    }
+    row.addEventListener("click", function (e) {
+      var btn = e.target.closest("button[data-scheme]"); if (!btn) return;
+      scheme = btn.getAttribute("data-scheme");
+      Array.prototype.forEach.call(row.querySelectorAll("button"), function (x) { x.className = x === btn ? "g-primary" : ""; });
+      render();
+    });
+    onData(render);
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  // ---- Demo 4: memory budget vs concurrency -----------------------------
+  (function () {
+    var canvas = document.getElementById("kv-budget");
+    var ctx, W = 640, H = 360;
+    var modelSel = document.getElementById("kv-budget-model");
+    var accelSel = document.getElementById("kv-budget-accel");
+    var T = document.getElementById("kv-budget-ctx");
+    var wRow = document.getElementById("kv-budget-wrow");
+    var kRow = document.getElementById("kv-budget-krow");
+    var readout = document.getElementById("kv-budget-readout");
+    var paramVal = document.getElementById("kv-budget-param");
+    var wBytes = 2, kBytes = 2, modelIdx = 0, accelIdx = 1, NMAX = 128;
+
+    function accelList() {
+      var all = (DATA.accelerators && DATA.accelerators.items) || [];
+      var perGpu = all.filter(function (a) { return a.hbmGB && a.hbmGB <= 1000; });
+      return perGpu.length ? perGpu : [{ name: "H100 80GB", hbmGB: 80 }];
+    }
+    function buildSelects() {
+      modelSel.innerHTML = "";
+      models().forEach(function (m, i) { var o = document.createElement("option"); o.value = String(i); o.textContent = m.name; modelSel.appendChild(o); });
+      modelSel.value = String(modelIdx);
+      accelSel.innerHTML = "";
+      accelList().forEach(function (a, i) { var o = document.createElement("option"); o.value = String(i); o.textContent = a.name + " · " + a.hbmGB + " GB"; accelSel.appendChild(o); });
+      accelSel.value = String(Math.min(accelIdx, accelList().length - 1));
+    }
+    function weightsGB(m) { return m.totalParamsB * 1e9 * wBytes / 1e9; }
+    function actPerSeq(m) { return m.hidden * 2 * 6 / 1e9; }
+    function totalAt(m, ctxn, conc) { return weightsGB(m) + conc * (bytesPerToken(m, kBytes) * ctxn + actPerSeq(m)) / 1e9; }
+    function maxConc(m, ctxn, cap, kb) {
+      var per = bytesPerToken(m, kb) * ctxn + actPerSeq(m) * 1e9;
+      if (per <= 0) return 0;
+      var room = cap - weightsGB(m);
+      if (room <= 0) return 0;
+      return Math.floor(room / (per / 1e9));
+    }
+
+    function render() {
+      if (!ctx) return;
+      var m = pick(models(), modelIdx);
+      var acc = pick(accelList(), accelIdx) || accelList()[0];
+      var ctxn = parseInt(T.value, 10);
+      var cap = acc.hbmGB;
+      paramVal.textContent = m.totalParamsB + "B";
+
+      var maxN = maxConc(m, ctxn, cap, kBytes);
+      var xMax = Math.max(16, Math.min(NMAX, maxN * 2 + 8));
+      var series = [];
+      var wl = weightsGB(m);
+      var kvPts = [], totPts = [], wPts = [];
+      for (var n = 0; n <= xMax; n++) {
+        var kv = n * bytesPerToken(m, kBytes) * ctxn / 1e9;
+        var act = n * actPerSeq(m);
+        wPts.push({ x: n, y: wl });
+        kvPts.push({ x: n, y: wl + kv });
+        totPts.push({ x: n, y: wl + kv + act });
+      }
+      var yMax = Math.max(cap * 1.25, totPts[totPts.length - 1].y * 1.05);
+      series.push({ points: totPts, color: c.accent, width: 2.5 });
+      series.push({ points: kvPts, color: c.accent2, width: 1.8, dashed: true });
+      series.push({ points: wPts, color: c.accent700, width: 1.4, dashed: true });
+
+      ctx.clearRect(0, 0, W, H);
+      var axes = G.drawLines(ctx, W, H, series, [0, xMax], [0, yMax], { xLabel: "concurrent sequences", yLabel: "resident GB", padR: 30 });
+      var capY = axes.py(cap);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(axes.padL, capY); ctx.lineTo(axes.padL + axes.plotW, capY); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText(cap + " GB capacity", axes.padL + 6, capY - 5);
+      if (maxN > 0) {
+        var mx = axes.px(Math.min(maxN, xMax));
+        ctx.strokeStyle = c.accent; ctx.beginPath(); ctx.moveTo(mx, axes.padT); ctx.lineTo(mx, axes.padT + axes.plotH); ctx.stroke();
+        ctx.fillStyle = c.accent; ctx.fillText("max " + maxN, mx + 4, axes.padT + 12);
+      } else {
+        ctx.fillStyle = c.accent2; ctx.fillText("weights alone exceed capacity", axes.padL + 6, axes.padT + 12);
+      }
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font;
+      ctx.fillText("total · KV-only(+weights) · weights", axes.padL + 6, axes.padT + 26);
+
+      var mKv = maxConc(m, ctxn, cap, 1);
+      var mCap2 = maxConc(m, ctxn, cap * 2, kBytes);
+      var mHalf = maxConc(m, Math.max(1024, Math.round(ctxn / 2)), cap, kBytes);
+      var dKv = mKv - maxN, dCap = mCap2 - maxN, dHalf = mHalf - maxN;
+      var best = Math.max(dKv, dCap, dHalf);
+      var winner = best === dKv ? "KV FP8" : best === dCap ? "double capacity" : "halve context";
+      if (maxN === 0) winner = "reduce weights (quantize or shard)";
+
+      readout.innerHTML =
+        '<span class="k">weights:</span> ' + wl.toFixed(1) + " GB · <span class=\"k\">KV/seq at " + ctxn + " tok:</span> " + (bytesPerToken(m, kBytes) * ctxn / 1e9).toFixed(2) + " GB<br>" +
+        '<span class="k">max concurrency on ' + cap + " GB:</span> <span class=\"hi\">" + maxN + "</span><br>" +
+        '<span class="k">KV FP8 →</span> ' + mKv + " (" + (dKv >= 0 ? "+" : "") + dKv + ") · " +
+        '<span class="k">2× capacity →</span> ' + mCap2 + " (" + (dCap >= 0 ? "+" : "") + dCap + ") · " +
+        '<span class="k">half context →</span> ' + mHalf + " (" + (dHalf >= 0 ? "+" : "") + dHalf + ")<br>" +
+        '<span class="k">biggest lever:</span> <span class="hi">' + winner + "</span>";
+      var av = document.getElementById("kv-budget-accel-val");
+      if (av) av.textContent = acc.name.replace("NVIDIA ", "") + " · " + cap + " GB";
+    }
+    modelSel.addEventListener("change", function () { modelIdx = parseInt(modelSel.value, 10) || 0; render(); });
+    accelSel.addEventListener("change", function () { accelIdx = parseInt(accelSel.value, 10) || 0; render(); });
+    wRow.addEventListener("click", function (e) {
+      var btn = e.target.closest("button[data-w]"); if (!btn) return;
+      wBytes = parseFloat(btn.getAttribute("data-w"));
+      Array.prototype.forEach.call(wRow.querySelectorAll("button"), function (x) { x.className = x === btn ? "g-primary" : ""; });
+      render();
+    });
+    kRow.addEventListener("click", function (e) {
+      var btn = e.target.closest("button[data-k]"); if (!btn) return;
+      kBytes = parseFloat(btn.getAttribute("data-k"));
+      Array.prototype.forEach.call(kRow.querySelectorAll("button"), function (x) { x.className = x === btn ? "g-primary" : ""; });
+      render();
+    });
+    G.bindSliders([T], render);
+    buildSelects();
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    onData(function () { buildSelects(); render(); });
+    render();
+  })();
+
+  // ---- Demo 5: sliding window vs full -----------------------------------
+  (function () {
+    var canvas = document.getElementById("kv-window");
+    var ctx, W = 640, H = 360;
+    var WS = document.getElementById("kv-window-w");
+    var modelSel = document.getElementById("kv-window-model");
+    var readout = document.getElementById("kv-window-readout");
+    var playBtn = document.getElementById("kv-window-play");
+    var schemeVal = document.getElementById("kv-window-scheme");
+    var modelIdx = 5, Wwin = 4096, Tcur = 0;
+
+    function buildSelect() {
+      modelSel.innerHTML = "";
+      models().forEach(function (m, i) { var o = document.createElement("option"); o.value = String(i); o.textContent = m.name; modelSel.appendChild(o); });
+      modelSel.value = String(modelIdx);
+    }
+    function render() {
+      if (!ctx) return;
+      var m = pick(models(), modelIdx);
+      Wwin = parseInt(WS.value, 10);
+      var ctxLen = Math.min(m.contextLen, 32768);
+      schemeVal.textContent = m.kvScheme;
+      var per = bytesPerToken(m, 2) / 1e9;
+      var fullPts = [], winPts = [], hybPts = [];
+      for (var t = 0; t <= ctxLen; t += Math.max(1, Math.floor(ctxLen / 120))) {
+        fullPts.push({ x: t, y: per * t });
+        winPts.push({ x: t, y: per * Math.min(t, Wwin) });
+        hybPts.push({ x: t, y: per * (0.5 * t + 0.5 * Math.min(t, Wwin)) });
+      }
+      var yMax = per * ctxLen * 1.05;
+      ctx.clearRect(0, 0, W, H);
+      var axes = G.drawLines(ctx, W, H, [
+        { points: fullPts, color: c.accent, width: 2.5 },
+        { points: hybPts, color: c.accent500, width: 1.8, dashed: true },
+        { points: winPts, color: c.accent2, width: 2.2 }
+      ], [0, ctxLen], [0, yMax], { xLabel: "sequence length T (tokens)", yLabel: "KV per sequence (GB)" });
+
+      var mx = axes.px(Math.min(Tcur, ctxLen));
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(mx, axes.padT); ctx.lineTo(mx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("full · hybrid (½ window) · window W", axes.padL + 6, axes.padT + 12);
+
+      var fullPeak = per * ctxLen;
+      var winPeak = per * Math.min(ctxLen, Wwin);
+      readout.innerHTML =
+        '<span class="k">model:</span> ' + m.name + " (" + m.kvScheme + ")<br>" +
+        '<span class="k">per token:</span> ' + fmtBytes(bytesPerToken(m, 2)) + "<br>" +
+        '<span class="k">at T = ' + ctxLen + ":</span> full " + fullPeak.toFixed(2) + " GB · window " + winPeak.toFixed(2) + " GB · hybrid " + ((0.5 * fullPeak + 0.5 * winPeak)).toFixed(2) + " GB<br>" +
+        '<span class="k">saving from W=' + Wwin + ":</span> <span class=\"hi\">" + (fullPeak > 0 ? (100 * (1 - winPeak / fullPeak)).toFixed(0) : "0") + "%</span> per sequence";
+    }
+    modelSel.addEventListener("change", function () { modelIdx = parseInt(modelSel.value, 10) || 0; render(); });
+    if (!ctx) ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    G.bindSliders([WS], render);
+    var loop = G.loop({
+      button: playBtn, interval: 55,
+      onStep: function () {
+        var m = pick(models(), modelIdx);
+        var ctxLen = Math.min(m.contextLen, 32768);
+        Tcur += Math.max(1, Math.floor(ctxLen / 90));
+        if (Tcur > ctxLen) Tcur = 0;
+        render();
+      }
+    });
+    onData(function () { buildSelect(); render(); });
+    buildSelect();
+    render();
+  })();
+
+  fetch(window.__KV_DATA_URL).then(function (r) { return r.json(); }).then(applyData).catch(function () { applyData(FALLBACK); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

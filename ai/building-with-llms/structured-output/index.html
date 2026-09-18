@@ -1,0 +1,647 @@
+---
+title: "Building with LLMs, Interactively — Part 9: Structured output and constrained decoding"
+description: "JSON Schema, strict tools, and grammar/FSM token masking; why a constrained decoder guarantees syntax and never semantics."
+permalink: "/ai/building-with-llms/structured-output/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Structured output and constrained decoding</h1>
+    <p>The moment an LLM's output stops being prose and starts being a parameter to a program, the failure mode changes shape. A malformed JSON blob is not a slightly worse answer; it is an exception in a downstream service. This part walks the ladder from politely asking for JSON to a decoder that physically cannot emit anything else — and then draws the line that no decoder can cross: a constrained grammar guarantees the shape of the output and says nothing whatsoever about whether it is true.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="ladder">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The ladder to reliable structure</h2></div>
+    <p class="g-eyebrow">Ask nicely → JSON mode → constrained decoding</p>
+    <p>There are three rungs and they are not equivalent. The first is instruction and example: put the schema in the prompt, show one well-formed instance, and hope. It works often enough to be tempting and fails often enough to break a pipeline — and the failures cluster on exactly the hard cases: long outputs, deep nesting, unusual values, content that contains quotes or newlines. The second rung is JSON mode, where the API guarantees the output is <em>parseable</em> JSON but not that it matches any particular schema; you still validate, and you still handle retries. The third rung is constrained (or guided) decoding, where the sampler itself is only allowed to consider tokens that keep the output a valid prefix of the target grammar.</p>
+    <div class="g-code"><span class="k">// three rungs, three different guarantees</span>
+{ <span class="s">"mode"</span>: "prompted",   <span class="k">// "please reply with JSON"      — no guarantee</span>
+  <span class="s">"mode"</span>: "json_mode",  <span class="k">// parseable JSON, any shape     — syntax only, not your schema</span>
+  <span class="s">"mode"</span>: "grammar",      <span class="k">// a token mask enforces your schema at every step</span>
+}</div>
+    <p>Under the third rung sits a finite-state machine built from the grammar. At each decoding step the engine knows which state it is in, computes the set of vocabulary tokens that would keep the string a valid prefix, masks every other logit to negative infinity, and samples from what is left. The mask below is hand-built for the tiny schema <code>{"name": &lt;string&gt;, "age": &lt;int&gt;}</code> over a deliberately small twelve-token vocabulary. Step through it and watch the allowed set change while the emitted text stays a valid prefix.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="structured-fsm-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Top: the grammar's states, left to right. Middle: the text emitted so far. Bottom: the twelve-token vocabulary — highlighted tokens are allowed in the current state; the rest are masked.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="structured-step" class="g-primary">Emit next token</button>
+          <button id="structured-reset">Reset</button>
+          <button id="structured-play">Play</button>
+        </div>
+        <div class="g-readout" id="structured-fsm-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The first idea:</b> constrained decoding moves the guarantee from the prompt (a request) to the sampler (a mechanism). Once the mask is in place, a malformed <em>token sequence</em> is not a risk any more — it is unreachable.</span></div>
+  </section>
+
+  <section class="g-step" id="how-it-works">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>How the mask is built</h2></div>
+    <p class="g-eyebrow">Grammar to FSM, and why nesting needs a stack</p>
+    <p>Engines like XGrammar (arXiv:2411.15100), Outlines (arXiv:2307.09702) and LLGuidance all take the same shape. Compile the target format — a JSON Schema, a regex, a context-free grammar such as a SQL dialect — into an automaton over the model's vocabulary. At each step, walk the automaton's current state, look at each vocabulary token, and mark it legal only if consuming it keeps the string on a path to an accepting state. Then apply that mask to the logits before sampling. Practical engines precompute per-state masks and cache the small number of states a real request actually visits, which is why constrained decoding is close to free in latency.</p>
+    <p>JSON needs more than a finite-state machine, and that is the detail most explanations skip. Nesting is not regular: <code>{"a": {"b": {"c": …}}}</code> requires counting that the closing braces match the opening ones, so a plain FSM cannot recognise it. The engines use a <strong>pushdown automaton</strong> — an FSM plus a stack — where entering an object pushes and the closing brace pops. Vocabulary tokens that span a structural boundary, such as a token that contains both a value and a closing brace, are handled by advancing the automaton over the token's characters one at a time and masking it only if every character is legal.</p>
+    <p>Two refinements are worth knowing because they change the felt behaviour. <strong>Strict function-calling schemas</strong> are the hosted version of the same idea: you declare the tool arguments as JSON Schema, the provider enforces it (OpenAI's strict mode, for instance, additionally requires that every property be required and that optionality be expressed through unions with null). <strong>Jump-forward decoding</strong> goes further: when the automaton reaches a state where the next characters are forced — the <code>":{"</code> between two known keys — the engine appends those tokens directly instead of sampling them, saving steps and removing a whole class of low-probability mistakes.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="structured-parse-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Left: seeded parse-success rate against the number of schema fields. Bottom: twenty individual unconstrained outputs at the current setting — red is a parse failure.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Schema fields <span class="val">4</span></label><input type="range" id="structured-fields" min="1" max="8" step="1" value="4"></div>
+        <div class="g-field"><label>Per-field reliability <span class="val">93</span></label><input type="range" id="structured-reliability" min="80" max="99" step="1" value="93"></div>
+        <div class="g-readout" id="structured-parse-readout"></div>
+      </div>
+    </div>
+    <p>xGrammar's headline claim is that its compilation and mask generation are fast enough to add only microseconds to a decode step: the cost of correctness here is engineering, not throughput.</p>
+  </section>
+
+  <section class="g-step" id="syntax-not-semantics">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Syntax is not semantics</h2></div>
+    <p class="g-eyebrow">Valid JSON that says the wrong thing</p>
+    <p>This is the sentence to carry away from the part. A constrained decoder guarantees that the output parses. It does not guarantee that a single field is correct. Every failure mode of an unconstrained model survives intact inside a well-formed envelope: wrong numbers, transposed dates, hallucinated fields, the wrong enum value, a unit mismatch between the field name and the value. What changed is only that the failure now arrives as a typed object that your program will happily act on, which is frequently worse than a parse error — a crash is loud, and a plausible wrong value is silent.</p>
+    <p>Notice also what the decoder can do to your confidence. Constraining the output makes the model's tokens near-deterministic in the structural positions, and a downstream reader sees a tidy, syntactically flawless object. The tidiness is manufactured by the grammar, not earned by the content. The demo below makes the point with a real <code>JSON.parse</code>: the object is provably valid, and it contradicts the source on several fields at once.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="structured-semantics-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Left: the source text. Right: the model's output. Red marks flag fields whose values contradict the source, even though the object parses.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="structured-prev">Previous example</button>
+          <button id="structured-next" class="g-primary">Next example</button>
+        </div>
+        <div class="g-readout" id="structured-semantics-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> "we use structured output, so our extraction is reliable" is a category error. The grammar is a <b>syntax</b> guarantee. Reliability of the <b>values</b> still has to be measured, verified against the source, and — where it matters — checked by a second, independent pass.</span></div>
+  </section>
+
+  <section class="g-step" id="schema-design">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Schema design is API design</h2></div>
+    <p class="g-eyebrow">Every nullable union is a branch your caller must handle</p>
+    <p>Because the schema is enforced mechanically, it stops being documentation and becomes an interface. Three habits pay off. Prefer an <strong>enum</strong> to free text whenever the set of answers is closed: <code>"status": {"enum": ["new", "triaged", "closed"]}</code> makes an off-vocabulary value unreachable, where <code>"status": "string"</code> merely invites the model to invent a synonym. Mark fields <strong>required</strong> unless you have genuinely thought about the absent case, because downstream code that assumes presence fails at the worst moment; the strict-mode rules encode exactly this instinct. And avoid <strong>ambiguous unions</strong>: a value that may be a string, a number or an object forces every consumer to branch, and it usually means the model is being asked to make a modelling decision it should not own.</p>
+    <p>The panel below toggles those three decisions and reports a seeded mock validation-failure rate over 300 trials. The baseline is small; free text, optional fields and ambiguous unions move it by tens of points, which is the difference between an extraction pipeline you can trust and one that pages you at night.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="structured-schema-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Left: seeded downstream validation-failure rate for the current schema and two references. Right: the schema the toggles imply.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="structured-enum" class="g-primary">status: enum</button>
+          <button id="structured-required" class="g-primary">fields: required</button>
+          <button id="structured-union">optional: union null</button>
+        </div>
+        <div class="g-readout" id="structured-schema-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="when-you-cannot-constrain">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>When you cannot constrain</h2></div>
+    <p class="g-eyebrow">Retry, validate, and fail loudly</p>
+    <p>Constrained decoding is not always available. The output may be prose that must contain a structured fragment; the provider may not support a grammar; the schema may be too large to compile; or the task may be a free-form answer you only intend to post-process. In those cases the discipline is a validation loop with a hard budget: parse, validate against the schema, and on failure re-ask once with the validator's own error message appended to the conversation. That last detail matters — "field <code>total</code> expected number, got string" is a far better repair prompt than the original instruction repeated.</p>
+    <p>Two rules make the loop safe. First, never let a retry loop run unbounded; three attempts and a typed failure is almost always better than a request that hangs a worker. Second, validate twice: once for the schema and once for the semantics you actually care about — bounds, cross-field consistency, agreement with the source. The first check is what a constrained decoder gives you for free; the second is the check that catches the failure this part exists to warn about.</p>
+    <div class="g-goal">💡 <span><b>Put it together:</b> constrain when you can, validate when you cannot, and treat every structured output as <b>untrusted data with a trustworthy shape</b>. The shape is the decoder's job. The truth is yours.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What does JSON mode guarantee?</td><td>Parseable JSON and nothing more — not your schema, not your field names, not your types.</td></tr>
+        <tr><td>What does a grammar constraint guarantee?</td><td>That the emitted token sequence is a valid string of the grammar. Syntax only.</td></tr>
+        <tr><td>Why is an FSM not enough for JSON?</td><td>Nesting needs a stack to match braces; the engine uses a pushdown automaton, not a finite-state machine.</td></tr>
+        <tr><td>What is jump-forward decoding?</td><td>Appending forced tokens directly instead of sampling them, skipping steps the grammar has already decided.</td></tr>
+        <tr><td>Does constrained decoding improve accuracy?</td><td>Not on the values. It removes malformed-output failures and can otherwise leave content quality unchanged or slightly worse.</td></tr>
+        <tr><td>Enum or free text?</td><td>Enum whenever the answer set is closed; free text invites synonyms a downstream switch will not match.</td></tr>
+        <tr><td>Optional or required?</td><td>Required unless the absent case is designed for; consumers assume presence and fail at the worst moment otherwise.</td></tr>
+        <tr><td>How do you repair a failed parse?</td><td>Re-ask once with the validator's error message appended, bounded to a few attempts, then fail loudly.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Dong et al., <a href="https://arxiv.org/abs/2411.15100">"XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models"</a>, 2024 — grammar compilation and near-zero-overhead token masking.</li>
+      <li>Willard &amp; Louf, <a href="https://arxiv.org/abs/2307.09702">"Efficient Guided Generation for Large Language Models"</a>, 2023 — the Outlines approach: format constraints as FSM-guided decoding.</li>
+      <li>Beurer-Kellner et al., <a href="https://arxiv.org/abs/2403.06988">"Guiding LLMs The Right Way: Fast, Non-Invasive Constrained Generation"</a>, ICML 2024 — why masking must be subword-aligned, and what naive masking costs in task accuracy.</li>
+      <li>OpenAI, <a href="https://platform.openai.com/docs/guides/structured-outputs">Structured outputs guide</a>, 2024 — strict JSON Schema for tool arguments, including the all-fields-required rule.</li>
+      <li>JSON Schema, <a href="https://json-schema.org/specification">Specification</a> — the vocabulary the schemas above are written in; draft revisions are dated and stable enough to pin.</li>
+      <li>Microsoft Guidance, <a href="https://github.com/guidance-ai/llguidance">LLGuidance</a> — a context-free-grammar engine that computes a token mask per step with Earley parsing over a token trie, reports roughly 50 µs per mask, and now backs OpenAI's JSON Schema enforcement.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}You can now guarantee the shape of a single reply. The harder problem is the whole window across many turns — what to keep, drop, summarise and quarantine. Next: the smallest set of high-signal tokens that still produces the outcome.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var GRAMMAR_TITLE = 'grammar:  { "name": <string>, "age": <int> }   ·   10 states   ·   12-token vocabulary';
+
+  // ------------------------------------------------------------------
+  // Demo A — the FSM token-mask visualiser
+  // ------------------------------------------------------------------
+  var VOCAB = ['{', '}', '"name"', '"age"', ':', ',', '"', '"Ada Lovelace"', '"Grace Hopper"', '42', '36', '7'];
+  var STATES = [
+    { label: 'start', allowed: [0], next: { 0: 1 } },
+    { label: 'after {', allowed: [2, 3], next: { 2: 2, 3: 6 } },
+    { label: 'after "name"', allowed: [4], next: { 4: 3 } },
+    { label: 'after "name":', allowed: [7, 8], next: { 7: 4, 8: 4 } },
+    { label: 'after name value', allowed: [5, 1], next: { 5: 5, 1: 9 } },
+    { label: 'after comma', allowed: [3], next: { 3: 6 } },
+    { label: 'after "age"', allowed: [4], next: { 4: 7 } },
+    { label: 'after "age":', allowed: [9, 10, 11], next: { 9: 8, 10: 8, 11: 8 } },
+    { label: 'after age value', allowed: [1], next: { 1: 9 } },
+    { label: 'accept', allowed: [], next: {} }
+  ];
+  var A = { state: 0, emitted: [] };
+  var setupA = Guide.setupCanvas(el('structured-fsm-canvas'), 640, 360, drawA);
+  function emitToken() {
+    var st = STATES[A.state];
+    if (!st.allowed.length) return;
+    var pick = st.allowed[0];
+    A.emitted.push(pick);
+    A.state = st.next[pick];
+  }
+  function emittedText() {
+    return A.emitted.map(function (i) { return VOCAB[i]; }).join('');
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var st = STATES[A.state];
+
+    ctx.textAlign = 'left'; ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText(GRAMMAR_TITLE, 16, 18);
+
+    // state track
+    var n = STATES.length, x0 = 30, x1 = 610;
+    var y = 44, gap = (x1 - x0) / (n - 1);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    STATES.forEach(function (s, i) {
+      var x = x0 + i * gap;
+      var active = i === A.state;
+      var done = i < A.state;
+      ctx.beginPath(); ctx.arc(x, y, active ? 9 : 6, 0, 2 * Math.PI);
+      ctx.fillStyle = active ? c.accent2 : (done ? c.accent700 : c.divider);
+      ctx.fill();
+      if (active) { ctx.strokeStyle = c.accent2; ctx.lineWidth = 2; ctx.stroke(); }
+      ctx.fillStyle = c.text; ctx.font = (active ? '600 ' : '') + '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(String(i), x, y + 21);
+    });
+    ctx.textAlign = 'left'; ctx.font = '600 10px ' + c.font; ctx.fillStyle = c.accent2;
+    ctx.fillText('state ' + A.state + ' · ' + st.label, 16, y + 21);
+
+    // emitted text
+    ctx.fillStyle = c.divider; ctx.fillRect(16, 78, 608, 34);
+    ctx.fillStyle = c.text; ctx.font = '13px ' + c.mono;
+    var txt = emittedText() || '(nothing emitted yet)';
+    ctx.fillText(txt, 26, 100);
+
+    // mask
+    var allowed = st.allowed;
+    ctx.font = '600 10px ' + c.font; ctx.fillStyle = c.text; ctx.textAlign = 'left';
+    ctx.fillText('vocabulary — allowed ' + allowed.length + ' of 12, masked ' + (12 - allowed.length), 16, 132);
+
+    var cols = 6, cw = 92, ch = 64, gx = 8, gy = 10, sx = 20, sy = 146;
+    VOCAB.forEach(function (tok, i) {
+      var cx = sx + (i % cols) * (cw + gx);
+      var cy = sy + Math.floor(i / cols) * (ch + gy);
+      var isAllowed = allowed.indexOf(i) >= 0;
+      ctx.fillStyle = isAllowed ? 'rgba(43,95,255,0.16)' : 'rgba(120,120,120,0.07)';
+      ctx.fillRect(cx, cy, cw, ch);
+      ctx.strokeStyle = isAllowed ? c.accent : c.divider; ctx.lineWidth = isAllowed ? 2 : 1;
+      ctx.strokeRect(cx, cy, cw, ch);
+      ctx.fillStyle = isAllowed ? c.accent700 : c.text;
+      ctx.font = (isAllowed ? '600 ' : '') + '11px ' + c.mono; ctx.textAlign = 'center';
+      ctx.fillText(tok, cx + cw / 2, cy + 26);
+      ctx.font = '9px ' + c.font;
+      ctx.fillStyle = isAllowed ? c.accent700 : 'rgba(120,120,120,0.85)';
+      ctx.fillText(isAllowed ? 'allowed' : 'masked (logit −∞)', cx + cw / 2, cy + 46);
+      ctx.textAlign = 'left';
+    });
+
+    var total = A.emitted.length;
+    el('structured-fsm-readout').innerHTML =
+      '<div><span class="k">state</span> ' + A.state + ' · ' + st.label + ' &nbsp; <span class="k">tokens emitted</span> ' + total + '</div>' +
+      '<div><span class="k">allowed</span> <span class="hi">' + allowed.length + '</span> of 12 &nbsp; <span class="k">masked</span> ' + (12 - allowed.length) + '</div>' +
+      '<div><span class="k">text so far</span> <span class="hi">' + (emittedText() || '—') + '</span></div>' +
+      '<div class="k">' + (A.state === 9 ? 'accepting state reached — the object is complete and valid' : 'every emitted token keeps the string a valid prefix of the grammar') + '</div>';
+  }
+  el('structured-step').addEventListener('click', function () { emitToken(); drawA(); });
+  el('structured-reset').addEventListener('click', function () { A.state = 0; A.emitted = []; drawA(); });
+  var Aplay = Guide.loop({
+    onStep: function () {
+      if (A.state === 9) { Aplay.stop(); return; }
+      emitToken(); drawA();
+      if (A.state === 9) Aplay.stop();
+    },
+    button: el('structured-play'), interval: 550, playLabel: 'Play', pauseLabel: 'Pause'
+  });
+  el('structured-play').addEventListener('click', function () {
+    if (A.state === 9) { A.state = 0; A.emitted = []; drawA(); }
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — constrained versus unconstrained parse rate
+  // ------------------------------------------------------------------
+  var B = { fields: el('structured-fields'), reliability: el('structured-reliability') };
+  var setupB = Guide.setupCanvas(el('structured-parse-canvas'), 640, 320, drawB);
+  function parseRate(fields, q, offset) {
+    var T = 200, ok = 0;
+    for (var t = 0; t < T; t++) {
+      var r = AppSim.rng(4100 + offset * 997 + t * 53 + fields * 17);
+      var good = true;
+      for (var i = 0; i < fields; i++) { if (r() >= q) { good = false; break; } }
+      if (good) ok++;
+    }
+    return ok / T;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var fields = parseInt(B.fields.value, 10);
+    var q = parseInt(B.reliability.value, 10) / 100;
+
+    var px0 = 54, py0 = 46, pw = 500, ph = 170;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(px0, py0 + ph); ctx.lineTo(px0 + pw, py0 + ph); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.fillText('schema fields', px0 + pw / 2, py0 + ph + 22);
+    ctx.save(); ctx.translate(14, py0 + ph / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('outputs that parse', 0, 0); ctx.restore();
+    ctx.textAlign = 'right';
+    ['0%', '50%', '100%'].forEach(function (lab, i) {
+      var v = i * 0.5;
+      ctx.fillText(lab, px0 - 5, py0 + ph * (1 - v) + 3);
+      ctx.strokeStyle = 'rgba(120,120,120,0.12)';
+      ctx.beginPath(); ctx.moveTo(px0, py0 + ph * (1 - v)); ctx.lineTo(px0 + pw, py0 + ph * (1 - v)); ctx.stroke();
+    });
+    function X(f) { return px0 + pw * (f - 1) / 7; }
+    function Y(v) { return py0 + ph * (1 - v); }
+
+    var uncon = [], con = [];
+    var f;
+    for (f = 1; f <= 8; f++) {
+      uncon.push({ x: f, y: parseRate(f, q, 0) });
+      con.push({ x: f, y: 1 });
+    }
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.4; ctx.beginPath();
+    uncon.forEach(function (pt, i) { if (i === 0) ctx.moveTo(X(pt.x), Y(pt.y)); else ctx.lineTo(X(pt.x), Y(pt.y)); });
+    ctx.stroke();
+    ctx.fillStyle = c.accent2;
+    uncon.forEach(function (pt) { ctx.beginPath(); ctx.arc(X(pt.x), Y(pt.y), 2.6, 0, 2 * Math.PI); ctx.fill(); });
+
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 2.4; ctx.beginPath();
+    con.forEach(function (pt, i) { if (i === 0) ctx.moveTo(X(pt.x), Y(pt.y)); else ctx.lineTo(X(pt.x), Y(pt.y)); });
+    ctx.stroke();
+
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent2; ctx.fillText('unconstrained (prompted)', px0 + 8, py0 + 14);
+    ctx.fillStyle = c.accent700; ctx.fillText('grammar-constrained — flat 100%', px0 + 8, py0 + 28);
+
+    // per-output strip at the current field count
+    var T = 20, bad = 0;
+    var r = AppSim.rng(9100 + fields * 23);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('twenty unconstrained outputs at ' + fields + ' field' + (fields === 1 ? '' : 's') + ':', px0, 258);
+    for (var i = 0; i < T; i++) {
+      var good = true;
+      for (var k = 0; k < fields; k++) { if (r() >= q) { good = false; break; } }
+      if (!good) bad++;
+      var bx = px0 + i * 25;
+      ctx.fillStyle = good ? c.accent400 : c.accent2;
+      ctx.fillRect(bx, 268, 21, 18);
+    }
+    ctx.fillStyle = c.text; ctx.fillText('failures: ' + bad + ' / ' + T, px0, 304);
+    ctx.fillStyle = c.accent700; ctx.fillText('constrained: 0 / ' + T + ' — unparseable token sequences are unreachable', px0 + 150, 304);
+
+    var now = parseRate(fields, q, 0);
+    var lvl = parseRate(1, q, 0);
+    el('structured-parse-readout').innerHTML =
+      '<div><span class="k">fields</span> ' + fields + ' &nbsp; <span class="k">per-field reliability</span> ' + (q * 100).toFixed(0) + '%</div>' +
+      '<div><span class="k">unconstrained parse rate</span> <span class="hi">' + (now * 100).toFixed(0) + '%</span></div>' +
+      '<div><span class="k">constrained parse rate</span> <span class="hi">100%</span> — by construction, at any field count</div>' +
+      '<div class="k">one field parses ' + (lvl * 100).toFixed(0) + '% of the time; eight compound to ' + ((parseRate(8, q, 0)) * 100).toFixed(0) + '%</div>';
+  }
+  Guide.bindSliders([B.fields, B.reliability], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — valid JSON, wrong values
+  // ------------------------------------------------------------------
+  var EXAMPLES = [
+    {
+      source: 'Invoice IN-4471, dated 3 March 2026, from Northwind Traders to Acme Ltd. Line items: 12 x widget at $4.50 = $54.00; 3 x bracket at $18.00 = $54.00. Subtotal $108.00, tax $8.64, total $116.64. Payment due 2 April 2026.',
+      json: [
+        '{',
+        '  "invoice_id": "IN-4471",',
+        '  "date": "2026-03-13",',
+        '  "vendor": "Northwind Traders",',
+        '  "currency": "USD",',
+        '  "total": 1116.64,',
+        '  "due_date": "2026-04-02"',
+        '}'
+      ],
+      issues: [
+        { line: 2, note: 'source says 3 March; this says the 13th' },
+        { line: 4, note: 'the currency is never stated in the source' },
+        { line: 5, note: 'source total is $116.64, not $1116.64' }
+      ]
+    },
+    {
+      source: 'The refund for order 88213 was issued on 4 November 2025 for EUR 240.50, to the card ending 4417.',
+      json: [
+        '{',
+        '  "order_id": "88213",',
+        '  "amount": 204.5,',
+        '  "currency": "EUR",',
+        '  "issued_on": "2025-11-04",',
+        '  "card_last4": "4417"',
+        '}'
+      ],
+      issues: [
+        { line: 2, note: 'source says 240.50; the digits are transposed' }
+      ]
+    },
+    {
+      source: 'Ticket 4417 was closed as "duplicate" on 2026-02-11; the reporter was moved to the 3.2 milestone.',
+      json: [
+        '{',
+        '  "ticket": 4417,',
+        '  "status": "resolved",',
+        '  "closed_on": "2026-02-11",',
+        '  "milestone": "3.2"',
+        '}'
+      ],
+      issues: [
+        { line: 2, note: 'source says "duplicate"; "resolved" is a different value of the same field' }
+      ]
+    },
+    {
+      source: 'The median end-to-end latency was 240 ms at p50 and 610 ms at p99; throughput held at 120 requests per second.',
+      json: [
+        '{',
+        '  "latency_p50_seconds": 240,',
+        '  "latency_p99_seconds": 610,',
+        '  "throughput_rps": 120',
+        '}'
+      ],
+      issues: [
+        { line: 1, note: '240 is milliseconds; the field name claims seconds' },
+        { line: 2, note: '610 is milliseconds; the field name claims seconds' }
+      ]
+    }
+  ];
+  var C = { idx: 0 };
+  var setupC = Guide.setupCanvas(el('structured-semantics-canvas'), 640, 300, drawC);
+  function wrapText(ctx, text, maxWidth) {
+    var words = String(text).split(/\s+/), lines = [], cur = '';
+    words.forEach(function (w) {
+      var trial = cur ? cur + ' ' + w : w;
+      if (ctx.measureText(trial).width > maxWidth && cur) { lines.push(cur); cur = w; }
+      else { cur = trial; }
+    });
+    if (cur) lines.push(cur);
+    return lines;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var ex = EXAMPLES[C.idx];
+
+    ctx.textAlign = 'left'; ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText('source text', 16, 18);
+    ctx.font = '10.5px ' + c.font; ctx.fillStyle = c.text;
+    var lines = wrapText(ctx, ex.source, 288);
+    lines.forEach(function (ln, i) { ctx.fillText(ln, 16, 40 + i * 16); });
+
+    ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText('model output — parsed with JSON.parse', 328, 18);
+
+    var issueLines = {};
+    ex.issues.forEach(function (iss) { issueLines[iss.line] = iss; });
+    ctx.font = '11px ' + c.mono;
+    ex.json.forEach(function (ln, i) {
+      var y = 40 + i * 22;
+      if (issueLines[i]) {
+        ctx.fillStyle = 'rgba(214,0,108,0.13)';
+        ctx.fillRect(324, y - 13, 300, 20);
+        ctx.fillStyle = c.accent2;
+        ctx.fillRect(324, y - 13, 3, 20);
+      }
+      ctx.fillStyle = issueLines[i] ? c.accent2 : c.text;
+      ctx.fillText(ln, 334, y);
+    });
+
+    var valid = true, parsed = null;
+    try { parsed = JSON.parse(ex.json.join('\n')); } catch (e) { valid = false; }
+    ctx.fillStyle = valid ? c.accent700 : c.accent2;
+    ctx.font = '600 11px ' + c.font;
+    ctx.fillText(valid ? '✓ JSON.parse succeeded — the shape is flawless' : '✗ JSON.parse failed', 328, 286);
+
+    el('structured-semantics-readout').innerHTML =
+      '<div><span class="k">valid JSON</span> <span class="hi">' + (valid ? 'yes' : 'no') + '</span>' +
+      ' &nbsp; <span class="k">contradictions</span> <span class="bad">' + ex.issues.length + '</span></div>' +
+      ex.issues.map(function (iss) {
+        return '<div><span class="k">line ' + (iss.line + 1) + '</span> ' + iss.note + '</div>';
+      }).join('') +
+      '<div class="k">' + (parsed ? 'the object parsed; every consumer downstream would accept it without complaint' : '') + '</div>';
+  }
+  el('structured-prev').addEventListener('click', function () { C.idx = (C.idx + EXAMPLES.length - 1) % EXAMPLES.length; drawC(); });
+  el('structured-next').addEventListener('click', function () { C.idx = (C.idx + 1) % EXAMPLES.length; drawC(); });
+
+  // ------------------------------------------------------------------
+  // Demo D — schema design panel
+  // ------------------------------------------------------------------
+  var D = { enums: true, required: true, union: false };
+  var setupD = Guide.setupCanvas(el('structured-schema-canvas'), 640, 300, drawD);
+  function failureProb(o) {
+    var p = 0.03;
+    if (!o.enums) p += 0.22;
+    if (!o.required) p += 0.17;
+    if (o.union) p += 0.13;
+    return Math.min(0.95, p);
+  }
+  function seededFailure(o) {
+    var prob = failureProb(o);
+    var seed = 6000 + (o.enums ? 11 : 0) + (o.required ? 7 : 0) + (o.union ? 13 : 0);
+    var T = 300, bad = 0;
+    for (var t = 0; t < T; t++) { if (AppSim.rng(seed + t * 37)() < prob) bad++; }
+    return bad / T;
+  }
+  function schemaLines(o) {
+    return [
+      'type: object',
+      'properties:',
+      '  status:',
+      o.enums ? '    enum: [new, triaged, closed]' : '    type: string',
+      '  total:',
+      o.union ? '    type: [number, "null"]' : '    type: number',
+      'required:',
+      o.required ? '  [status, total]' : '  []  // nothing required'
+    ];
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 300;
+    ctx.clearRect(0, 0, W, H);
+
+    var cur = seededFailure(D);
+    var strict = seededFailure({ enums: true, required: true, union: false });
+    var naive = seededFailure({ enums: false, required: false, union: true });
+    var rows = [
+      { label: 'this schema', value: cur, color: c.accent },
+      { label: 'strict reference', value: strict, color: c.accent700 },
+      { label: 'naive reference', value: naive, color: c.accent2 }
+    ];
+    var bx = 130, bw = 200;
+    ctx.textAlign = 'left'; ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText('seeded downstream validation failures · 300 trials', 16, 18);
+    rows.forEach(function (r, i) {
+      var y = 50 + i * 40;
+      ctx.font = '11px ' + c.font; ctx.fillStyle = c.text; ctx.textAlign = 'right';
+      ctx.fillText(r.label, bx - 8, y + 14);
+      ctx.fillStyle = c.divider; ctx.fillRect(bx, y, bw, 20);
+      ctx.fillStyle = r.color; ctx.fillRect(bx, y, Math.max(1, bw * r.value), 20);
+      ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+      ctx.fillText((r.value * 100).toFixed(0) + '%', bx + bw + 8, y + 14);
+    });
+
+    ctx.textAlign = 'left'; ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText('schema the toggles describe', 400, 18);
+    ctx.font = '11px ' + c.mono;
+    schemaLines(D).forEach(function (ln, i) {
+      ctx.fillStyle = c.text;
+      ctx.fillText(ln, 400, 44 + i * 19);
+    });
+
+    var delta = cur - strict;
+    el('structured-schema-readout').innerHTML =
+      '<div><span class="k">status</span> ' + (D.enums ? 'enum' : 'free text') +
+      ' &nbsp; <span class="k">fields</span> ' + (D.required ? 'required' : 'optional') +
+      ' &nbsp; <span class="k">optional</span> ' + (D.union ? 'union with null' : 'non-null') + '</div>' +
+      '<div><span class="k">failure rate</span> <span class="' + (cur > 0.15 ? 'bad' : 'hi') + '">' + (cur * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">strict reference</span> ' + (strict * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">naive reference</span> ' + (naive * 100).toFixed(0) + '%</div>' +
+      '<div class="k">' + (delta < 0.02
+        ? 'the schema is doing as much work as a schema can: closed vocabulary, required fields, no ambiguous union'
+        : 'every removed guarantee is worth ' + (delta * 100).toFixed(0) + ' points of downstream failure') + '</div>';
+  }
+  function syncD() {
+    el('structured-enum').className = D.enums ? 'g-primary' : '';
+    el('structured-enum').textContent = D.enums ? 'status: enum' : 'status: free text';
+    el('structured-required').className = D.required ? 'g-primary' : '';
+    el('structured-required').textContent = D.required ? 'fields: required' : 'fields: optional';
+    el('structured-union').className = D.union ? 'g-primary' : '';
+    drawD();
+  }
+  el('structured-enum').addEventListener('click', function () { D.enums = !D.enums; syncD(); });
+  el('structured-required').addEventListener('click', function () { D.required = !D.required; syncD(); });
+  el('structured-union').addEventListener('click', function () { D.union = !D.union; syncD(); });
+
+  drawA(); drawB(); drawC(); syncD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'structured-output-syntax-semantics',
+      kind: 'choice',
+      prompt: 'A grammar-constrained decoder emits a JSON object with a wrong total and a fabricated field. What did the constraint guarantee?',
+      options: [
+        { label: 'Only that the output parses as valid JSON of the declared shape — nothing about the values.', correct: true },
+        { label: 'That the values are consistent with the source, since the schema was enforced.', correct: false },
+        { label: 'That the model verified each field before emitting it.', correct: false },
+        { label: 'Nothing at all; constrained decoding is purely cosmetic.', correct: false }
+      ],
+      explanation: 'The mask operates on the token sequence, so it can only constrain syntax. Wrong numbers, transposed dates and hallucinated fields all survive inside a well-formed envelope — the failure is now silent rather than loud.'
+    },
+    {
+      id: 'structured-output-mask-numeric',
+      kind: 'numeric',
+      prompt: 'In the token-mask demo the vocabulary has 12 tokens, and the very first state allows only the opening brace. How many tokens are masked at that step?',
+      answer: 11,
+      unit: 'tokens',
+      tolerance: 0,
+      explanation: 'The mask covers every token that is not allowed: 12 − 1 = 11 tokens are set to negative infinity, so only the opening brace can be sampled.'
+    },
+    {
+      id: 'structured-output-pushdown',
+      kind: 'choice',
+      prompt: 'Why does constraining JSON require more than a finite-state machine?',
+      options: [
+        { label: 'Nesting needs a counter for opened and closed braces, so the automaton needs a stack — a pushdown automaton.', correct: true },
+        { label: 'JSON keys are unbounded strings, and an FSM cannot store strings.', correct: false },
+        { label: 'Numbers are real-valued and an FSM only handles integers.', correct: false },
+        { label: 'An FSM cannot represent the boolean literals true and false.', correct: false }
+      ],
+      explanation: 'Matching nested braces is not a regular language: you must remember how many objects are open. Engines use an FSM plus a stack, advancing over a token\'s characters one at a time so tokens that span a structural boundary are handled correctly.'
+    },
+    {
+      id: 'structured-output-schema-design',
+      kind: 'choice',
+      prompt: 'A field\'s value comes from a closed set of five labels. What should the schema say?',
+      options: [
+        { label: 'An enum of the five labels, so any other value is unreachable.', correct: true },
+        { label: 'A free-text string, because the model writes better prose than it picks options.', correct: false },
+        { label: 'A union of string, number and object, to be flexible about formats.', correct: false },
+        { label: 'An optional string, so the model can omit it when unsure.', correct: false }
+      ],
+      explanation: 'Enums make off-vocabulary values impossible and are directly checkable; free text invites synonyms a downstream switch will not match, and an ambiguous union forces every consumer to branch.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,576 @@
+---
+title: "Building with LLMs, Interactively — Part 5: Your first eval, in twenty lines"
+description: "Five examples, a binary check and a pass rate — built deliberately early, so every later part is measurable."
+permalink: "/ai/building-with-llms/first-eval/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Your first eval, in twenty lines</h1>
+    <p>Five labelled inputs, one binary check, one number. That is an evaluation, and it is the smallest piece of real infrastructure in this volume. It is deliberately early — before retrieval, before reasoning, before any agent — because every later part is only measurable against it. A prompt is disposable; a labelled set and the check that grades it survive every model upgrade. This part builds the harness you will use for the rest of the series, and makes the case that evaluation, not prompting, is the durable moat.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="what-an-eval-is">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>An eval is three things</h2></div>
+    <p class="g-eyebrow">Labelled inputs, a deterministic check, a pass rate</p>
+    <p>An evaluation is not a leaderboard, a vibes check, or an afternoon of reading outputs. It is three pieces of machinery: a <b>labelled set</b> of inputs where each input carries an expected result, a <b>deterministic check</b> that grades one output as pass or fail, and the <b>pass rate</b> over the set. That is the entire object. Twenty lines of code will build it, and you can build it today.</p>
+    <p>The reason to build it this early — before retrieval, before agents, before a real product — is that everything downstream becomes measurable the moment it exists. A prompt change, a new model version, a reranker, a compaction policy: each is only <em>better</em> in relation to a number. Without the harness, "better" is an opinion, and opinions do not survive a model upgrade.</p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> a prompt is a hypothesis, and an eval is the only thing that can tell you whether the hypothesis is still true. Write the check before you write the twenty-second prompt variation.</span></div>
+    <p>Below is a five-case harness. Each row of the heatmap is a labelled input; each column is a prompt version; the colour is the probability that case passes under that version, drawn from a fixed seed. The bars on the right are the realised pass rate. Nothing here calls a model — the probabilities <em>are</em> the mock model, and the seeded coin flip per case is the flakiness you would see on a real one.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fe-harness-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: per-case pass probability for each prompt version (fixed seed). Right: the realised pass rate of the selected version. Re-run to draw a new seed and watch a flaky case flip.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prompt version <span class="val">2</span></label><input type="range" id="fe-version" min="1" max="3" step="1" value="2"></div>
+        <div class="g-btnrow">
+          <button id="fe-rerun" class="g-primary">Re-run the eval (new seed)</button>
+        </div>
+        <div class="g-readout" id="fe-harness-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> a check that needs a human to read the output is not a check — it is a review. If you cannot express "correct" as a function from output to <code>true</code>/<code>false</code>, the first job is to reshape the task until you can.</span></div>
+  </section>
+
+  <section class="g-step" id="five-examples">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Five examples is already enough</h2></div>
+    <p class="g-eyebrow">Imprecise, but not useless</p>
+    <p>Five cases will not give you a precise pass rate, and it is worth being honest about how imprecise. With five trials, a 95% confidence interval around an 80% pass rate spans roughly 38 to 96 per cent. That number is nearly useless as a measurement and completely useful as an <em>alarm</em>: a gross regression — a prompt that breaks formatting, a model that stops following the output contract — turns five passes into one or two, and that is visible through the noise.</p>
+    <p>The mistake is to treat precision as a prerequisite. Early on you are not estimating a rate, you are detecting a catastrophe, and a small golden set does that on day one. Precision is what you buy later, by growing the set. The demo below makes the trade concrete: it draws a seeded sample as the eval set grows and reports the 95% interval around the running pass rate.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fe-n-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Running pass rate as the set grows (seeded sample). The band is the 95% Wilson interval — wide at n=5, workable at n=50. Error bars mark both.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>True pass rate <span class="val">80</span></label><input type="range" id="fe-b-p" min="50" max="95" step="1" value="80"></div>
+        <div class="g-btnrow">
+          <button id="fe-b-reroll">Draw a new sample</button>
+        </div>
+        <div class="g-readout" id="fe-b-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Rule of thumb:</b> interval width falls as <var>1/√n</var>. Going from 5 to 20 cases halves it; going from 20 to 80 halves it again. Buy precision in powers of four, and only when the decision needs it.</span></div>
+  </section>
+
+  <section class="g-step" id="golden-set">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Three sets, three jobs</h2></div>
+    <p class="g-eyebrow">Golden, held-out, production sample</p>
+    <p>Once the harness exists, the labelled data splits into three roles, and conflating them is how teams fool themselves.</p>
+    <p>A <b>golden set</b> is small, curated and fixed. You look at it constantly, you tune against it, and its job is to catch regressions — to shout when a case that used to pass stops passing. A <b>held-out set</b> is labelled but <em>not</em> looked at while you iterate; its job is to give an honest estimate, because a prompt tuned against the golden set will eventually memorise it. (This is overfitting a prompt to its examples, and it gets the full treatment in <a href="{{ '/ai/agents-in-action/datasets-and-ci/' | relative_url }}">Agents in Action, Part 9</a>.) A <b>production sample</b> is drawn from live traffic, labelled later, and its job is to catch drift — the world moving out from under a set you froze six months ago.</p>
+    <p>Below is the golden set doing its one job: comparing two prompt versions case by case and pointing at the single case that flipped. That highlighted row is the entire value of a golden set.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fe-diff-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Per-case outcome for two versions. A red row is a regression (passed before, fails now); green is a fix; grey is unchanged.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Version A <span class="val">2</span></label><input type="range" id="fe-diff-a" min="1" max="3" step="1" value="2"></div>
+        <div class="g-field"><label>Version B <span class="val">3</span></label><input type="range" id="fe-diff-b" min="1" max="3" step="1" value="3"></div>
+        <div class="g-readout" id="fe-diff-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> tuning against the set you also report on. The moment a golden case is edited to make a prompt pass, it is no longer evidence. Freeze the golden set, and keep the tuning edits in the prompt.</span></div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What it costs to know</h2></div>
+    <p class="g-eyebrow">Calls × tokens × price × how often you run it</p>
+    <p>An eval is inference, and inference is billed. The cost of one run is <var>cases × calls-per-case × tokens-per-call × price-per-token</var>, and the cost of <em>having</em> an eval is that figure multiplied by how often CI runs it. The arithmetic is friendly: even a five-hundred-case set with one call per case is a few dollars a run at list prices, which is why the honest framing is not "can we afford evals" but "can we afford to ship blind".</p>
+    <p>Latency matters too, because a suite that takes an hour will not run on every pull request. Below, a small suite (five cases), a working suite (fifty) and a release suite (five hundred) are priced daily against the same token and price assumptions. Move the sliders and watch the release suite become the only one worth optimising.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fe-cost-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Estimated daily cost of running each suite at the chosen cadence, using the selected token counts and price list. The release suite is highlighted.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Input tokens per call <span class="val">600</span></label><input type="range" id="fe-cost-in" min="50" max="2000" step="50" value="600"></div>
+        <div class="g-field"><label>Output tokens per call <span class="val">120</span></label><input type="range" id="fe-cost-out" min="20" max="500" step="10" value="120"></div>
+        <div class="g-field"><label>Calls per case <span class="val">1</span></label><input type="range" id="fe-cost-calls" min="1" max="3" step="1" value="1"></div>
+        <div class="g-field"><label>CI runs per day <span class="val">4</span></label><input type="range" id="fe-cost-runs" min="1" max="50" step="1" value="4"></div>
+        <div class="g-readout" id="fe-cost-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="fe-price-source"></p>
+    <p class="g-source" id="fe-cost-source"></p>
+  </section>
+
+  <section class="g-step" id="moat">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Evaluation is the durable moat</h2></div>
+    <p class="g-eyebrow">The thesis of both volumes</p>
+    <p>Prompting is a real skill and it transfers — but a prompt is a fragile artifact. It is tuned to one model at one moment, and the next checkpoint can break it silently. What compounds instead is the labelled set, the harness that grades it, and the habits around them: the golden set that catches regressions, the held-out set that keeps you honest, the production sample that catches drift, and the CI wiring that makes all three run without being asked.</p>
+    <p>Put the argument at its strongest and it sounds like this: <em>as models improve, most prompt engineering is automated away, but the ability to say what "good" means — as labelled examples and a check — only becomes more valuable, because it is the thing that directs the improvement.</em> No model can be told to "make the product better"; it can be told to raise a pass rate on a set you defined. The set is the specification.</p>
+    <p>The counter-argument is worth stating too, because it is not weak. An eval is a measurement, and measurements get gamed: an engineer under a pass-rate target will find the shortest path to the number rather than the fix, and a set frozen too early ossifies into a target that no longer matches the product. The answer is not to abandon the harness but to treat it as living machinery — refresh it from production, hold out the honest estimate, and never let one number be the whole picture. The point stands: the moat is not the model, and not the prompt. It is the loop that measures them.</p>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> every remaining part of this volume adds a component — tokens, sampling, cost, instructions, examples, reasoning, retrieval — and each one is only an improvement if it moves a pass rate you built in this part.</span></div>
+    <p class="g-source" id="fe-source"></p>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes everything</th></tr></thead>
+      <tbody>
+        <tr><td>What is an eval?</td><td>Labelled inputs + a deterministic check + a pass rate. Nothing else.</td></tr>
+        <tr><td>When do I build it?</td><td>Before you need it — before the prompt has variations worth comparing.</td></tr>
+        <tr><td>Why is a binary check better than a score?</td><td>A pass/fail you can defend beats a 1–10 you cannot reproduce.</td></tr>
+        <tr><td>How many cases do I start with?</td><td>Five. It cannot measure, but it can detect a catastrophe.</td></tr>
+        <tr><td>Golden vs held-out vs production sample?</td><td>Regressions · honest estimate · drift. Keep the roles separate.</td></tr>
+        <tr><td>Why is n=5 noisy?</td><td>The 95% interval at n=5 spans tens of percentage points. Width falls as 1/√n.</td></tr>
+        <tr><td>What does an eval cost?</td><td>cases × calls × tokens × price × cadence. Cheaper than shipping blind.</td></tr>
+        <tr><td>Where is the moat?</td><td>In evaluation, not prompting: the labelled set and the harness around it.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024 — the arXiv version of the benchmark behind the SWE-bench Verified subset.</li>
+      <li>OpenAI, <a href="https://openai.com/index/introducing-swe-bench-verified/">"Introducing SWE-bench Verified"</a>, 13 August 2024 — a 500-instance human-validated subset, and a worked example of curating a golden set.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — the paper that introduced pass^k as the reliability counterpart to pass@k.</li>
+      <li>Mialon et al., <a href="https://arxiv.org/abs/2311.12983">"GAIA: A Benchmark for General AI Assistants"</a>, 2023 — multi-step assistant tasks graded against exact answers, and a lesson in how much a grader can hide.</li>
+      <li>Liang et al., <a href="https://arxiv.org/abs/2211.09110">"Holistic Evaluation of Language Models"</a>, 2022 — HELM's argument for reporting many metrics rather than one number.</li>
+      <li>Sculley et al., <a href="https://papers.nips.cc/paper/5656-hidden-technical-debt-in-machine-learning-systems">"Hidden Technical Debt in Machine Learning Systems"</a>, NeurIPS 2015 — why the code is a small part of the system, and why the data and the loop dominate.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}With a pass rate in hand, the next lever is the text at the top of every prompt: who the model thinks it is, what the roles mean, and where the data stops and the instructions begin.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024), SWE-bench Verified (OpenAI, 2024-08), τ-bench (Yao et al., arXiv:2406.12045, 2024), GAIA (Mialon et al., arXiv:2311.12983, 2023) and HELM (Liang et al., arXiv:2211.09110, 2022). Public scores are contaminated by training-data leakage and harness drift; a public number is a weak predictor of your task. Offline fallback."
+    },
+    pricing: {
+      source: "Historical vendor list prices, early-to-mid 2025, per 1M tokens. Offline fallback constants.",
+      items: [
+        { model: "GPT-4o", inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25 }
+      ]
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). Eval-run cost is arithmetic: cases x calls x tokens x price x cadence. Offline fallback."
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Shared mock model: 5 golden cases, 3 prompt versions, seeded outcomes
+  // ------------------------------------------------------------------
+  var CASES = ['refund-policy', 'shipping-window', 'account-merge', 'invoice-format', 'cancel-order'];
+  var CASE_LABELS = ['refund', 'shipping', 'merge', 'invoice', 'cancel'];
+  var VERSIONS = ['v1', 'v2', 'v3'];
+  // Intended outcome per version (1 = pass). v2 is the best; v3 introduces a
+  // regression on case 2 that the golden set exists to catch.
+  var INTENT = [
+    [1, 0, 1, 0, 0],
+    [1, 1, 1, 1, 1],
+    [1, 1, 0, 1, 1]
+  ];
+  var DIFF = [0.10, 0.34, 0.58, 0.22, 0.46];
+
+  function caseProb(v, i, seed) {
+    var r = AppSim.rng(seed * 13 + v * 101 + i * 37);
+    var jitter = (r() - 0.5) * 0.10;
+    var base = INTENT[v][i] ? 0.90 : 0.15;
+    return Math.max(0.03, Math.min(0.97, base + jitter - DIFF[i] * 0.15));
+  }
+  function casePass(v, i, seed) {
+    var r = AppSim.rng(seed * 29 + v * 211 + i * 53);
+    return r() < caseProb(v, i, seed);
+  }
+  function passList(v, seed) {
+    var out = [];
+    for (var i = 0; i < CASES.length; i++) out.push(casePass(v, i, seed));
+    return out;
+  }
+  function passRate(v, seed) {
+    var n = 0;
+    passList(v, seed).forEach(function (p) { if (p) n++; });
+    return n / CASES.length;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the harness: per-case heatmap + realised pass-rate bars
+  // ------------------------------------------------------------------
+  var A = { version: el('fe-version'), seed: 3 };
+  var setupA = Guide.setupCanvas(el('fe-harness-canvas'), 640, 340, drawA);
+
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, H = 340;
+    var seed = A.seed;
+    var ver = parseInt(A.version.value, 10) - 1;
+
+    var matrix = [];
+    for (var i = 0; i < CASES.length; i++) {
+      var row = [];
+      for (var v = 0; v < VERSIONS.length; v++) row.push(caseProb(v, i, seed));
+      matrix.push(row);
+    }
+    var geo = Guide.drawHeatmap(ctx, 380, H, matrix, {
+      min: 0, max: 1, rowLabels: CASE_LABELS, colLabels: VERSIONS,
+      padL: 104, padT: 42, padB: 36, fontSize: 10,
+      colorLow: [240, 236, 244], colorHigh: [214, 0, 108]
+    });
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('per-case pass probability (fixed seed ' + seed + ')', 10, 16);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('case', 10, 30);
+
+    ctx.strokeStyle = c.text; ctx.lineWidth = 2;
+    ctx.strokeRect(geo.padL + ver * geo.cellW, geo.padT, geo.cellW, geo.cellH * CASES.length);
+    ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('selected', geo.padL + ver * geo.cellW + geo.cellW / 2, geo.padT - 6);
+
+    // right pane: realised pass rate per version
+    ctx.clearRect(384, 0, 256, H);
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('realised pass rate', 396, 16);
+    var bx = 434, bw = 168;
+    for (var v2 = 0; v2 < VERSIONS.length; v2++) {
+      var rate = passRate(v2, seed);
+      var y = 60 + v2 * 70;
+      ctx.fillStyle = c.divider; ctx.fillRect(bx, y, bw, 26);
+      ctx.fillStyle = (v2 === ver) ? c.accent2 : c.accent400;
+      ctx.fillRect(bx, y, bw * rate, 26);
+      ctx.fillStyle = c.text; ctx.font = (v2 === ver ? '600 ' : '') + '11px ' + c.font;
+      ctx.textAlign = 'right';
+      ctx.fillText(VERSIONS[v2], bx - 8, y + 17);
+      ctx.textAlign = 'left';
+      ctx.fillText(Math.round(rate * CASES.length) + '/' + CASES.length, bx + bw + 6, y + 17);
+    }
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('a seeded coin flip per case', 396, 60 + 3 * 70 + 6);
+    ctx.fillText('is the flakiness of a real model.', 396, 60 + 3 * 70 + 20);
+
+    var list = passList(ver, seed);
+    var failed = [];
+    list.forEach(function (p, idx) { if (!p) failed.push(CASE_LABELS[idx]); });
+    el('fe-harness-readout').innerHTML =
+      '<div><span class="k">selected prompt</span> <span class="hi">' + VERSIONS[ver] + '</span> · seed ' + seed + '</div>' +
+      '<div><span class="k">pass rate</span> <span class="hi">' + Guide.fmtPct(passRate(ver, seed), 0) + '</span> (' + (CASES.length - failed.length) + ' of ' + CASES.length + ')</div>' +
+      '<div><span class="k">failing cases</span> ' + (failed.length ? failed.join(', ') : 'none') + '</div>' +
+      '<div class="k">re-run to resample the flaky cases and watch the rate move</div>';
+  }
+  Guide.bindSliders([A.version], function () {
+    var ver = parseInt(A.version.value, 10);
+    var valEl = A.version.parentElement ? A.version.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = 'v' + ver;
+    drawA();
+  });
+  el('fe-rerun').addEventListener('click', function () {
+    A.seed = (A.seed + 13) % 401;
+    drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — n=5 vs n=50: the interval narrows as 1/sqrt(n)
+  // ------------------------------------------------------------------
+  var B = { p: el('fe-b-p'), seed: 11 };
+  var setupB = Guide.setupCanvas(el('fe-n-canvas'), 640, 340, drawB);
+
+  function wilson(phat, n) {
+    var z = 1.96;
+    var denom = 1 + z * z / n;
+    var centre = (phat + z * z / (2 * n)) / denom;
+    var half = z * Math.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom;
+    return { lo: Math.max(0, centre - half), hi: Math.min(1, centre + half), half: half };
+  }
+  function sampleAt(n, p, seed) {
+    var r = AppSim.rng(seed);
+    var hits = 0, arr = [];
+    for (var i = 0; i < n; i++) { var v = r() < p ? 1 : 0; hits += v; arr.push(v); }
+    return { hits: hits, n: n, phat: hits / n, arr: arr };
+  }
+
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, H = 340;
+    var p = parseInt(B.p.value, 10) / 100;
+    var N = 200;
+    var sample = sampleAt(N, p, B.seed).arr;
+    var cum = 0, los = [], his = [], pts = [];
+    for (var n = 1; n <= N; n++) {
+      cum += sample[n - 1];
+      var phat = cum / n;
+      var ci = wilson(phat, n);
+      los.push({ x: n, y: ci.lo });
+      his.push({ x: n, y: ci.hi });
+      pts.push({ x: n, y: phat });
+    }
+    var axes = Guide.drawLines(ctx, 640, H,
+      [
+        { points: los, color: c.accent400, width: 1.4 },
+        { points: his, color: c.accent400, width: 1.4 },
+        { points: pts, color: c.accent, width: 2.2 }
+      ],
+      [1, N], [0, 1],
+      { xLabel: 'labelled cases in the eval set (n)', yLabel: 'pass rate', padL: 54, padB: 32, padT: 34 });
+    // true rate reference line
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(axes.padL, axes.py(p)); ctx.lineTo(axes.padL + axes.plotW, axes.py(p)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('true rate ' + Guide.fmtPct(p, 0), axes.padL + 4, axes.py(p) - 4);
+
+    function bar(n) {
+      var s = sampleAt(n, p, B.seed);
+      var ci = wilson(s.phat, n);
+      var x = axes.px(n);
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, axes.py(ci.lo)); ctx.lineTo(x, axes.py(ci.hi)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x - 7, axes.py(ci.lo)); ctx.lineTo(x + 7, axes.py(ci.lo)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x - 7, axes.py(ci.hi)); ctx.lineTo(x + 7, axes.py(ci.hi)); ctx.stroke();
+      ctx.fillStyle = c.accent700; ctx.beginPath(); ctx.arc(x, axes.py(s.phat), 3.5, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('n=' + n, x, H - 20);
+      return ci;
+    }
+    var ci5 = bar(5), ci50 = bar(50);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('point = running pass rate · whiskers = 95% Wilson interval', axes.padL + 4, 18);
+
+    el('fe-b-readout').innerHTML =
+      '<div><span class="k">at n=5</span> interval width <span class="hi">' + (100 * (ci5.hi - ci5.lo)).toFixed(0) + ' pts</span></div>' +
+      '<div><span class="k">at n=50</span> interval width <span class="hi">' + (100 * (ci50.hi - ci50.lo)).toFixed(0) + ' pts</span></div>' +
+      '<div><span class="k">running estimate</span> ' + Guide.fmtPct(pts[N - 1].y, 1) + ' over ' + N + ' cases</div>' +
+      '<div class="k">width falls as 1/sqrt(n): 5 to 20 halves it; 20 to 80 halves it again</div>';
+  }
+  Guide.bindSliders([B.p], drawB);
+  el('fe-b-reroll').addEventListener('click', function () { B.seed = (B.seed + 17) % 401; drawB(); });
+
+  // ------------------------------------------------------------------
+  // Demo C — the regression catcher: a per-case diff of two versions
+  // ------------------------------------------------------------------
+  var C = { a: el('fe-diff-a'), b: el('fe-diff-b'), seed: 7 };
+  var setupC = Guide.setupCanvas(el('fe-diff-canvas'), 640, 340, drawC);
+
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, H = 340;
+    var a = parseInt(C.a.value, 10) - 1, b = parseInt(C.b.value, 10) - 1;
+    var la = passList(a, C.seed), lb = passList(b, C.seed);
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('version ' + VERSIONS[a] + ' → version ' + VERSIONS[b] + ' per case', 14, 18);
+    var xA = 300, xB = 470, y0 = 56, rowH = 54;
+    ctx.font = '10px ' + c.font;
+    ctx.fillStyle = c.accent700; ctx.textAlign = 'center';
+    ctx.fillText(VERSIONS[a], xA, y0 - 14);
+    ctx.fillText(VERSIONS[b], xB, y0 - 14);
+    var flips = [];
+    for (var i = 0; i < CASES.length; i++) {
+      var y = y0 + i * rowH;
+      var pa = la[i], pb = lb[i];
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(CASE_LABELS[i], xA - 60, y + 5);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(xA + 16, y); ctx.lineTo(xB - 16, y); ctx.stroke();
+      function dot(x, pass, col) {
+        ctx.beginPath(); ctx.arc(x, y, 9, 0, 2 * Math.PI);
+        ctx.fillStyle = pass ? col : '#ffffff'; ctx.fill();
+        ctx.strokeStyle = pass ? col : c.divider; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = pass ? '#ffffff' : c.divider; ctx.font = '600 10px ' + c.font;
+        ctx.textAlign = 'center'; ctx.fillText(pass ? 'P' : 'F', x, y + 4);
+      }
+      dot(xA, pa, c.accent400);
+      dot(xB, pb, c.accent);
+      if (pa && !pb) {
+        flips.push({ case: CASE_LABELS[i], kind: 'regression' });
+        ctx.fillStyle = c.accent2; ctx.globalAlpha = 0.10;
+        ctx.fillRect(120, y - 20, 500, 40); ctx.globalAlpha = 1;
+        ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText('REGRESSION', xB + 22, y + 4);
+      } else if (!pa && pb) {
+        flips.push({ case: CASE_LABELS[i], kind: 'fix' });
+        ctx.fillStyle = '#2f7d32'; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText('FIXED', xB + 22, y + 4);
+      }
+    }
+    var regressions = flips.filter(function (f) { return f.kind === 'regression'; });
+    var fixes = flips.filter(function (f) { return f.kind === 'fix'; });
+    el('fe-diff-readout').innerHTML =
+      '<div><span class="k">pass rate</span> ' + VERSIONS[a] + ' <span class="hi">' + Guide.fmtPct(passRate(a, C.seed), 0) + '</span> → ' + VERSIONS[b] + ' <span class="hi">' + Guide.fmtPct(passRate(b, C.seed), 0) + '</span></div>' +
+      '<div><span class="k">regressions</span> <span class="' + (regressions.length ? 'bad' : 'hi') + '">' + (regressions.length ? regressions.map(function (f) { return f.case; }).join(', ') : 'none') + '</span></div>' +
+      '<div><span class="k">fixes</span> ' + (fixes.length ? fixes.map(function (f) { return f.case; }).join(', ') : 'none') + '</div>' +
+      '<div class="k">one flipped case is the whole reason a golden set exists</div>';
+  }
+  Guide.bindSliders([C.a, C.b], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — what it costs to know
+  // ------------------------------------------------------------------
+  var PRICES = { inputPerM: 3.0, outputPerM: 15.0, cachedPerM: 0.3 };
+  var PRICE_LABEL = 'Claude 3.5 Sonnet (historical list price)';
+  var D = {
+    input: el('fe-cost-in'), output: el('fe-cost-out'),
+    calls: el('fe-cost-calls'), runs: el('fe-cost-runs')
+  };
+  var setupD = Guide.setupCanvas(el('fe-cost-canvas'), 640, 320, drawD);
+  var SUITES = [{ name: 'smoke', cases: 5 }, { name: 'working', cases: 50 }, { name: 'release', cases: 500 }];
+
+  function costFor(cases) {
+    var calls = cases * (+D.calls.value);
+    var inTok = +D.input.value, outTok = +D.output.value;
+    var perRun = AppSim.costModel({
+      inputTokens: inTok, outputTokens: outTok, calls: calls,
+      prices: { inputPerM: PRICES.inputPerM, outputPerM: PRICES.outputPerM, cachedPerM: PRICES.cachedPerM }
+    }).total;
+    var runs = +D.runs.value;
+    var msPerRun = calls * AppSim.latencyModel({ outputTokens: outTok, ttftBaseMs: 300, tpotMs: 12 }).e2eMs;
+    return { calls: calls, perRun: perRun, daily: perRun * runs, monthly: perRun * runs * 30, minutes: msPerRun / 60000 };
+  }
+
+  function drawD() {
+    if (!setupD) return;
+    var data = SUITES.map(function (s, i) {
+      var r = costFor(s.cases);
+      return {
+        label: s.name + ' · n=' + s.cases,
+        value: r.daily,
+        valueLabel: '$' + r.daily.toFixed(r.daily < 1 ? 3 : 2),
+        color: i === 2 ? c.accent2 : c.accent400
+      };
+    });
+    var maxV = Math.max.apply(null, data.map(function (d) { return d.value; })) || 1;
+    Guide.drawBars(setupD.ctx, 640, 320, data, { padL: 150, padR: 90, padT: 20, padB: 14, maxV: maxV, gap: 18 });
+    var ctx = setupD.ctx;
+    var work = costFor(50);
+    var rel = costFor(500);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('estimated cost per day (USD, list prices)', 16, 16);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('$' + work.daily.toFixed(2) + '/day working · $' + rel.daily.toFixed(2) + '/day release (at ' + D.runs.value + ' runs/day)', 16, 306);
+    el('fe-cost-readout').innerHTML =
+      '<div><span class="k">working suite (n=50)</span> <span class="hi">$' + work.perRun.toFixed(3) + '</span> per run · ' + work.minutes.toFixed(1) + ' min</div>' +
+      '<div><span class="k">release suite (n=500)</span> <span class="hi">$' + rel.perRun.toFixed(2) + '</span> per run · ' + rel.minutes.toFixed(1) + ' min</div>' +
+      '<div><span class="k">release suite, monthly</span> $' + rel.monthly.toFixed(2) + ' at ' + D.runs.value + ' runs/day · ' + Guide.fmtNum(rel.calls) + ' calls/run</div>' +
+      '<div class="k">priced with ' + PRICE_LABEL + '</div>';
+  }
+  Guide.bindSliders([D.input, D.output, D.calls, D.runs], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  var SOURCE_IDS = {
+    evals: 'fe-source', pricing: 'fe-price-source', cost_latency: 'fe-cost-source'
+  };
+  function setSources(data) {
+    Object.keys(SOURCE_IDS).forEach(function (key) {
+      var node = el(SOURCE_IDS[key]);
+      if (node && data && data[key] && data[key].source) node.textContent = data[key].source;
+    });
+  }
+  function applyNumbers(data) {
+    if (data && data.pricing && data.pricing.items && data.pricing.items.length) {
+      var pick = data.pricing.items[2] || data.pricing.items[0];
+      if (pick) {
+        PRICES = { inputPerM: pick.inputPerMUSD, outputPerM: pick.outputPerMUSD, cachedPerM: pick.cachedInputPerMUSD };
+        PRICE_LABEL = pick.model + ' (historical list price, 2025-02)';
+      }
+    }
+    setSources(data || FALLBACK);
+    drawA(); drawB(); drawC(); drawD();
+  }
+  setSources(FALLBACK);
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'first-eval-three-parts',
+      kind: 'choice',
+      prompt: 'What are the three parts of an evaluation, as this part defines it?',
+      options: [
+        { label: 'A model, a temperature and a leaderboard.' },
+        { label: 'A labelled set of inputs, a deterministic check, and a pass rate.', correct: true },
+        { label: 'A human reviewer, a rubric and a score out of ten.' },
+        { label: 'A prompt, a dataset and a fine-tuned checkpoint.' }
+      ],
+      explanation: 'An eval is exactly that: inputs with expected results, a check that grades an output pass or fail, and the pass rate over the set. Everything else is tooling around those three.'
+    },
+    {
+      id: 'first-eval-pass-rate',
+      kind: 'numeric',
+      prompt: 'A five-case eval passes three of its five cases. What is the pass rate, in percent?',
+      answer: 60,
+      unit: '%',
+      tolerance: 0.5,
+      explanation: 'The pass rate is passes divided by cases: 3 / 5 = 0.60, or 60%. A binary-per-case metric makes this the whole summary.'
+    },
+    {
+      id: 'first-eval-cases-to-detect',
+      kind: 'numeric',
+      prompt: 'A regression breaks 5% of inputs. On average, how many labelled cases must you run before at least one broken case appears?',
+      answer: 20,
+      unit: 'cases',
+      tolerance: 1,
+      explanation: 'One broken case appears every 1 / 0.05 = 20 cases on average. That is why a five-case set misses a subtle 5% regression most of the time — the expected number of cases is twenty, so you calibrate set size to the size of the regression you care about.'
+    },
+    {
+      id: 'first-eval-set-roles',
+      kind: 'choice',
+      prompt: 'You keep tuning a prompt until it passes every case, then report that pass rate as your honest estimate. What went wrong?',
+      options: [
+        { label: 'Nothing — a high pass rate is a high pass rate.' },
+        { label: 'The check should have been a score out of ten, not binary.' },
+        { label: 'The set you tuned on is the golden set; the honest estimate needs a held-out set.', correct: true },
+        { label: 'You should have used a larger model.' }
+      ],
+      explanation: 'A golden set is meant to be tuned against and to catch regressions. Reporting that same number as an unbiased estimate overfits the prompt to its examples — the held-out set exists precisely to keep the reported number honest.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

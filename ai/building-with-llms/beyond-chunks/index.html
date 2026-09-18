@@ -1,0 +1,697 @@
+---
+title: "Building with LLMs, Interactively — Part 17: Beyond chunks: query transforms, graph, multimodal, code — and the “RAG is dead” debate"
+description: "HyDE, multi-query and step-back; Self-RAG and CRAG; GraphRAG's global questions; ColPali; grep versus embeddings for code; and the long-context argument presented as an argument."
+permalink: "/ai/building-with-llms/beyond-chunks/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Beyond chunks: query transforms, graph, multimodal, code — and the “RAG is dead” debate</h1>
+    <p>The pipeline so far is the orthodox one: split documents, embed the chunks, retrieve a wide candidate set, rerank narrow, put the best passages in the context. This part is the edge of that map. Some questions are answered by rewriting the query before you search; some are properties of the whole corpus that no single passage contains; some live in page images that OCR destroys; some are code, where the unfashionable answer is that grep often wins. And the loudest claim in the field — that a long context makes retrieval obsolete — is treated here as an argument with two sides, not a settled fact.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="transforms">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Query transforms: rewrite the question before you search</h2></div>
+    <p class="g-eyebrow">HyDE, multi-query, step-back</p>
+    <p>Retrieval quality is bounded by the query as much as by the index. A terse question and the passage that answers it often share almost no vocabulary, which is exactly the mismatch the lexical layer cannot bridge. Three transforms rewrite the query before it is matched, and each buys recall in a different way.</p>
+    <p><strong>HyDE</strong> (Gao et al., <a href="https://arxiv.org/abs/2212.10496">arXiv:2212.10496</a>) asks the model to write a <em>hypothetical answer</em> to the question and embeds that instead of the question. Answers resemble answers, so the hypothetical document lands nearer the real passages than the terse query does. <strong>Multi-query expansion</strong> generates several paraphrases of the same question and unions their result lists (fused with RRF, so a document that one phrasing missed another can still catch). <strong>Step-back prompting</strong> replaces the specific question with a more general one — <em>what class of problem is this?</em> — and retrieves for the abstraction, which helps when the passage is written in the vocabulary of the general rule rather than the specific instance.</p>
+    <div class="g-goal">💡 <span><b>When each helps:</b> HyDE on short, vague or vocabulary-mismatched queries; multi-query when recall matters more than latency (each paraphrase is another retrieval call); step-back on reasoning-shaped questions whose answer depends on a principle. All three cost extra model calls and can <em>hurt</em> precision — a hypothetical answer is a guess, and a confident wrong guess retrieves confident wrong neighbours. Measure recall, not just top-1.</span></div>
+    <p>Pick a query and compare four strategies over the shared corpus. Each row lists the top three documents and marks the ones on the hand-labelled relevant set; the bar is recall@5.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="beyond-transform-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">raw vs HyDE vs multi-query vs step-back. Green titles are documents the labelled set counts as relevant.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="beyond-q-forget" class="g-primary">forgetting mid-task</button>
+          <button id="beyond-q-acl">who can see it</button>
+          <button id="beyond-q-serving">memory bandwidth</button>
+        </div>
+        <div class="g-readout" id="beyond-transform-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="beyond-src-fusion"></p>
+  </section>
+
+  <section class="g-step" id="self-critique">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Self-critique: retrieve, then check</h2></div>
+    <p class="g-eyebrow">Self-RAG and CRAG turn retrieval into a decision</p>
+    <p><strong>Self-RAG</strong> (Asai et al., <a href="https://arxiv.org/abs/2310.11511">arXiv:2310.11511</a>, ICLR 2024) trains the model to emit <em>reflection tokens</em> at generation time: should I retrieve at all, is this passage relevant, is my draft supported by it? The model learns to critique its own retrieval rather than consuming whatever the pipeline returned. <strong>CRAG</strong> (Yan et al., <a href="https://arxiv.org/abs/2401.15884">arXiv:2401.15884</a>, 2024) attaches a lightweight evaluator to the retriever and grades the returned set as correct, ambiguous or incorrect; a poor grade triggers a rewrite or a fallback to web search instead of proceeding with bad evidence.</p>
+    <p>The methods differ, but the engineering lesson is shared and portable: retrieval should be a <em>decision with a check</em>, not a fixed stage. If nothing verifies relevance and nothing verifies that the answer stayed inside the evidence, a bad retrieval becomes a bad answer with no signal in between. That is the failure the RAGAS metrics in the last section are designed to expose.</p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> a self-critique step that is graded by the same model that wrote the answer is a closed loop. Judge against a held-out set of labelled passages, or at least against a different model, or the critique learns to agree with itself.</span></div>
+  </section>
+
+  <section class="g-step" id="global">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Local and global questions: GraphRAG</h2></div>
+    <p class="g-eyebrow">“Find the passage” versus “what themes run through this corpus”</p>
+    <p>Flat chunk retrieval answers a <em>local</em> question: find the passage that mentions X. It cannot answer a <em>global</em> question — <em>what themes run through this corpus?</em> — because the answer is not in any passage. It is a property of the whole set, and top-k retrieval returns unrelated passages that happen to share a word.</p>
+    <p><strong>GraphRAG</strong> (Microsoft Research, 2024) targets that gap. An LLM pass extracts entities and relationships from the corpus, entity communities are detected, and each community is pre-summarised. A global question is then answered by reading summaries of summaries, not by hunting for a lucky chunk. The trade is real: building and refreshing the graph and its summaries is an LLM pass over the whole corpus, and the index has to be maintained as the corpus changes. So it answers a class of question flat retrieval simply cannot, and it is overkill for find-the-passage.</p>
+    <p>Toggle the two questions. The flat retriever on the left is doing exactly what it was built to do; it is just being asked the wrong kind of question.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="beyond-global-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: flat chunk retrieval. Right: a graph/community summary index (mock). The query is the same kind of text in tone, different in kind.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="beyond-mode-local" class="g-primary">Local: “find the passage”</button>
+          <button id="beyond-mode-global">Global: “what themes?”</button>
+        </div>
+        <div class="g-readout" id="beyond-global-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="beyond-src-rag"></p>
+  </section>
+
+  <section class="g-step" id="multimodal">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Multimodal and page-image retrieval</h2></div>
+    <p class="g-eyebrow">When OCR throws away the answer</p>
+    <p>PDFs, slide decks and scanned pages are where text-first pipelines lose the most. OCR turns a page into a flat stream of characters and in doing so discards layout: which number belongs to which row of a table, that a figure caption describes the chart above it, that two labels sit in the same column. A question about a value in a table then retrieves a page whose extracted text mentions none of the query words.</p>
+    <p><strong>ColPali</strong> (Faysse et al., <a href="https://arxiv.org/abs/2407.01449">arXiv:2407.01449</a>, 2024) skips OCR entirely. A vision-language model embeds <em>page images</em> directly — keeping the page as the retrieval unit and the layout intact — and a text query is matched against multi-vector page representations using late interaction, the ColBERT idea (Khattab &amp; Zaharia, <a href="https://arxiv.org/abs/2004.12832">arXiv:2004.12832</a>, SIGIR 2020) of scoring query tokens against document tokens and summing the best matches. The cost is a heavier encoder and much larger index storage; the win is that a question about something a reader would point to retrieves the page a reader would turn to.</p>
+    <div class="g-goal">💡 <span><b>Pick the unit to match the document:</b> prose documents chunk well into passages; forms, tables and slides retrieve as page images. A pipeline that forces every document through the same chunk-the-text path is making a layout decision it did not intend to make.</span></div>
+  </section>
+
+  <section class="g-step" id="code">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Code search: grep versus embeddings</h2></div>
+    <p class="g-eyebrow">The unfashionable answer is that lexical often wins</p>
+    <p>Code is a case where the honest answer is not the trendy one. Identifiers, error strings, file paths and API names are <em>literal</em> tokens. <code>grep -r</code>, ripgrep, or a trigram index finds them exactly, cheaply, with no index to embed and a result a human can verify by eye. Embeddings cannot reliably reproduce an exact identifier match, and they are a very expensive way to try.</p>
+    <p>Embeddings win on <em>intent</em>: “where do we decide whether the caller is allowed to read this record” shares no token with the function that does it, and a lexical search returns nothing. The practical answer is both, and the skill is knowing which query you are holding: literal queries to the lexical index, intent queries to the semantic one, and a reranker when the two disagree. Do not embed your way past a problem grep already solves.</p>
+    <div class="g-code"><span class="k">// literal — exact, cheap, verifiable by eye</span>
+rg <span class="s">"AuthTokenValidator"</span> packages/
+<span class="k">// intent — shares no token with the code; lexical returns nothing</span>
+<span class="s">"where do we decide if the caller may read a record"</span></div>
+    <p>Six queries, each with a lexical score (does the literal token appear?) and an illustrative semantic score. The verdict column changes sides with the query — that is the point.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="beyond-code-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Blue = lexical (grep) score, pink = embedding-style semantic score. Identifiers and error strings favour grep; intent favours embeddings.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="beyond-code-ids" class="g-primary">Identifiers</button>
+          <button id="beyond-code-errors">Error strings</button>
+          <button id="beyond-code-intent">Semantic intent</button>
+        </div>
+        <div class="g-readout" id="beyond-code-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="debate">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>“RAG is dead”: an argument, not a verdict</h2></div>
+    <p class="g-eyebrow">Both sides at full strength</p>
+    <p>With million-token windows, the claim “long context replaces retrieval” is worth stating as strongly as its proponents do. <strong>The pro-window case:</strong> if the corpus fits in the window, there is no index to build or keep fresh, no embedding model to drift, no second system to operate, no ACL-filtering layer to get wrong — you paste the documents in and ask. For a single, bounded document set that fits, this is genuinely simpler, and it removes an entire class of retrieval failures (the right chunk that never got retrieved).</p>
+    <p><strong>The pro-retrieval case:</strong> a long window is billed per token on every query. A 500k-token corpus sent whole is priced on every request, so cost scales with corpus size <em>and</em> query volume at once. Retrieval is also where freshness, per-user access control and citable provenance actually live — properties the model cannot supply at any window size, because it does not know who is asking or what changed an hour ago. And even inside a 1M window, attention degrades: <em>lost in the middle</em> shows accuracy is U-shaped rather than flat, so a passage that is technically present may not be used. A window is finite, and it is priced.</p>
+    <p>Neither side is resolved here, and pretending otherwise would be the error. The conditions decide: move the sliders and watch the verdict flip between “the window is enough” and “you need retrieval”.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="beyond-debate-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Two evidence boards. Items light up when the current conditions make them bite; the banner is computed from the sliders.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Corpus size (documents) <span class="val">40</span></label><input type="range" id="beyond-docs" min="10" max="20000" step="10" value="40"></div>
+        <div class="g-field"><label>Queries per day <span class="val">100</span></label><input type="range" id="beyond-volume" min="10" max="200000" step="10" value="100"></div>
+        <div class="g-field"><label>Freshness tolerance (hours) <span class="val">168</span></label><input type="range" id="beyond-fresh" min="1" max="720" step="1" value="168"></div>
+        <div class="g-readout" id="beyond-debate-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="beyond-src-windows"></p>
+  </section>
+
+  <section class="g-step" id="measure">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>What to actually do: measure on your corpus</h2></div>
+    <p class="g-eyebrow">The only tie-breaker</p>
+    <p>Every technique on this page is corpus-dependent. HyDE helps some query distributions and hurts others; GraphRAG earns its build cost only on global questions; grep wins on code identifiers and loses on intent; the window replaces retrieval for a small bounded set and fails on a large fresh one. The honest resolution of the debate is not a side — it is a measurement on your corpus with your questions.</p>
+    <p>So keep a small labelled set: real questions paired with the passages that answer them. Compare strategies — raw, HyDE, multi-query, step-back, hybrid, graph — on that set. The RAGAS metrics (Es et al., <a href="https://arxiv.org/abs/2309.15217">arXiv:2309.15217</a>, EACL 2024) tell you which failure you have: <strong>context recall</strong> (did the passages contain what was needed?), <strong>context precision</strong> (were they relevant?), and <strong>faithfulness</strong> (did the answer stay inside them?). A retrieval change you cannot measure is a change you cannot defend — and, in the long run, cannot keep.</p>
+    <p>The contextual-retrieval numbers are the shape of the argument: on one large corpus the top-20 failure rate fell from 5.7% at baseline to 3.7% with contextual embeddings, 2.9% adding BM25, and 1.9% with reranking. Every step was a retrieval-side change measured on a labelled set.</p>
+    <p class="g-source" id="beyond-src-retrieval"></p>
+    <p class="g-source" id="beyond-src-embeddings"></p>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>What does HyDE change?</td><td>The query: it embeds a hypothetical <em>answer</em>, so the vector sits nearer real passages than a terse question does.</td></tr>
+        <tr><td>When does multi-query help?</td><td>When recall matters more than latency — each paraphrase is another retrieval call, fused with RRF.</td></tr>
+        <tr><td>When does step-back help?</td><td>Reasoning-shaped questions whose answer is a principle; retrieve for the abstraction, not the instance.</td></tr>
+        <tr><td>What do Self-RAG and CRAG add?</td><td>A check: decide whether to retrieve, grade relevance, and refuse or rewrite bad evidence.</td></tr>
+        <tr><td>What can flat chunk retrieval not answer?</td><td>A global question — “what themes run through this corpus” — because the answer is not in any passage.</td></tr>
+        <tr><td>What is GraphRAG for?</td><td>Entity/relationship graph plus community summaries, so global questions are answered from summaries of summaries.</td></tr>
+        <tr><td>What does ColPali retrieve?</td><td>Page images, not OCR text — layout kept intact, matched with late interaction. Heavier encoder, bigger index.</td></tr>
+        <tr><td>Grep or embeddings for code?</td><td>Literal (identifiers, error strings) to grep; intent to embeddings; rerank when they disagree.</td></tr>
+        <tr><td>Is RAG dead?</td><td>It is an argument. Windows are finite and billed per token; retrieval owns freshness, ACLs, citations. Measure your corpus.</td></tr>
+        <tr><td>What is the tie-breaker?</td><td>A labelled set and the RAGAS metrics: context recall, context precision, faithfulness.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Gao, Ma, Lin &amp; Callan, <a href="https://arxiv.org/abs/2212.10496">“Precise Zero-Shot Dense Retrieval without Relevance Labels” (HyDE)</a>, 2022 — embed a hypothetical answer instead of the query.</li>
+      <li>Asai et al., <a href="https://arxiv.org/abs/2310.11511">“Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection”</a>, ICLR 2024 — reflection tokens as a retrieval decision.</li>
+      <li>Yan et al., <a href="https://arxiv.org/abs/2401.15884">“Corrective Retrieval Augmented Generation” (CRAG)</a>, 2024 — grade the retrieved set, then correct or fall back.</li>
+      <li>Microsoft Research, <a href="https://www.microsoft.com/en-us/research/blog/graphrag-unlocking-llm-discovery-on-narrative-private-data/">“GraphRAG: Unlocking LLM discovery on narrative private data”</a>, 2024 — the global-question case and community summaries.</li>
+      <li>Faysse et al., <a href="https://arxiv.org/abs/2407.01449">“ColPali: Efficient Document Retrieval with Vision Language Models”</a>, 2024 — page-image retrieval without OCR.</li>
+      <li>Khattab &amp; Zaharia, <a href="https://arxiv.org/abs/2004.12832">“ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT”</a>, SIGIR 2020 — the late-interaction idea ColPali reuses.</li>
+      <li>Es et al., <a href="https://arxiv.org/abs/2309.15217">“RAGAS: Automated Evaluation of Retrieval Augmented Generation”</a>, EACL 2024 — faithfulness, answer relevance, context precision, context recall.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2307.03172">“Lost in the Middle: How Language Models Use Long Contexts”</a>, TACL 2024 — the U-shaped curve behind the pro-retrieval evidence.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the end of the volume's parts. The appendix is a reference: every term linked back to the part that introduces it, a retrieval-architecture selection table, and a RAG failure-mode to metric table you can check a real pipeline against.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function shortTitle(t) { t = String(t || ''); return t.length > 34 ? t.slice(0, 33) + '…' : t; }
+
+  var FALLBACK = {
+    rag: {
+      source: "RAGAS metrics (Es et al., arXiv:2309.15217, EACL 2024): faithfulness, answer relevance, context precision, context recall. Self-RAG (Asai et al., arXiv:2310.11511, ICLR 2024) and CRAG / Corrective RAG (Yan et al., arXiv:2401.15884, 2024) add self-critique; GraphRAG (Microsoft Research, 2024) targets global 'what themes run through this corpus' questions that flat chunk retrieval cannot answer; ColPali (Faysse et al., arXiv:2407.01449, 2024) retrieves over page images without OCR; HyDE (Gao et al., arXiv:2212.10496, 2022) generates a hypothetical answer to embed as the query; multi-query and step-back prompting widen or abstract the query. Component-level numbers are benchmark-specific and do not transfer directly.",
+      metrics: ["faithfulness", "answer relevance", "context precision", "context recall"],
+      failureModes: [
+        { mode: "Missing evidence", metric: "context recall", fix: "hybrid retrieval, query transforms, larger candidate set" },
+        { mode: "Wrong chunk retrieved", metric: "context precision", fix: "reranking, better chunking, metadata filters" },
+        { mode: "Answer not grounded in the context", metric: "faithfulness", fix: "grounding instructions, citations, retrieval-gated answers" },
+        { mode: "Retrieved but not used (middle of long context)", metric: "end-to-end task accuracy", fix: "reorder context, retrieve fewer and better chunks" },
+        { mode: "Agent answers without retrieving", metric: "tool-call rate / retrieval rate", fix: "prompt and tool design; measure it, do not assume it" }
+      ]
+    },
+    embeddings: {
+      source: "Sentence-BERT (Reimers & Gurevych, arXiv:1908.10084, EMNLP 2019); E5 (Wang et al., arXiv:2212.03533, 2022); BGE / C-Pack (Xiao et al., arXiv:2309.07597, 2023); Matryoshka Representation Learning (Kusupati et al., arXiv:2205.13147, NeurIPS 2022) for nested, truncatable embeddings; MTEB (Muennighoff et al., arXiv:2210.07316, 2022) as the leaderboard. MTEB scores are dominated by a handful of points and correlate imperfectly with retrieval on a specific corpus: treat the leaderboard as a shortlist, then measure on your own labelled set.",
+      typicalDims: [384, 512, 768, 1024, 1536, 3072],
+      matryoshkaTruncation: "A Matryoshka-trained embedding can be truncated at 1/2, 1/4 or 1/8 of its width with a small, measurable recall loss — cheaper storage and faster search in exchange for accuracy you can plot."
+    },
+    fusion: {
+      source: "Reciprocal Rank Fusion (Cormack, Clarke & Buettcher, SIGIR 2009), k=60 as the paper's default. SPLADE (Formal et al., arXiv:2107.05720, SIGIR 2021) for learned sparse retrieval; ColBERT late interaction (Khattab & Zaharia, arXiv:2004.12832, SIGIR 2020) and ColBERTv2 (Santhanam et al., arXiv:2112.01488, 2021); MUVERA (arXiv:2405.19504, 2024) turns multi-vector ColBERT similarity into single-vector MIPS. Cross-encoders rerank far more accurately than they retrieve, which is why the standard shape is retrieve-wide then rerank-narrow.",
+      rrfK: 60,
+      patterns: ["lexical + dense fused with RRF", "SPLADE or other learned sparse", "cross-encoder rerank of the top 50-100", "ColBERT late interaction as a middle ground between bi- and cross-encoders"]
+    },
+    context_windows: {
+      source: "Vendor model cards and API docs, retrieved 2026-09. GPT-4o and GPT-4.1 (128K); Claude 3.5/3.7 Sonnet and Claude 4.x (200K, with 1M available on some tiers); Gemini 1.5 Pro (2M) and Gemini 2.x (1M); Llama 3.1/3.3 (128K); DeepSeek-V3 config max_position_embeddings 163,840, advertised 128K; Kimi K2 (128K); Qwen2.5 (128K). Windows move fast and several of these are already superseded; treat every value as a dated snapshot, not a current quote.",
+      items: [
+        { model: "GPT-4o", tokens: 128000, note: "Long-context behaviour degrades well before the nominal limit on retrieval tasks." },
+        { model: "Claude 3.7 Sonnet / 4.x", tokens: 200000, note: "1M-token tier on some plans. Anthropic reports context-rot effects within the window." },
+        { model: "Gemini 1.5 Pro / 2.x", tokens: 1000000, note: "2M on 1.5 Pro; effective retrieval accuracy falls off a cliff well inside the window." }
+      ]
+    },
+    retrieval_contextual: {
+      source: "Anthropic, 'Introducing Contextual Retrieval' (2024-09-19). Reported top-20 retrieval failure rate on a large corpus falling from 5.7% (baseline) to 3.7% with contextual embeddings, 2.9% with contextual embeddings + BM25, and 1.9% with contextual embeddings + BM25 + reranking. Those are absolute failure rates; the widely quoted '35% -> 49% -> 67%' figures are the relative reductions in failure rate at each step. Corpus, chunking and reranker dependent.",
+      baselineFailurePct: 5.7,
+      contextualEmbeddingsFailurePct: 3.7,
+      plusBM25FailurePct: 2.9,
+      plusRerankFailurePct: 1.9,
+      relativeReductions: { contextual: "35%", plusBM25: "49%", plusRerank: "67%" }
+    }
+  };
+  var NUM = FALLBACK;
+
+  // ------------------------------------------------------------------
+  // Demo A — the query-transform bench
+  // ------------------------------------------------------------------
+  var BENCH = [
+    {
+      raw: 'how do I keep an agent from forgetting earlier steps',
+      hyde: 'An agent forgets earlier facts because compaction evicts them from the context window; the fix is structured notes and a running summary of the history.',
+      multis: [
+        'the agent loses track of earlier decisions',
+        'context compaction drops facts from the transcript',
+        'the agent redoes work after the history is summarised'
+      ],
+      stepback: 'context management for long multi-turn agent tasks',
+      relevant: { 'context-engineering': 1, 'agent-loops': 1, 'structured-output': 1, 'prompt-caching': 1 }
+    },
+    {
+      raw: 'which documents can this user see',
+      hyde: 'Retrieval must filter candidate documents by the caller access control list before ranking, so a restricted passage never enters the context or the UI.',
+      multis: [
+        'per user document permissions in search',
+        'acl filtering of retrieved passages',
+        'access control for the retrieval index'
+      ],
+      stepback: 'security boundaries in retrieval systems',
+      relevant: { 'rag': 1, 'prompt-injection': 1, 'guardrails': 1 }
+    },
+    {
+      raw: 'memory bandwidth during token generation',
+      hyde: 'Decoding one token at a time reads every weight and the key value cache from memory, so generation speed is set by memory bandwidth, not compute.',
+      multis: [
+        'why is token generation memory bound',
+        'key value cache reads dominate decode',
+        'accelerator bandwidth decides tokens per second'
+      ],
+      stepback: 'the memory wall in inference hardware',
+      relevant: { 'decode-loop': 1, 'hardware': 1, 'metrics': 1, 'quantization': 1 }
+    }
+  ];
+  var A = { idx: 0 };
+  var setupA = Guide.setupCanvas(el('beyond-transform-canvas'), 640, 380, drawA);
+  function rankIds(q) {
+    return AppSim.bm25(AppSim.CORPUS, q, {}).map(function (e) { return e.id; });
+  }
+  function rankMulti(list) {
+    return AppSim.rrf(list.map(rankIds)).map(function (e) { return e.id; });
+  }
+  function metrics(b, ranking) {
+    var rel = Object.keys(b.relevant); var hit = 0;
+    ranking.slice(0, 5).forEach(function (id) { if (b.relevant[id]) hit++; });
+    return { recall: rel.length ? hit / rel.length : 0, prec: hit / 5, hit: hit, rel: rel.length };
+  }
+  function strategiesFor(b) {
+    return [
+      { name: 'raw', ranking: rankIds(b.raw) },
+      { name: 'HyDE', ranking: rankIds(b.hyde) },
+      { name: 'multi-query', ranking: rankMulti(b.multis) },
+      { name: 'step-back', ranking: rankIds(b.stepback) }
+    ];
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var b = BENCH[A.idx];
+    var rows = strategiesFor(b);
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('raw query: “' + b.raw + '”', 12, 16);
+    var top = 34, blockH = 84;
+    rows.forEach(function (r, i) {
+      var y = top + i * blockH;
+      var m = metrics(b, r.ranking);
+      ctx.font = '600 12px ' + c.font; ctx.fillStyle = c.accent700; ctx.textAlign = 'left';
+      ctx.fillText(r.name, 12, y + 12);
+      ctx.font = '10px ' + c.font; ctx.fillStyle = c.text;
+      ctx.fillText('recall@5 ' + m.recall.toFixed(2), 12, y + 31);
+      ctx.fillText('prec@5 ' + m.prec.toFixed(2), 12, y + 45);
+      ctx.fillStyle = c.accent400; ctx.fillRect(12, y + 54, Math.max(1, 72 * m.recall), 5);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(12, y + 54, 72, 5);
+      for (var k = 0; k < 3; k++) {
+        var id = r.ranking[k]; if (!id) break;
+        var d = AppSim.CORPUS_BY_ID[id]; if (!d) continue;
+        var hit = b.relevant[id] === 1;
+        ctx.fillStyle = hit ? c.accent700 : c.text;
+        ctx.font = (hit ? '600 ' : '') + '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText((hit ? '✓ ' : '· ') + shortTitle(d.title), 96, y + 14 + k * 20);
+      }
+    });
+    var best = rows[0];
+    rows.forEach(function (r) { if (metrics(b, r.ranking).recall > metrics(b, best.ranking).recall) best = r; });
+    var rawM = metrics(b, rows[0].ranking), bestM = metrics(b, best.ranking);
+    el('beyond-transform-readout').innerHTML =
+      '<div><span class="k">labelled relevant set</span> ' + rawM.rel + ' documents</div>' +
+      '<div><span class="k">raw recall@5</span> <span class="hi">' + rawM.recall.toFixed(2) + '</span>' +
+      ' · <span class="k">best (' + best.name + ')</span> <span class="hi">' + bestM.recall.toFixed(2) + '</span></div>' +
+      '<div class="k">' + (bestM.recall > rawM.recall
+        ? best.name + ' surfaces documents the raw query misses — the vocabulary-mismatch gap.'
+        : 'the raw query already finds the labelled set; here the extra calls buy little and can cost precision.') + '</div>';
+  }
+  Guide.bindSliders([], drawA);
+  function setBench(i) {
+    A.idx = i; drawA();
+    el('beyond-q-forget').className = i === 0 ? 'g-primary' : '';
+    el('beyond-q-acl').className = i === 1 ? 'g-primary' : '';
+    el('beyond-q-serving').className = i === 2 ? 'g-primary' : '';
+  }
+  el('beyond-q-forget').addEventListener('click', function () { setBench(0); });
+  el('beyond-q-acl').addEventListener('click', function () { setBench(1); });
+  el('beyond-q-serving').addEventListener('click', function () { setBench(2); });
+
+  // ------------------------------------------------------------------
+  // Demo B — local versus global questions
+  // ------------------------------------------------------------------
+  var THEME_TEXT = {
+    'llm-training': 'Model internals: tokens, architecture, pretraining, scaling, tuning.',
+    'llm-serving': 'Serving: decode loops, KV cache, batching, quantization, routing, cost.',
+    'llm-apps': 'Applications: prompting, context, retrieval, evaluation, agents, security.',
+    'math': 'Mathematical foundations: linear algebra, calculus, probability, optimization.',
+    'vision-robotics': 'Perception and robotics: geometry, SLAM, calibration, ROS.'
+  };
+  var B = { mode: 'local' };
+  var setupB = Guide.setupCanvas(el('beyond-global-canvas'), 640, 340, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var local = B.mode === 'local';
+    var query = local ? 'what is the kv cache' : 'what themes run through this corpus';
+    var scores = AppSim.bm25(AppSim.CORPUS, query, {}).slice(0, 5);
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('query: “' + query + '”  ·  ' + (local ? 'local question' : 'global question'), 12, 16);
+    // column headers
+    ctx.font = '600 12px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('flat chunk retrieval', 12, 40);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('graph / community summary', 338, 40);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(320, 46); ctx.lineTo(320, H - 34); ctx.stroke();
+    // left: flat results
+    var top = 60;
+    if (!local) {
+      ctx.fillStyle = c.accent2; ctx.font = '600 11px ' + c.font;
+      ctx.fillText('no passage contains these terms.', 12, top + 14);
+      ctx.font = '11px ' + c.font; ctx.fillStyle = c.text;
+      ctx.fillText('top-k returns near-zero-score noise;', 12, top + 32);
+      ctx.fillText('the answer is not in any single passage.', 12, top + 48);
+      ctx.fillStyle = c.accent400; ctx.fillRect(12, top + 62, 120, 5);
+    } else {
+      var maxS = scores.reduce(function (m, s) { return Math.max(m, s.score); }, 0) || 1;
+      scores.forEach(function (s, i) {
+        var d = AppSim.CORPUS_BY_ID[s.id];
+        var y = top + i * 30;
+        ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(shortTitle(d ? d.title : s.id), 12, y + 12);
+        ctx.fillStyle = c.accent; ctx.fillRect(12, y + 18, Math.max(1, 280 * (s.score / maxS)), 6);
+        ctx.textAlign = 'right'; ctx.fillStyle = c.accent700;
+        ctx.fillText(s.score.toFixed(2), 306, y + 24); ctx.textAlign = 'left';
+      });
+    }
+    // right: graph summaries (always drawn; framed per mode)
+    if (local) {
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+      ctx.fillText('A graph index would answer this too —', 338, top + 14);
+      ctx.fillText('but building it for a find-the-passage', 338, top + 32);
+      ctx.fillText('question is an LLM pass you do not need.', 338, top + 50);
+    } else {
+      var grouped = {};
+      AppSim.CORPUS.forEach(function (d) {
+        if (!grouped[d.guide]) grouped[d.guide] = { n: 0, titles: [] };
+        grouped[d.guide].n++; grouped[d.guide].titles.push(d.title);
+      });
+      var keys = ['llm-training', 'llm-serving', 'llm-apps', 'math', 'vision-robotics'];
+      keys.forEach(function (k, i) {
+        var g = grouped[k]; if (!g) return;
+        var y = top + i * 48;
+        ctx.fillStyle = c.accent2; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(AppSim.GUIDE_LABELS[k] + '  ·  ' + g.n + ' docs', 338, y + 12);
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+        ctx.fillText(THEME_TEXT[k], 338, y + 28);
+        ctx.fillStyle = c.divider;
+        ctx.fillRect(338, y + 36, 282, 1);
+      });
+    }
+    el('beyond-global-readout').innerHTML = local
+      ? '<div><span class="k">mode</span> local · flat retrieval <span class="hi">answers it</span></div>' +
+        '<div class="k">top passages score strongly; the graph adds nothing for a find-the-passage query.</div>'
+      : '<div><span class="k">mode</span> global · flat retrieval <span class="bad">cannot answer it</span></div>' +
+        '<div><span class="k">graph index</span> <span class="hi">5 community summaries</span> over ' + AppSim.CORPUS.length + ' documents</div>' +
+        '<div class="k">the answer is a property of the whole set, so it must be computed over the whole set.</div>';
+  }
+  function syncB() {
+    el('beyond-mode-local').className = B.mode === 'local' ? 'g-primary' : '';
+    el('beyond-mode-global').className = B.mode === 'global' ? 'g-primary' : '';
+  }
+  el('beyond-mode-local').addEventListener('click', function () { B.mode = 'local'; syncB(); drawB(); });
+  el('beyond-mode-global').addEventListener('click', function () { B.mode = 'global'; syncB(); drawB(); });
+
+  // ------------------------------------------------------------------
+  // Demo C — grep versus embeddings for code
+  // ------------------------------------------------------------------
+  var CODE_QUERIES = [
+    { q: 'getUserById', kind: 'identifier', snippet: 'function getUserById(id) { return db.users.find(u => u.id === id); }', sem: 0.25 },
+    { q: 'AuthTokenValidator', kind: 'identifier', snippet: 'class AuthTokenValidator { validate(token) { return checkSignature(token); } }', sem: 0.30 },
+    { q: 'ECONNREFUSED 127.0.0.1:5432', kind: 'error', snippet: 'connect() failed: ECONNREFUSED 127.0.0.1:5432; retrying in 500ms', sem: 0.10 },
+    { q: 'retry budget exhausted', kind: 'error', snippet: 'throw new TimeoutError("retry budget exhausted after 3 attempts")', sem: 0.55 },
+    { q: 'where do we decide if the caller may read a record', kind: 'intent', snippet: 'function getUserById(id) { return db.users.find(u => u.id === id); }', sem: 0.88 },
+    { q: 'stop outbound calls from hammering the provider', kind: 'intent', snippet: 'await limiter.acquire(); return client.post(url, body);', sem: 0.80 }
+  ];
+  var C = { kind: 'identifier' };
+  var setupC = Guide.setupCanvas(el('beyond-code-canvas'), 640, 380, drawC);
+  function lexicalScore(query, snippet) {
+    var q = AppSim.terms(query), s = String(snippet).toLowerCase();
+    if (!q.length) return 0;
+    var hit = 0;
+    q.forEach(function (t) { if (s.indexOf(t) >= 0) hit++; });
+    return hit / q.length;
+  }
+  function visibleC() { return CODE_QUERIES.filter(function (x) { return x.kind === C.kind; }); }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var rows = visibleC();
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('code-like queries  ·  blue lexical (grep) vs pink semantic (embeddings)', 12, 16);
+    var top = 40, rowH = 54, lexicalWins = 0, semanticWins = 0;
+    rows.forEach(function (r, i) {
+      var y = top + i * rowH;
+      var lex = lexicalScore(r.q, r.snippet);
+      var sem = r.sem;
+      var lexWins = lex >= 0.5 && lex >= sem;
+      if (lexWins) lexicalWins++; else semanticWins++;
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(shortTitle(r.q), 12, y + 12);
+      ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+      ctx.fillText('lexical ' + lex.toFixed(2), 12, y + 30);
+      ctx.fillStyle = c.accent; ctx.fillRect(82, y + 22, Math.max(1, 150 * lex), 8);
+      ctx.fillStyle = c.accent2;
+      ctx.fillText('semantic ' + sem.toFixed(2), 300, y + 30);
+      ctx.fillRect(376, y + 22, Math.max(1, 150 * sem), 8);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = lexWins ? c.accent700 : c.accent2;
+      ctx.font = '600 11px ' + c.font;
+      ctx.fillText(lexWins ? 'grep wins' : 'embeddings win', 628, y + 30);
+      ctx.textAlign = 'left';
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(12, y + 40); ctx.lineTo(628, y + 40); ctx.stroke();
+    });
+    el('beyond-code-readout').innerHTML =
+      '<div><span class="k">' + C.kind + ' queries</span> ' + rows.length + '</div>' +
+      '<div><span class="k">grep wins</span> <span class="hi">' + lexicalWins + '</span> · <span class="k">embeddings win</span> ' + semanticWins + '</div>' +
+      '<div class="k">' + (C.kind === 'intent'
+        ? 'intent queries share no token with the code, so exact matching returns nothing — this is the case embeddings exist for.'
+        : 'the token is literal, so an exact index finds it with certainty and at a fraction of the cost.') + '</div>';
+  }
+  function setCode(kind) {
+    C.kind = kind; drawC();
+    el('beyond-code-ids').className = kind === 'identifier' ? 'g-primary' : '';
+    el('beyond-code-errors').className = kind === 'error' ? 'g-primary' : '';
+    el('beyond-code-intent').className = kind === 'intent' ? 'g-primary' : '';
+  }
+  el('beyond-code-ids').addEventListener('click', function () { setCode('identifier'); });
+  el('beyond-code-errors').addEventListener('click', function () { setCode('error'); });
+  el('beyond-code-intent').addEventListener('click', function () { setCode('intent'); });
+
+  // ------------------------------------------------------------------
+  // Demo D — the “RAG is dead” debate dashboard
+  // ------------------------------------------------------------------
+  var DOC_TOKENS = 1400, WINDOW = 200000, USABLE = 0.5, INPUT_PER_M = 3.0;
+  var PRO_WINDOW = [
+    { label: 'no index to build or keep fresh', active: function (s) { return true; } },
+    { label: 'one system, one dependency', active: function (s) { return true; } },
+    { label: 'the whole set is in context', active: function (s) { return s.fits; } },
+    { label: 'no embedding drift, no ACL layer', active: function (s) { return true; } },
+    { label: 'right passage cannot be missed', active: function (s) { return s.fits; } }
+  ];
+  var PRO_RETRIEVAL = [
+    { label: 'cost scales with corpus × volume', active: function (s) { return s.volPressure || !s.fits; } },
+    { label: 'freshness: data changes hourly', active: function (s) { return s.freshPressure; } },
+    { label: 'per-user ACLs filter before the model', active: function (s) { return true; } },
+    { label: 'citations need the source passage', active: function (s) { return true; } },
+    { label: 'attention degrades inside the window', active: function (s) { return true; } },
+    { label: 'the window is finite, and priced', active: function (s) { return true; } }
+  ];
+  var D = { docs: el('beyond-docs'), volume: el('beyond-volume'), fresh: el('beyond-fresh') };
+  var setupD = Guide.setupCanvas(el('beyond-debate-canvas'), 640, 340, drawD);
+  function debateState() {
+    var docs = +D.docs.value, volume = +D.volume.value, fresh = +D.fresh.value;
+    var corpusTokens = docs * DOC_TOKENS;
+    var fits = corpusTokens <= WINDOW * USABLE;
+    var volPressure = volume >= 5000;
+    var freshPressure = fresh <= 24;
+    var sent = Math.min(corpusTokens, WINDOW * USABLE);
+    var costPerQuery = sent / 1e6 * INPUT_PER_M;
+    var score = (fits ? 0 : 2) + (volPressure ? 1 : 0) + (freshPressure ? 1 : 0);
+    return {
+      docs: docs, volume: volume, fresh: fresh, corpusTokens: corpusTokens, fits: fits,
+      volPressure: volPressure, freshPressure: freshPressure,
+      costPerQuery: costPerQuery, dailyCost: costPerQuery * volume, score: score
+    };
+  }
+  function verdict(s) {
+    if (s.score >= 2) return { title: 'YOU NEED RETRIEVAL', col: c.accent2, text: 'The corpus does not fit, or the volume or freshness requirement makes per-token resending the wrong shape. Index it.' };
+    if (s.score === 0) return { title: 'THE WINDOW IS ENOUGH', col: c.accent700, text: 'A bounded, small, slowly-changing document set queried rarely: pasting it is simpler and fails less.' };
+    return { title: 'MEASURE ON YOUR CORPUS', col: c.accent, text: 'One pressure is rising. Build the labelled set and let recall and cost decide, not the slogan.' };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var s = debateState();
+    var v = verdict(s);
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('corpus ≈ ' + Guide.fmtNum(s.corpusTokens) + ' tokens  ·  window reference 200,000  ·  ' +
+      (s.fits ? 'fits in context' : 'does not fit in context'), 12, 16);
+    ctx.font = '600 12px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('pro-window: paste it all', 12, 40);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('pro-retrieval: index it', 338, 40);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(320, 48); ctx.lineTo(320, 244); ctx.stroke();
+    function drawItems(items, x) {
+      items.forEach(function (it, i) {
+        var y = 62 + i * 24;
+        var on = it.active(s);
+        ctx.beginPath(); ctx.arc(x + 4, y + 4, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = on ? (x < 320 ? c.accent700 : c.accent2) : c.divider;
+        ctx.fill();
+        ctx.fillStyle = on ? c.text : 'rgba(0,0,0,0.35)';
+        ctx.font = (on ? '600 ' : '') + '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(it.label, x + 16, y + 8);
+      });
+    }
+    drawItems(PRO_WINDOW, 12);
+    drawItems(PRO_RETRIEVAL, 338);
+    ctx.fillStyle = v.col; ctx.fillRect(12, 250, 616, 74);
+    ctx.fillStyle = '#fff'; ctx.font = '600 15px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(v.title, 24, 276);
+    ctx.font = '11px ' + c.font;
+    var words = v.text.split(' '), line = '', ly = 296;
+    words.forEach(function (w) {
+      var test = line ? line + ' ' + w : w;
+      if (ctx.measureText(test).width > 590) { ctx.fillText(line, 24, ly); ly += 14; line = w; }
+      else line = test;
+    });
+    if (line) ctx.fillText(line, 24, ly);
+    var dv = el('beyond-docs').parentElement.querySelector('.val');
+    var vv = el('beyond-volume').parentElement.querySelector('.val');
+    var fv = el('beyond-fresh').parentElement.querySelector('.val');
+    if (dv) dv.textContent = Guide.fmtNum(s.docs);
+    if (vv) vv.textContent = Guide.fmtNum(s.volume);
+    if (fv) fv.textContent = s.fresh + ' h';
+    el('beyond-debate-readout').innerHTML =
+      '<div><span class="k">verdict</span> <span class="' + (s.score >= 2 ? 'bad' : 'hi') + '">' + v.title + '</span></div>' +
+      '<div><span class="k">whole-corpus cost per query</span> USD ' + s.costPerQuery.toFixed(2) +
+      ' · <span class="k">per day</span> USD ' + Guide.fmtNum(s.dailyCost, 0) + ' <span class="k">(input at 3.00 per 1M)</span></div>' +
+      '<div class="k">retrieval resends only the retrieved tokens, but adds an index, freshness and an ACL layer to operate.</div>';
+  }
+  Guide.bindSliders([D.docs, D.volume, D.fresh], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function setSource(id, text) { var e = el(id); if (e) e.textContent = text || ''; }
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    setSource('beyond-src-rag', NUM.rag && NUM.rag.source);
+    setSource('beyond-src-fusion', NUM.fusion && NUM.fusion.source);
+    setSource('beyond-src-retrieval', NUM.retrieval_contextual && NUM.retrieval_contextual.source);
+    setSource('beyond-src-embeddings', NUM.embeddings && NUM.embeddings.source);
+    setSource('beyond-src-windows', NUM.context_windows && NUM.context_windows.source);
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); syncB(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'beyond-chunks-hyde',
+      kind: 'choice',
+      prompt: 'What does HyDE change about a retrieval query?',
+      options: [
+        { label: 'It embeds a hypothetical answer instead of the question, so the vector sits nearer real passages.', correct: true },
+        { label: 'It splits the query into one term per word for exact matching.' },
+        { label: 'It expands the query with synonyms from a dictionary.' },
+        { label: 'It reranks the retrieved passages with a cross-encoder.' }
+      ],
+      explanation: 'HyDE generates a hypothetical answer and embeds that, because answers resemble answers. It buys recall on vocabulary-mismatched queries and can hurt precision when the hypothetical answer is wrong.'
+    },
+    {
+      id: 'beyond-chunks-graph-global',
+      kind: 'choice',
+      prompt: 'Which question is flat chunk retrieval structurally unable to answer?',
+      options: [
+        { label: '“What themes run through this whole corpus?”', correct: true },
+        { label: '“Which passage defines the KV cache?”' },
+        { label: '“Where is the retry budget mentioned?”' },
+        { label: '“What does the acronym TTFT stand for?”' }
+      ],
+      explanation: 'A global question’s answer is a property of the whole set, not of any passage. GraphRAG builds an entity graph and community summaries so summaries of summaries can answer it; flat top-k returns near-zero-score noise.'
+    },
+    {
+      id: 'beyond-chunks-selfrag',
+      kind: 'choice',
+      prompt: 'What do Self-RAG and CRAG have in common as a lesson?',
+      options: [
+        { label: 'Retrieval should be a decision with a check — decide whether to retrieve and grade what came back.', correct: true },
+        { label: 'Both replace the embedding model with a keyword index.' },
+        { label: 'Both remove reranking from the pipeline.' },
+        { label: 'Both require a separate reward model trained on human preferences.' }
+      ],
+      explanation: 'Self-RAG emits reflection tokens about retrieval and support; CRAG grades the retrieved set and corrects or falls back. The portable lesson: do not let a fixed pipeline stage turn bad evidence into a bad answer unchecked.'
+    },
+    {
+      id: 'beyond-chunks-code-lexical',
+      kind: 'choice',
+      prompt: 'For finding an exact code identifier such as AuthTokenValidator in a repository, what usually wins?',
+      options: [
+        { label: 'Lexical/grep-style search, because the identifier is a literal token an exact index matches with certainty.', correct: true },
+        { label: 'Dense embeddings, because they capture the identifier’s meaning.' },
+        { label: 'A cross-encoder reranker over all files.' },
+        { label: 'GraphRAG, because code is a graph.' }
+      ],
+      explanation: 'Identifiers, error strings and paths are literal; exact matching finds them cheaply and verifiably. Embeddings earn their place on intent queries that share no token with the code, and the skill is knowing which query you hold.'
+    },
+    {
+      id: 'beyond-chunks-cost',
+      kind: 'numeric',
+      prompt: 'A 500,000-token corpus is sent whole on every query. At 3.00 per 1M input tokens, what is the daily input cost for 2,000 queries?',
+      answer: 3000,
+      unit: 'USD',
+      tolerance: 1,
+      explanation: 'Per query: 500,000 / 1,000,000 × 3.00 = 1.50. For 2,000 queries: 1.50 × 2,000 = 3,000 per day. This is the pro-retrieval cost argument: a long window is billed per token on every request.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

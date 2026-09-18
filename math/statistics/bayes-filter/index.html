@@ -1,0 +1,431 @@
+---
+title: "Statistics, Interactively — Part 27: The Bayes filter"
+description: "A robot in a corridor keeps a histogram belief that blurs when it moves and multiplies when it sees a door."
+permalink: "/math/statistics/bayes-filter/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-doors { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; margin-top: 4px; }
+  .g-doors i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>The Bayes filter</h1>
+    <p>A robot is somewhere in a corridor. It cannot see the whole corridor at once, its wheels slip, and its door sensor fires from a distance. Yet from a stream of noisy moves and observations it holds a running belief about where it is &mdash; not one guessed position but a whole distribution over positions, narrowed by every measurement and spread out by every metre of travel. The Bayes filter is the recursion that does this, built here in the simplest possible representation: a one-dimensional histogram over the corridor, so that its two moves &mdash; blur when you move, multiply when you see &mdash; are things you can watch happen.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Where am I, given everything I have seen so far?</p>
+    <p>Every estimation problem in this series has been about a quantity you cannot see directly. Here the quantity is the robot's <em>state</em>: its position along the corridor, a number that changes as the robot drives and that no sensor reports exactly. The robot has two noisy sources of information &mdash; how far it <em>tried</em> to drive, and what a sensor <em>observed</em>, such as a door somewhere ahead. Neither alone pins down the position.</p>
+    <p>The honest answer to "where am I?" is therefore a probability distribution over the corridor, called the <em>belief</em>: your current knowledge given every control command and measurement so far. Because data arrive one at a time, the belief is updated one step at a time &mdash; take the belief you had a moment ago, account for the motion, then account for the new measurement. That is the whole idea, and it repeats forever.</p>
+    <p>What makes the recursion worth a part of its own is that it is <em>general</em>. Whether the state is a robot in a corridor, an aircraft in the sky, or a parameter being tracked as data stream, the same three ingredients appear: a prior belief, a motion model, and a measurement model. Only the way you <em>store</em> the belief changes, and this part deliberately uses the crudest storage &mdash; a histogram &mdash; so that nothing is hidden behind algebra. Later parts swap in smarter storage.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a belief that is only ever blurred and multiplied can localise a lost robot from a completely uniform starting point, why uncertainty grows on the predict step and shrinks on the update step, and why the choice of representation &mdash; histogram, particles, or a single Gaussian &mdash; is the real decision in designing a filter.</span></div>
+    <div class="g-toc">
+      <a href="#recursive">2 · The recursive filter</a>
+      <a href="#demo">3 · A belief in a corridor</a>
+      <a href="#representation">4 · What the representation buys</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="recursive">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The recursive Bayes filter</h2></div>
+    <p class="g-eyebrow">Prior, predict, update &mdash; the same three lines forever</p>
+    <p>Write $x_t$ for the state at time $t$ and $z_t$ for the measurement. The belief is the conditional density $bel(x_t) = p(x_t \mid z_{1:t}, u_{1:t})$, a distribution over where the robot could be. The filter computes it recursively, because holding the whole history explicitly would grow without bound &mdash; and it gets away with that thanks to one assumption.</p>
+    <p>The <em>Markov assumption</em> says the present state is a sufficient summary of the past: once you know where the robot is now, earlier positions add nothing, and the last measurement depends on the state and nothing older. Written out, $p(x_t \mid x_{t-1}, \dots) = p(x_t \mid x_{t-1})$ and $p(z_t \mid x_t, \dots) = p(z_t \mid x_t)$. The first factor is the <em>motion model</em>, the second the <em>measurement model</em>. With those two assumptions the history collapses to a two-line loop.</p>
+    <p>The first line is <em>predict</em>, also called the control update. The robot applies a control $u_t$ and moves. Because the motion is uncertain, the belief spreads: the new prediction is the old belief convolved with the motion model,</p>
+    <div class="g-math g-katex">$$\overline{bel}(x_t) = \int p(x_t \mid x_{t-1}, u_t)\, bel(x_{t-1})\, dx_{t-1}$$</div>
+    <p>For a robot driving forward this is a shift and a blur. Mass that was at one position is carried forward and smeared over the distance the robot might have travelled. In a histogram the integral becomes a sum, and the convolution is a loop over bins: each bin's mass is redistributed to its neighbours, shifted forward. Prediction never adds information; uncertainty goes up.</p>
+    <p>The second line is <em>update</em>, also called the measurement update. A measurement $z_t$ arrives and is compared against what each candidate state would have predicted. Bayes' rule multiplies the prediction by the likelihood at each position and normalises,</p>
+    <div class="g-math g-katex">$$bel(x_t) = \eta \, p(z_t \mid x_t)\, \overline{bel}(x_t), \qquad \eta = 1 / \textstyle\int p(z_t \mid x_t)\, \overline{bel}(x_t)\, dx_t$$</div>
+    <p>The constant $\eta$ is just the normaliser that makes the result a distribution again. This step <em>multiplies</em> whatever the sensor's model says is plausible, and it is where information enters: positions that explain the measurement keep their mass or gain it, positions that cannot explain it are multiplied down. Uncertainty goes down. Bayesian inference is not a special technique here; it is what happens when you keep applying Bayes' rule one observation at a time. The order matches the events: predict because the robot moved, update because a sensor fired. Skip the predict and the belief never follows the robot; skip the update and it only ever spreads.</p>
+  </section>
+
+  <section class="g-step" id="demo">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>A belief in a corridor</h2></div>
+    <p class="g-eyebrow">The histogram filter, one metre at a time</p>
+    <p>The robot below drives down a corridor twelve metres long with five doors. The doors carry colour codes &mdash; three blue, one red, one green &mdash; and the sensor reports which colour it sees, not how far away it is. The belief is a histogram: the corridor is cut into $121$ narrow bins, each holding the probability that the robot is in that slice. At the start nothing is known, so the histogram is flat: a uniform prior over the whole corridor. This is <em>global localisation</em>, the hard case where the robot has no idea where it is.</p>
+    <p>Press <b>Move +1 m</b> and the robot takes one step. Its true position advances only approximately &mdash; the wheels slip, so the step is one metre plus a random error the filter does not know. It therefore predicts by shifting the histogram one metre forward and blurring it by an amount set by the <em>process noise</em> slider. A wide slider smears the belief badly; a narrow one keeps it crisp but overconfident. Entropy climbs on every move: prediction is lossy by construction.</p>
+    <p>Now press <b>See door</b>. The sensor reports a colour, and the filter builds a likelihood that is a sharp Gaussian around every door carrying that colour, multiplies the belief by it, and renormalises. Because the blue doors are spread along the corridor, seeing blue produces three separate peaks: the measurement rules out the stretches between doors but cannot tell which blue door is in front of the robot. The belief snaps to a set of spikes. Seeing the single red or green door is far more decisive. This is the honest behaviour of global localisation &mdash; a sensor that distinguishes only a few door types leaves real ambiguity, and a correct filter represents it rather than pretending to one answer.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="corridor-canvas" width="640" height="160"></canvas>
+        <canvas id="belief-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Top: the corridor, its doors, the true robot, and the belief's mean and MAP. Bottom: the belief itself, a filled histogram over position.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Process noise (blur per step) <span class="val">0.35</span> m</label><input type="range" id="proc-slider" min="0.05" max="1" step="0.05" value="0.35"></div>
+        <div class="g-field"><label>Measurement noise (door sensor) <span class="val">0.5</span> m</label><input type="range" id="meas-slider" min="0.1" max="1.5" step="0.05" value="0.5"></div>
+        <div class="g-field"><label for="door-select">Which door the sensor reports</label>
+          <select id="door-select">
+            <option value="nearest">nearest to the true position</option>
+            <option value="0">blue doors (D0)</option>
+            <option value="1">red door (D1)</option>
+            <option value="2">green door (D2)</option>
+          </select>
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="move-one" class="g-primary">Move +1 m</button>
+          <button type="button" id="see-door">See door</button>
+          <button type="button" id="move-ten">Move 10 steps</button>
+          <button type="button" id="reset">Reset</button>
+        </div>
+        <div class="g-readout" id="readout"></div>
+        <div class="g-doors" id="door-legend"></div>
+      </div>
+    </div>
+    <p>Watch the two markers on the upper canvas. The <em>mean</em> is the probability-weighted average position and the <em>MAP</em> is the most likely bin. After a decisive measurement they agree. After a blue-door measurement they can disagree sharply: the mean averages across three spikes and may land in an empty stretch where the robot certainly is not, while the MAP picks one spike. A mean is only meaningful for a belief with one hill; for a multimodal belief it can be actively misleading, and the filter should report the distribution rather than a point.</p>
+    <div class="g-warn">⚠ <span><b>The belief is not the robot.</b> A sharp histogram means the filter is confident given the models you gave it, not that the robot is definitely right. Set the process noise too low and the filter becomes overconfident, trusting its motion model and refusing to recover when the robot is elsewhere. Tuning the noise is a statement about how wrong you believe your models are.</span></div>
+    <p>Try a sequence: <b>Reset</b>, then <b>Move 10 steps</b>, and watch the flat prior smear into an even flatter, edge-heavy belief. Now press <b>See door</b> twice: the first sighting collapses the belief onto the doors of one colour, the second reinforces whichever of those the robot is actually near and the spikes sharpen. The filter has localised from a uniform prior using nothing but blur and multiply.</p>
+  </section>
+
+  <section class="g-step" id="representation">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What the representation buys</h2></div>
+    <p class="g-eyebrow">Histograms, particles, and the single Gaussian</p>
+    <p>The recursion never changes; only the way you store $bel(x_t)$ does. The histogram is the most literal storage: a grid of bins, each holding a probability. Its virtue is that it assumes nothing about the shape of the belief &mdash; flat, spiked, skewed, or a row of separate hills, exactly what global localisation produces. Multimodal beliefs are represented without apology.</p>
+    <p>The price is resolution and cost. A histogram with $n$ bins has a fixed precision of one bin width, and the predict convolution naively touches every pair of bins, which is $O(n^2)$ work; it can be reduced to $O(n)$ with a compact kernel, but the number of bins multiplies with each new state variable, so the cost of good resolution grows steeply in higher dimensions. That curse of dimensionality is why a fixed grid is rarely the end of the story.</p>
+    <p>The <em>particle filter</em> replaces the grid with a cloud of weighted samples that move to wherever the belief has mass, concentrating effort on the likely regions. It keeps the freedom to be multimodal and scales to many dimensions, at the risk of particle deprivation when the cloud loses a hypothesis. It is the subject of a later part of this series.</p>
+    <p>The <em>Kalman filter</em> makes the opposite bet: the belief is always a single Gaussian, described completely by a mean and a covariance. Predicting a Gaussian through a linear motion model gives another Gaussian, and multiplying two Gaussians gives a third &mdash; the Gaussian fusion from earlier in the series, now run as a loop in time. The whole filter reduces to updating an ellipse: cheap and exact for linear-Gaussian systems, but unable to represent two hypotheses at once. A Kalman filter started from a uniform prior cannot do global localisation, because it has no way to say "either here or there." That is the representation trade in one sentence: histograms and particles can be wrong-shaped and expensive, Gaussians are cheap and forced to be single-hilled.</p>
+    <p>Two threads from earlier run underneath. The normaliser $\eta$ is a marginal likelihood, the probability that the sensor would have produced this reading under the current belief; when the numbers get small, working in logs keeps the arithmetic from underflowing, which is why numerical care matters even here. And the shift-and-blur picture is precisely a convolution, the same object that made the central limit theorem tangible. The machinery is not new; it is the same statistics, one time step at a time.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One recursion, many robots</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Odometry is the motion model</h3>
+        <p style="margin-bottom:0;">The wheel encoders described in the <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry section</a> are exactly the control input $u_t$ of this filter. Integrating their counts gives a displacement, and the process-noise slider is a statement about slip, uneven ground and calibration drift. Odometry alone always drifts; the filter is what keeps a sensor in the loop so the drift can be corrected instead of accumulating forever.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision &amp; Geometry</div>
+        <h3 style="margin:6px 0;">SLAM is this filter, plus the map</h3>
+        <p style="margin-bottom:0;">Simultaneous localisation and mapping, in the <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM chapter</a>, runs the same predict-and-update recursion with the landmark positions added to the state. The doors here are landmarks measured against an unknown map; estimate both and the ambiguity of global localisation becomes the loop-closure problem that offline factor-graph methods attack.</p>
+      </div>
+    </div>
+    <p>The pattern repeats wherever a hidden state evolves and noisy observations arrive. A vision pipeline tracking a calibration parameter across frames runs a Bayes filter with one state variable; a recommender revising a user's taste as clicks arrive predicts and updates the same way. Whenever the object you care about changes over time and you see it only through noise, this recursion is the thing to reach for.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below treat the Bayes filter as the unifying recursion rather than a collection of algorithms, which is the order that makes the two-step loop memorable. If you take away one thing, take away the picture of a belief that blurs when it moves and multiplies when it sees.</p>
+    <p>Thrun, Burgard and Fox derive the general filter and then the histogram, Kalman and particle versions from it in sequence &mdash; exactly the arc this part begins. Murphy's chapter is the cleanest probabilistic treatment for a reader who wants the graphical-model view, and Stachniss's lectures make the same material concrete on a board.</p>
+    <ul class="g-refs">
+      <li>Sebastian Thrun, Wolfram Burgard and Dieter Fox, <em>Probabilistic Robotics</em>, chapter 2 &mdash; the recursive Bayes filter and the histogram filter worked in one dimension.</li>
+      <li>Kevin Murphy, <em>Probabilistic Machine Learning: Advanced Topics</em>, chapter on state-space models &mdash; the filter as inference in a hidden Markov model.</li>
+      <li>Cyrill Stachniss, <a href="https://www.youtube.com/playlist?list=PLgnQpQtFTOGQrZ4O5QzbIHgl3b1JHimN_">"Probabilistic Robotics"</a> lecture series &mdash; the corridor-with-doors example used here, developed on a board.</li>
+      <li>3Blue1Brown, <a href="https://www.youtube.com/playlist?list=PLiaHhY2iBX9ihLasvE8BKnCFdFuwt7b0K">probability and Bayes series</a> &mdash; the visual style behind the histogram smoother.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>$bel(x_t)$</td><td>The belief: a distribution over the state given all controls and measurements so far</td></tr>
+        <tr><td>Markov assumption</td><td>The present state summarises the past; older states add nothing once $x_{t-1}$ is known</td></tr>
+        <tr><td>Motion model</td><td>$p(x_t \mid x_{t-1}, u_t)$ &mdash; how the state evolves under a control; used on predict</td></tr>
+        <tr><td>Measurement model</td><td>$p(z_t \mid x_t)$ &mdash; how likely each state is to produce the observation; used on update</td></tr>
+        <tr><td>Predict</td><td>Convolve (shift and blur) with the motion model. Uncertainty goes up</td></tr>
+        <tr><td>Update</td><td>Multiply by the likelihood and normalise. Uncertainty goes down</td></tr>
+        <tr><td>Normaliser $\eta$</td><td>Reciprocal of the total mass after multiplying; a marginal likelihood</td></tr>
+        <tr><td>Histogram filter</td><td>Belief stored as a grid of bins; any shape, cost grows with dimensions</td></tr>
+        <tr><td>Particle filter</td><td>Belief stored as weighted samples; any shape, scales to many dimensions</td></tr>
+        <tr><td>Kalman filter</td><td>Belief stored as one Gaussian (mean and covariance); cheap, but unimodal</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A histogram can hold any belief, but it cannot scale to many dimensions. If a single Gaussian is enough, the whole recursion collapses to updating a mean and a covariance &mdash; and it has a name.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 2 : d; var s = x.toFixed(d); if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, ''); return s === '-0' ? '0' : s; }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---- the world -------------------------------------------------------
+  var L = 12;                 // corridor length in metres
+  var DOORS = [
+    { x: 1.5, id: 0 },
+    { x: 4.0, id: 1 },
+    { x: 6.5, id: 0 },
+    { x: 9.5, id: 2 },
+    { x: 11.0, id: 0 }
+  ];
+  var DOOR_COLOR = [c.accent, c.accent2, c.accent700];
+  var DOOR_NAME = ['blue', 'red', 'green'];
+
+  var BINS = 121;
+  var SEED = 20260914;
+  var STEP_NOISE = 0.25;      // true wheel-slip sd per step, in metres
+  var trueX = 6;
+  var steps = 0;
+  var lastSeen = -1;
+  var processNoise = 0.35;
+  var measNoise = 0.5;
+  var doorMode = 'nearest';
+  var rng = S.rng(SEED);
+
+  function newFilter() {
+    return S.filter.histogram1d({
+      n: BINS, domain: [0, L],
+      initial: function () { return 1; }
+    });
+  }
+  var filt = newFilter();
+
+  // ---- corridor canvas (plain canvas; no axes) -------------------------
+  var CW = 640, CH = 160;
+  var PADL = 62, PADR = 30;
+  var corridorReady = false;
+  var corridor = Guide.setupCanvas(el('corridor-canvas'), CW, CH, function () { if (corridorReady) redrawCorridor(); });
+  corridorReady = true;
+
+  function cpx(x) { return PADL + (CW - PADL - PADR) * clamp(x / L, 0, 1); }
+
+  function redrawCorridor() {
+    var ctx = corridor.ctx;
+    ctx.clearRect(0, 0, CW, CH);
+    var y0 = 62, bandH = 36, x0 = cpx(0), x1 = cpx(L);
+
+    ctx.fillStyle = 'rgba(32,30,29,0.05)';
+    ctx.fillRect(x0, y0, x1 - x0, bandH);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(x0, y0, x1 - x0, bandH);
+
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for (var m = 0; m <= L; m++) {
+      var X = cpx(m);
+      ctx.strokeStyle = 'rgba(32,30,29,0.15)';
+      ctx.beginPath(); ctx.moveTo(X, y0 + bandH); ctx.lineTo(X, y0 + bandH + 4); ctx.stroke();
+      if (m % 3 === 0) ctx.fillText(m + ' m', X, y0 + bandH + 6);
+    }
+
+    var i, d, Xd, col;
+    for (i = 0; i < DOORS.length; i++) {
+      d = DOORS[i]; Xd = cpx(d.x); col = DOOR_COLOR[d.id];
+      ctx.fillStyle = col;
+      ctx.fillRect(Xd - 5, y0 - 2, 10, bandH + 4);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 9px ' + c.font;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('D' + d.id, Xd, y0 + bandH / 2);
+    }
+
+    var Xt = cpx(trueX);
+    ctx.beginPath(); ctx.arc(Xt, y0 - 18, 7, 0, 2 * Math.PI);
+    ctx.fillStyle = c.text; ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText('true', Xt, y0 - 28);
+
+    var mean = filt.mean(), map = filt.map();
+    var Xm = cpx(mean), Xp = cpx(map);
+    ctx.fillStyle = c.accent2;
+    ctx.beginPath(); ctx.moveTo(Xm, y0 + bandH + 30); ctx.lineTo(Xm - 5, y0 + bandH + 22); ctx.lineTo(Xm + 5, y0 + bandH + 22); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = c.accent700;
+    ctx.beginPath(); ctx.moveTo(Xp, y0 + bandH + 48); ctx.lineTo(Xp - 5, y0 + bandH + 40); ctx.lineTo(Xp + 5, y0 + bandH + 40); ctx.closePath(); ctx.fill();
+    ctx.font = '9px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillStyle = c.accent2; ctx.fillText('mean', Xm, y0 + bandH + 52);
+    ctx.fillStyle = c.accent700; ctx.fillText('MAP', Xp, y0 + bandH + 52);
+  }
+
+  // ---- belief canvas (Stats.plot histogram) ----------------------------
+  var beliefPlot = null;
+
+  function redrawBelief() {
+    if (!beliefPlot) return;
+    beliefPlot.clear();
+    var p = filt.p, xs = filt.xs, i, maxp = 0;
+    for (i = 0; i < p.length; i++) if (p[i] > maxp) maxp = p[i];
+    var yTop = Math.max(maxp * 1.25, 4 / BINS);
+    beliefPlot.yRange[0] = 0; beliefPlot.yRange[1] = yTop;
+    beliefPlot.axes({ xLabel: 'position (m)', yLabel: 'probability' });
+
+    var dx = xs.length > 1 ? xs[1] - xs[0] : 1;
+    var bins = [];
+    for (i = 0; i < p.length; i++) bins.push({ x0: xs[i] - dx / 2, x1: xs[i] + dx / 2, h: p[i] });
+    beliefPlot.columns(bins, { color: c.accent, alpha: 0.65 });
+
+    beliefPlot.vline(trueX, { color: c.text, dashed: true, width: 1.6, label: 'true', labelY: yTop * 0.99 });
+    beliefPlot.vline(filt.mean(), { color: c.accent2, width: 2, label: 'mean', labelY: yTop * 0.82 });
+    beliefPlot.vline(filt.map(), { color: c.accent700, width: 2, label: 'MAP', labelY: yTop * 0.65 });
+
+    beliefPlot.legend([
+      { label: 'belief (histogram)', color: c.accent, fill: true },
+      { label: 'true position', color: c.text, dashed: true },
+      { label: 'belief mean', color: c.accent2 },
+      { label: 'belief MAP', color: c.accent700 }
+    ], { dy: 6 });
+  }
+
+  beliefPlot = S.plot(el('belief-canvas'), {
+    W: 640, H: 300, xRange: [0, L], yRange: [0, 1],
+    xLabel: 'position (m)', yLabel: 'probability', onResize: redrawBelief
+  });
+
+  // ---- readouts --------------------------------------------------------
+  function updateReadout() {
+    var mean = filt.mean(), map = filt.map(), v = filt.variance(), ent = filt.entropy();
+    var idtxt = lastSeen < 0 ? '&mdash;' : (DOOR_NAME[lastSeen] + ' (D' + lastSeen + ')');
+    el('readout').innerHTML =
+      '<div><span class="k">true position</span> <span class="hi">' + fmt(trueX, 2) + ' m</span></div>' +
+      '<div><span class="k">belief mean</span> ' + fmt(mean, 2) + ' m</div>' +
+      '<div><span class="k">belief MAP</span> ' + fmt(map, 2) + ' m</div>' +
+      '<div><span class="k">belief sd</span> ' + fmt(Math.sqrt(Math.max(0, v)), 2) + ' m</div>' +
+      '<div><span class="k">entropy</span> ' + fmt(ent, 2) + ' nats</div>' +
+      '<div><span class="k">last door seen</span> ' + idtxt + '</div>' +
+      '<div class="g-mini">' + steps + ' step' + (steps === 1 ? '' : 's') + '. Prediction blurs, the update multiplies.</div>';
+  }
+
+  // ---- filter operations ----------------------------------------------
+  function trueStep() {
+    trueX = trueX + 1 + S.sample.normal(rng, 0, STEP_NOISE);
+    if (trueX > L - 0.1) trueX = (L - 0.1) - (trueX - (L - 0.1));
+    if (trueX < 0.1) trueX = 0.1 + (0.1 - trueX);
+    trueX = clamp(trueX, 0.1, L - 0.1);
+  }
+
+  function doMove() {
+    trueStep();
+    filt.predict(1, processNoise);
+    steps++;
+  }
+
+  function nearestDoorId(x) {
+    var best = 0, bd = Infinity;
+    for (var i = 0; i < DOORS.length; i++) {
+      var d = Math.abs(DOORS[i].x - x);
+      if (d < bd) { bd = d; best = DOORS[i].id; }
+    }
+    return best;
+  }
+
+  function makeLikelihood(id) {
+    return function (x) {
+      var s = 0;
+      for (var i = 0; i < DOORS.length; i++) {
+        if (DOORS[i].id !== id) continue;
+        var z = (x - DOORS[i].x) / measNoise;
+        s += Math.exp(-0.5 * z * z);
+      }
+      return s;
+    };
+  }
+
+  function doSee() {
+    var id = (doorMode === 'nearest') ? nearestDoorId(trueX) : parseInt(doorMode, 10);
+    filt.update(makeLikelihood(id));
+    lastSeen = id;
+  }
+
+  function redraw() { redrawCorridor(); redrawBelief(); updateReadout(); }
+
+  function reset() {
+    filt = newFilter();
+    trueX = 6; steps = 0; lastSeen = -1;
+    rng = S.rng(SEED);
+    redraw();
+  }
+
+  // ---- controls --------------------------------------------------------
+  Guide.bindSliders([el('proc-slider')], function (sl) { processNoise = parseFloat(sl.value); });
+  Guide.bindSliders([el('meas-slider')], function (sl) { measNoise = parseFloat(sl.value); });
+  el('door-select').addEventListener('change', function () { doorMode = this.value; });
+
+  el('move-one').addEventListener('click', function () { doMove(); redraw(); });
+  el('see-door').addEventListener('click', function () { doSee(); redraw(); });
+  el('move-ten').addEventListener('click', function () { for (var i = 0; i < 10; i++) doMove(); redraw(); });
+  el('reset').addEventListener('click', reset);
+
+  el('door-legend').innerHTML =
+    '<span><i style="background:' + c.accent + '"></i>blue doors D0 (x = 1.5, 6.5, 11.0)</span>' +
+    '<span><i style="background:' + c.accent2 + '"></i>red door D1 (x = 4.0)</span>' +
+    '<span><i style="background:' + c.accent700 + '"></i>green door D2 (x = 9.5)</span>';
+
+  redraw();
+
+  // ---- check your understanding ---------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'bayes-filter-predict',
+      kind: 'choice',
+      prompt: 'What does the predict step do to the belief, and what happens to its uncertainty?',
+      options: [
+        { label: 'It convolves the belief with the motion model &mdash; shifting and blurring it &mdash; so uncertainty grows.', correct: true },
+        { label: 'It multiplies the belief by the measurement likelihood, so uncertainty shrinks.', correct: false },
+        { label: 'It resets the belief to a uniform distribution over the whole corridor.', correct: false }
+      ],
+      explanation: 'Prediction accounts for motion. Because the motion is uncertain, the belief is shifted forward and smeared: this convolution only loses information, so entropy (uncertainty) increases. The multiply-by-likelihood step is the update, not the predict.'
+    },
+    {
+      id: 'bayes-filter-normalize',
+      kind: 'numeric',
+      prompt: 'A two-bin belief is $[0.5, 0.5]$. A measurement likelihood multiplies the first bin by 1 and the second by 3, giving unnormalised weights $[0.5, 1.5]$. After normalising, what is the posterior probability of the second bin?',
+      answer: 0.75,
+      tolerance: 0.001,
+      explanation: 'The unnormalised weights sum to 0.5 + 1.5 = 2. Dividing by that total gives [0.25, 0.75], so the second bin holds 0.75. Normalising is what makes the multiplied belief a probability distribution again.'
+    },
+    {
+      id: 'bayes-filter-entropy',
+      kind: 'numeric',
+      prompt: 'Before a move the belief has entropy 2.0 nats. After the predict step its entropy is 2.4 nats. By how many nats did the uncertainty increase?',
+      answer: 0.4,
+      tolerance: 0.001,
+      explanation: 'The increase is 2.4 &minus; 2.0 = 0.4 nats. Prediction is lossy: because the motion model is uncertain, the belief can only spread and entropy can only rise. The update is the step that brings it back down.'
+    },
+    {
+      id: 'bayes-filter-markov',
+      kind: 'choice',
+      prompt: 'The recursion is cheap because the belief only needs the previous state, not the whole history. Which assumption buys that?',
+      options: [
+        { label: 'The Markov assumption: given the previous state, earlier states add nothing, and the measurement depends only on the current state.', correct: true },
+        { label: 'The assumption that the measurement noise is zero.', correct: false },
+        { label: 'The assumption that the belief is always a single Gaussian.', correct: false }
+      ],
+      explanation: 'The Markov assumption makes the current state a sufficient summary of the past. That is what lets the filter carry forward a single distribution instead of the entire history. Assuming a single Gaussian is a separate choice about representation, made by the Kalman filter but not required here.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

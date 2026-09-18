@@ -1,0 +1,243 @@
+---
+title: "LLM Serving, Interactively — Series Hub"
+description: "The full map of the 20-part interactive LLM Serving guide — a clickable request path from gateway to decode worker, the worker internals, the substrate it runs on, and a routing table for jumping in wherever you already know the basics."
+permalink: /ai/llm-serving/
+section: ai
+series: llm_serving
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .hub-pipeline { width: 100%; height: auto; }
+  .hub-pipeline .stage { cursor: pointer; }
+  .hub-pipeline .stage rect { fill: var(--color-surface); stroke: var(--color-divider); transition: fill 0.15s; }
+  .hub-pipeline .stage:hover rect { fill: var(--color-accent-100); stroke: var(--color-accent); }
+  .hub-pipeline .stage text { fill: var(--color-text); font-family: var(--font-body); }
+  .hub-pipeline .stage .stage-title { font-weight: 600; font-size: 12px; }
+  .hub-pipeline .stage .stage-meta { font-size: 9.5px; opacity: 0.65; }
+  .hub-pipeline .lanelabel { font-family: var(--font-heading); font-weight: 600; font-size: 12px; fill: var(--color-text); opacity: 0.55; letter-spacing: 0.06em; text-transform: uppercase; }
+  .hub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; margin-top: 16px; }
+  .hub-card {
+    background: var(--color-surface); border-radius: var(--radius-md); padding: 16px;
+    text-decoration: none; color: var(--color-text); display: block; transition: box-shadow 0.15s;
+  }
+  .hub-card:hover { box-shadow: var(--shadow-md); }
+  .hub-card .num { font-family: var(--font-mono); font-size: 11px; opacity: 0.55; }
+  .hub-card h3 { margin: 4px 0 6px; font-size: 16px; }
+  .hub-card p { margin: 0; font-size: 13px; opacity: 0.8; line-height: 1.5; }
+  .route-table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 10px; }
+  .route-table th, .route-table td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); text-align: left; vertical-align: top; }
+  .route-table th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Series hub</span>
+    <h1>LLM Serving, Interactively</h1>
+    <p>Part 11 of the training guide established the KV cache, prefill versus decode, and continuous batching in twenty minutes. This series rebuilds all of it as a quantitative model you plug your own hardware into, then follows it out to what hyperscalers actually run: disaggregated prefill and decode pools, wide expert parallelism, rack-scale NVLink, and a cost per task you can defend.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 24px;"></div>
+
+  <section class="g-step" style="border-top:none; padding-top:0;">
+    <h2 style="margin-top:0;">The life of a request</h2>
+    <p>Click any stage to jump to the part that covers it. The request path runs left to right across lane A; lane B is what a single worker is made of; lane C is the substrate underneath all of it.</p>
+    <svg class="hub-pipeline" viewBox="0 0 1180 470" role="img" aria-label="LLM serving request path, worker internals and substrate diagram">
+      <defs>
+        <marker id="hub-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="var(--color-divider)"/>
+        </marker>
+        <marker id="hub-arrow-kv" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="var(--color-accent-2)"/>
+        </marker>
+      </defs>
+
+      <!-- ================= Lane A: the request path ================= -->
+      <text x="20" y="20" class="lanelabel">A · the request path</text>
+      <a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}"><g class="stage" transform="translate(20,30)">
+        <rect width="160" height="100" rx="4"/>
+        <text x="80" y="28" text-anchor="middle" class="stage-title">Client / API gateway</text>
+        <text x="80" y="48" text-anchor="middle" class="stage-meta">Parts 17, 19</text>
+        <text x="80" y="70" text-anchor="middle" class="stage-meta">429s, token buckets</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}"><g class="stage" transform="translate(200,30)">
+        <rect width="160" height="100" rx="4"/>
+        <text x="80" y="28" text-anchor="middle" class="stage-title">KV-aware load balancer</text>
+        <text x="80" y="48" text-anchor="middle" class="stage-meta">Parts 8, 19</text>
+        <text x="80" y="70" text-anchor="middle" class="stage-meta">prefix affinity</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}"><g class="stage" transform="translate(380,30)">
+        <rect width="160" height="100" rx="4"/>
+        <text x="80" y="28" text-anchor="middle" class="stage-title">Queue + scheduler</text>
+        <text x="80" y="48" text-anchor="middle" class="stage-meta">Parts 6, 7</text>
+        <text x="80" y="70" text-anchor="middle" class="stage-meta">SLOs, fairness</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}"><g class="stage" transform="translate(560,30)">
+        <rect width="160" height="100" rx="4"/>
+        <text x="80" y="28" text-anchor="middle" class="stage-title">Prefill worker</text>
+        <text x="80" y="48" text-anchor="middle" class="stage-meta">Parts 1, 6, 12</text>
+        <text x="80" y="70" text-anchor="middle" class="stage-meta">compute-bound</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}"><g class="stage" transform="translate(740,30)">
+        <rect width="160" height="100" rx="4"/>
+        <text x="80" y="28" text-anchor="middle" class="stage-title">Decode worker</text>
+        <text x="80" y="48" text-anchor="middle" class="stage-meta">Parts 1, 6, 12</text>
+        <text x="80" y="70" text-anchor="middle" class="stage-meta">memory-bound</text>
+      </g></a>
+      <line x1="180" y1="80" x2="198" y2="80" stroke="var(--color-divider)" stroke-width="2" marker-end="url(#hub-arrow)"/>
+      <line x1="360" y1="80" x2="378" y2="80" stroke="var(--color-divider)" stroke-width="2" marker-end="url(#hub-arrow)"/>
+      <line x1="540" y1="80" x2="558" y2="80" stroke="var(--color-divider)" stroke-width="2" marker-end="url(#hub-arrow)"/>
+      <line x1="720" y1="80" x2="738" y2="80" stroke="var(--color-divider)" stroke-width="2" marker-end="url(#hub-arrow)"/>
+      <path d="M640,132 C640,150 460,150 460,132" fill="none" stroke="var(--color-accent-2)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#hub-arrow-kv)"/>
+      <text x="550" y="150" text-anchor="middle" class="stage-meta">KV transfer over RDMA · Part 13</text>
+      <path d="M820,132 C820,168 800,168 520,168 C500,168 470,150 462,136" fill="none" stroke="var(--color-divider)" stroke-width="1.6" marker-end="url(#hub-arrow)"/>
+      <text x="700" y="184" text-anchor="middle" class="stage-meta">next step / preemption · Part 7</text>
+
+      <!-- ================= Lane B: what a worker is made of ================= -->
+      <text x="20" y="212" class="lanelabel">B · what a worker is made of</text>
+      <a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}"><g class="stage" transform="translate(20,220)">
+        <rect width="130" height="92" rx="4"/>
+        <text x="65" y="26" text-anchor="middle" class="stage-title">Paged KV cache</text>
+        <text x="65" y="46" text-anchor="middle" class="stage-meta">Part 5</text>
+        <text x="65" y="66" text-anchor="middle" class="stage-meta">16-token blocks</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}"><g class="stage" transform="translate(170,220)">
+        <rect width="130" height="92" rx="4"/>
+        <text x="65" y="26" text-anchor="middle" class="stage-title">Prefix cache / radix</text>
+        <text x="65" y="46" text-anchor="middle" class="stage-meta">Part 8</text>
+        <text x="65" y="66" text-anchor="middle" class="stage-meta">shared prefixes</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/engine/' | relative_url }}"><g class="stage" transform="translate(320,220)">
+        <rect width="130" height="92" rx="4"/>
+        <text x="65" y="26" text-anchor="middle" class="stage-title">Attention &amp; sampling</text>
+        <text x="65" y="46" text-anchor="middle" class="stage-meta">Part 9</text>
+        <text x="65" y="66" text-anchor="middle" class="stage-meta">FlashAttention tiling</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/quantization/' | relative_url }}"><g class="stage" transform="translate(470,220)">
+        <rect width="130" height="92" rx="4"/>
+        <text x="65" y="26" text-anchor="middle" class="stage-title">Quantized weights</text>
+        <text x="65" y="46" text-anchor="middle" class="stage-meta">Part 10</text>
+        <text x="65" y="66" text-anchor="middle" class="stage-meta">FP8 / MXFP4</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/speculative/' | relative_url }}"><g class="stage" transform="translate(620,220)">
+        <rect width="130" height="92" rx="4"/>
+        <text x="65" y="26" text-anchor="middle" class="stage-title">Draft model</text>
+        <text x="65" y="46" text-anchor="middle" class="stage-meta">Part 11</text>
+        <text x="65" y="66" text-anchor="middle" class="stage-meta">EAGLE-3</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}"><g class="stage" transform="translate(770,220)">
+        <rect width="130" height="92" rx="4"/>
+        <text x="65" y="26" text-anchor="middle" class="stage-title">TP · PP · EP shards</text>
+        <text x="65" y="46" text-anchor="middle" class="stage-meta">Part 12</text>
+        <text x="65" y="66" text-anchor="middle" class="stage-meta">NVLink domain</text>
+      </g></a>
+
+      <!-- ================= Lane C: the substrate ================= -->
+      <text x="20" y="342" class="lanelabel">C · the substrate</text>
+      <a href="{{ '/ai/llm-serving/hardware/' | relative_url }}"><g class="stage" transform="translate(20,350)">
+        <rect width="205" height="92" rx="4"/>
+        <text x="102" y="26" text-anchor="middle" class="stage-title">GPU + HBM bandwidth</text>
+        <text x="102" y="46" text-anchor="middle" class="stage-meta">Part 2</text>
+        <text x="102" y="66" text-anchor="middle" class="stage-meta">~1–2 FLOPs/byte decode</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/moe/' | relative_url }}"><g class="stage" transform="translate(245,350)">
+        <rect width="205" height="92" rx="4"/>
+        <text x="102" y="26" text-anchor="middle" class="stage-title">MoE experts &amp; all-to-all</text>
+        <text x="102" y="46" text-anchor="middle" class="stage-meta">Part 14</text>
+        <text x="102" y="66" text-anchor="middle" class="stage-meta">top 4% take 38% of tokens</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/cluster/' | relative_url }}"><g class="stage" transform="translate(470,350)">
+        <rect width="205" height="92" rx="4"/>
+        <text x="102" y="26" text-anchor="middle" class="stage-title">K8s autoscaling / cold start</text>
+        <text x="102" y="46" text-anchor="middle" class="stage-meta">Part 19</text>
+        <text x="102" y="66" text-anchor="middle" class="stage-meta">40–90 s to first token</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/economics/' | relative_url }}"><g class="stage" transform="translate(695,350)">
+        <rect width="205" height="92" rx="4"/>
+        <text x="102" y="26" text-anchor="middle" class="stage-title">SLOs, goodput, $/M tokens</text>
+        <text x="102" y="46" text-anchor="middle" class="stage-meta">Parts 3, 20</text>
+        <text x="102" y="66" text-anchor="middle" class="stage-meta">cost per task, not per token</text>
+      </g></a>
+
+      <!-- ================= Right rail: workload shapes ================= -->
+      <text x="930" y="20" class="lanelabel">Workload shapes</text>
+      <a href="{{ '/ai/llm-serving/long-context/' | relative_url }}"><g class="stage" transform="translate(930,30)">
+        <rect width="230" height="92" rx="4"/>
+        <text x="115" y="28" text-anchor="middle" class="stage-title">Long context</text>
+        <text x="115" y="48" text-anchor="middle" class="stage-meta">Part 15</text>
+        <text x="115" y="68" text-anchor="middle" class="stage-meta">quadratic prefill, linear KV</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}"><g class="stage" transform="translate(930,140)">
+        <rect width="230" height="92" rx="4"/>
+        <text x="115" y="28" text-anchor="middle" class="stage-title">Structured output</text>
+        <text x="115" y="48" text-anchor="middle" class="stage-meta">Part 16</text>
+        <text x="115" y="68" text-anchor="middle" class="stage-meta">150K-wide token mask</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}"><g class="stage" transform="translate(930,250)">
+        <rect width="230" height="92" rx="4"/>
+        <text x="115" y="28" text-anchor="middle" class="stage-title">Agents &amp; multimodal</text>
+        <text x="115" y="48" text-anchor="middle" class="stage-meta">Part 18</text>
+        <text x="115" y="68" text-anchor="middle" class="stage-meta">prefill:decode inversion</text>
+      </g></a>
+      <a href="{{ '/ai/llm-serving/economics/' | relative_url }}"><g class="stage" transform="translate(930,360)">
+        <rect width="230" height="82" rx="4"/>
+        <text x="115" y="26" text-anchor="middle" class="stage-title">Reasoning</text>
+        <text x="115" y="46" text-anchor="middle" class="stage-meta">Parts 18, 20</text>
+        <text x="115" y="66" text-anchor="middle" class="stage-meta">thinking tokens blow up outputs</text>
+      </g></a>
+    </svg>
+  </section>
+
+  <section class="g-step">
+    <h2 style="margin-top:0;">All 20 parts</h2>
+    <div class="hub-grid">
+      {% for part in site.data.series.llm_serving.parts %}
+      <a class="hub-card" href="{{ part.permalink | relative_url }}">
+        <span class="num">{{ part.short }} of 20</span>
+        <h3>{{ part.title }}</h3>
+        <p>{{ part.blurb }}</p>
+      </a>
+      {% endfor %}
+      {% for extra in site.data.series.llm_serving.appendix %}
+      <a class="hub-card" href="{{ extra.permalink | relative_url }}">
+        <span class="num">Reference</span>
+        <h3>{{ extra.title }}</h3>
+        <p>{{ extra.blurb }}</p>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2 style="margin-top:0;">Already know some of this? Start here</h2>
+    <table class="route-table">
+      <thead><tr><th>If you...</th><th>Start at</th></tr></thead>
+      <tbody>
+        <tr><td>Read Part 11 of the training guide and want the real thing</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1 — The decode loop and the memory wall</a></td></tr>
+        <tr><td>Just need to size a GPU for a model</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2 — The machine</a> and <a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4 — The KV cache</a></td></tr>
+        <tr><td>p99 TTFT is bad but throughput looks fine</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3 — TTFT, TPOT and goodput</a>, then <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Parts 6–7</a></td></tr>
+        <tr><td>Are paying too much per token</td><td><a href="{{ '/ai/llm-serving/economics/' | relative_url }}">Part 20 — Benchmarking, cost and capacity planning</a></td></tr>
+        <tr><td>Serve agents and the KV cache thrashes</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8 — Prefix caching</a>, then <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18 — Workloads</a></td></tr>
+        <tr><td>Want to know what DeepSeek actually runs</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13 — Prefill/decode disaggregation</a></td></tr>
+        <tr><td>Are deploying on Kubernetes tomorrow</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19 — Kubernetes, autoscaling, cold starts and routing</a></td></tr>
+        <tr><td>Need to guarantee valid JSON or a regex</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16 — Structured output and constrained decoding</a></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div class="g-next reveal">
+    <span>Start from the beginning, or jump straight into whichever part you need.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Start with Part 1 →</a>
+  </div>
+</main>
+
+{% include guide-footer.html %}
+
+</body>
+</html>

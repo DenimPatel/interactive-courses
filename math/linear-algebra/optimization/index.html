@@ -1,0 +1,366 @@
+---
+title: "Linear Algebra, Interactively — Part 21: Jacobians, Hessians and Gauss–Newton"
+description: "How nonlinear least squares turns into a linear solve: the Jacobian, the Gauss–Newton step, the Hessian approximation, and the sparsity that makes pose graphs tractable."
+permalink: "/math/linear-algebra/optimization/"
+section: "math"
+series: "linear_algebra"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .g-heat-caption { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.linear_algebra %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Linear algebra</span>
+    <h1>Jacobians, Hessians and Gauss–Newton</h1>
+    <p>Most of the problems in this site's other guides &mdash; bundle adjustment, pose graphs, sensor calibration &mdash; are the same shape: minimise a sum of squared residuals that depends nonlinearly on parameters. You cannot solve them with the linear algebra of Part 10 directly, because the residual is not a line. What you can do is linearise the residual around the current guess, solve a linear least-squares problem for the correction, and repeat. This part is that loop, and the matrix that drives it.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="problem">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The problem</h2></div>
+    <p class="g-eyebrow">A sum of squares with no closed-form answer</p>
+    <p>Take a model with a handful of parameters <var>p</var> and a stack of measurements. For each measurement <var>i</var> define a residual <var>r<sub>i</sub>(p)</var>: how far the model's prediction is from what you observed. The cost is the sum of squares,</p>
+    <div class="g-math g-katex">$$C(p) = \tfrac{1}{2}\sum_i r_i(p)^2 = \tfrac{1}{2}\,\lVert r(p)\rVert^2 .$$</div>
+    <p>When each <var>r<sub>i</sub></var> is linear in <var>p</var>, this is exactly the least-squares problem of <a href="{{ '/math/linear-algebra/least-squares/' | relative_url }}">Part 10</a>, and the normal equations give the answer in one step. When the residuals are nonlinear &mdash; a camera projection, an exponential decay, a rotation &mdash; there is no formula, only a search. The search is built out of linear solves, which is why this part is linear algebra.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a nonlinear fit is a sequence of linear least-squares problems, where the Jacobian comes from, why <var>JᵀJ</var> stands in for the Hessian, and why the resulting normal equations are sparse exactly when the problem has a graph underneath it.</span></div>
+  </section>
+
+  <section class="g-step" id="linearise">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Linearise, then solve</h2></div>
+    <p class="g-eyebrow">One Taylor step, one least-squares problem</p>
+    <p>Suppose you have a current guess <var>p</var> and want a correction <var>δ</var>. A first-order Taylor expansion says <var>r(p+δ) ≈ r(p) + Jδ</var>, where <var>J</var> is the <strong>Jacobian</strong>: one row per residual, one column per parameter, entry <var>J<sub>ij</sub> = ∂r<sub>i</sub>/∂p<sub>j</sub></var>. Minimising the linearised cost over <var>δ</var> is now a linear least-squares problem,</p>
+    <div class="g-math g-katex">$$\min_\delta \lVert r + J\delta\rVert^2 \quad\Longrightarrow\quad J^\top J\,\delta = -J^\top r .$$</div>
+    <p>That is the <strong>Gauss–Newton step</strong>: form <var>JᵀJ</var> and <var>Jᵀr</var>, solve a linear system, add <var>δ</var> to <var>p</var>, and do it again. The matrix <var>JᵀJ</var> is square, symmetric and positive semidefinite, so it is the same kind of object as <a href="{{ '/math/linear-algebra/symmetric/' | relative_url }}">Part 15's</a> quadratic forms. Watch a single step on a decaying-exponential fit: the model snaps toward the data, and the residuals shrink.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gn-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Blue points are the data; the curve is <var>a·e<sup>−bx</sup> + c</var>; the grey segments are the residuals <var>r<sub>i</sub></var>. One step solves <var>JᵀJ δ = −Jᵀr</var>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button class="btn btn-secondary" id="gn-step" type="button">Gauss–Newton step</button>
+          <button class="btn btn-secondary" id="gn-reset" type="button">Reset</button>
+        </div>
+        <div class="g-readout" id="gn-readout"></div>
+      </div>
+    </div>
+    <p>Each step is a linear solve, not a search. The nonlinearity is handled entirely by re-forming <var>J</var> and <var>r</var> at the new <var>p</var> and stepping again, which is why the method is called <em>iterative</em>: it walks a sequence of quadratic approximations toward a minimum.</p>
+  </section>
+
+  <section class="g-step" id="normalmatrix">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The normal matrix <var>JᵀJ</var></h2></div>
+    <p class="g-eyebrow">What the Jacobian's shape buys you</p>
+    <p>The Jacobian carries all the local information. Its rows say how sensitive each residual is to each parameter; inside <var>JᵀJ</var> those rows become inner products, exactly as in <a href="{{ '/math/linear-algebra/rank-subspaces/' | relative_url }}">Part 7</a>. A parameter direction that no residual responds to gives a nearly zero diagonal entry &mdash; a redundant parameter, and an ill-conditioned normal matrix. The heatmap and the eigenvalues below update as you step the fit above.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="jac-canvas" width="420" height="330"></canvas>
+        <p class="g-heat-caption">The Jacobian <var>J</var>: 12 residuals (rows) × 3 parameters (columns).</p>
+      </div>
+      <div class="g-controls">
+        <div id="jtj-matrix"></div>
+        <div class="g-readout" id="jtj-readout"></div>
+      </div>
+    </div>
+    <p>Because <var>JᵀJ</var> is symmetric, its eigenvalues are real and its eigenvectors are orthogonal &mdash; <a href="{{ '/math/linear-algebra/symmetric/' | relative_url }}">Part 15</a> again. They are the principal curvatures of the local quadratic, so their ratio is the condition number of the linear solve at the heart of every Gauss–Newton step. That ratio is the practical version of the conditioning story in <a href="{{ '/math/linear-algebra/numerics/' | relative_url }}">Part 19</a>, and it is why real solvers add a damping term before inverting.</p>
+  </section>
+
+  <section class="g-step" id="hessian">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The Hessian, and why <var>JᵀJ</var> is enough</h2></div>
+    <p class="g-eyebrow">Dropping the second-order term on purpose</p>
+    <p>The true second derivative of the cost is the Hessian. Differentiating <var>C = ½‖r‖²</var> twice gives two pieces,</p>
+    <div class="g-math g-katex">$$H = J^\top J + \sum_i r_i\,\nabla^2 r_i .$$</div>
+    <p>Gauss–Newton throws away the second sum. That sounds reckless until you notice what it buys: <var>JᵀJ</var> is guaranteed symmetric positive semidefinite and costs nothing extra to form, while the discarded term needs every residual's second derivative and can make <var>H</var> indefinite. Near a good fit the residuals are small, so the dropped term is small too, and the approximation is excellent; far from a fit it can be poor, which is what trust-region and Levenberg–Marquardt machinery exists to manage.</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <h3 style="margin-top:0;">Gauss–Newton</h3>
+        <p style="margin-bottom:0;">Solve <var>JᵀJ δ = −Jᵀr</var>. Quadratic convergence near a good fit, cheap, but can overshoot when the linearisation is bad.</p>
+      </div>
+      <div class="g-card reveal">
+        <h3 style="margin-top:0;">Levenberg–Marquardt</h3>
+        <p style="margin-bottom:0;">Solve <var>(JᵀJ + λI) δ = −Jᵀr</var>. The <var>λ</var> term interpolates between Gauss–Newton and a small gradient step, keeping the step inside the region where the linearisation holds. This is the same ridge idea as the damped pseudoinverse in <a href="{{ '/math/linear-algebra/pseudoinverse/' | relative_url }}">Part 18</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="sparsity">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Sparsity is the whole game</h2></div>
+    <p class="g-eyebrow">Why pose graphs with a million variables are solvable</p>
+    <p>A bundle-adjustment problem has one small block of parameters per camera and per 3D point, and each measurement touches only two of them. So a Jacobian row has a handful of nonzeros, and <var>JᵀJ</var> is sparse in the same pattern: a block for every parameter, and an off-diagonal block only where two parameters appear in a common measurement. A chain of poses produces the block-tridiagonal pattern below. The matrix is enormous and nearly empty, which is what makes the linear solve affordable.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sparse-canvas" width="440" height="380"></canvas>
+        <p class="g-canvas-hint">The nonzero pattern of <var>JᵀJ</var> for a chain of <var>N</var> poses. One node per parameter block; an edge means the two appear together in a measurement.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Nodes <var>N</var> <span class="val">18</span></label><input type="range" id="sparse-n" min="6" max="40" step="1" value="18"></div>
+        <div class="g-readout" id="sparse-readout"></div>
+      </div>
+    </div>
+    <p>The picture generalises directly. Replace each scalar node with a 6-DOF pose block and you have the structure of a SLAM problem; the nonzero count stays proportional to the number of measurements rather than the square of the number of parameters, and sparse Cholesky or QR exploits that to solve systems that would be hopeless as dense matrices. Knowing the pattern is knowing which factorisation you can afford, which is the practical content of <a href="{{ '/math/linear-algebra/numerics/' | relative_url }}">Part 19</a>.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The loop behind every geometry pipeline</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Pose graphs and bundle adjustment</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/vision/nonlinear-optimization/pose-graph/' | relative_url }}">pose-graph part</a> of the optimization guide is exactly this loop with <var>SE(3)</var> blocks, and <a href="{{ '/vision/multi-view-geometry/sfm/' | relative_url }}">structure from motion</a> runs it over camera poses and 3D points at once. The sparsity you just saw is the only reason those systems close.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">MAP estimation and second-order training</h3>
+        <p style="margin-bottom:0;">Fitting a probabilistic model by maximum a posteriori estimation is the same least-squares problem, and second-order optimisers approximate the curvature with <var>JᵀJ</var>. The <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">architecture chapter</a> shows the forward pass these derivatives come from.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Object</th><th>Size</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><var>r(p)</var></td><td>m × 1</td><td>Residual for each of the m measurements</td></tr>
+        <tr><td><var>J</var></td><td>m × n</td><td><var>J<sub>ij</sub> = ∂r<sub>i</sub>/∂p<sub>j</sub></var>, one row per measurement</td></tr>
+        <tr><td><var>JᵀJ</var></td><td>n × n</td><td>Symmetric PSD approximation of the Hessian</td></tr>
+        <tr><td><var>Jᵀr</var></td><td>n × 1</td><td>Gradient of the cost, up to sign</td></tr>
+        <tr><td><var>(JᵀJ + λI)δ = −Jᵀr</var></td><td>n × 1</td><td>Levenberg–Marquardt step; <var>λ → 0</var> is Gauss–Newton</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>This site's <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization guide</a> &mdash; the same material developed for robotics.</li>
+      <li>K. Madsen, H. B. Nielsen and O. Tingleff, <em>Methods for Non-Linear Least Squares Problems</em>, IMM, 2004.</li>
+      <li>Gilbert Strang, <a href="https://ocw.mit.edu/courses/18-06-linear-algebra-spring-2010/">18.06 Linear Algebra</a>, Lecture 17 (least squares and the normal equations).</li>
+      <li>Triggs et al., <em>Bundle Adjustment &mdash; A Modern Synthesis</em>, 2000 &mdash; where the sparsity pattern earns its keep.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The last act has one more stop: the matrices a transformer actually multiplies.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.linear_algebra teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var LA = LinAlg;
+  function el(id) { return document.getElementById(id); }
+
+  // ------------------------------------------------------------------
+  // shared curve-fit problem:  y = a*exp(-b x) + c
+  // ------------------------------------------------------------------
+  var RAND = Guide.seededRandom(21);
+  var DATA = [];
+  (function () {
+    for (var i = 0; i < 12; i++) {
+      var x = 0.25 + i * 0.82;
+      var noise = (RAND() - 0.5) * 0.5;
+      DATA.push([x, 3.0 * Math.exp(-0.5 * x) + 1.0 + noise]);
+    }
+  })();
+
+  var P0 = [2.0, 0.85, 0.4];
+  var P = P0.slice();
+  var iters = 0;
+
+  function model(x, p) { return p[0] * Math.exp(-p[1] * x) + p[2]; }
+  function residuals(p) {
+    return DATA.map(function (d) { return model(d[0], p) - d[1]; });
+  }
+  function jacobian(p) {
+    return DATA.map(function (d) {
+      var x = d[0], e = Math.exp(-p[1] * x);
+      return [e, -p[0] * x * e, 1];
+    });
+  }
+  function cost(p) {
+    return 0.5 * residuals(p).reduce(function (s, r) { return s + r * r; }, 0);
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — Gauss-Newton steps on the curve fit
+  // ------------------------------------------------------------------
+  var planeA = null;
+  function drawA() {
+    if (!planeA) return;
+    planeA.clear();
+    planeA.grid(null, { step: 1 });
+    planeA.axes({ step: 1 });
+    var ctx = planeA.ctx;
+    var rs = residuals(P);
+    // residual segments
+    ctx.strokeStyle = 'rgba(120,120,120,0.55)';
+    ctx.lineWidth = 1;
+    DATA.forEach(function (d, i) {
+      ctx.beginPath();
+      ctx.moveTo(planeA.px(d[0]), planeA.py(d[1]));
+      ctx.lineTo(planeA.px(d[0]), planeA.py(model(d[0], P)));
+      ctx.stroke();
+    });
+    // fitted curve
+    ctx.strokeStyle = c.accent;
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    for (var k = 0; k <= 200; k++) {
+      var x = 0.25 + (9.45 - 0.25) * k / 200;
+      var X = planeA.px(x), Y = planeA.py(model(x, P));
+      if (k === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.stroke();
+    planeA.points(DATA, { color: c.accent700, r: 4 });
+    el('gn-readout').innerHTML =
+      '<div><span class="k">a, b, c</span> (' + P[0].toFixed(3) + ', ' + P[1].toFixed(3) + ', ' + P[2].toFixed(3) + ')</div>' +
+      '<div><span class="k">cost ½‖r‖²</span> <span class="hi">' + cost(P).toFixed(5) + '</span></div>' +
+      '<div><span class="k">iterations</span> ' + iters + '</div>';
+    drawB();
+  }
+
+  function gnStep() {
+    var J = jacobian(P), r = residuals(P);
+    var Jt = LA.mat.transpose(J);
+    var A = LA.mat.mul(Jt, J);
+    var g = LA.mat.mulVec(Jt, r);
+    // light damping keeps the solve stable if a parameter is flat
+    for (var i = 0; i < A.length; i++) A[i][i] += 1e-9;
+    var delta = LA.mat.solve(A, g.map(function (v) { return -v; }));
+    if (!delta) return;
+    for (i = 0; i < P.length; i++) P[i] += delta[i];
+    iters++;
+    drawA();
+  }
+
+  planeA = LA.plane(el('gn-canvas'), { xRange: [0, 10], yRange: [-1, 5], W: 640, H: 320, onResize: drawA });
+  el('gn-step').addEventListener('click', gnStep);
+  el('gn-reset').addEventListener('click', function () { P = P0.slice(); iters = 0; drawA(); });
+
+  // ------------------------------------------------------------------
+  // Demo B — the Jacobian heatmap and J^T J
+  // ------------------------------------------------------------------
+  var setB = null;
+  function drawB() {
+    if (!setB) return;
+    var J = jacobian(P);
+    Guide.drawHeatmap(setB.ctx, 420, 330, J, {
+      rowLabels: DATA.map(function (d, i) { return 'r' + (i + 1); }),
+      colLabels: ['a', 'b', 'c'],
+      colorLow: [245, 248, 250], colorHigh: [200, 40, 120]
+    });
+    var Jt = LA.mat.transpose(J);
+    var A = LA.mat.mul(Jt, J);
+    LA.setMatrix(el('jtj-matrix'), A, { digits: 3, label: 'JᵀJ =', highlight: [[0, 0], [1, 1], [2, 2]] });
+    var eig = LA.mat.eigSym(A).values;
+    var kappa = eig[2] > 1e-12 ? eig[0] / eig[2] : Infinity;
+    el('jtj-readout').innerHTML =
+      '<div><span class="k">eigenvalues of JᵀJ</span></div>' +
+      '<div>λ₁ = ' + eig[0].toExponential(2) + ', λ₂ = ' + eig[1].toExponential(2) + ', λ₃ = ' + eig[2].toExponential(2) + '</div>' +
+      '<div><span class="k">κ(JᵀJ)</span> <span class="hi">' + (isFinite(kappa) ? kappa.toExponential(2) : '∞') + '</span></div>' +
+      '<div style="opacity:.7;font-size:11.5px;">All eigenvalues ≥ 0: JᵀJ is symmetric positive semidefinite.</div>';
+  }
+  setB = Guide.setupCanvas(el('jac-canvas'), 420, 330, drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — sparsity of J^T J for a pose chain
+  // ------------------------------------------------------------------
+  var setC = null;
+  function drawC() {
+    if (!setC) return;
+    var N = parseInt(el('sparse-n').value, 10);
+    var M = LA.mat.zeros(N, N);
+    for (var i = 0; i < N; i++) {
+      M[i][i] = 1;
+      if (i + 1 < N) { M[i][i + 1] = 0.75; M[i + 1][i] = 0.75; }
+    }
+    Guide.drawHeatmap(setC.ctx, 440, 380, M, { min: 0, max: 1, colorLow: [247, 249, 250], colorHigh: [43, 95, 255] });
+    var nonzeros = N + 2 * (N - 1);
+    var density = nonzeros / (N * N);
+    el('sparse-readout').innerHTML =
+      '<div><span class="k">parameters</span> ' + N + '</div>' +
+      '<div><span class="k">nonzeros in JᵀJ</span> <span class="hi">' + nonzeros + '</span></div>' +
+      '<div><span class="k">density</span> ' + (density * 100).toFixed(1) + '%</div>' +
+      '<div style="opacity:.7;font-size:11.5px;">Nonzeros grow like N; the dense square grows like N².</div>';
+  }
+  setC = Guide.setupCanvas(el('sparse-canvas'), 440, 380, drawC);
+  Guide.bindSliders([el('sparse-n')], drawC);
+
+  drawA();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'opt-gauss-newton-drop',
+      kind: 'choice',
+      prompt: 'The true Hessian is <var>H = J&#7488;J + &Sigma;ᵢ rᵢ&nabla;&sup2;rᵢ</var>. Why does Gauss&ndash;Newton throw away the second sum?',
+      options: [
+        { label: 'JᵀJ is guaranteed symmetric positive semidefinite and free to form, while the dropped term needs every residual’s second derivative and can make H indefinite.', correct: true },
+        { label: 'The second sum is always exactly zero for any nonlinear least-squares problem.', correct: false },
+        { label: 'Dropping it is only valid for linear residuals, so Gauss–Newton cannot be used on genuinely nonlinear problems.', correct: false }
+      ],
+      explanation: 'JᵀJ costs nothing extra beyond the Jacobian you already computed, and it is always PSD. The discarded term requires second derivatives of every residual and can make the true Hessian indefinite. Near a good fit the residuals are small, so the dropped term is small too and the approximation is excellent — which is exactly why the method works well close to a solution.'
+    },
+    {
+      id: 'opt-sparsity-payoff',
+      kind: 'choice',
+      prompt: 'Why does sparsity make pose graphs with a million variables solvable?',
+      options: [
+        { label: 'Each measurement touches only a couple of parameter blocks, so the nonzero count in JᵀJ grows proportional to the number of measurements rather than the square of the number of parameters.', correct: true },
+        { label: 'Sparse matrices always have a smaller condition number than dense ones, so the linear solve converges faster.', correct: false },
+        { label: 'Sparsity lets you skip forming JᵀJ altogether and solve Jδ = −r directly instead.', correct: false }
+      ],
+      explanation: 'A bundle-adjustment measurement touches only a handful of parameter blocks, so a Jacobian row has few nonzeros and JᵀJ inherits the same sparse structure — a block for every parameter, and an off-diagonal block only where two parameters share a measurement. That keeps the nonzero count proportional to N rather than N², which is what makes sparse Cholesky or QR affordable at scale.'
+    },
+    {
+      id: 'opt-sparse-nonzeros',
+      kind: 'numeric',
+      prompt: 'The sparsity demo defaults to <var>N = 18</var> pose nodes in a chain, with nonzeros in <var>J&#7488;J</var> counted as <var>N + 2(N &minus; 1)</var>. How many nonzero entries does that give?',
+      answer: 52,
+      tolerance: 0,
+      explanation: 'N + 2(N − 1) = 18 + 2(17) = 18 + 34 = 52. Each node contributes one diagonal entry, and each of the 17 links in the chain contributes one nonzero above and one below the diagonal — the classic block-tridiagonal pattern.'
+    },
+    {
+      id: 'opt-sparse-density',
+      kind: 'numeric',
+      prompt: 'With those same 52 nonzeros in an 18×18 matrix (324 total entries), what density does the readout report, as a percentage?',
+      answer: 16.05,
+      tolerance: 0.1,
+      explanation: '52 / 324 ≈ 0.1605, or about 16.05%. Because the nonzero count grows linearly in N while the dense square grows as N², that density keeps shrinking as the chain gets longer — the whole reason a million-variable pose graph stays tractable.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

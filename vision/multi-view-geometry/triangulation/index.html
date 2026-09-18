@@ -1,0 +1,1358 @@
+---
+title: "Triangulation & Recovering Pose, Interactively"
+description: "Recovering relative camera pose from the essential matrix, and triangulating 3D points from two known views, linear vs. nonlinear."
+permalink: "/vision/multi-view-geometry/triangulation/"
+section: "vision"
+series: "multi_view_geometry"
+redirect_from:
+  - /multi-view-geometry-triangulation.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .mvg { max-width: 1180px; }
+  .mvg .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .mvg-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .mvg-step:first-of-type { border-top: none; }
+  .mvg-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .mvg-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .mvg-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .mvg-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .mvg-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-goal b { color: var(--color-accent-800); }
+  .mvg-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-warn b { color: var(--color-accent-2-800); }
+  .mvg-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .mvg-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .mvg-canvas-wrap { flex: 1 1 380px; min-width: 280px; }
+  .mvg-plot3d { width: 100%; height: 420px; background: var(--color-neutral-100); border-radius: var(--radius-sm); cursor: grab; }
+  .mvg-plot3d:active { cursor: grabbing; }
+  .mvg-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .mvg-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .mvg-field { margin-bottom: 14px; }
+  .mvg-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .mvg-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .mvg-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .mvg-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .mvg-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .mvg-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .mvg-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .mvg-readout .k { opacity: 0.6; }
+  .mvg-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .mvg-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .mvg-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .mvg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .mvg-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .mvg-cheat th, .mvg-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .mvg-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .mvg-cheat code { white-space: nowrap; }
+  .mvg-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  @media (max-width: 640px) {
+    .mvg-eyebrow { margin-left: 0; }
+    .mvg-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multi_view_geometry %}
+
+<main>
+<div class="wrap mvg">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 10 of {{ site.data.series.multi_view_geometry.parts | size }}</span>
+    <h1>Triangulation &amp; Recovering Pose</h1>
+    <p>Epipolar geometry (<a href="{{ '/vision/multi-view-geometry/epipolar/' | relative_url }}">Part 6</a>) tells you where a match <em>could</em> be; homographies (<a href="{{ '/vision/multi-view-geometry/homography/' | relative_url }}">Part 8</a>) only work on flat scenes. This part closes the loop for the general case: given two cameras and a correspondence, actually compute the 3D point — the first real moment of 3D reconstruction in this series.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="mvg-step" id="setup">
+    <div class="mvg-step-head"><span class="mvg-step-num">0</span><h2>Two problems, in order</h2></div>
+    <p class="mvg-eyebrow">Setup</p>
+    <p>Reconstructing a scene from two images is really two separate problems, solved in order: <strong>(1)</strong> figure out where camera 2 is relative to camera 1 (its relative pose), then <strong>(2)</strong> given both poses, work out where each matched point actually is in 3D. Part 6 already got us the essential matrix <var>E</var> from correspondences; this page turns <var>E</var> into an actual pose, and then turns rays into points.</p>
+  </section>
+
+  <section class="mvg-step" id="posefromE">
+    <div class="mvg-step-head"><span class="mvg-step-num">1</span><h2>From E to (R, t): four candidates, one makes sense</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+{% endraw %}    <p>The essential matrix <var>E = [t]&#215;R</var> can be factored back into a rotation and a translation direction via its singular value decomposition, <var>E = U&#931;V&#7488;</var>. The algebra always produces exactly <strong>four</strong> candidate poses — two possible rotations, each paired with <var>+t</var> or <var>−t</var> — and all four satisfy the epipolar constraint equally well, because <var>E</var> only fixes <var>t</var> up to an unknown overall scale and sign. (The full worked recipe — the <var>W</var> matrix and all — is in Section 4 below, not deferred to a textbook.) A minimal calibrated solver for <var>E</var> — the five-point algorithm, which needs only five correspondences instead of eight — is treated in <a href="{{ '/vision/multi-view-geometry/five-point/' | relative_url }}">Part 13</a>.</p>{% raw %}
+    <div class="mvg-math">(R&#8321;,t), (R&#8321;,−t), (R&#8322;,t), (R&#8322;,−t)&nbsp;&nbsp;&mdash;&nbsp;&nbsp;only one is physically valid</div>
+    <p>Only one of the four puts a triangulated point <strong>in front of both cameras</strong> (positive depth in both) — the other three put it behind one or both. That test is called the <strong>cheirality check</strong>: triangulate a single correspondence with each candidate and keep the one where both depths come out positive. This is also exactly why triangulation (next) and pose recovery are tangled together in practice — you need a candidate pose to triangulate, and triangulating is how you rule the bad candidates out.</p>
+  </section>
+
+  <section class="mvg-step" id="triangmath">
+    <div class="mvg-step-head"><span class="mvg-step-num">2</span><h2>Two ways to triangulate</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Once both camera poses are known, a correspondence <var>(x&#8321;, x&#8322;)</var> defines two rays in 3D that, with perfect noise-free data, cross at exactly one point. With real (noisy) pixel measurements, the rays almost never exactly intersect — so "triangulation" really means <em>finding the point that best explains both observations</em>, and there are two standard ways to define "best":</p>
+    <p><strong>Linear (DLT) triangulation.</strong> Stack the two cameras' projection equations into one linear system and solve it directly — fast, no iteration, but it's minimizing an algebraic error that doesn't correspond to anything visually meaningful.</p>
+    <div class="mvg-math">x&#8321;&#215;(P&#8321;X) = 0, x&#8322;&#215;(P&#8322;X) = 0&nbsp;&nbsp;&#8594;&nbsp;&nbsp;linear system AX = 0, solved directly</div>
+{% endraw %}    <p><strong>Nonlinear (reprojection-error) triangulation.</strong> Start from the linear solution, then refine it by minimizing the actual pixel distance between where <var>X</var> reprojects and where it was observed, in both images — the same kind of nonlinear least-squares problem, and the same Gauss-Newton machinery, as the earlier <a href="{{ '/vision/nonlinear-optimization/gradient-descent/' | relative_url }}">Nonlinear Optimization series</a>.</p>{% raw %}
+    <div class="mvg-math">min&#8339; &Sigma;&#8339;&#8712;{1,2} ‖&#960;(P&#8339;, X) − x&#8339;‖&#178;</div>
+    <p>The nonlinear version is slower (it iterates) but minimizes the error you actually care about — how far off the predicted pixel is — and is noticeably more accurate whenever the two camera rays are close to parallel (a narrow baseline) or the noise is large.</p>
+  </section>
+
+  <section class="mvg-step" id="demo">
+    <div class="mvg-step-head"><span class="mvg-step-num">3</span><h2>Play with it: triangulate a noisy point</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">🎯 <b>Learning goal:</b> both methods agree almost exactly at low noise. Crank up pixel noise (or narrow the baseline) and watch the linear estimate drift further from the truth than the nonlinear, reprojection-error-minimizing one.</div>
+    <p>Two cameras (fixed poses) each get one noisy pixel observation of the same true 3D point. Compare where linear DLT vs. nonlinear (Gauss-Newton on reprojection error) place the reconstructed point.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s3-plot3d" class="mvg-plot3d"></div>
+        <p class="mvg-canvas-hint">Drag to orbit, scroll to zoom.</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-text)"></i>true point</span>
+          <span><i style="background:#9b9797"></i>linear (DLT)</span>
+          <span><i style="background:var(--color-accent-2)"></i>nonlinear (refined)</span>
+        </div>
+      </div>
+      <div class="mvg-canvas-wrap">
+        <div class="mvg-imgrow" style="display:flex; gap:12px; flex-wrap:wrap;">
+          <div style="flex:1 1 180px;">
+            <h4 style="margin:0 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; opacity:.7;">Image 1 observation</h4>
+            <canvas id="s3-canvas1" width="420" height="300"></canvas>
+          </div>
+          <div style="flex:1 1 180px;">
+            <h4 style="margin:0 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; opacity:.7;">Image 2 observation</h4>
+            <canvas id="s3-canvas2" width="420" height="300"></canvas>
+          </div>
+        </div>
+        <p class="mvg-canvas-hint">The actual inputs: ring = where the true point projects, dot = the noisy pixel the triangulators receive. Every estimation error traces back to these two offsets.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Pixel noise σ <span class="val" id="s3-noiseval"></span></label><input type="range" id="s3-noise" min="0" max="12" step="0.1" value="4"></div>
+        <div class="mvg-field"><label>Baseline (camera separation) <span class="val" id="s3-baseval"></span></label><input type="range" id="s3-base" min="0.6" max="5" step="0.05" value="3"></div>
+        <div class="mvg-btnrow">
+          <button id="s3-resample" class="mvg-primary">New noisy observation</button>
+        </div>
+        <div class="mvg-readout" id="s3-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="svddecomp">
+    <div class="mvg-step-head"><span class="mvg-step-num">4</span><h2>The SVD recipe, worked through</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p><var>E = [t]&#215;R</var> is built from a rotation and a translation, so it has to be possible to pull those two pieces back out — and unlike most factorizations in this series, the recipe is short enough to write out in full rather than wave at a textbook. Because <var>[t]&#215;</var> is skew-symmetric with rank 2, <var>E</var> always has two equal nonzero singular values and a third that is exactly zero. (With real, noisy correspondences the two nonzero ones only come out <em>approximately</em> equal — the standard fix is to force them, replacing whatever the raw SVD returns with <var>&#931; = diag(1,1,0)</var> before doing anything else.)</p>
+    <div class="mvg-math">E = U&#931;V&#7488;&nbsp;&nbsp;&nbsp;&nbsp;&#931; = diag(1,1,0)<br>W = [[0,&minus;1,0], [1,0,0], [0,0,1]]&nbsp;&nbsp;(a 90&#176; rotation about z &mdash; det(W)=1, WW&#7488;=I)</div>
+    <p><var>W</var> is chosen because <var>UWV&#7488;</var> and <var>U&#931;V&#7488;</var> both reuse the same <var>U</var> and <var>V</var> — swapping <var>&#931;</var> for a rotation-shaped matrix turns "the rank-2 essential-matrix basis" into "a candidate rotation," in the same basis <var>E</var> was already decomposed in. Plugging <var>U</var> and <var>V</var> into <var>W</var> two different ways (<var>W</var> or <var>W&#7488;</var>), and pairing each with either sign of the translation, produces <strong>exactly four</strong> candidate poses:</p>
+    <div class="mvg-math">R &#8712; { UWV&#7488;, UW&#7488;V&#7488; }&nbsp;&nbsp;&nbsp;&nbsp;t &#8712; { +u&#8323;, &minus;u&#8323; }&nbsp;&nbsp;&nbsp;&nbsp;(u&#8323; = U's third column)</div>
+    <p>Why <var>u&#8323;</var> in particular: since <var>E = [t]&#215;R</var>, <var>E&#7488;t = R&#7488;[t]&#215;&#7488;t = &minus;R&#7488;(t&#215;t) = 0</var> — so <var>t</var> lives in the left null space of <var>E</var>, exactly the singular vector paired with the zero singular value, i.e. <var>u&#8323;</var>. That's the same vector that shows up as the epipole in image 2 (<var>e&#8322;&#7488;E = 0 &#8660; E&#7488;e&#8322; = 0</var>): the translation direction and the epipole direction are the same null space, so recovering one recovers the other, up to the scale and sign <var>E</var> never carried in the first place. All four candidates satisfy the epipolar constraint identically well — <var>E</var> genuinely cannot distinguish between them.</p>
+    <div class="mvg-warn">&#9888; One bookkeeping detail the formula above glosses over: <var>UWV&#7488;</var> is only guaranteed to be a proper rotation (<var>det = +1</var>, not a reflection) if <var>det(U) = det(V) = +1</var>. The SVD doesn't promise that on its own — the fix is to flip the sign of whichever singular vector has the unconstrained sign (the one paired with the zero singular value) until both determinants come out positive.</div>
+    <p>Four candidates, one correspondence: which one is real? That's a separate, much simpler question than the algebra above — cheirality, next.</p>
+  </section>
+
+  <section class="mvg-step" id="cheirality">
+    <div class="mvg-step-head"><span class="mvg-step-num">5</span><h2>Cheirality: reconstruct once, check the sign, done</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> this is not a subtle test. Triangulate <em>one</em> correspondence under each of the four candidates and look at the sign of its depth in both cameras — three candidates put the point behind a camera (physically impossible, since a camera can't photograph what's behind its own lens), and exactly one puts it in front of both. That one is <var>(R, t)</var>.</div>
+    <p>Below: a ground-truth two-camera rig, decomposed live via the exact SVD recipe above, all four candidates triangulating the same point simultaneously. Drag the sliders — the test point and the relative rotation between the cameras — and watch which candidate wins update in real time.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s4-plot3d" class="mvg-plot3d"></div>
+        <p class="mvg-canvas-hint">Drag to orbit, scroll to zoom. Camera 1 is fixed at the origin.</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-text)"></i>camera 1 (fixed)</span>
+          <span><i style="background:#2a9d3f"></i>correct candidate</span>
+          <span><i style="background:#c23b3b"></i>impossible candidates</span>
+        </div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Camera 2 rotation <span class="val" id="s4-rotval"></span></label><input type="range" id="s4-rot" min="-60" max="60" step="1" value="18"></div>
+        <div class="mvg-field"><label>Test point x <span class="val" id="s4-pxval"></span></label><input type="range" id="s4-px" min="-1.5" max="1.5" step="0.05" value="0.4"></div>
+        <div class="mvg-field"><label>Test point depth (z) <span class="val" id="s4-pzval"></span></label><input type="range" id="s4-pz" min="1" max="6" step="0.1" value="3.5"></div>
+        <div class="mvg-readout" id="s4-readout"></div>
+      </div>
+    </div>
+    <div class="mvg-warn">&#9888; The candidate translations are unit vectors (that's all four singular-vector decomposition can give you — recall <var>t</var>'s scale is unrecoverable from <var>E</var> alone). To make the picture legible, each candidate camera 2 here is drawn at the <em>true</em> baseline distance along its recovered direction — real pipelines don't get to do that, they just keep the unit vector and fix the scale later (Section 9, below).</div>
+  </section>
+
+  <section class="mvg-step" id="triangmethods2">
+    <div class="mvg-step-head"><span class="mvg-step-num">6</span><h2>Midpoint vs. optimal: a third and fourth way to triangulate</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Section 2 already compared linear DLT to nonlinear reprojection refinement. Two more members of the same family are worth knowing, because they sit at opposite ends of "cheap and biased" vs. "correct and expensive."</p>
+    <p><strong>Midpoint triangulation.</strong> Back-project each pixel into a 3D ray, <var>ray = C + &#955;&#183;d</var> (camera center <var>C</var>, unit direction <var>d</var> toward the pixel). With noisy pixels the two rays almost never meet, so take the two points — one on each ray — that are mutually closest, and report their midpoint. Solving for the two closest points is a small 2&#215;2 linear system:</p>
+    <div class="mvg-math">r = C&#8321; &minus; C&#8322;,&nbsp; a = d&#8321;&#183;d&#8321;,&nbsp; b = d&#8321;&#183;d&#8322;,&nbsp; c = d&#8322;&#183;d&#8322;,&nbsp; d&#8242; = d&#8321;&#183;r,&nbsp; e&#8242; = d&#8322;&#183;r<br>t* = (b&#183;e&#8242; &minus; c&#183;d&#8242;) / (ac &minus; b&#178;)&nbsp;&nbsp;&nbsp;&nbsp;s* = (a&#183;e&#8242; &minus; b&#183;d&#8242;) / (ac &minus; b&#178;)<br>M = &#189;[(C&#8321;+t*d&#8321;) + (C&#8322;+s*d&#8322;)]</div>
+    <p>This is fast, closed-form, and geometrically intuitive — and systematically wrong in a specific way. <strong>Worked example:</strong> two cameras a unit apart, <var>C&#8321;=(0,0,0)</var>, <var>C&#8322;=(1,0,0)</var>, true point <var>X=(0.5, 0.3, 4)</var>. Camera 1's ray is exact; camera 2's ray is perturbed by a tiny angle (&#8776; the effect of a couple of pixels of noise at typical focal length) away from the true direction. Solving the system above gives a midpoint <var>M &#8776; (0.480, 0.288, 3.843)</var> — error vector <var>M &minus; X &#8776; (&minus;0.020, &minus;0.012, &minus;0.157)</var>. A single small perturbation on <em>one</em> ray produces an error that is <strong>eight times larger along depth (z) than laterally (x, y)</strong>. That's not a coincidence of this example: minimizing 3D distance to two rays weights every direction in space equally, but the rays themselves are far more sensitive to angular error along the depth axis than across it (a ray sweeps a huge distance in <var>z</var> for a tiny angular nudge, once it's traveled a few units out) — so the point that minimizes 3D ray distance is <em>not</em> the point that minimizes 2D pixel reprojection error. It systematically isn't the maximum-likelihood estimate under pixel noise.</p>
+    <p><strong>Optimal (Hartley&ndash;Sturm) triangulation.</strong> Reframe the problem entirely in pixel space, where the noise actually lives. Instead of asking "which 3D point best explains these rays," ask: find corrected points <var>x&#770;&#8321;, x&#770;&#8322;</var> that (a) satisfy the epipolar constraint <em>exactly</em>, <var>x&#770;&#8322;&#7488;Fx&#770;&#8321; = 0</var>, and (b) are as close as possible to the actually-observed <var>x&#8321;, x&#8322;</var>:</p>
+    <div class="mvg-math">min &#8214;x&#770;&#8321; &minus; x&#8321;&#8214;&#178; + &#8214;x&#770;&#8322; &minus; x&#8322;&#8214;&#178;&nbsp;&nbsp;subject to&nbsp;&nbsp;x&#770;&#8322;&#7488;Fx&#770;&#8321; = 0</div>
+    <p>Once <var>x&#770;&#8321;, x&#770;&#8322;</var> exactly satisfy the epipolar constraint, their rays are guaranteed to intersect exactly — so triangulating them is trivial, any linear method gives the identical answer. All the work is in finding the corrected pair, and Hartley &amp; Zisserman show the constrained minimization reduces to a single-variable function of one parameter along the epipolar line, whose minimum is a root of a degree-6 polynomial (solvable in closed form, no iteration, no local minima). The point of the machinery isn't the polynomial's coefficients — it's that this is provably the pixel-space maximum-likelihood point under Gaussian pixel noise, which is exactly the error the midpoint method above ignores.</p>
+    <div class="mvg-warn">&#9888; The Gauss-Newton reprojection refinement from Section 2 minimizes the same reprojection-error objective, and in practice lands extremely close to the Hartley&ndash;Sturm answer — but it's a local iterative solve seeded from the linear estimate, not a closed-form global optimum. For two views the gap rarely matters; it matters more once outliers or bad initialization are in the picture.</div>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> all four methods on the <em>same</em> noisy observation. Midpoint is the fastest and visibly biased along depth; DLT and Gauss&ndash;Newton agree closely; the epipolar-consistent optimal correction (Hartley&ndash;Sturm's objective, minimized numerically here) lands on essentially the same answer as GN &mdash; the bar chart makes the depth-bias of midpoint impossible to miss.</div>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s6-plot3d" class="mvg-plot3d" style="height:340px;"></div>
+        <p class="mvg-canvas-hint">Drag to orbit. Diamond-open = truth; gray = midpoint; teal = linear DLT; pink = Gauss&ndash;Newton; purple = epipolar-consistent optimal.</p>
+      </div>
+      <div class="mvg-canvas-wrap">
+        <canvas id="s6-bars" width="420" height="240"></canvas>
+        <p class="mvg-canvas-hint">3D reconstruction error per method, split into depth (z) and lateral (x,y) components. Watch midpoint&#8217;s depth bar dwarf its lateral one &mdash; the 8:1 bias from the worked example, live.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Pixel noise &#963; (px) <span class="val" id="s6-noiseval"></span></label><input type="range" id="s6-noise" min="0" max="12" step="0.1" value="5"></div>
+        <div class="mvg-field"><label>Baseline (camera separation) <span class="val" id="s6-baseval"></span></label><input type="range" id="s6-base" min="0.6" max="5" step="0.05" value="1.2"></div>
+        <div class="mvg-btnrow"><button id="s6-resample" class="mvg-primary">New noisy observation</button></div>
+        <div class="mvg-readout" id="s6-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="uncertainty">
+    <div class="mvg-step-head"><span class="mvg-step-num">7</span><h2>How good is a triangulated point? The depth-uncertainty ellipsoid</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Every triangulated point carries uncertainty inherited from pixel noise, and that uncertainty is not the same in every direction — it forms an ellipsoid stretched along the viewing (depth) axis. The small-baseline stereo approximation makes the size of the stretch concrete. For two cameras separated by baseline <var>B</var>, focal length <var>f</var> (pixels), and disparity <var>d</var> (pixels) between the two observations of the same point:</p>
+    <div class="mvg-math">Z = fB / d</div>
+    <p>Differentiate with respect to disparity to see how a pixel-sized error in <var>d</var> turns into an error in <var>Z</var>:</p>
+    <div class="mvg-math">dZ/dd = &minus;fB / d&#178; = &minus;Z&#178; / (fB)&nbsp;&nbsp;&nbsp;&nbsp;(substituting d = fB/Z)<br>&#8658;&nbsp;&nbsp;&#916;Z &#8776; &#963; &#183; Z&#178; / (fB)&nbsp;&nbsp;&nbsp;&nbsp;for pixel noise &#963;</div>
+    <p>Compare that to the <em>lateral</em> (x, y) uncertainty, which comes from a single camera's angular resolution at that depth and has no baseline in it at all: <var>&#916;X &#8776; &#963;&#183;Z/f</var> — linear in depth, no benefit from a wider rig. Depth uncertainty, by contrast, is quadratic in <var>Z</var> and only inversely linear in <var>B</var>. Spelled out:</p>
+    <div class="mvg-goal">&#127919; <b>The one intuition to keep:</b> doubling your baseline only <em>halves</em> your depth error at a given distance. Doubling your distance <em>quadruples</em> it. Baseline is a linear knob; distance is a quadratic tax. That asymmetry — not sensor noise, not calibration error — is the fundamental reason long-range stereo and triangulation get hard fast, and why active range sensors (LIDAR, radar, ToF) exist for anything beyond a few tens of meters: they measure range directly instead of inferring it from a shrinking intersection angle.</div>
+    <p>Geometrically, this is the same story from the other direction: as a point moves farther from the rig (or the baseline shrinks), the angle between the two rays converging on it narrows, and a fixed pixel-sized wobble in either ray sweeps a much larger span along the now-nearly-parallel viewing direction than across it — exactly the elongated-ellipsoid picture, and exactly why the worked midpoint example above showed an 8:1 depth-to-lateral error ratio.</p>
+  </section>
+
+  <section class="mvg-step" id="deptherror">
+    <div class="mvg-step-head"><span class="mvg-step-num">8</span><h2>Play with it: the uncertainty ellipse</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> narrow the ray-intersection angle — by shrinking the baseline or pushing the point farther away — and watch the ellipse stretch along the depth axis, exactly tracking the &#916;Z &#8776; &#963;&#183;Z&#178;/(fB) formula shown numerically alongside.</div>
+    <p>Two cameras <var>B</var> apart, both looking at a point at depth <var>Z</var> on their shared perpendicular bisector (keeping the point centered isolates the depth-vs-baseline effect — an off-center point tilts the ellipse instead of just stretching it). The ellipse is drawn <strong>20&#215; actual scale</strong> for visibility; the numbers are the true, unscaled values.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <canvas id="s5-canvas" width="480" height="360"></canvas>
+        <p class="mvg-canvas-hint">Depth axis is vertical; baseline axis is horizontal. Faint dots = 60 repeated triangulations of noisy observations (Monte-Carlo); the ellipse is the analytic prediction.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Baseline B (m) <span class="val" id="s5-baseval"></span></label><input type="range" id="s5-base" min="0.05" max="2" step="0.01" value="0.5"></div>
+        <div class="mvg-field"><label>Depth Z (m) <span class="val" id="s5-depthval"></span></label><input type="range" id="s5-depth" min="1" max="30" step="0.1" value="6"></div>
+        <div class="mvg-field"><label>Pixel noise &#963; (px) <span class="val" id="s5-noiseval"></span></label><input type="range" id="s5-noise" min="0.2" max="5" step="0.1" value="1.5"></div>
+        <div class="mvg-btnrow"><button id="s5-mc" class="mvg-primary">Run 60 Monte-Carlo trials</button></div>
+        <div class="mvg-readout" id="s5-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="scaleambiguity">
+    <div class="mvg-step-head"><span class="mvg-step-num">9</span><h2>Scale ambiguity: the metric you never measured</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Trace the scale of every quantity on this page back to its source. <var>E</var> is defined only up to an overall scale — it's built from correspondences alone, and <var>E</var> and <var>&#955;E</var> satisfy the identical epipolar constraint for any <var>&#955; &#8800; 0</var>. The SVD recipe above hands back a unit-length <var>t</var> by construction. Every triangulated point inherits that same unknown scale. Nowhere in this entire pipeline — Part 6's essential matrix, this page's pose recovery, this page's triangulation — does an actual physical measurement (meters, millimeters, anything) ever enter. Two uncalibrated-scale images simply cannot tell you whether you're looking at a dollhouse or a house.</p>
+    <p>The size of that ambiguity depends on exactly one thing: whether the cameras are <strong>calibrated</strong>. A two-view reconstruction from an <strong>uncalibrated</strong> pair — <var>K</var> unknown, so the fundamental matrix is all you have — is defined only up to a general <strong>projective transformation <var>H</var></strong> of 3D space, the full <strong>15-DOF</strong> group of <var>P&#179;</var> (an arbitrary invertible 4&#215;4 matrix, modulo overall scale). Applying any such <var>H</var> to every camera and every 3D point leaves every image measurement bit-for-bit unchanged: send <var>X &#8594; HX</var> and <var>P &#8594; PH&#8315;&#185;</var> and the projection becomes <var>P&#8242;(HX) = PH&#8315;&#185;HX = PX</var> — literally the same number, for any <var>H</var>. An uncalibrated reconstruction is therefore only <em>projectively</em> correct: straight lines stay straight and cross-ratios survive, but angles, length ratios, and parallelism do not.</p>
+    <p>Knowing <var>K</var> removes the projective (and affine) part of that freedom. Calibration is what lets you promote <var>F</var> to the essential matrix <var>E = K&#7488;FK</var>, whose decomposition carries a genuine rotation and a metric translation direction; fold <var>K</var> in and only a <strong>similarity transform</strong> remains — <strong>7 DOF</strong> (3 rotation + 3 translation + 1 uniform scale), i.e. a Euclidean reconstruction up to a single unknown scale. The similarity group is the subgroup of <var>H</var> that additionally preserves angles and length ratios, which is precisely the extra structure calibration buys you. So: <strong>uncalibrated pair &#8594; projective <var>H</var>, 15 DOF; calibrated pair &#8594; similarity <var>(sR, t)</var>, 7 DOF.</strong></p>
+    <p>The intermediate step of that promotion has a name worth keeping. Recovering the <strong>plane at infinity</strong> (equivalently, the <strong>absolute dual quadric</strong>, or the image of the absolute conic) is what upgrades a projective reconstruction to an <em>affine</em> one; imposing the absolute conic&#8217;s constraints on that object is what then upgrades the affine reconstruction to <em>metric</em>. Calling this the &#8220;metric upgrade&#8221; is exact — it is not more triangulation, it is the extra geometric object that calibration pins down.</p>
+    <p>In the calibrated case, what you get instead is a reconstruction correct up to a <strong>similarity transform</strong> — a global rotation, a global translation, and a single global scale factor applied to every camera and every point simultaneously, with no way to distinguish the true reconstruction from any rescaled copy of it:</p>
+    <div class="mvg-math">(R, t, {X&#8305;}) &nbsp;and&nbsp; (R, s&#183;t, {s&#183;X&#8305;}) &nbsp;are indistinguishable, for any s &gt; 0</div>
+{% endraw %}    <p>That's <strong>7 degrees of freedom</strong> (3 rotation + 3 translation + 1 scale) that no amount of additional two-view geometry can pin down — a <strong>gauge freedom</strong>, not a solvable unknown. The only way out is an external reference: a known physical size somewhere in the scene, a second sensor with its own metric ground truth (IMU, GPS, LIDAR), or a stereo rig with a physically-measured baseline (which is exactly why Section 7's <var>B</var> has to be a real, known number — that's where the metric scale that monocular two-view geometry can't supply comes from). This same 7-DOF freedom reappears, unchanged, as the gauge freedom that has to be fixed (usually by anchoring one camera and one distance) in bundle adjustment when reconstructing from many views in <a href="{{ '/vision/multi-view-geometry/sfm/' | relative_url }}">Structure from Motion</a>.</p>{% raw %}
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> drag the global scale slider. The reconstruction grows and shrinks like a dollhouse, but the reprojection error &mdash; the only thing the images can actually measure &mdash; stays exactly at zero for <em>every</em> scale. Nothing in the two images moves. That is what "7-DOF gauge freedom" feels like.</div>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s9-plot3d" class="mvg-plot3d" style="height:320px;"></div>
+        <p class="mvg-canvas-hint">Drag to orbit. The whole reconstruction (cube + cameras) is scaled by the slider about the origin.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Global scale s <span class="val" id="s9-scaleval"></span></label><input type="range" id="s9-scale" min="0.3" max="3" step="0.05" value="1"></div>
+        <div class="mvg-readout" id="s9-readout"></div>
+      </div>
+    </div>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> switch the ambiguity group and roll a random transform. Under the <b>projective H</b> the cube shears and its edge lengths stop being equal; under the <b>similarity (sR, t)</b> it only rotates, translates, and uniformly rescales. In <em>both</em> cases the reprojected pixels are untouched: the readout&#8217;s max reprojection difference stays at float noise while the 3D coordinates visibly move. That gap between &#8220;the images cannot tell&#8221; and &#8220;the 3D scene clearly changed&#8221; <em>is</em> the ambiguity.</div>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <canvas id="s9b-canvas" width="480" height="360"></canvas>
+        <p class="mvg-canvas-hint">Orthographic 2D view; the framing fits both the ghost and the transformed scene, so any motion you see is real. Ghost = original reconstruction, solid = transformed (and its cameras).</p>
+        <div class="mvg-legend">
+          <span><i style="background:#9b9797"></i>original</span>
+          <span><i style="background:var(--color-text)"></i>transformed</span>
+          <span><i style="background:var(--color-accent)"></i>camera 1</span>
+          <span><i style="background:var(--color-accent-2)"></i>camera 2</span>
+        </div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-btnrow">
+          <button id="s9b-proj" class="mvg-primary">projective H (15 DOF)</button>
+          <button id="s9b-sim">similarity (sR, t) (7 DOF)</button>
+        </div>
+        <div class="mvg-btnrow"><button id="s9b-random">Apply a random transform</button></div>
+        <div class="mvg-readout" id="s9b-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="cheatsheet">
+    <div class="mvg-step-head"><span class="mvg-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="mvg-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="mvg-cheat">
+      <thead><tr><th>Step</th><th>Input</th><th>Output</th><th>Ambiguity / cost</th></tr></thead>
+      <tbody>
+        <tr><td>Decompose E</td><td>Essential matrix</td><td>4 candidate (R,t) poses</td><td>Resolved by the cheirality (positive-depth) check</td></tr>
+        <tr><td>Linear triangulation</td><td>Both poses + a correspondence</td><td>3D point, one linear solve</td><td>Minimizes algebraic error, not pixel error</td></tr>
+        <tr><td>Nonlinear triangulation</td><td>Linear estimate as a starting point</td><td>Refined 3D point</td><td>Minimizes true reprojection error via Gauss-Newton</td></tr>
+        <tr><td>SVD recipe</td><td><code>E = U&#931;V&#7488;</code>, <code>W = [[0,&minus;1,0],[1,0,0],[0,0,1]]</code></td><td><code>R&#8712;{UWV&#7488;,UW&#7488;V&#7488;}</code>, <code>t=&plusmn;u&#8323;</code></td><td>u&#8323; = U's 3rd column (null vector of E&#7488;, since E&#7488;t=0)</td></tr>
+        <tr><td>Cheirality test</td><td>1 correspondence, all 4 candidates</td><td>The correct (R,t)</td><td>Keep the candidate with positive depth in <em>both</em> cameras</td></tr>
+        <tr><td>Midpoint triangulation</td><td>Two back-projected rays</td><td>Midpoint of common perpendicular</td><td>Minimizes 3D ray distance, not pixel error — biased along depth</td></tr>
+        <tr><td>Optimal (Hartley&ndash;Sturm) triangulation</td><td><var>F</var> + noisy <var>x&#8321;, x&#8322;</var></td><td>Corrected <var>x&#770;&#8321;, x&#770;&#8322;</var> on the epipolar constraint</td><td>ML-optimal under Gaussian pixel noise; degree-6 polynomial, closed-form</td></tr>
+        <tr><td>Depth uncertainty</td><td>Pixel noise &#963;, focal <var>f</var>, baseline <var>B</var>, depth <var>Z</var></td><td><code>&#916;Z &#8776; &#963;&#183;Z&#178;/(fB)</code></td><td>Quadratic in distance, only linear (inverse) in baseline</td></tr>
+        <tr><td>Scale ambiguity</td><td>Two views; uncalibrated vs. calibrated (K known)</td><td>Reconstruction up to <var>H</var>, or up to a similarity once <var>K</var> is known</td><td>Uncalibrated: 15-DOF projective <var>H</var> in <var>P&#179;</var>. Calibrated: 7-DOF similarity gauge (3 rot + 3 trans + 1 scale). Both need an external metric reference</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+{% endraw %}
+
+  <div class="mvg-next">
+    <span>Triangulation assumed you already had two calibrated camera poses. In a real reconstruction, every <em>new</em> camera has to be located against a 3D map that already exists — that's PnP, camera resection.</span>
+    <a class="btn btn-secondary" href="{{ '/vision/multi-view-geometry/pnp/' | relative_url }}">Continue: PnP & camera resection →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.multi_view_geometry %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+
+  function gaussianNoise(std){
+    var u = Math.max(Math.random(), 1e-9), v = Math.random();
+    return std * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v);
+  }
+
+  var MVG = {};
+  MVG.sub = function(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; };
+  MVG.add = function(a,b){ return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]; };
+  MVG.scale = function(a,s){ return [a[0]*s,a[1]*s,a[2]*s]; };
+  MVG.dot = function(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; };
+  MVG.cross = function(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; };
+  MVG.norm = function(a){ return Math.hypot(a[0],a[1],a[2]); };
+  MVG.normalize = function(a){ var n=MVG.norm(a)||1; return [a[0]/n,a[1]/n,a[2]/n]; };
+  MVG.matVec = function(R,v){ return [MVG.dot(R[0],v),MVG.dot(R[1],v),MVG.dot(R[2],v)]; };
+  MVG.orbitCamera = function(az, el, dist, lookAt){
+    lookAt = lookAt || [0,0,0];
+    var C = [ lookAt[0] + dist*Math.cos(el)*Math.sin(az), lookAt[1] + dist*Math.sin(el), lookAt[2] + dist*Math.cos(el)*Math.cos(az) ];
+    var forward = MVG.normalize(MVG.sub(lookAt, C));
+    var right = MVG.normalize(MVG.cross(forward, [0,1,0]));
+    var down = MVG.cross(forward, right);
+    return { C: C, R: [right, down, forward] };
+  };
+  MVG.worldToCamera = function(cam, X){ return MVG.matVec(cam.R, MVG.sub(X, cam.C)); };
+  MVG.project = function(K, cam, X){
+    var Xc = MVG.worldToCamera(cam, X);
+    if (Xc[2] <= 1e-6) return null;
+    return { u: K.fx*Xc[0]/Xc[2] + K.cx, v: K.fy*Xc[1]/Xc[2] + K.cy, depth: Xc[2] };
+  };
+
+  // ---------- linear algebra helpers ----------
+  function matTMatN(A){ var m=A.length,n=A[0].length,R=[]; for (var i=0;i<n;i++) R.push(new Array(n).fill(0));
+    for (var i=0;i<n;i++) for (var j=0;j<n;j++){ var s=0; for (var k=0;k<m;k++) s+=A[k][i]*A[k][j]; R[i][j]=s; } return R; }
+  function matTVecN(A,b){ var m=A.length,n=A[0].length,r=new Array(n).fill(0); for (var i=0;i<n;i++){ var s=0; for (var k=0;k<m;k++) s+=A[k][i]*b[k]; r[i]=s; } return r; }
+  function solveLinearN(A,b){
+    var n=A.length; var M=A.map(function(row,i){ return row.concat([b[i]]); });
+    for (var col=0; col<n; col++){
+      var piv=col; for (var r=col+1;r<n;r++) if (Math.abs(M[r][col])>Math.abs(M[piv][col])) piv=r;
+      var tmp=M[col]; M[col]=M[piv]; M[piv]=tmp; var pv=M[col][col]; if (Math.abs(pv)<1e-12) continue;
+      for (var r2=0;r2<n;r2++){ if (r2===col) continue; var f=M[r2][col]/pv; for (var c2=col;c2<=n;c2++) M[r2][c2]-=f*M[col][c2]; }
+    }
+    return M.map(function(row,i){ return row[i]===0?0:row[n]/row[i]; });
+  }
+
+  function projectionMatrix(K, cam){
+    var Kmat=[[K.fx,0,K.cx],[0,K.fy,K.cy],[0,0,1]];
+    var t = MVG.scale(MVG.matVec(cam.R, cam.C), -1);
+    var Rt34 = [ cam.R[0].concat([t[0]]), cam.R[1].concat([t[1]]), cam.R[2].concat([t[2]]) ];
+    var P = [[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<4;j++){ var s=0; for (var k=0;k<3;k++) s+=Kmat[i][k]*Rt34[k][j]; P[i][j]=s; }
+    return P;
+  }
+  function scaleRow(r,s){ return r.map(function(v){ return v*s; }); }
+  function sub4(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2],a[3]-b[3]]; }
+  function triangulateLinear(P1, x1, P2, x2){
+    var A = [
+      sub4(scaleRow(P1[2], x1[0]), P1[0]),
+      sub4(scaleRow(P1[2], x1[1]), P1[1]),
+      sub4(scaleRow(P2[2], x2[0]), P2[0]),
+      sub4(scaleRow(P2[2], x2[1]), P2[1])
+    ];
+    var A3 = A.map(function(r){ return [r[0],r[1],r[2]]; });
+    var b = A.map(function(r){ return -r[3]; });
+    return solveLinearN(matTMatN(A3), matTVecN(A3,b));
+  }
+
+  function reprojResidual(K, cam, X, obs){
+    var p = MVG.project(K, cam, X);
+    if (!p) return [1e3,1e3];
+    return [p.u-obs[0], p.v-obs[1]];
+  }
+  function numJacobianPoint(K, cam, X, eps){
+    eps = eps||1e-4;
+    var J=[];
+    for (var d=0; d<3; d++){
+      var Xp=X.slice(), Xm=X.slice(); Xp[d]+=eps; Xm[d]-=eps;
+      var rp=reprojResidual(K,cam,Xp,[0,0]), rm=reprojResidual(K,cam,Xm,[0,0]);
+      J.push([(rp[0]-rm[0])/(2*eps), (rp[1]-rm[1])/(2*eps)]);
+    }
+    return J;
+  }
+  function triangulateNonlinear(K, cams, obsList, Xinit){
+    var X = Xinit.slice();
+    for (var iter=0; iter<12; iter++){
+      var H=[[0,0,0],[0,0,0],[0,0,0]], g=[0,0,0];
+      for (var c=0;c<cams.length;c++){
+        var r = reprojResidual(K, cams[c], X, obsList[c]);
+        var J = numJacobianPoint(K, cams[c], X);
+        for (var d1=0; d1<3; d1++){
+          g[d1] += J[d1][0]*r[0] + J[d1][1]*r[1];
+          for (var d2=0; d2<3; d2++) H[d1][d2] += J[d1][0]*J[d2][0] + J[d1][1]*J[d2][1];
+        }
+      }
+      var delta = solveLinearN(H, g.map(function(v){return -v;}));
+      X = [X[0]+delta[0], X[1]+delta[1], X[2]+delta[2]];
+    }
+    return X;
+  }
+
+  // ---------- Step 3: triangulation demo ----------
+  (function(){
+    var div = document.getElementById('s3-plot3d');
+    var K = { fx: 480, fy: 480, cx: 0, cy: 0 };
+    var Xtrue = [0.5, -0.4, 0.6];
+    var noiseEl = document.getElementById('s3-noise'), baseEl = document.getElementById('s3-base');
+
+    function cams(){
+      var b = parseFloat(baseEl.value);
+      var cam1 = MVG.orbitCamera(-b*0.28, 0.2, 7, [0,0,0]);
+      var cam2 = MVG.orbitCamera(b*0.28, 0.2, 7, [0,0,0]);
+      return [cam1, cam2];
+    }
+
+    function layout(){
+      return {
+        autosize:true, margin:{l:0,r:0,t:0,b:0}, showlegend:false, paper_bgcolor:'transparent',
+        scene: {
+          xaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'x' },
+          yaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'y' },
+          zaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'z' },
+          aspectmode:'cube', camera:{ eye:{x:1.4,y:-1.4,z:1.0} }
+        }
+      };
+    }
+
+    var lastObs = null;
+    var imgCanvas1 = document.getElementById('s3-canvas1'), imgCtx1 = imgCanvas1 ? imgCanvas1.getContext('2d') : null;
+    var imgCanvas2 = document.getElementById('s3-canvas2'), imgCtx2 = imgCanvas2 ? imgCanvas2.getContext('2d') : null;
+
+    function drawObs(imgCtx, canvas, cam, obs){
+      if (!imgCtx) return;
+      var W = canvas.width, H = canvas.height;
+      imgCtx.clearRect(0,0,W,H);
+      imgCtx.fillStyle = 'rgba(0,0,0,0.05)'; imgCtx.fillRect(0,0,W,H);
+      var ccx = W/2, ccy = H/2;
+      imgCtx.strokeStyle = COLOR_DIVIDER; imgCtx.lineWidth = 1.5;
+      imgCtx.strokeRect(10, 10, W-20, H-20);
+      imgCtx.fillStyle = COLOR_ACCENT;
+      imgCtx.beginPath(); imgCtx.arc(ccx, ccy, 3, 0, 7); imgCtx.fill();
+      var pTrue = MVG.project(K, cam, Xtrue);
+      var truePix = [ccx + pTrue.u, ccy + pTrue.v];
+      var obsPix = [ccx + obs[0], ccy + obs[1]];
+      // ring = noise-free projection, dot = noisy observation, segment = the noise offset
+      imgCtx.strokeStyle = COLOR_TEXT; imgCtx.lineWidth = 1.6;
+      imgCtx.beginPath(); imgCtx.arc(truePix[0], truePix[1], 8, 0, 7); imgCtx.stroke();
+      imgCtx.strokeStyle = COLOR_ACCENT2; imgCtx.lineWidth = 1.4;
+      imgCtx.beginPath(); imgCtx.moveTo(truePix[0], truePix[1]); imgCtx.lineTo(obsPix[0], obsPix[1]); imgCtx.stroke();
+      imgCtx.fillStyle = COLOR_ACCENT2;
+      imgCtx.beginPath(); imgCtx.arc(obsPix[0], obsPix[1], 4.5, 0, 7); imgCtx.fill();
+      var d = Math.hypot(obs[0]-pTrue.u, obs[1]-pTrue.v);
+      imgCtx.fillStyle = COLOR_TEXT; imgCtx.font = '11px monospace';
+      imgCtx.fillText('noise ' + d.toFixed(1) + ' px', 14, 24);
+    }
+
+    function resample(){
+      var [cam1, cam2] = cams();
+      var K1 = K, K2 = K;
+      var noise = parseFloat(noiseEl.value);
+      var p1 = MVG.project(K1, cam1, Xtrue), p2 = MVG.project(K2, cam2, Xtrue);
+      lastObs = {
+        x1: [p1.u + gaussianNoise(noise), p1.v + gaussianNoise(noise)],
+        x2: [p2.u + gaussianNoise(noise), p2.v + gaussianNoise(noise)]
+      };
+      render();
+    }
+
+    function render(){
+      var [cam1, cam2] = cams();
+      var P1 = projectionMatrix(K, cam1), P2 = projectionMatrix(K, cam2);
+      var Xlin = triangulateLinear(P1, lastObs.x1, P2, lastObs.x2);
+      var Xnl = triangulateNonlinear(K, [cam1,cam2], [lastObs.x1, lastObs.x2], Xlin);
+
+      function rayTrace(cam, X, color){
+        var far = MVG.add(cam.C, MVG.scale(MVG.normalize(MVG.sub(X, cam.C)), 9));
+        return { type:'scatter3d', mode:'lines', x:[cam.C[0],far[0]], y:[cam.C[1],far[1]], z:[cam.C[2],far[2]],
+          line:{ color:color, width:2, dash:'dot' }, hoverinfo:'skip' };
+      }
+      function markerTrace(X, color, size, symbol){
+        return { type:'scatter3d', mode:'markers', x:[X[0]], y:[X[1]], z:[X[2]], marker:{ size:size||7, color:color, symbol: symbol||'circle' }, hoverinfo:'skip' };
+      }
+      function camTrace(cam, color){
+        return { type:'scatter3d', mode:'markers', x:[cam.C[0]], y:[cam.C[1]], z:[cam.C[2]], marker:{ size:6, color:color, symbol:'diamond' }, hoverinfo:'skip' };
+      }
+
+      Plotly.react(div, [
+        cameraFrustumTrace(cam1, COLOR_ACCENT), cameraFrustumTrace(cam2, COLOR_ACCENT),
+        rayTrace(cam1, Xlin, 'rgba(32,30,29,0.35)'), rayTrace(cam2, Xlin, 'rgba(32,30,29,0.35)'),
+        markerTrace(Xtrue, COLOR_TEXT, 8, 'diamond-open'),
+        markerTrace(Xlin, '#9b9797', 6),
+        markerTrace(Xnl, COLOR_ACCENT2, 6)
+      ], layout(), { displayModeBar:false, responsive:true });
+
+      drawObs(imgCtx1, imgCanvas1, cam1, lastObs.x1);
+      drawObs(imgCtx2, imgCanvas2, cam2, lastObs.x2);
+
+      var errLin = MVG.norm(MVG.sub(Xlin, Xtrue));
+      var errNl = MVG.norm(MVG.sub(Xnl, Xtrue));
+      document.getElementById('s3-noiseval').textContent = parseFloat(noiseEl.value).toFixed(1) + ' px';
+      document.getElementById('s3-baseval').textContent = parseFloat(baseEl.value).toFixed(2);
+      document.getElementById('s3-readout').innerHTML =
+        '<div><span class="k">true point</span> = (' + Xtrue.map(function(v){return v.toFixed(2);}).join(', ') + ')</div>' +
+        '<div><span class="k">linear estimate</span> = (' + Xlin.map(function(v){return v.toFixed(2);}).join(', ') + '), error <span class="hi">' + errLin.toFixed(3) + '</span></div>' +
+        '<div><span class="k">nonlinear estimate</span> = (' + Xnl.map(function(v){return v.toFixed(2);}).join(', ') + '), error <span class="hi">' + errNl.toFixed(3) + '</span></div>';
+    }
+
+    document.getElementById('s3-resample').addEventListener('click', resample);
+    noiseEl.addEventListener('input', function(){ if (lastObs) render(); document.getElementById('s3-noiseval').textContent = parseFloat(noiseEl.value).toFixed(1) + ' px'; });
+    baseEl.addEventListener('input', resample);
+    resample();
+  })();
+
+  // ---------- shared: 3x3 matrix helpers + Jacobi symmetric-eigen SVD ----------
+  function mat3T(A){ return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]]; }
+  function mat3Mul(A,B){
+    var R=[[0,0,0],[0,0,0],[0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<3;j++){ var s=0; for (var k=0;k<3;k++) s+=A[i][k]*B[k][j]; R[i][j]=s; }
+    return R;
+  }
+  function mat3Det(A){
+    return A[0][0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1]) - A[0][1]*(A[1][0]*A[2][2]-A[1][2]*A[2][0]) + A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0]);
+  }
+  // Cyclic Jacobi eigenvalue algorithm for a symmetric 3x3 matrix: repeatedly
+  // zero the largest off-diagonal entry with a plane rotation until it converges.
+  function symEig3(Ain){
+    var a = [Ain[0].slice(), Ain[1].slice(), Ain[2].slice()];
+    var V = [[1,0,0],[0,1,0],[0,0,1]];
+    for (var sweep=0; sweep<60; sweep++){
+      var p=0,q=1,maxv=Math.abs(a[0][1]);
+      if (Math.abs(a[0][2])>maxv){ maxv=Math.abs(a[0][2]); p=0; q=2; }
+      if (Math.abs(a[1][2])>maxv){ maxv=Math.abs(a[1][2]); p=1; q=2; }
+      if (maxv < 1e-12) break;
+      var app=a[p][p], aqq=a[q][q], apq=a[p][q];
+      var phi = 0.5*Math.atan2(2*apq, aqq-app);
+      var c=Math.cos(phi), s=Math.sin(phi), k;
+      for (k=0;k<3;k++){ var akp=a[k][p], akq=a[k][q]; a[k][p]=c*akp-s*akq; a[k][q]=s*akp+c*akq; }
+      for (k=0;k<3;k++){ var apk=a[p][k], aqk=a[q][k]; a[p][k]=c*apk-s*aqk; a[q][k]=s*apk+c*aqk; }
+      for (k=0;k<3;k++){ var vkp=V[k][p], vkq=V[k][q]; V[k][p]=c*vkp-s*vkq; V[k][q]=s*vkp+c*vkq; }
+    }
+    var vals=[a[0][0],a[1][1],a[2][2]];
+    var idx=[0,1,2].sort(function(i,j){ return vals[j]-vals[i]; });
+    var Vs=[[0,0,0],[0,0,0],[0,0,0]], valsS=[0,0,0];
+    for (var c2=0;c2<3;c2++){ valsS[c2]=vals[idx[c2]]; for (var r=0;r<3;r++) Vs[r][c2]=V[r][idx[c2]]; }
+    return { V: Vs, vals: valsS };
+  }
+  // SVD of a 3x3 matrix via eigendecomposition of E^T E (gives V and the
+  // singular values), then U = E V / sigma for the two nonzero singular
+  // values, with the third column filled in by cross product to keep U a
+  // proper rotation. The two nonzero singular values are forced to 1 (E is
+  // rank-2 with equal nonzero singular values by construction).
+  function svd3(E){
+    var Et = mat3T(E);
+    var EtE = mat3Mul(Et, E);
+    var eig = symEig3(EtE);
+    var V = eig.V;
+    var sigma = eig.vals.map(function(v){ return Math.sqrt(Math.max(v,0)); });
+    var U = [[0,0,0],[0,0,0],[0,0,0]];
+    for (var i=0;i<2;i++){
+      var vcol=[V[0][i],V[1][i],V[2][i]];
+      var Ev = MVG.matVec(E, vcol);
+      var s = sigma[i] > 1e-9 ? sigma[i] : 1;
+      for (var r=0;r<3;r++) U[r][i]=Ev[r]/s;
+    }
+    var u0=[U[0][0],U[1][0],U[2][0]], u1=[U[0][1],U[1][1],U[2][1]];
+    var u2 = MVG.cross(u0,u1);
+    for (var r=0;r<3;r++) U[r][2]=u2[r];
+    if (mat3Det(V) < 0){ for (var r2=0;r2<3;r2++) V[r2][2] = -V[r2][2]; } // fix handedness (sign of the null-space column is free)
+    return { U:U, V:V };
+  }
+  var W3 = [[0,-1,0],[1,0,0],[0,0,1]];
+  var W3t = mat3T(W3);
+  function skew(t){ return [[0,-t[2],t[1]],[t[2],0,-t[0]],[-t[1],t[0],0]]; }
+  // The four-candidate SVD recipe from Section 4.
+  function decomposeE(E){
+    var svd = svd3(E);
+    var U=svd.U, V=svd.V, Vt=mat3T(V);
+    var R1 = mat3Mul(mat3Mul(U,W3), Vt);
+    var R2 = mat3Mul(mat3Mul(U,W3t), Vt);
+    var u3 = [U[0][2],U[1][2],U[2][2]];
+    return [
+      { R:R1, t:u3.slice() },
+      { R:R1, t:MVG.scale(u3,-1) },
+      { R:R2, t:u3.slice() },
+      { R:R2, t:MVG.scale(u3,-1) }
+    ];
+  }
+  function projectionMatrixRt(K,R,t){
+    var Kmat=[[K.fx,0,K.cx],[0,K.fy,K.cy],[0,0,1]];
+    var Rt34=[R[0].concat([t[0]]), R[1].concat([t[1]]), R[2].concat([t[2]])];
+    var P=[[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<4;j++){ var s=0; for (var k=0;k<3;k++) s+=Kmat[i][k]*Rt34[k][j]; P[i][j]=s; }
+    return P;
+  }
+  // Wireframe frustum for a camera (matches Part 4's style).
+  function cameraFrustumTrace(cam, color, size){
+    size = size || 0.45;
+    var right = cam.R[0], down = cam.R[1], fwd = cam.R[2];
+    var corners = [[-1,-1],[1,-1],[1,1],[-1,1]].map(function(s){
+      return MVG.add(MVG.add(cam.C, MVG.scale(fwd, size)),
+        MVG.add(MVG.scale(right, s[0]*size*0.6), MVG.scale(down, s[1]*size*0.6)));
+    });
+    var xs=[], ys=[], zs=[];
+    corners.forEach(function(pt){ xs.push(cam.C[0],pt[0],null); ys.push(cam.C[1],pt[1],null); zs.push(cam.C[2],pt[2],null); });
+    for (var i=0;i<4;i++){ var a=corners[i], b=corners[(i+1)%4]; xs.push(a[0],b[0],null); ys.push(a[1],b[1],null); zs.push(a[2],b[2],null); }
+    return { type:'scatter3d', mode:'lines', x:xs, y:ys, z:zs, line:{ color:color, width:3 }, hoverinfo:'skip' };
+  }
+
+  // ---------- Step 5: cheirality demo ----------
+  (function(){
+    var div = document.getElementById('s4-plot3d');
+    if (!div) return;
+    var K = { fx: 480, fy: 480, cx: 0, cy: 0 };
+    var rotEl = document.getElementById('s4-rot'), xEl = document.getElementById('s4-px'), zEl = document.getElementById('s4-pz');
+    var GREEN = '#2a9d3f', RED = '#c23b3b';
+
+    function groundTruth(){
+      var ang = parseFloat(rotEl.value) * Math.PI/180;
+      var R2 = [[Math.cos(ang),0,Math.sin(ang)],[0,1,0],[-Math.sin(ang),0,Math.cos(ang)]];
+      var C2 = [2.2, 0.3, -0.4];
+      var t2 = MVG.scale(MVG.matVec(R2, C2), -1); // t = -R*C, matching the P=[R|t] convention
+      return { R: R2, t: t2, C: C2 };
+    }
+
+    function layout(){
+      return {
+        autosize:true, margin:{l:0,r:0,t:0,b:0}, showlegend:false, paper_bgcolor:'transparent',
+        scene: {
+          xaxis:{ range:[-2,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'x' },
+          yaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'y' },
+          zaxis:{ range:[-4,6], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'z (depth)' },
+          aspectmode:'cube', camera:{ eye:{x:1.5,y:-1.7,z:0.9} }
+        }
+      };
+    }
+
+    function render(){
+      var gt = groundTruth();
+      var cam1 = { R:[[1,0,0],[0,1,0],[0,0,1]], C:[0,0,0] };
+      var cam2 = { R:gt.R, C:gt.C };
+      var X = [parseFloat(xEl.value), 0.2, parseFloat(zEl.value)];
+
+      var p1 = MVG.project(K, cam1, X);
+      var p2 = MVG.project(K, cam2, X);
+
+      document.getElementById('s4-rotval').textContent = rotEl.value + '°';
+      document.getElementById('s4-pxval').textContent = parseFloat(xEl.value).toFixed(2);
+      document.getElementById('s4-pzval').textContent = parseFloat(zEl.value).toFixed(1);
+
+      if (!p1 || !p2){
+        document.getElementById('s4-readout').innerHTML = '<div class="hi">Test point is behind the true camera setup for these sliders — pick a point in front of both first.</div>';
+        Plotly.react(div, [], layout(), { displayModeBar:false, responsive:true });
+        return;
+      }
+
+      var baseline = MVG.norm(gt.t);
+      var E = mat3Mul(skew(gt.t), gt.R);
+      var candidates = decomposeE(E);
+      var P1 = projectionMatrixRt(K, cam1.R, [0,0,0]);
+
+      var traces = [
+        { type:'scatter3d', mode:'markers', x:[0], y:[0], z:[0], marker:{ size:7, color:COLOR_TEXT, symbol:'diamond' }, hoverinfo:'skip' }
+      ];
+      var rows = [];
+      var trueCandIdx = -1, bestScore = -1;
+
+      candidates.forEach(function(cand, i){
+        var tScaled = MVG.scale(cand.t, baseline); // rescale the unit SVD translation to the true baseline, purely for a legible picture (see warning below the demo)
+        var P2 = projectionMatrixRt(K, cand.R, tScaled);
+        var Xc = triangulateLinear(P1, [p1.u,p1.v], P2, [p2.u,p2.v]);
+        var depth1 = Xc[2];
+        var depth2 = (MVG.matVec(cand.R, Xc)[2] + tScaled[2]);
+        var valid = depth1 > 0 && depth2 > 0;
+        var Ccand = MVG.scale(MVG.matVec(mat3T(cand.R), tScaled), -1); // C = -R^T t
+        var color = valid ? GREEN : RED;
+        traces.push({ type:'scatter3d', mode:'markers', x:[Ccand[0]], y:[Ccand[1]], z:[Ccand[2]], marker:{ size:6, color:color, symbol:'diamond' }, hoverinfo:'skip' });
+        traces.push({ type:'scatter3d', mode:'markers', x:[Xc[0]], y:[Xc[1]], z:[Xc[2]], marker:{ size:6, color:color, symbol:'circle' }, hoverinfo:'skip' });
+        traces.push({ type:'scatter3d', mode:'lines', x:[Ccand[0],Xc[0]], y:[Ccand[1],Xc[1]], z:[Ccand[2],Xc[2]], line:{ color:color, width:2, dash:'dot' }, hoverinfo:'skip' });
+        if (valid){ trueCandIdx = i; }
+        rows.push('<div><span class="k">candidate ' + (i+1) + '</span> depth&#8321;=' + depth1.toFixed(2) + ', depth&#8322;=' + depth2.toFixed(2) + ' &mdash; ' + (valid ? '<span class="hi">in front of both (valid)</span>' : 'behind a camera (impossible)') + '</div>');
+      });
+
+      Plotly.react(div, traces, layout(), { displayModeBar:false, responsive:true });
+      document.getElementById('s4-readout').innerHTML = rows.join('') +
+        '<div style="margin-top:6px;">' + (trueCandIdx >= 0 ? '<span class="hi">exactly 1 of 4 passes cheirality — that one is (R,t)</span>' : 'no candidate passed — try a point in front of both true cameras') + '</div>';
+    }
+
+    [rotEl, xEl, zEl].forEach(function(el){ el.addEventListener('input', render); });
+    render();
+  })();
+
+  // ---------- Step 8: depth-error / ray-intersection-angle uncertainty demo ----------
+  (function(){
+    var canvas = document.getElementById('s5-canvas');
+    if (!canvas) return;
+    var ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var f = 800; // fixed pixel focal length for this demo
+
+    var baseEl = document.getElementById('s5-base'), depthEl = document.getElementById('s5-depth'), noiseEl = document.getElementById('s5-noise');
+    var mcBtn = document.getElementById('s5-mc');
+    var mcPts = []; // Monte-Carlo triangulation results, drawn in the side view
+
+    function runMC(){
+      var B = parseFloat(baseEl.value), Z = parseFloat(depthEl.value), sigma = parseFloat(noiseEl.value);
+      mcPts = [];
+      // parallel cameras at (∓B/2, 0, 0), identity rotations, looking along +z
+      var cam1 = { R: [[1,0,0],[0,1,0],[0,0,1]], C: [-B/2, 0, 0] };
+      var cam2 = { R: [[1,0,0],[0,1,0],[0,0,1]], C: [ B/2, 0, 0] };
+      var P1 = projectionMatrix({fx:f, fy:f, cx:0, cy:0}, cam1);
+      var P2 = projectionMatrix({fx:f, fy:f, cx:0, cy:0}, cam2);
+      var p1t = MVG.project({fx:f, fy:f, cx:0, cy:0}, cam1, [0,0,Z]);
+      var p2t = MVG.project({fx:f, fy:f, cx:0, cy:0}, cam2, [0,0,Z]);
+      for (var k=0; k<60; k++){
+        var o1 = [p1t.u + gaussianNoise(sigma), p1t.v + gaussianNoise(sigma)];
+        var o2 = [p2t.u + gaussianNoise(sigma), p2t.v + gaussianNoise(sigma)];
+        var X = triangulateLinear(P1, o1, P2, o2);
+        if (isFinite(X[0]) && isFinite(X[2])) mcPts.push([X[0], X[2]]);
+      }
+      update();
+    }
+    if (mcBtn) mcBtn.addEventListener('click', runMC);
+
+    function update(){
+      var B = parseFloat(baseEl.value), Z = parseFloat(depthEl.value), sigma = parseFloat(noiseEl.value);
+      document.getElementById('s5-baseval').textContent = B.toFixed(2) + ' m';
+      document.getElementById('s5-depthval').textContent = Z.toFixed(1) + ' m';
+      document.getElementById('s5-noiseval').textContent = sigma.toFixed(1) + ' px';
+
+      var dZ = sigma * Z*Z / (f*B);          // depth-uncertainty formula, Section 7
+      var dX = sigma * Z / f;                 // lateral uncertainty, no baseline term
+
+      // ray-intersection angle at the point, cameras at (-B/2,0) and (B/2,0), point at (0,Z)
+      var half = Math.atan2(B/2, Z);
+      var angleDeg = (2*half) * 180/Math.PI;
+
+      // world-to-pixel scale: fit both cameras and the point comfortably on the canvas
+      var worldHalfExtent = Math.max(Z*1.15, B*1.2, 1);
+      var scale = Math.min(W,H)*0.42 / worldHalfExtent;
+      var cx = W/2, cy = H - 30;
+      function toPx(x,y){ return [cx + x*scale, cy - y*scale]; }
+
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(0,0,0,0.04)'; ctx.fillRect(0,0,W,H);
+
+      var c1 = toPx(-B/2, 0), c2 = toPx(B/2, 0), pt = toPx(0, Z);
+
+      // rays
+      ctx.strokeStyle = COLOR_DIVIDER; ctx.lineWidth = 1.5; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(c1[0],c1[1]); ctx.lineTo(pt[0],pt[1]); ctx.moveTo(c2[0],c2[1]); ctx.lineTo(pt[0],pt[1]); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // camera markers
+      [c1,c2].forEach(function(p){
+        ctx.fillStyle = COLOR_ACCENT;
+        ctx.beginPath(); ctx.arc(p[0],p[1],5,0,7); ctx.fill();
+      });
+
+      // uncertainty ellipse, exaggerated 20x for visibility, axis-aligned since the point
+      // sits on the perpendicular bisector (depth = vertical, lateral = horizontal here)
+      var EXAG = 20;
+      var rx = Math.max(dX*scale*EXAG, 2);
+      var ry = Math.max(dZ*scale*EXAG, 2);
+      ctx.strokeStyle = COLOR_ACCENT2; ctx.fillStyle = 'rgba(214,0,108,0.15)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.ellipse(pt[0], pt[1], rx, ry, 0, 0, 2*Math.PI); ctx.fill(); ctx.stroke();
+
+      // point marker
+      ctx.fillStyle = COLOR_TEXT;
+      ctx.beginPath(); ctx.arc(pt[0], pt[1], 4, 0, 7); ctx.fill();
+
+      // Monte-Carlo scatter (world x = lateral/horizontal, z = depth/vertical)
+      if (mcPts.length){
+        ctx.fillStyle = COLOR_ACCENT;
+        mcPts.forEach(function(p){
+          var q = toPx(p[0], p[1]);
+          ctx.globalAlpha = 0.35;
+          ctx.beginPath(); ctx.arc(q[0], q[1], 2.4, 0, 7); ctx.fill();
+        });
+        ctx.globalAlpha = 1;
+        // empirical spread vs analytic prediction
+        var lat = mcPts.map(function(p){ return p[0]; }), dep = mcPts.map(function(p){ return p[1]; });
+        function std(arr){ var m = arr.reduce(function(a,b){return a+b;},0)/arr.length;
+          return Math.sqrt(arr.reduce(function(a,b){return a+(b-m)*(b-m);},0)/arr.length); }
+        var sLat = std(lat), sDep = std(dep);
+        document.getElementById('s5-readout').innerHTML =
+          '<div><span class="k">ray intersection angle</span> = <span class="hi">' + angleDeg.toFixed(1) + '&#176;</span></div>' +
+          '<div><span class="k">&#916;Z &#8776; &#963;&#183;Z&#178;/(fB)</span> = <span class="hi">' + dZ.toFixed(4) + ' m</span></div>' +
+          '<div><span class="k">&#916;X &#8776; &#963;&#183;Z/f</span> = ' + dX.toFixed(4) + ' m</div>' +
+          '<div><span class="k">depth / lateral ratio</span> = ' + (dZ/dX).toFixed(2) + '&#215;</div>' +
+          '<div><span class="k">Monte-Carlo empirical std (60 trials)</span>: depth = <span class="hi">' + sDep.toFixed(4) + ' m</span>, lateral = ' + sLat.toFixed(4) + ' m <span style="opacity:.6">(should land close to the analytic &#916;s above)</span></div>';
+      } else {
+        document.getElementById('s5-readout').innerHTML =
+          '<div><span class="k">ray intersection angle</span> = <span class="hi">' + angleDeg.toFixed(1) + '&#176;</span></div>' +
+          '<div><span class="k">&#916;Z &#8776; &#963;&#183;Z&#178;/(fB)</span> = <span class="hi">' + dZ.toFixed(4) + ' m</span></div>' +
+          '<div><span class="k">&#916;X &#8776; &#963;&#183;Z/f</span> = ' + dX.toFixed(4) + ' m</div>' +
+          '<div><span class="k">depth / lateral ratio</span> = ' + (dZ/dX).toFixed(2) + '&#215;</div>';
+      }
+    }
+
+    [baseEl, depthEl, noiseEl].forEach(function(el){
+      el.addEventListener('input', function(){ mcPts = []; update(); });
+    });
+    update();
+  })();
+
+  // ---------- Step 6: four-method triangulation shootout ----------
+  (function(){
+    var div = document.getElementById('s6-plot3d');
+    if (!div) return;
+    var K = { fx: 480, fy: 480, cx: 0, cy: 0 };
+    var Xtrue = [0.5, -0.4, 0.6];
+    var noiseEl = document.getElementById('s6-noise'), baseEl = document.getElementById('s6-base');
+    var barsCanvas = document.getElementById('s6-bars'), barsCtx = barsCanvas ? barsCanvas.getContext('2d') : null;
+
+    function cams(){
+      var b = parseFloat(baseEl.value);
+      return [ MVG.orbitCamera(-b*0.28, 0.2, 7, [0,0,0]), MVG.orbitCamera(b*0.28, 0.2, 7, [0,0,0]) ];
+    }
+    function layout3d(){
+      return {
+        autosize:true, margin:{l:0,r:0,t:0,b:0}, showlegend:false, paper_bgcolor:'transparent',
+        scene: {
+          xaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'x' },
+          yaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'y' },
+          zaxis:{ range:[-3,3], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'z' },
+          aspectmode:'cube', camera:{ eye:{x:1.4,y:-1.4,z:1.0} }
+        }
+      };
+    }
+    function mv3(M, v){ return [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]]; }
+    function inv3(M){
+      var a=M[0][0],b=M[0][1],c=M[0][2],d=M[1][0],e=M[1][1],f=M[1][2],g=M[2][0],h=M[2][1],i=M[2][2];
+      var A=e*i-f*h, B=-(d*i-f*g), C=d*h-e*g, D=-(b*i-c*h), E=a*i-c*g, F=-(a*h-b*g), G=b*f-c*e, Hh=-(a*f-c*d), I=a*e-b*d;
+      var det=a*A+b*B+c*C;
+      return [[A/det,D/det,G/det],[B/det,E/det,Hh/det],[C/det,F/det,I/det]];
+    }
+    function camRay(cam, x){
+      var dCam = [ (x[0]-K.cx)/K.fx, (x[1]-K.cy)/K.fy, 1 ];
+      return MVG.normalize(mv3(mat3T(cam.R), dCam));
+    }
+    // Midpoint triangulation: closest points on the two back-projected rays, then average.
+    function midpointTriangulate(cam1, cam2, x1, x2){
+      var d1 = camRay(cam1, x1), d2 = camRay(cam2, x2);
+      var r = MVG.sub(cam1.C, cam2.C);
+      var a = MVG.dot(d1,d1), b = MVG.dot(d1,d2), c = MVG.dot(d2,d2);
+      var dp = MVG.dot(d1,r), ep = MVG.dot(d2,r);
+      var den = a*c - b*b;
+      if (Math.abs(den) < 1e-12) return MVG.add(cam1.C, MVG.scale(d1, 1));
+      var t = (b*ep - c*dp)/den, s = (a*ep - b*dp)/den;
+      var P1 = MVG.add(cam1.C, MVG.scale(d1, t)), P2 = MVG.add(cam2.C, MVG.scale(d2, s));
+      return MVG.scale(MVG.add(P1, P2), 0.5);
+    }
+    function fundamentalOf(cam1, cam2){
+      var R = mat3Mul(cam2.R, mat3T(cam1.R));
+      var t = mv3(cam2.R, MVG.sub(cam1.C, cam2.C));
+      var E = mat3Mul(skew(t), R);
+      var Km = [[K.fx,0,K.cx],[0,K.fy,K.cy],[0,0,1]];
+      var Ki = inv3(Km);
+      return mat3Mul(mat3Mul(mat3T(Ki), E), Ki);
+    }
+    function footOfPerp(p, l){
+      var n2 = l[0]*l[0] + l[1]*l[1];
+      if (n2 < 1e-12) return p.slice();
+      var d = l[0]*p[0] + l[1]*p[1] + l[2];
+      return [ p[0] - l[0]*d/n2, p[1] - l[1]*d/n2 ];
+    }
+    // Epipolar-consistent optimal correction: minimize d(x̂1,x1)² + d(foot(x̂2, F x̂1), x̂2)²
+    // over x̂1 (2-D coordinate descent). This is Hartley–Sturm's objective; they solve it in
+    // closed form via a degree-6 polynomial — here it's minimized numerically, same optimum.
+    function optimalCorrect(F, x1, x2){
+      function cost(p){
+        var l2 = mv3(F, [p[0], p[1], 1]);
+        var x2c = footOfPerp(x2, l2);
+        var d1 = p[0]-x1[0], d2 = p[1]-x1[1];
+        var d3 = x2c[0]-x2[0], d4 = x2c[1]-x2[1];
+        return d1*d1 + d2*d2 + d3*d3 + d4*d4;
+      }
+      var p = x1.slice(), step = 30;
+      for (var it=0; it<60; it++){
+        var c0 = cost(p);
+        var bestP = null, bestC = c0;
+        for (var ax=0; ax<2; ax++){
+          for (var sgn=-1; sgn<=1; sgn+=2){
+            var q = p.slice(); q[ax] += sgn*step;
+            var cq = cost(q);
+            if (cq < bestC){ bestC = cq; bestP = q; }
+          }
+        }
+        if (bestP) p = bestP; else step *= 0.7;
+        if (step < 0.02) break;
+      }
+      var l2 = mv3(F, [p[0], p[1], 1]);
+      return { x1c: p, x2c: footOfPerp(x2, l2) };
+    }
+
+    var lastObs = null;
+    function resample(){
+      var cs = cams();
+      var noise = parseFloat(noiseEl.value);
+      var p1 = MVG.project(K, cs[0], Xtrue), p2 = MVG.project(K, cs[1], Xtrue);
+      lastObs = {
+        x1: [p1.u + gaussianNoise(noise), p1.v + gaussianNoise(noise)],
+        x2: [p2.u + gaussianNoise(noise), p2.v + gaussianNoise(noise)]
+      };
+      render();
+    }
+
+    function drawBars(errs){
+      if (!barsCtx) return;
+      var ctx = barsCtx, W = barsCanvas.width, H = barsCanvas.height;
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(0,0,0,0.04)'; ctx.fillRect(0,0,W,H);
+      var names = ['midpoint', 'linear DLT', 'Gauss-Newton', 'optimal'];
+      var cols = ['#9b9797', COLOR_ACCENT, COLOR_ACCENT2, '#8a5cff'];
+      var maxE = 0.01;
+      errs.forEach(function(e){ maxE = Math.max(maxE, e.lat, e.dep); });
+      var x0 = 96, bw = 26, gap = 34;
+      ctx.font = '11px monospace'; ctx.fillStyle = COLOR_TEXT;
+      ctx.strokeStyle = COLOR_DIVIDER; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x0-6, 16); ctx.lineTo(x0-6, H-40); ctx.lineTo(W-14, H-40); ctx.stroke();
+      errs.forEach(function(e, i){
+        var bx = x0 + i*(2*bw+gap);
+        var hLat = (e.lat/maxE)*(H-70);
+        var hDep = (e.dep/maxE)*(H-70);
+        ctx.fillStyle = cols[i];
+        ctx.fillRect(bx, H-40-hLat, bw, hLat);
+        ctx.globalAlpha = 0.55;
+        ctx.fillRect(bx+bw+4, H-40-hDep, bw, hDep);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = COLOR_TEXT;
+        ctx.fillText(names[i], bx-8, H-24);
+      });
+      ctx.fillStyle = COLOR_TEXT;
+      ctx.fillText('light bar = depth (z) error', x0, 14);
+      ctx.fillText('solid = lateral (x,y) error', x0, 28);
+    }
+
+    function render(){
+      if (!lastObs) return;
+      var cs = cams();
+      var cam1 = cs[0], cam2 = cs[1];
+      var P1 = projectionMatrix(K, cam1), P2 = projectionMatrix(K, cam2);
+      var Xm = midpointTriangulate(cam1, cam2, lastObs.x1, lastObs.x2);
+      var Xl = triangulateLinear(P1, lastObs.x1, P2, lastObs.x2);
+      var Xg = triangulateNonlinear(K, cs, [lastObs.x1, lastObs.x2], Xl);
+      var F = fundamentalOf(cam1, cam2);
+      var opt = optimalCorrect(F, lastObs.x1, lastObs.x2);
+      var Xo = triangulateLinear(P1, opt.x1c, P2, opt.x2c);
+
+      function markerTrace(X, color, size, symbol){
+        return { type:'scatter3d', mode:'markers', x:[X[0]], y:[X[1]], z:[X[2]], marker:{ size:size||7, color:color, symbol: symbol||'circle' }, hoverinfo:'skip' };
+      }
+      Plotly.react(div, [
+        cameraFrustumTrace(cam1, COLOR_ACCENT), cameraFrustumTrace(cam2, COLOR_ACCENT),
+        markerTrace(Xtrue, COLOR_TEXT, 8, 'diamond-open'),
+        markerTrace(Xm, '#9b9797', 6),
+        markerTrace(Xl, COLOR_ACCENT, 6),
+        markerTrace(Xg, COLOR_ACCENT2, 6),
+        markerTrace(Xo, '#8a5cff', 6)
+      ], layout3d(), { displayModeBar:false, responsive:true });
+
+      function err(X){ return { tot: MVG.norm(MVG.sub(X, Xtrue)), dep: Math.abs(X[2]-Xtrue[2]), lat: Math.hypot(X[0]-Xtrue[0], X[1]-Xtrue[1]) }; }
+      var errs = [err(Xm), err(Xl), err(Xg), err(Xo)];
+      drawBars(errs);
+
+      document.getElementById('s6-noiseval').textContent = parseFloat(noiseEl.value).toFixed(1) + ' px';
+      document.getElementById('s6-baseval').textContent = parseFloat(baseEl.value).toFixed(2);
+      var names = ['midpoint', 'linear DLT', 'Gauss-Newton', 'optimal'];
+      document.getElementById('s6-readout').innerHTML =
+        names.map(function(n, i){
+          return '<div><span class="k">' + n + '</span> error = <span class="hi">' + errs[i].tot.toFixed(3) + '</span>' +
+            ' <span style="opacity:.6">(depth ' + errs[i].dep.toFixed(3) + ', lateral ' + errs[i].lat.toFixed(3) + ')</span></div>';
+        }).join('');
+    }
+
+    document.getElementById('s6-resample').addEventListener('click', resample);
+    noiseEl.addEventListener('input', function(){ resample(); });
+    baseEl.addEventListener('input', resample);
+    resample();
+  })();
+
+  // ---------- Step 9: scale-ambiguity demo ----------
+  (function(){
+    var div = document.getElementById('s9-plot3d');
+    if (!div) return;
+    var scaleEl = document.getElementById('s9-scale');
+    var K = { fx: 480, fy: 480, cx: 0, cy: 0 };
+
+    // base scene: a small cube and two cameras looking at it
+    var R0 = 0.9;
+    var CUBE = [];
+    [-1,1].forEach(function(sx){ [-1,1].forEach(function(sy){ [-1,1].forEach(function(sz){
+      CUBE.push([sx*R0, sy*R0, sz*R0 + 1.4]);
+    }); }); });
+    var EDGES = [];
+    for (var i=0;i<8;i++) for (var j=i+1;j<8;j++){
+      var d = 0; for (var k=0;k<3;k++) d += Math.abs(CUBE[i][k]-CUBE[j][k]) > 1e-6 ? 1 : 0;
+      if (d === 1) EDGES.push([i,j]);
+    }
+    var cam1 = { R: [[1,0,0],[0,1,0],[0,0,1]], C: [0, 0, -3.2] };
+    var cam2 = MVG.orbitCamera(0.55, 0.2, 4.6, [0, 0, 1.4]);
+
+    function frustum(cam, color, size){
+      size = size || 0.4;
+      var corners = [[-1,-1],[1,-1],[1,1],[-1,1]].map(function(s){
+        return [
+          cam.C[0] + cam.R[2][0]*size + cam.R[0][0]*s[0]*size*0.6 + cam.R[1][0]*s[1]*size*0.6,
+          cam.C[1] + cam.R[2][1]*size + cam.R[0][1]*s[0]*size*0.6 + cam.R[1][1]*s[1]*size*0.6,
+          cam.C[2] + cam.R[2][2]*size + cam.R[0][2]*s[0]*size*0.6 + cam.R[1][2]*s[1]*size*0.6
+        ];
+      });
+      var xs=[], ys=[], zs=[];
+      corners.forEach(function(pt){ xs.push(cam.C[0],pt[0],null); ys.push(cam.C[1],pt[1],null); zs.push(cam.C[2],pt[2],null); });
+      for (var i2=0;i2<4;i2++){ var a=corners[i2], b=corners[(i2+1)%4]; xs.push(a[0],b[0],null); ys.push(a[1],b[1],null); zs.push(a[2],b[2],null); }
+      return { type:'scatter3d', mode:'lines', x:xs, y:ys, z:zs, line:{ color:color, width:3 }, hoverinfo:'skip' };
+    }
+
+    function update(){
+      var s = parseFloat(scaleEl.value);
+      document.getElementById('s9-scaleval').textContent = s.toFixed(2) + '&times;'.replace('&times;','x');
+      function sc(p){ return [p[0]*s, p[1]*s, p[2]*s]; }
+      var cubeS = CUBE.map(sc);
+      var cam1S = { R: cam1.R, C: sc(cam1.C) };
+      var cam2S = { R: cam2.R, C: sc(cam2.C) };
+      var xs=[], ys=[], zs=[];
+      EDGES.forEach(function(e){
+        var a = cubeS[e[0]], b = cubeS[e[1]];
+        xs.push(a[0],b[0],null); ys.push(a[1],b[1],null); zs.push(a[2],b[2],null);
+      });
+      var traces = [
+        { type:'scatter3d', mode:'lines', x:xs, y:ys, z:zs, line:{ color:COLOR_TEXT, width:4 }, hoverinfo:'skip' },
+        frustum(cam1S, COLOR_ACCENT), frustum(cam2S, COLOR_ACCENT2)
+      ];
+      Plotly.react(div, traces, {
+        autosize:true, margin:{l:0,r:0,t:0,b:0}, showlegend:false, paper_bgcolor:'transparent',
+        scene: {
+          xaxis:{ range:[-4,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'x' },
+          yaxis:{ range:[-4,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'y' },
+          zaxis:{ range:[-4,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'z' },
+          aspectmode:'cube', camera:{ eye:{x:1.4,y:-1.4,z:1.0} }
+        }
+      }, { displayModeBar:false, responsive:true });
+
+      // the only thing images can measure: pixels. Scale the whole world -> identical pixels.
+      var maxDiff = 0;
+      CUBE.forEach(function(X, i2){
+        var pA = MVG.project(K, cam1, X), pB = MVG.project(K, cam1S, cubeS[i2]);
+        if (pA && pB) maxDiff = Math.max(maxDiff, Math.hypot(pA.u-pB.u, pA.v-pB.v));
+        pA = MVG.project(K, cam2, X); pB = MVG.project(K, cam2S, cubeS[i2]);
+        if (pA && pB) maxDiff = Math.max(maxDiff, Math.hypot(pA.u-pB.u, pA.v-pB.v));
+      });
+      document.getElementById('s9-readout').innerHTML =
+        '<div><span class="k">reconstruction scale</span> = <span class="hi">' + s.toFixed(2) + '&times;</span></div>' +
+        '<div><span class="k">cube edge length</span> = <span class="hi">' + (1.8*s).toFixed(2) + ' units</span> <span style="opacity:.6">— meters? millimeters? undecidable</span></div>' +
+        '<div><span class="k">max reprojection difference vs. s=1</span> = <span class="hi">' + maxDiff.toExponential(1) + ' px</span> <span class="hi">— zero at every scale</span></div>' +
+        '<div style="opacity:.65">Both reconstructions produce pixel-identical images. Nothing in the two views breaks the tie — that requires an external metric reference (a known size, IMU, or a measured stereo baseline).</div>';
+    }
+    scaleEl.addEventListener('input', update);
+    update();
+  })();
+
+  // ---------- Step 9b: projective vs. similarity ambiguity demo ----------
+  (function(){
+    var canvas = document.getElementById('s9b-canvas');
+    if (!canvas) return;
+    var ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var K = { fx: 480, fy: 480, cx: 0, cy: 0 };
+    var group = 'projective';
+    var Hmat = null;
+
+    // scene: a cube and two cameras (same idea as the scale demo above)
+    var R0 = 0.9;
+    var PTS = [];
+    [-1,1].forEach(function(sx){ [-1,1].forEach(function(sy){ [-1,1].forEach(function(sz){
+      PTS.push([sx*R0, sy*R0, sz*R0 + 1.4]);
+    }); }); });
+    var EDGES = [];
+    for (var pi=0; pi<8; pi++) for (var pj=pi+1; pj<8; pj++){
+      var nd = 0;
+      for (var pk=0; pk<3; pk++) nd += Math.abs(PTS[pi][pk]-PTS[pj][pk]) > 1e-6 ? 1 : 0;
+      if (nd === 1) EDGES.push([pi, pj]);
+    }
+    var CAMS = [
+      { R: [[1,0,0],[0,1,0],[0,0,1]], C: [0,0,-3.2] },
+      MVG.orbitCamera(0.55, 0.2, 4.6, [0,0,1.4])
+    ];
+    var Pbase = CAMS.map(function(c){ return projectionMatrix(K, c); });
+    var view = MVG.orbitCamera(0.9, 0.25, 16, [0,0,0.5]);
+
+    function projP(P, X){
+      var xh = [X[0], X[1], X[2], 1];
+      var u = P[0][0]*xh[0] + P[0][1]*xh[1] + P[0][2]*xh[2] + P[0][3];
+      var v = P[1][0]*xh[0] + P[1][1]*xh[1] + P[1][2]*xh[2] + P[1][3];
+      var w = P[2][0]*xh[0] + P[2][1]*xh[1] + P[2][2]*xh[2] + P[2][3];
+      if (Math.abs(w) < 1e-12) return null;
+      return { u: u/w, v: v/w };
+    }
+    var PIX = PTS.map(function(X){ return Pbase.map(function(P){ return projP(P, X); }); });
+
+    function mul34(P, M){
+      var out = [[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+      for (var i=0;i<3;i++) for (var j=0;j<4;j++){ var s=0; for (var k=0;k<4;k++) s += P[i][k]*M[k][j]; out[i][j]=s; }
+      return out;
+    }
+    function det4(m){
+      var sg = [1,-1,1,-1], s = 0;
+      for (var c=0;c<4;c++){
+        if (!m[0][c]) continue;
+        var sub = [];
+        for (var r=1;r<4;r++){ var row=[]; for (var cc=0;cc<4;cc++){ if (cc!==c) row.push(m[r][cc]); } sub.push(row); }
+        s += sg[c]*m[0][c]*mat3Det(sub);
+      }
+      return s;
+    }
+    function inv4(A){
+      var n=4, M=[[],[],[],[]], I=[[],[],[],[]];
+      for (var r=0;r<n;r++) for (var c=0;c<n;c++){ M[r].push(A[r][c]); I[r].push(r===c?1:0); }
+      for (var col=0; col<n; col++){
+        var piv=col;
+        for (var rr=col+1; rr<n; rr++) if (Math.abs(M[rr][col]) > Math.abs(M[piv][col])) piv=rr;
+        var t1=M[col]; M[col]=M[piv]; M[piv]=t1; var t2=I[col]; I[col]=I[piv]; I[piv]=t2;
+        var pv = M[col][col] || 1e-12;
+        for (var c2=0;c2<n;c2++){ M[col][c2]/=pv; I[col][c2]/=pv; }
+        for (var r2=0;r2<n;r2++){
+          if (r2===col) continue;
+          var f=M[r2][col];
+          if (!f) continue;
+          for (var c3=0;c3<n;c3++){ M[r2][c3]-=f*M[col][c3]; I[r2][c3]-=f*I[col][c3]; }
+        }
+      }
+      return I;
+    }
+    function applyH(M, X){
+      var xh=[X[0],X[1],X[2],1], y=[0,0,0,0];
+      for (var i=0;i<4;i++){ var s=0; for (var j=0;j<4;j++) s += M[i][j]*xh[j]; y[i]=s; }
+      if (Math.abs(y[3]) < 1e-9) return null;
+      return [y[0]/y[3], y[1]/y[3], y[2]/y[3]];
+    }
+    function applyDir(M, d){
+      var y=[0,0,0,0];
+      for (var i=0;i<4;i++){ var s=0; for (var j=0;j<3;j++) s += M[i][j]*d[j]; y[i]=s; }
+      if (Math.abs(y[3]) < 1e-6) return null;
+      return MVG.normalize([y[0]/y[3], y[1]/y[3], y[2]/y[3]]);
+    }
+
+    function makeSimilarity(){
+      var a=(Math.random()*2-1)*Math.PI*0.85, b=(Math.random()*2-1)*Math.PI*0.55, c=(Math.random()*2-1)*Math.PI*0.85;
+      var Rz=[[Math.cos(c),-Math.sin(c),0],[Math.sin(c),Math.cos(c),0],[0,0,1]];
+      var Ry=[[Math.cos(b),0,Math.sin(b)],[0,1,0],[-Math.sin(b),0,Math.cos(b)]];
+      var Rx=[[1,0,0],[0,Math.cos(a),-Math.sin(a)],[0,Math.sin(a),Math.cos(a)]];
+      var R = mat3Mul(mat3Mul(Rz,Ry), Rx);
+      var s = 0.5 + Math.random()*1.3;
+      var t = [(Math.random()*2-1)*1.3, (Math.random()*2-1)*1.0, (Math.random()*2-1)*1.3];
+      var M = [[0,0,0,t[0]],[0,0,0,t[1]],[0,0,0,t[2]],[0,0,0,1]];
+      for (var i=0;i<3;i++) for (var j=0;j<3;j++) M[i][j] = s*R[i][j];
+      return M;
+    }
+    function makeProjective(){
+      var M = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]];
+      var i, j;
+      for (i=0;i<3;i++) for (j=0;j<3;j++) M[i][j] += gaussianNoise(0.26);
+      for (i=0;i<3;i++) M[i][3] += gaussianNoise(0.7);
+      for (j=0;j<3;j++) M[3][j] += gaussianNoise(0.07);
+      var f = Math.pow(Math.abs(det4(M)), 0.25) || 1;
+      for (i=0;i<4;i++) for (j=0;j<4;j++) M[i][j] /= f;
+      return M;
+    }
+    function tryMake(){
+      var checks = PTS.concat(CAMS.map(function(c){ return c.C; }));
+      for (var attempt=0; attempt<80; attempt++){
+        var M = group === 'similarity' ? makeSimilarity() : makeProjective();
+        var ok = true;
+        for (var i=0;i<checks.length && ok;i++){
+          var Y = applyH(M, checks[i]);
+          if (!Y || !isFinite(Y[0]) || !isFinite(Y[1]) || !isFinite(Y[2]) || MVG.norm(Y) > 45) ok = false;
+        }
+        if (ok) return M;
+      }
+      return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0.05,0.03,0.04,1]];
+    }
+
+    function toView(p){ var q = MVG.worldToCamera(view, p); return [q[0], q[1]]; }
+
+    function render(){
+      var Hinv = inv4(Hmat);
+      var Ptr = Pbase.map(function(P){ return mul34(P, Hinv); });
+      var pts = PTS.map(function(X){ return applyH(Hmat, X); });
+
+      // the invariance claim: P(H^{-1}) applied to H X must reproduce the original pixels
+      var maxDiff = 0, maxMove = 0;
+      for (var i=0;i<PTS.length;i++){
+        for (var c=0;c<2;c++){
+          var qq = projP(Ptr[c], pts[i]);
+          var pp = PIX[i][c];
+          if (qq && pp) maxDiff = Math.max(maxDiff, Math.hypot(qq.u-pp.u, qq.v-pp.v));
+        }
+        maxMove = Math.max(maxMove, MVG.norm(MVG.sub(pts[i], PTS[i])));
+      }
+      var lens = [];
+      EDGES.forEach(function(e){
+        if (pts[e[0]] && pts[e[1]]) lens.push(MVG.norm(MVG.sub(pts[e[0]], pts[e[1]])));
+      });
+      var lmin = Math.min.apply(null, lens), lmax = Math.max.apply(null, lens);
+      var spread = lmin > 1e-9 ? lmax/lmin : Infinity;
+
+      // ---- draw the reconstruction ----
+      var camSolid = CAMS.map(function(cam){
+        return { C: applyH(Hmat, cam.C), ax: [0,1,2].map(function(k){ return applyDir(Hmat, cam.R[k]); }) };
+      });
+      var ghost = PTS.map(toView);
+      var solid = pts.map(function(p){ return p ? toView(p) : null; });
+
+      var allv = ghost.concat(solid.filter(function(p){ return p; }));
+      var minx=1e9, maxx=-1e9, miny=1e9, maxy=-1e9;
+      allv.forEach(function(p){ minx=Math.min(minx,p[0]); maxx=Math.max(maxx,p[0]); miny=Math.min(miny,p[1]); maxy=Math.max(maxy,p[1]); });
+      var span = Math.max(maxx-minx, maxy-miny, 1e-3);
+      var sc = Math.min(W,H)*0.82/span;
+      var ccx=(minx+maxx)/2, ccy=(miny+maxy)/2;
+      var camSize = span*0.11;
+      function toPx(v){ return [W/2 + (v[0]-ccx)*sc, H/2 + (v[1]-ccy)*sc]; }
+
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(0,0,0,0.04)'; ctx.fillRect(0,0,W,H);
+
+      // ghost cube + camera centers
+      ctx.strokeStyle = '#9b9797'; ctx.lineWidth = 1.2; ctx.setLineDash([4,3]); ctx.globalAlpha = 0.85;
+      EDGES.forEach(function(e){
+        var a=toPx(ghost[e[0]]), b=toPx(ghost[e[1]]);
+        ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+      });
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = '#9b9797';
+      CAMS.forEach(function(cam){ var s=toPx(toView(cam.C)); ctx.beginPath(); ctx.arc(s[0],s[1],3,0,7); ctx.fill(); });
+
+      // transformed cube
+      ctx.strokeStyle = COLOR_TEXT; ctx.lineWidth = 2;
+      EDGES.forEach(function(e){
+        if (!solid[e[0]] || !solid[e[1]]) return;
+        var a=toPx(solid[e[0]]), b=toPx(solid[e[1]]);
+        ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+      });
+
+      // transformed cameras + frusta
+      camSolid.forEach(function(cam, idx){
+        if (!cam.C) return;
+        var color = idx===0 ? COLOR_ACCENT : COLOR_ACCENT2;
+        var Cv = MVG.worldToCamera(view, cam.C);
+        var f  = cam.ax[2] ? MVG.matVec(view.R, cam.ax[2]) : [0,0,1];
+        var rr = cam.ax[0] ? MVG.matVec(view.R, cam.ax[0]) : [1,0,0];
+        var dd = cam.ax[1] ? MVG.matVec(view.R, cam.ax[1]) : [0,1,0];
+        var corners = [[-1,-1],[1,-1],[1,1],[-1,1]].map(function(sg){
+          return [Cv[0]+f[0]*camSize + rr[0]*sg[0]*camSize*0.6 + dd[0]*sg[1]*camSize*0.6,
+                  Cv[1]+f[1]*camSize + rr[1]*sg[0]*camSize*0.6 + dd[1]*sg[1]*camSize*0.6];
+        });
+        var cPx = toPx([Cv[0],Cv[1]]);
+        ctx.strokeStyle = color; ctx.lineWidth = 1.4;
+        corners.forEach(function(v){ var p=toPx(v); ctx.beginPath(); ctx.moveTo(cPx[0],cPx[1]); ctx.lineTo(p[0],p[1]); ctx.stroke(); });
+        for (var ci=0; ci<4; ci++){
+          var a=toPx(corners[ci]), b=toPx(corners[(ci+1)%4]);
+          ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+        }
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(cPx[0],cPx[1],4.5,0,7); ctx.fill();
+      });
+
+      var label = group === 'similarity' ? 'similarity (sR, t)' : 'projective H';
+      var dof = group === 'similarity' ? '7' : '15';
+      document.getElementById('s9b-readout').innerHTML =
+        '<div><span class="k">active group</span> = <span class="hi">' + label + '</span> (' + dof + ' DOF)</div>' +
+        '<div><span class="k">max reprojection difference vs. original</span> = <span class="hi">' + maxDiff.toExponential(1) + ' px</span> <span style="opacity:.6">(float noise &#8212; the images are identical)</span></div>' +
+        '<div><span class="k">max 3D point displacement</span> = <span class="hi">' + maxMove.toFixed(2) + ' units</span></div>' +
+        '<div><span class="k">cube edge-length spread (max/min)</span> = <span class="hi">' + (isFinite(spread) ? spread.toFixed(3) : '&#8734;') + '</span> <span style="opacity:.6">' + (group === 'similarity' ? '&#8212; rigid + uniform scale, so exactly 1' : '&#8212; a projective H shears lengths unequally') + '</span></div>' +
+        '<div style="opacity:.65">Identical pixels, different 3D. That is the 15-DOF projective ambiguity of an uncalibrated pair, and the 7-DOF similarity gauge that survives even with K known.</div>';
+    }
+
+    var projBtn = document.getElementById('s9b-proj'), simBtn = document.getElementById('s9b-sim');
+    function setActive(){
+      projBtn.classList.toggle('mvg-primary', group === 'projective');
+      simBtn.classList.toggle('mvg-primary', group === 'similarity');
+    }
+    function randomize(){ Hmat = tryMake(); render(); }
+    projBtn.addEventListener('click', function(){ group='projective'; setActive(); randomize(); });
+    simBtn.addEventListener('click', function(){ group='similarity'; setActive(); randomize(); });
+    document.getElementById('s9b-random').addEventListener('click', randomize);
+    setActive();
+    randomize();
+  })();
+
+})();
+</script>
+{% endraw %}
+</body>
+</html>

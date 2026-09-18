@@ -1,0 +1,828 @@
+---
+title: "Nonlinear Optimization — Pose Graphs & Loop Closure"
+description: "Part four of the interactive optimization guide — chaining many robot poses together with noisy odometry, watching dead-reckoning drift accumulate, and seeing how a single loop-closure landmark sighting lets joint optimization correct the whole trajectory at once."
+permalink: "/vision/nonlinear-optimization/pose-graph/"
+section: "vision"
+series: "nonlinear_optimization"
+redirect_from:
+  - /nonlinear-optimization-pose-graph.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .nlo { max-width: 1180px; }
+  .nlo .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .nlo-part { display: inline-block; font-size: 11.5px; }
+  .nlo-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .nlo-step:first-of-type { border-top: none; }
+  .nlo-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .nlo-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .nlo-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .nlo-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .nlo-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .nlo-goal b { color: var(--color-accent-800); }
+  .nlo-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .nlo-warn b { color: var(--color-accent-2-800); }
+  .nlo-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .nlo-math sub, .nlo-math sup, p sub, p sup, td sub, td sup {
+    font-size: 0.72em;
+  }
+  .nlo-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .nlo-canvas-wrap { flex: 1 1 380px; min-width: 280px; }
+  .nlo-canvas-wrap canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .nlo-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .nlo-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .nlo-field { margin-bottom: 14px; }
+  .nlo-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .nlo-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .nlo-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .nlo-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .nlo-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .nlo-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .nlo-btnrow button.nlo-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .nlo-btnrow button.nlo-primary:hover { background: var(--color-accent-600); }
+  .nlo-btnrow button:disabled { opacity: 0.45; cursor: default; }
+  .nlo-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .nlo-readout .k { opacity: 0.6; }
+  .nlo-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .nlo-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .nlo-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .nlo-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .nlo-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .nlo-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
+  .nlo-table th, .nlo-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--color-divider); }
+  .nlo-table th { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .nlo-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .nlo-cheat th, .nlo-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .nlo-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .nlo-cheat code { white-space: nowrap; }
+  .nlo-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  .nlo-sparsity { display: grid; gap: 2px; }
+  .nlo-sparsity div { aspect-ratio: 1; border-radius: 2px; }
+  @media (max-width: 640px) {
+    .nlo-eyebrow { margin-left: 0; }
+    .nlo-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.nonlinear_optimization %}
+
+<main>
+<div class="wrap nlo">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · part 4</span>
+    <h1>Pose Graphs &amp; Loop Closure</h1>
+    <p><a class="nlo-part" href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">← Part 3 recap: jointly estimating pose and unknown landmarks</a></p>
+    <p>Every part so far optimized a single moment. Real robots move continuously, and each small step of motion — <strong>odometry</strong> — is itself a noisy measurement. String enough of those together and small errors compound into serious drift. This part builds a chain of poses, watches that drift happen, and then shows the one trick — revisiting a known landmark — that lets a single joint optimization correct the entire trajectory at once.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="nlo-step" id="setup">
+    <div class="nlo-step-head"><span class="nlo-step-num">0</span><h2>What's new: a chain of poses</h2></div>
+    <p class="nlo-eyebrow">Recap</p>
+    <p>Before: one pose (and maybe some landmarks), estimated once. Now: a whole <strong>sequence</strong> of poses <code>p&#8320;, p&#8321;, …, p&#7480;</code> — one per moment in time — linked together by <strong>odometry</strong>: a noisy measurement of how far and which way the robot moved between consecutive poses, taken from the robot's own wheels, IMU, or visual motion estimate.</p>
+    <div class="nlo-math">state = (p&#8321;, p&#8322;, …, p&#7480;)&nbsp;&nbsp;&nbsp;&nbsp;3N unknowns&nbsp;&nbsp;&nbsp;&nbsp;(p&#8320; is fixed as the known starting point)</div>
+    <p>This structure — small nodes (poses) connected by measured edges (odometry, plus the occasional landmark sighting) — is exactly what people mean by a <strong>pose graph</strong>. Optimizing it is the same least-squares machinery as every part before this; the only new ingredient is the shape of one more residual: relative motion instead of a bearing.</p>
+  </section>
+
+  <section class="nlo-step" id="compose">
+    <div class="nlo-step-head"><span class="nlo-step-num">1</span><h2>Composing motion: the same rotation, the other way</h2></div>
+    <p class="nlo-eyebrow">Foundations</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> a bearing measurement converts a world-frame offset <em>into</em> the robot's body frame (part 2). Odometry does the reverse: it converts a body-frame motion command <em>out into</em> the world frame, using the same rotation matrix run the other direction.</div>
+    <div class="nlo-math">p<sub>i</sub>&#8330;&#8321; = p<sub>i</sub> + R(θ<sub>i</sub>) · u<sub>i</sub>&nbsp;&nbsp;&nbsp;&nbsp;u<sub>i</sub> = measured (forward, left) motion, in the robot's own frame at time i</div>
+    <p>The robot always reports odometry in its own frame — "I moved 2.5 forward and drifted 0.4 to my left" — because that's all its wheels or IMU actually know. Drag the heading slider and watch the <em>same</em> reported motion produce a completely different push across the world, depending only on which way the robot happened to be facing when it made that move.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s1-canvas" width="480" height="360"></canvas>
+        <div class="nlo-legend">
+          <span><i style="background:var(--color-accent)"></i>Reported motion (body frame)</span>
+          <span><i style="background:var(--color-accent-2)"></i>Actual displacement (world frame)</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-field"><label><span>Heading at time i, θ<sub>i</sub></span> <span class="val" id="s1-tval"></span></label><input type="range" id="s1-theta" min="-180" max="180" step="1" value="35"></div>
+        <div class="nlo-readout" id="s1-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="drift">
+    <div class="nlo-step-head"><span class="nlo-step-num">2</span><h2>Dead reckoning: drift with no correction</h2></div>
+    <p class="nlo-eyebrow">The problem</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> chaining noisy odometry forward with no outside reference isn't optimization at all — it's just repeated addition, and every step's error rides along into every step after it.</div>
+    <p>The robot drives a six-step loop. Its <em>true</em> path is the faint dashed line. Step through the noisy odometry one link at a time, integrating it forward from the known start (<code>p&#8320;</code> is exact — only the motion in between is noisy) — no fitting, no optimizer, just addition. Watch the estimate quietly wander away from the truth, worst at the far end where the fewest corrections have had any chance to help. This is <strong>dead reckoning</strong>, and it's what you get with odometry alone.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s2-canvas" width="480" height="400"></canvas>
+        <div class="nlo-legend">
+          <span style="opacity:.6"><i style="background:var(--color-text)"></i>True path</span>
+          <span><i style="background:var(--color-accent-2)"></i>Dead-reckoning estimate</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-btnrow">
+          <button id="s2-step" class="nlo-primary">Step ▸</button>
+          <button id="s2-reset">Reset</button>
+        </div>
+        <div class="nlo-readout" id="s2-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="loopclosure">
+    <div class="nlo-step-head"><span class="nlo-step-num">3</span><h2>Loop closure: one sighting corrects everything</h2></div>
+    <p class="nlo-eyebrow">The fix</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> a landmark sighting only ever pulls on the <em>one</em> pose that saw it — but solving the whole chain <em>simultaneously</em>, instead of one link at a time, lets that pull ripple backward through every shared odometry constraint in between.</div>
+    <p>Same six-step trajectory. With the box unchecked, the robot only spots the landmark once, right at the end — Gauss-Newton can straighten out the last pose, but everything before it is still running on odometry alone. Check the box to also give it a sighting of that <em>same</em> landmark back at pose 1 — a genuine loop closure — and re-run: the error at <em>every single pose</em> drops, not just the ones directly touching the landmark, because the optimizer now has to satisfy the odometry chain <em>and</em> both sightings of the same landmark at once, all in one joint solve. The dashed rays from the robot to the landmark are exactly the two constraints being satisfied.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s3-canvas" width="480" height="400"></canvas>
+        <div class="nlo-legend">
+          <span style="opacity:.5"><i style="background:var(--color-text)"></i>True path</span>
+          <span><i style="background:var(--color-accent-2)"></i>Dead reckoning</span>
+          <span><i style="background:var(--color-accent)"></i>Optimized</span>
+          <span>◆ landmark</span>
+          <span>┄ landmark sighting (constraint)</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <label class="nlo-toggle"><input type="checkbox" id="s3-loop"> Also sight the landmark from pose 1 (loop closure)</label>
+        <div class="nlo-btnrow">
+          <button id="s3-step" class="nlo-primary">Step ▸</button>
+          <button id="s3-run">Run</button>
+          <button id="s3-reset">Reset</button>
+        </div>
+        <div class="nlo-readout" id="s3-readout"></div>
+        <table class="nlo-table" id="s3-poseTable">
+          <thead><tr><th>Pose</th><th>Dead reck.</th><th>Estimate</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p style="font-size:11.5px; opacity:.7; margin:16px 0 4px;">J&#7488;J block structure (18×18: pose 1 … pose 6) — banded, since each pose only shares an edge with its neighbor; a landmark sighting shows up as extra weight on its own pose's diagonal block, not a new off-diagonal link. Hover a cell for its real value.</p>
+        <div class="nlo-sparsity" id="s3-sparsity" style="grid-template-columns: repeat(18, 1fr); max-width:216px;"></div>
+        <p style="font-size:11.5px; opacity:.7; margin:16px 0 4px;">Pose 1's own 3×3 diagonal block (x, y, θ) — real J&#7488;J values, not just color:</p>
+        <div class="nlo-readout" id="s3-block" style="font-size:11.5px;"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="lmgraph">
+    <div class="nlo-step-head"><span class="nlo-step-num">4</span><h2>Levenberg-Marquardt on the graph</h2></div>
+    <p class="nlo-eyebrow">Same damping, a chain-shaped problem</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> damping doesn't know or care whether the state is one pose, a pose plus a map, or an entire trajectory — <code>λI</code> just grows to match, again.</div>
+    <p>Same loop-closed graph, but with noisier odometry this time — enough that plain Gauss-Newton's first couple of steps can be genuinely bad guesses. Adaptive λ keeps early steps small and cautious, then gets out of the way once the estimate is close.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s4-canvas" width="480" height="400"></canvas>
+      </div>
+      <div class="nlo-controls">
+        <label class="nlo-toggle"><input type="checkbox" id="s4-adaptive" checked> Adapt λ automatically</label>
+        <div class="nlo-btnrow">
+          <button id="s4-step" class="nlo-primary">Step ▸</button>
+          <button id="s4-run">Run</button>
+          <button id="s4-reset">Reset</button>
+        </div>
+        <div class="nlo-readout" id="s4-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="playground">
+    <div class="nlo-step-head"><span class="nlo-step-num">5</span><h2>Playground: drive, drift, and close the loop</h2></div>
+    <p class="nlo-eyebrow">Put it all together</p>
+    <p>Same loop-closed six-pose trajectory. Race gradient descent, Gauss-Newton, and Levenberg-Marquardt (full Newton skipped again, for the same reason as part 3 — the curvature terms for a whole chain of odometry edges get unwieldy fast). The table tracks average pose position error across all six poses.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s5-canvas" width="520" height="420"></canvas>
+        <div class="nlo-legend">
+          <span><i style="background:#9b9797"></i>Gradient descent</span>
+          <span><i style="background:var(--color-accent-2)"></i>Gauss-Newton</span>
+          <span><i style="background:#1a7a3a"></i>Levenberg-Marquardt</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-btnrow">
+          <button id="s5-run" class="nlo-primary">Race ▸</button>
+          <button id="s5-reset">Reset</button>
+          <button id="s5-scenario">New scenario</button>
+        </div>
+        <table class="nlo-table" id="s5-table">
+          <thead><tr><th>Method</th><th>Iters</th><th>Avg. pos err</th><th>Status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="cheatsheet">
+    <div class="nlo-step-head"><span class="nlo-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="nlo-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="nlo-cheat">
+      <thead><tr><th>Concept</th><th>What changed from part 3</th></tr></thead>
+      <tbody>
+        <tr><td>Unknown</td><td>One pose (+ optional landmarks) → a whole trajectory of poses, one per time step</td></tr>
+        <tr><td>New edge type</td><td>Odometry — a noisy relative-motion measurement between two <em>consecutive</em> poses</td></tr>
+        <tr><td>New failure mode</td><td>Drift — errors compound step after step with nothing to correct them</td></tr>
+        <tr><td>The fix</td><td>Loop closure — re-observing something already seen, and re-optimizing every pose together instead of chaining forward</td></tr>
+        <tr><td>Sparsity pattern</td><td>Banded / chain-shaped — each pose only shares a direct edge with its neighbor, even across a loop closure</td></tr>
+        <tr><td>Update rules</td><td>Identical in form to every part before this — just a (much) bigger state vector</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p style="margin-top:20px;">This is, essentially, a pocket-sized pose-graph SLAM back-end — the same shape of problem that runs continuously on real robots and self-driving cars, just with thousands of poses and landmarks instead of six and one. From here, the last remaining piece is dimensionality: everything on this page happened in a flat 2D plane, where a heading is a single angle. Real-world robots, drones, and cameras rotate in full 3D — where "angle" stops being one number.</p>
+  </section>
+{% endraw %}
+
+  <div class="nlo-next">
+    <span>Everything so far happened in a flat 2D plane. What changes when a robot can rotate in full 3D?</span>
+    <a class="btn btn-secondary" href="{{ '/vision/nonlinear-optimization/3d-rotations/' | relative_url }}">Continue: rotations beyond a single angle →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.nonlinear_optimization %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  var PALETTE = [100,200,300,400,500,600,700,800,900].map(function(n){ return css('--color-accent-'+n) || '#93aefe'; });
+  var R0 = 3;
+
+  function mulberry32(seed){
+    return function(){
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var _rand = Math.random;
+  function gaussianNoise(std){
+    var u = Math.max(_rand(), 1e-9), v = _rand();
+    return std * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v);
+  }
+  function wrap(a){ return Math.atan2(Math.sin(a), Math.cos(a)); }
+  function deg2rad(d){ return d*Math.PI/180; }
+  function rad2deg(r){ return r*180/Math.PI; }
+
+  function predictRange(p, L){ return Math.hypot(L[0]-p[0], L[1]-p[1]); }
+  function predictBearing(p, L){ return wrap(Math.atan2(L[1]-p[1], L[0]-p[0]) - p[2]); }
+
+  function relativeOdom(pi, pj){
+    var dx = pj[0]-pi[0], dy = pj[1]-pi[1];
+    var c = Math.cos(pi[2]), s = Math.sin(pi[2]);
+    return { dx: c*dx + s*dy, dy: -s*dx + c*dy, dth: wrap(pj[2]-pi[2]) };
+  }
+  function composeOdom(pi, u){
+    var c = Math.cos(pi[2]), s = Math.sin(pi[2]);
+    return [ pi[0] + c*u.dx - s*u.dy, pi[1] + s*u.dx + c*u.dy, wrap(pi[2]+u.dth) ];
+  }
+
+  // ---------- Generic pose-graph engine ----------
+  // state = [x1,y1,th1, x2,y2,th2, ..., xN,yN,thN]; pose0 is a fixed constant.
+  function getPose(state, idx, fixedPose0){
+    if (idx === 0) return fixedPose0;
+    var off = 3*(idx-1);
+    return [state[off], state[off+1], state[off+2]];
+  }
+  function graphResidualsAndJac(state, fixedPose0, edges){
+    var n = state.length;
+    var rows = [];
+    edges.forEach(function(e){
+      if (e.type === 'odom'){
+        var pi = getPose(state, e.i, fixedPose0), pj = getPose(state, e.j, fixedPose0);
+        var dx = pj[0]-pi[0], dy = pj[1]-pi[1];
+        var c = Math.cos(pi[2]), s = Math.sin(pi[2]);
+        var predDux = c*dx + s*dy, predDuy = -s*dx + c*dy;
+        var rx = predDux - e.u.dx, ry = predDuy - e.u.dy, rth = R0*wrap((pj[2]-pi[2]) - e.u.dth);
+        var Jix = [-c,-s,-s*dx+c*dy], Jiy=[s,-c,-c*dx-s*dy], Jith=[0,0,-R0];
+        var Jjx = [c,s,0], Jjy=[-s,c,0], Jjth=[0,0,R0];
+        [ [rx,Jix,Jjx], [ry,Jiy,Jjy], [rth,Jith,Jjth] ].forEach(function(t){
+          var J = new Array(n).fill(0);
+          if (e.i > 0){ var oi=3*(e.i-1); J[oi]=t[1][0]; J[oi+1]=t[1][1]; J[oi+2]=t[1][2]; }
+          if (e.j > 0){ var oj=3*(e.j-1); J[oj]=t[2][0]; J[oj+1]=t[2][1]; J[oj+2]=t[2][2]; }
+          rows.push({ r:t[0], J:J });
+        });
+      } else if (e.type === 'landmark'){
+        var p = getPose(state, e.poseIdx, fixedPose0);
+        var L = e.L;
+        var ddx=L[0]-p[0], ddy=L[1]-p[1];
+        var rho2 = ddx*ddx+ddy*ddy, rho = Math.sqrt(rho2);
+        var ux=(p[0]-L[0])/rho, uy=(p[1]-L[1])/rho;
+        var rRange = rho - e.d;
+        var rBear = R0*wrap(predictBearing(p,L) - e.b);
+        var Jr = new Array(n).fill(0), Jb = new Array(n).fill(0);
+        if (e.poseIdx > 0){
+          var op = 3*(e.poseIdx-1);
+          Jr[op]=ux; Jr[op+1]=uy;
+          Jb[op]=R0*ddy/rho2; Jb[op+1]=-R0*ddx/rho2; Jb[op+2]=-R0;
+        }
+        rows.push({ r:rRange, J:Jr }); rows.push({ r:rBear, J:Jb });
+      }
+    });
+    return rows;
+  }
+  function graphCost(state, fixedPose0, edges){
+    var rows = graphResidualsAndJac(state, fixedPose0, edges), s=0;
+    rows.forEach(function(row){ s += row.r*row.r; });
+    return 0.5*s;
+  }
+  function graphGradHess(state, fixedPose0, edges){
+    var n = state.length;
+    var rows = graphResidualsAndJac(state, fixedPose0, edges);
+    var g = new Array(n).fill(0);
+    var H = []; for (var i=0;i<n;i++) H.push(new Array(n).fill(0));
+    rows.forEach(function(row){
+      for (var k=0;k<n;k++){
+        if (row.J[k] === 0) continue;
+        g[k] += row.r*row.J[k];
+        for (var j=0;j<n;j++){ if (row.J[j] !== 0) H[k][j] += row.J[k]*row.J[j]; }
+      }
+    });
+    return { g:g, H:H };
+  }
+  function solveN(H, g, n){
+    var A = H.map(function(row){ return row.slice(); });
+    var b = g.map(function(v){ return -v; });
+    for (var col=0; col<n; col++){
+      var piv = col;
+      for (var r=col+1;r<n;r++) if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+      if (Math.abs(A[piv][col]) < 1e-10) return null;
+      if (piv !== col){ var t=A[piv]; A[piv]=A[col]; A[col]=t; var tb=b[piv]; b[piv]=b[col]; b[col]=tb; }
+      for (r=col+1;r<n;r++){
+        var f = A[r][col]/A[col][col];
+        for (var c=col;c<n;c++) A[r][c] -= f*A[col][c];
+        b[r] -= f*b[col];
+      }
+    }
+    var x = new Array(n).fill(0);
+    for (r=n-1;r>=0;r--){ var s=b[r]; for (c=r+1;c<n;c++) s -= A[r][c]*x[c]; x[r] = s/A[r][r]; }
+    return x;
+  }
+  function graphStep(method, state, fixedPose0, edges, engineState){
+    var n = state.length;
+    var gh = graphGradHess(state, fixedPose0, edges);
+    var g = gh.g;
+    function wrapState(s){ for (var k=2;k<n;k+=3) s[k]=wrap(s[k]); return s; }
+    if (method === 'gd'){
+      var alpha = 1.0, cOld = graphCost(state, fixedPose0, edges), sNew;
+      for (var i=0;i<25;i++){
+        sNew = state.map(function(v,k){ return v-alpha*g[k]; });
+        if (graphCost(sNew, fixedPose0, edges) < cOld || alpha < 1e-4) break;
+        alpha *= 0.5;
+      }
+      return { state: wrapState(sNew), grad: g };
+    }
+    var H = gh.H;
+    if (method === 'lm') H = gh.H.map(function(row,i){ return row.map(function(v,j){ return v + (i===j?engineState.lambda:0); }); });
+    var delta = solveN(H, g, n);
+    if (!delta) delta = g.map(function(v){ return -0.1*v; });
+    var candidate = wrapState(state.map(function(v,k){ return v+delta[k]; }));
+    if (method === 'lm'){
+      var cOld2 = graphCost(state, fixedPose0, edges), cNew2 = graphCost(candidate, fixedPose0, edges);
+      if (cNew2 < cOld2){ engineState.lambda = Math.max(engineState.lambda*0.4, 1e-3); return { state: candidate, grad: g }; }
+      engineState.lambda = Math.min(engineState.lambda*3, 1e6);
+      return { state: state, grad: g };
+    }
+    return { state: candidate, grad: g };
+  }
+
+  // ---------- Canvas helpers ----------
+  function makeMapper(canvas, worldRange){
+    var W = canvas.width, H = canvas.height;
+    return {
+      toPx: function(pt){ return [ (pt[0]-worldRange.x[0])/(worldRange.x[1]-worldRange.x[0]) * W,
+                                    H - (pt[1]-worldRange.y[0])/(worldRange.y[1]-worldRange.y[0]) * H ]; },
+      W:W, H:H
+    };
+  }
+  function drawDiamond(ctx, mapper, pt, color){
+    var p = mapper.toPx(pt);
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.moveTo(p[0],p[1]-7); ctx.lineTo(p[0]+7,p[1]); ctx.lineTo(p[0],p[1]+7); ctx.lineTo(p[0]-7,p[1]); ctx.closePath(); ctx.fill();
+  }
+  function drawRobot(ctx, mapper, pose, color, big){
+    var pt = mapper.toPx(pose);
+    var size = big ? 10 : 7;
+    ctx.save(); ctx.translate(pt[0], pt[1]); ctx.rotate(-pose[2]);
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.moveTo(size,0); ctx.lineTo(-size*0.6, size*0.62); ctx.lineTo(-size*0.6,-size*0.62); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function drawPath(ctx, mapper, poses, color, dashed){
+    if (poses.length < 1) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    if (dashed) ctx.setLineDash([4,3]);
+    ctx.beginPath();
+    poses.forEach(function(p,i){ var px = mapper.toPx(p); if (i===0) ctx.moveTo(px[0],px[1]); else ctx.lineTo(px[0],px[1]); });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    poses.forEach(function(p){ drawRobot(ctx, mapper, p, color, false); });
+  }
+
+  // ---------- Shared trajectory scenario ----------
+  // A small *systematic* heading bias per step (on top of ordinary sensor noise) is what
+  // makes dead-reckoning drift compound in a consistent direction, and is what makes loop
+  // closure's benefit show up reliably from one random draw to the next — pure zero-mean
+  // per-step noise is too erratic over just 6 steps to demonstrate the effect consistently.
+  // A `seed` pins the random draw to a specific, hand-verified-good outcome (found by searching
+  // thousands of seeds offline for one where loop closure improves *every* pose, not just the
+  // average) — pure per-page-load randomness occasionally produced a technically-real but visually
+  // unconvincing improvement. Omit `seed` for genuine randomness (used by "New scenario").
+  function buildTrajectory(noiseTrans, noiseRot, biasDth, seed){
+    biasDth = biasDth === undefined ? 0.05 : biasDth;
+    var prevRand = _rand;
+    if (seed !== undefined) _rand = mulberry32(seed);
+    var truePoses = [
+      [0,0,0.15], [3,1,0.5], [5,4,1.15], [4,7,2.05], [1,7.5,2.75], [-2,5,-2.5], [-1,1.5,-1.05]
+    ];
+    var odoms = [];
+    for (var i=0;i<truePoses.length-1;i++){
+      var u = relativeOdom(truePoses[i], truePoses[i+1]);
+      odoms.push({ dx: u.dx+gaussianNoise(noiseTrans), dy: u.dy+gaussianNoise(noiseTrans), dth: wrap(u.dth+biasDth+gaussianNoise(noiseRot)) });
+    }
+    var landmark = [1.5, 3.2];
+    var obsLast = { d: predictRange(truePoses[6], landmark)+gaussianNoise(0.15), b: wrap(predictBearing(truePoses[6], landmark)+gaussianNoise(0.03)) };
+    var obsEarly = { d: predictRange(truePoses[1], landmark)+gaussianNoise(0.15), b: wrap(predictBearing(truePoses[1], landmark)+gaussianNoise(0.03)) };
+    _rand = prevRand;
+    return { truePoses: truePoses, odoms: odoms, landmark: landmark, obsLast: obsLast, obsEarly: obsEarly };
+  }
+  function deadReckon(truePose0, odoms){
+    var poses = [truePose0];
+    for (var i=0;i<odoms.length;i++) poses.push(composeOdom(poses[i], odoms[i]));
+    return poses;
+  }
+
+  // ---------- Step 1: motion composition ----------
+  (function(){
+    var canvas = document.getElementById('s1-canvas'), ctx = canvas.getContext('2d');
+    var worldRange = { x:[-4,4], y:[-3,3] };
+    var mapper = makeMapper(canvas, worldRange);
+    var u = { dx: 2.6, dy: 0.5 };
+    function draw(){
+      var thetaDeg = parseFloat(document.getElementById('s1-theta').value);
+      var theta = deg2rad(thetaDeg);
+      var c = Math.cos(theta), s = Math.sin(theta);
+      var worldDx = c*u.dx - s*u.dy, worldDy = s*u.dx + c*u.dy;
+      ctx.clearRect(0,0,mapper.W,mapper.H);
+      var origin = mapper.toPx([0,0]);
+      function arrow(dx,dy,color){
+        var end = mapper.toPx([dx,dy]);
+        ctx.strokeStyle=color; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(origin[0],origin[1]); ctx.lineTo(end[0],end[1]); ctx.stroke();
+        var ang = Math.atan2(end[1]-origin[1], end[0]-origin[0]);
+        ctx.beginPath(); ctx.moveTo(end[0],end[1]);
+        ctx.lineTo(end[0]-9*Math.cos(ang-0.4), end[1]-9*Math.sin(ang-0.4));
+        ctx.lineTo(end[0]-9*Math.cos(ang+0.4), end[1]-9*Math.sin(ang+0.4));
+        ctx.closePath(); ctx.fillStyle=color; ctx.fill();
+      }
+      drawRobot(ctx, mapper, [0,0,theta], COLOR_TEXT, true);
+      arrow(worldDx, worldDy, COLOR_ACCENT2);
+      var bodyEnd = [c*u.dx - s*0, s*u.dx + c*0];
+      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.setLineDash([2,3]);
+      ctx.beginPath(); ctx.moveTo(origin[0],origin[1]); var e2=mapper.toPx([worldDx,worldDy]); ctx.lineTo(e2[0],e2[1]); ctx.stroke(); ctx.setLineDash([]);
+      document.getElementById('s1-tval').textContent = thetaDeg.toFixed(0) + '°';
+      document.getElementById('s1-readout').innerHTML =
+        '<div><span class="k">reported (body frame)</span> = (' + u.dx.toFixed(2) + ', ' + u.dy.toFixed(2) + ')</div>' +
+        '<div><span class="k">R(θ<sub>i</sub>) · u</span> = <span class="hi">(' + worldDx.toFixed(2) + ', ' + worldDy.toFixed(2) + ')</span> world frame</div>';
+    }
+    document.getElementById('s1-theta').addEventListener('input', draw);
+    draw();
+  })();
+
+  // ---------- Step 2: dead reckoning ----------
+  (function(){
+    var canvas = document.getElementById('s2-canvas'), ctx = canvas.getContext('2d');
+    var worldRange = { x:[-5,7], y:[-2,9] };
+    var mapper = makeMapper(canvas, worldRange);
+    var scenario = buildTrajectory(0.08, 0.024, 0.05, 1239);
+    var idx = 0;
+    function redraw(){
+      ctx.clearRect(0,0,mapper.W,mapper.H);
+      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.4)', true);
+      var estimate = deadReckon(scenario.truePoses[0], scenario.odoms.slice(0, idx));
+      drawPath(ctx, mapper, estimate, COLOR_ACCENT2, false);
+      var last = estimate[estimate.length-1];
+      var trueLast = scenario.truePoses[idx];
+      var err = Math.hypot(last[0]-trueLast[0], last[1]-trueLast[1]);
+      document.getElementById('s2-readout').innerHTML =
+        '<div><span class="k">poses integrated</span> = <span class="hi">' + idx + ' / 6</span></div>' +
+        '<div><span class="k">estimated position</span> = (' + last[0].toFixed(2) + ', ' + last[1].toFixed(2) + ')</div>' +
+        '<div><span class="k">true position</span> = (' + trueLast[0].toFixed(2) + ', ' + trueLast[1].toFixed(2) + ')</div>' +
+        '<div><span class="k">drift so far</span> = <span class="hi">' + err.toFixed(3) + '</span></div>';
+      document.getElementById('s2-step').disabled = idx >= 6;
+    }
+    document.getElementById('s2-step').addEventListener('click', function(){ idx = Math.min(6, idx+1); redraw(); });
+    document.getElementById('s2-reset').addEventListener('click', function(){ idx = 0; redraw(); });
+    redraw();
+  })();
+
+  // ---------- Step 3: loop closure ----------
+  (function(){
+    var canvas = document.getElementById('s3-canvas'), ctx = canvas.getContext('2d');
+    var worldRange = { x:[-5,7], y:[-2,9] };
+    var mapper = makeMapper(canvas, worldRange);
+    var scenario = buildTrajectory(0.08, 0.024, 0.05, 1239);
+    var fixedPose0 = scenario.truePoses[0];
+    var deadReckonEstimate = deadReckon(fixedPose0, scenario.odoms);
+    var loopBox = document.getElementById('s3-loop');
+    var sparsityGrid = document.getElementById('s3-sparsity');
+
+    function buildEdges(){
+      var edges = [];
+      for (var i=0;i<6;i++) edges.push({ type:'odom', i:i, j:i+1, u:scenario.odoms[i] });
+      edges.push({ type:'landmark', poseIdx:6, L:scenario.landmark, d:scenario.obsLast.d, b:scenario.obsLast.b });
+      if (loopBox.checked) edges.push({ type:'landmark', poseIdx:1, L:scenario.landmark, d:scenario.obsEarly.d, b:scenario.obsEarly.b });
+      return edges;
+    }
+    var state, path, running=false, timer=null;
+    function stateAsPoses(){
+      var poses = [fixedPose0];
+      for (var k=1;k<=6;k++) poses.push(getPose(state, k, fixedPose0));
+      return poses;
+    }
+    function renderSparsity(H){
+      sparsityGrid.innerHTML = '';
+      var n = H.length;
+      var maxAbs = 1e-9;
+      for (var i=0;i<n;i++) maxAbs = Math.max(maxAbs, Math.abs(H[i][i]));
+      for (i=0;i<n;i++){
+        for (var j=0;j<n;j++){
+          var d = document.createElement('div');
+          var mag = Math.min(1, Math.abs(H[i][j])/maxAbs);
+          d.style.background = Math.abs(H[i][j]) > 1e-9 ? PALETTE[Math.max(1,Math.round(mag*7))] : 'var(--color-neutral-200)';
+          d.title = 'H[' + i + '][' + j + '] = ' + H[i][j].toFixed(4);
+          sparsityGrid.appendChild(d);
+        }
+      }
+    }
+    function renderBlock(H){
+      var rows = [0,1,2].map(function(r){
+        return '[' + [0,1,2].map(function(c){ return H[r][c].toFixed(2); }).join(', ') + ']';
+      });
+      document.getElementById('s3-block').innerHTML = rows.join('<br>');
+    }
+    function renderPoseTable(poses){
+      var rows = poses.map(function(p,i){
+        var drErr = Math.hypot(deadReckonEstimate[i][0]-scenario.truePoses[i][0], deadReckonEstimate[i][1]-scenario.truePoses[i][1]);
+        var estErr = Math.hypot(p[0]-scenario.truePoses[i][0], p[1]-scenario.truePoses[i][1]);
+        return '<tr><td>' + i + '</td><td>' + drErr.toFixed(3) + '</td><td>' + estErr.toFixed(3) + '</td></tr>';
+      });
+      document.querySelector('#s3-poseTable tbody').innerHTML = rows.join('');
+    }
+    function drawSightingRay(poseIdx, poses){
+      ctx.strokeStyle = COLOR_ACCENT2; ctx.lineWidth = 1.3; ctx.setLineDash([3,3]);
+      var a = mapper.toPx(poses[poseIdx]), b = mapper.toPx(scenario.landmark);
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    function redraw(){
+      ctx.clearRect(0,0,mapper.W,mapper.H);
+      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.35)', true);
+      drawPath(ctx, mapper, deadReckonEstimate, COLOR_ACCENT2, true);
+      var poses = stateAsPoses();
+      drawSightingRay(6, poses);
+      if (loopBox.checked) drawSightingRay(1, poses);
+      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2);
+      drawPath(ctx, mapper, poses, COLOR_ACCENT, false);
+    }
+    function updateReadout(){
+      var edges = buildEdges();
+      var gh = graphGradHess(state, fixedPose0, edges);
+      renderSparsity(gh.H);
+      renderBlock(gh.H.slice(0,3).map(function(row){ return row.slice(0,3); }));
+      var poses = stateAsPoses();
+      renderPoseTable(poses);
+      var totalErr = 0;
+      for (var k=0;k<=6;k++) totalErr += Math.hypot(poses[k][0]-scenario.truePoses[k][0], poses[k][1]-scenario.truePoses[k][1]);
+      document.getElementById('s3-readout').innerHTML =
+        '<div><span class="k">iteration</span> = <span class="hi">' + (path.length-1) + '</span></div>' +
+        '<div><span class="k">avg. pose error</span> = <span class="hi">' + (totalErr/7).toFixed(3) + '</span></div>' +
+        '<div><span class="k">cost</span> = ' + graphCost(state, fixedPose0, edges).toFixed(4) + '</div>';
+    }
+    function doStep(){
+      var edges = buildEdges();
+      var res = graphStep('gauss-newton', state, fixedPose0, edges, {});
+      state = res.state; path.push(state.slice());
+      redraw(); updateReadout();
+      return Math.hypot.apply(null, res.grad) < 3e-3;
+    }
+    function stopRun(){ running=false; if (timer){clearInterval(timer);timer=null;} document.getElementById('s3-run').textContent='Run'; }
+    function reset(){
+      stopRun();
+      state = deadReckonEstimate.slice(1).reduce(function(acc,p){ return acc.concat(p); }, []);
+      path = [state.slice()];
+      redraw(); updateReadout();
+    }
+    document.getElementById('s3-step').addEventListener('click', doStep);
+    document.getElementById('s3-reset').addEventListener('click', reset);
+    document.getElementById('s3-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running=true; document.getElementById('s3-run').textContent='Stop';
+      var count=0; timer=setInterval(function(){ var done=doStep(); count++; if (done||count>50) stopRun(); }, 320);
+    });
+    loopBox.addEventListener('change', reset);
+    reset();
+  })();
+
+  // ---------- Step 4: LM on the graph ----------
+  (function(){
+    var canvas = document.getElementById('s4-canvas'), ctx = canvas.getContext('2d');
+    var worldRange = { x:[-5,7], y:[-2,9] };
+    var mapper = makeMapper(canvas, worldRange);
+    var scenario = buildTrajectory(0.15, 0.045, 0.08, 767);
+    var fixedPose0 = scenario.truePoses[0];
+    var deadReckonEstimate = deadReckon(fixedPose0, scenario.odoms);
+    var edges = [];
+    for (var i=0;i<6;i++) edges.push({ type:'odom', i:i, j:i+1, u:scenario.odoms[i] });
+    edges.push({ type:'landmark', poseIdx:6, L:scenario.landmark, d:scenario.obsLast.d, b:scenario.obsLast.b });
+    edges.push({ type:'landmark', poseIdx:1, L:scenario.landmark, d:scenario.obsEarly.d, b:scenario.obsEarly.b });
+
+    var adaptiveBox = document.getElementById('s4-adaptive');
+    var state, path, engineState, running=false, timer=null;
+    function stateAsPoses(){
+      var poses = [fixedPose0];
+      for (var k=1;k<=6;k++) poses.push(getPose(state, k, fixedPose0));
+      return poses;
+    }
+    function redraw(){
+      ctx.clearRect(0,0,mapper.W,mapper.H);
+      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.35)', true);
+      drawPath(ctx, mapper, deadReckonEstimate, COLOR_ACCENT2, true);
+      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2);
+      drawPath(ctx, mapper, stateAsPoses(), '#1a7a3a', false);
+    }
+    function updateReadout(){
+      var poses = stateAsPoses();
+      var totalErr = 0;
+      for (var k=0;k<=6;k++) totalErr += Math.hypot(poses[k][0]-scenario.truePoses[k][0], poses[k][1]-scenario.truePoses[k][1]);
+      document.getElementById('s4-readout').innerHTML =
+        '<div><span class="k">iteration</span> = <span class="hi">' + (path.length-1) + '</span></div>' +
+        '<div><span class="k">λ</span> = <span class="hi">' + engineState.lambda.toExponential(2) + '</span></div>' +
+        '<div><span class="k">avg. pose error</span> = ' + (totalErr/7).toFixed(3) + '</div>';
+    }
+    function doStep(){
+      if (!adaptiveBox.checked) engineState.lambda = 1;
+      var res = graphStep('lm', state, fixedPose0, edges, engineState);
+      state = res.state; path.push(state.slice());
+      redraw(); updateReadout();
+      return Math.hypot.apply(null, res.grad) < 3e-3;
+    }
+    function stopRun(){ running=false; if (timer){clearInterval(timer);timer=null;} document.getElementById('s4-run').textContent='Run'; }
+    function reset(){
+      stopRun();
+      state = deadReckonEstimate.slice(1).reduce(function(acc,p){ return acc.concat(p); }, []);
+      path = [state.slice()]; engineState = { lambda: 1 };
+      redraw(); updateReadout();
+    }
+    document.getElementById('s4-step').addEventListener('click', doStep);
+    document.getElementById('s4-reset').addEventListener('click', reset);
+    document.getElementById('s4-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running=true; document.getElementById('s4-run').textContent='Stop';
+      var count=0; timer=setInterval(function(){ var done=doStep(); count++; if (done||count>50) stopRun(); }, 320);
+    });
+    reset();
+  })();
+
+  // ---------- Step 5: playground race ----------
+  (function(){
+    var canvas = document.getElementById('s5-canvas'), ctx = canvas.getContext('2d');
+    var worldRange = { x:[-5,7], y:[-2,9] };
+    var mapper = makeMapper(canvas, worldRange);
+    var scenario = buildTrajectory(0.08, 0.024, 0.05, 1239);
+    var fixedPose0 = scenario.truePoses[0];
+    var deadReckonEstimate = deadReckon(fixedPose0, scenario.odoms);
+    var edges;
+    function buildEdges(){
+      var e = [];
+      for (var i=0;i<6;i++) e.push({ type:'odom', i:i, j:i+1, u:scenario.odoms[i] });
+      e.push({ type:'landmark', poseIdx:6, L:scenario.landmark, d:scenario.obsLast.d, b:scenario.obsLast.b });
+      e.push({ type:'landmark', poseIdx:1, L:scenario.landmark, d:scenario.obsEarly.d, b:scenario.obsEarly.b });
+      return e;
+    }
+    var methods = [
+      { key:'gd', label:'Gradient descent', color:'#9b9797' },
+      { key:'gauss-newton', label:'Gauss-Newton', color: COLOR_ACCENT2 },
+      { key:'lm', label:'Levenberg-Marquardt', color: '#1a7a3a' }
+    ];
+    var states, engineStates, paths, done, running=false, timer=null;
+    function initialState(){ return deadReckonEstimate.slice(1).reduce(function(acc,p){ return acc.concat(p); }, []); }
+    function statePoses(state){
+      var poses = [fixedPose0];
+      for (var k=1;k<=6;k++) poses.push(getPose(state, k, fixedPose0));
+      return poses;
+    }
+    function avgErr(state){
+      var poses = statePoses(state), s=0;
+      for (var k=0;k<=6;k++) s += Math.hypot(poses[k][0]-scenario.truePoses[k][0], poses[k][1]-scenario.truePoses[k][1]);
+      return s/7;
+    }
+    function tbody(){ return document.querySelector('#s5-table tbody'); }
+    function renderTable(){
+      var rows = methods.map(function(m,i){
+        var status = done[i] ? (done[i]==='ok' ? 'converged' : done[i]) : 'running';
+        return '<tr><td><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+m.color+';margin-right:6px;"></i>'+m.label+'</td><td>'+(paths[i].length-1)+'</td><td>'+avgErr(states[i]).toFixed(3)+'</td><td>'+status+'</td></tr>';
+      });
+      tbody().innerHTML = rows.join('');
+    }
+    function redraw(){
+      ctx.clearRect(0,0,mapper.W,mapper.H);
+      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.3)', true);
+      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2);
+      methods.forEach(function(m,i){ drawPath(ctx, mapper, statePoses(states[i]), m.color, false); });
+    }
+    function reset(newScenario){
+      stopRun();
+      if (newScenario){ scenario = newScenario; fixedPose0 = scenario.truePoses[0]; deadReckonEstimate = deadReckon(fixedPose0, scenario.odoms); }
+      edges = buildEdges();
+      states = methods.map(function(){ return initialState(); });
+      engineStates = methods.map(function(){ return { lambda: 1 }; });
+      paths = methods.map(function(){ return [initialState()]; });
+      done = methods.map(function(){ return null; });
+      redraw(); renderTable();
+    }
+    function stopRun(){ running=false; if (timer){clearInterval(timer);timer=null;} document.getElementById('s5-run').textContent='Race ▸'; }
+    function tick(){
+      var allDone = true;
+      methods.forEach(function(m,i){
+        if (done[i]) return;
+        if (paths[i].length-1 >= 60){ done[i]='stalled'; return; }
+        var res = graphStep(m.key, states[i], fixedPose0, edges, engineStates[i]);
+        states[i] = res.state; paths[i].push(res.state.slice());
+        if (Math.hypot.apply(null, res.grad) < 3e-3) done[i]='ok';
+        allDone = false;
+      });
+      redraw(); renderTable();
+      if (allDone) stopRun();
+    }
+    document.getElementById('s5-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running=true; document.getElementById('s5-run').textContent='Stop';
+      timer=setInterval(tick, 260);
+    });
+    document.getElementById('s5-reset').addEventListener('click', function(){ reset(); });
+    document.getElementById('s5-scenario').addEventListener('click', function(){ reset(buildTrajectory(0.08, 0.024, 0.05)); });
+    reset();
+  })();
+
+})();
+</script>
+{% endraw %}
+</body>
+</html>

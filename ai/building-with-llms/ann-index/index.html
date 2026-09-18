@@ -1,0 +1,728 @@
+---
+title: "Building with LLMs, Interactively — Part 15: Approximate nearest neighbour"
+description: "Flat, IVF, PQ, HNSW, ScaNN and DiskANN; recall, QPS and memory as a four-way tradeoff; how HNSW's layered graph is searched; and why filtered ANN is genuinely hard."
+permalink: "/ai/building-with-llms/ann-index/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Approximate nearest neighbour</h1>
+    <p>An embedding is only useful if you can find its neighbours fast. Exact search is the honest baseline, not a strawman: brute force over a million vectors is correct and far too slow, so every production store replaces it with a structure that is <em>probably</em> right. This part builds HNSW's layered graph by hand, watches a query descend it, then places the whole index zoo on the same four axes — recall, latency, memory and build cost — before confronting the case that breaks them all: a filter.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="exact">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Exact search is the baseline</h2></div>
+    <p class="g-eyebrow">Correct, simple, and the thing you measure against</p>
+    <p>Exact nearest-neighbour search — "flat" — computes a distance from the query to every vector and takes the top <var>k</var>. It has no recall parameter because its recall is 1.0 by construction, it has no build step, and its cost is linear in the corpus. That makes it the reference every approximation must be measured against, and the answer for small corpora: below a few tens of thousands of vectors, a flat index is fast enough and you should stop optimising.</p>
+    <p>Above that, the arithmetic turns. A million vectors at 1,536 dimensions is six gigabytes in float32 and a million distance computations per query — fine on a GPU, hopeless on a request path. Approximate algorithms accept a recall below 1.0 in exchange for not visiting everything. The only meaningful question is <em>how much recall, at what latency, at what memory cost, and how long the build takes</em> — four axes, and they trade against each other.</p>
+    <div class="g-goal">💡 <span><b>Never report recall without its cost.</b> "99% recall" is marketing until you say at what <var>efSearch</var>, on what hardware, for what QPS and how many gigabytes. An approximate index is a point in a four-dimensional space, and the engineering is choosing a point.</span></div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> tuning on a random sample. A recall number measured on uniformly random queries flatters every index; real query distributions are clustered near the data, where hard cases live. Sample queries from your logs, not from the corpus.</span></div>
+  </section>
+
+  <section class="g-step" id="families">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The index families</h2></div>
+    <p class="g-eyebrow">Partition, compress, or link</p>
+    <p>Every ANN structure is one or more of three ideas: <strong>partition</strong> the space so a query can ignore most of it, <strong>compress</strong> the vectors so more fit in memory and each comparison is cheaper, or <strong>link</strong> the vectors into a graph that can be navigated greedily. The families combine them.</p>
+    <table class="g-cheat">
+      <thead><tr><th>Family</th><th>The idea</th><th>Where it wins</th></tr></thead>
+      <tbody>
+        <tr><td>Flat (exact)</td><td>Scan everything.</td><td>Small corpora; the ground truth you measure against.</td></tr>
+        <tr><td>IVF</td><td>k-means into <var>nlist</var> cells; probe the nearest <var>nprobe</var>.</td><td>Large corpora where a few cells hold the answer.</td></tr>
+        <tr><td>IVF + PQ</td><td>Compress each residual into product-quantisation codes.</td><td>Memory-constrained: keep the whole index resident.</td></tr>
+        <tr><td>HNSW</td><td>A multi-layer navigable graph; greedy descent then a bounded layer-0 search.</td><td>Low latency and high recall when memory is available.</td></tr>
+        <tr><td>ScaNN</td><td>Anisotropic quantisation tuned for inner-product search.</td><td>Recall-optimised compressed indexes.</td></tr>
+        <tr><td>DiskANN / Vamana</td><td>A graph designed to live on SSD with a single pass.</td><td>Billions of vectors on one node; memory too small for the graph.</td></tr>
+      </tbody>
+    </table>
+    <p>The rest of this part turns each of those rows into something you can see: HNSW's graph and its search trace, IVF-PQ's cells and its compression error, the four-way tradeoff as a chart you can steer, and finally the filter that turns a good index into a bad one.</p>
+    <p class="g-source" id="ann-src-families"></p>
+  </section>
+
+  <section class="g-step" id="hnsw">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>HNSW: a graph you can watch</h2></div>
+    <p class="g-eyebrow">Greedy descent above, bounded search below</p>
+    <p>HNSW builds a hierarchy of graphs over the same points. The top layers are sparse, with long edges that cross the space; the bottom layer is dense, with short edges between near neighbours. A query enters at the top, greedily walks to the closest node it can see, drops a layer, walks again, and finally runs a bounded best-first search at layer 0 keeping <var>efSearch</var> candidates. The graph is built with a degree cap <var>M</var> and a build-time candidate list <var>efConstruction</var>.</p>
+    <p>The two knobs do different jobs. <var>M</var> and <var>efConstruction</var> are fixed when you build: they decide how good the graph is. <var>efSearch</var> is chosen per query and does not require a rebuild: raise it and recall rises, latency rises with it, and memory does not move. Below, the query point descends the layers, visits nodes greedily, and the trace is drawn in order. Watch the visited count — the honest proxy for latency — move with <var>efSearch</var>, and whether the true nearest neighbour was found.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hnsw-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Layer-0 edges faint, layer-1 in pink, layer-2+ in dark blue. The numbered rings are the visited trace; the dashed path is the greedy descent.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>M (degree cap, build time) <span class="val">16</span></label><input type="range" id="hnsw-m" min="4" max="24" step="2" value="16"></div>
+        <div class="g-field"><label>efSearch (query time) <span class="val">10</span></label><input type="range" id="hnsw-ef" min="1" max="64" step="1" value="10"></div>
+        <div class="g-btnrow">
+          <button id="hnsw-q-kv">kv cache</button>
+          <button id="hnsw-q-rr">reranking</button>
+          <button id="hnsw-q-tok">tokens</button>
+          <button id="hnsw-play">Animate search</button>
+        </div>
+        <div class="g-readout" id="hnsw-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>What to notice:</b> a handful of hops through the sparse upper layers lands the search in the right region, and the work is done by the bounded layer-0 walk. That is why HNSW is fast at high recall — and why its memory is the graph, not just the vectors.</span></div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> rebuilding to change recall. If recall is low, raise <var>efSearch</var> first — it is free to change. Only rebuild (raising <var>M</var> or <var>efConstruction</var>) when the graph itself is the limit.</span></div>
+  </section>
+
+  <section class="g-step" id="ivfpq">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>IVF and product quantisation</h2></div>
+    <p class="g-eyebrow">Partition the space, then compress what is left</p>
+    <p>IVF runs k-means to place <var>nlist</var> centroids, assigns every vector to its nearest cell, and at query time probes only the <var>nprobe</var> nearest cells. Recall is bounded by a simple fact: if the true neighbour's cell is not probed, it cannot be found. Product quantisation attacks the memory side instead, splitting each vector into sub-vectors and replacing each with a codebook index, which is why the reconstructed point sits near — but rarely on — the original.</p>
+    <p>Below, the corpus is quantised into cells coloured by list. The query point probes the nearest <var>nprobe</var> cells (highlighted), and the thin lines from each point to its reconstruction show the quantisation error. Raise <var>nprobe</var> and recall climbs while more candidates are scanned; lower <var>nbits</var> and memory falls while the reconstructions drift further from the originals.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ivf-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Cells coloured by list; the probed cells are highlighted. Grey dots are originals, coloured dots are reconstructions, lines are the quantisation error.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>nlist (cells) <span class="val">8</span></label><input type="range" id="ivf-nlist" min="3" max="16" step="1" value="8"></div>
+        <div class="g-field"><label>nprobe <span class="val">2</span></label><input type="range" id="ivf-nprobe" min="1" max="16" step="1" value="2"></div>
+        <div class="g-field"><label>nbits per subquantiser <span class="val">3</span></label><input type="range" id="ivf-nbits" min="1" max="5" step="1" value="3"></div>
+        <div class="g-readout" id="ivf-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Two independent dials.</b> <var>nprobe</var> trades latency for recall and is a query-time decision. <var>nbits</var> trades memory for accuracy and is a build-time decision. Confusing the two is how indexes get rebuilt for the wrong reason.</span></div>
+  </section>
+
+  <section class="g-step" id="tradeoff">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The four-way tradeoff</h2></div>
+    <p class="g-eyebrow">Recall, latency, memory, build</p>
+    <p>No index dominates. Flat has perfect recall and the worst latency and memory. IVF-PQ is tiny and fast and pays in recall. HNSW is fast and accurate and pays in memory and build time. DiskANN puts the graph on SSD, so it scales to billions but each hop is a disk read. Choosing is a matter of which constraint binds: latency budget, memory budget, corpus size, or how often you can afford to rebuild.</p>
+    <p>The scatter plots each family at its typical operating point. Set your budgets and the picker recommends a family — then move a budget and watch the recommendation flip.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="trade-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">x is relative latency, y is recall, bubble size is relative memory. The shaded band is your latency budget; the picker ranks by recall subject to both budgets.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Latency budget (relative) <span class="val">40</span></label><input type="range" id="trade-lat" min="5" max="110" step="5" value="40"></div>
+        <div class="g-field"><label>Memory budget (relative) <span class="val">70</span></label><input type="range" id="trade-mem" min="5" max="110" step="5" value="70"></div>
+        <div class="g-field"><label>Corpus size <span class="val">1M</span></label><input type="range" id="trade-corpus" min="5" max="9" step="1" value="6"></div>
+        <div class="g-readout" id="trade-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="ann-src-tradeoff"></p>
+    <div class="g-warn">⚠️ <span><b>These figures are order-of-magnitude.</b> Recall, QPS and memory depend on dimension, distribution, hardware, thread count and the library's implementation. Read the chart as the shape of the tradeoff, then measure your own workload at your own scale.</span></div>
+  </section>
+
+  <section class="g-step" id="filtered">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Why filtered ANN is hard</h2></div>
+    <p class="g-eyebrow">A filter can delete the path the graph needs</p>
+    <p>Real queries are rarely "nearest neighbour of anything"; they are "nearest <em>policy document</em>", "nearest result this tenant may see", "nearest product in stock". A metadata filter turns the search into a constrained one, and the graph does not know about the constraint. This is where the naive approaches break.</p>
+    <ul>
+      <li><strong>Post-filtering</strong> searches the unfiltered graph and discards results that fail the filter. Simple, and it collapses as selectivity falls: if 1% of the corpus passes and you fetched ten candidates, you may have fetched none of them. The fix is over-fetching — request roughly <var>k</var>/selectivity candidates — which is exactly what destroys latency.</li>
+      <li><strong>Pre-filtering</strong> restricts traversal to passing vectors. Now the filter is respected, but the graph's long edges have been deleted: the nodes that connected a region to its neighbours may all fail the filter, so the walk becomes stranded and recall falls even though every returned result is valid.</li>
+    </ul>
+    <p>The plot compares the two as the filter narrows. Post-filtering tracks selectivity until over-fetching cannot keep up; pre-filtering holds on longer but degrades as connectivity disappears. Both trough hard when the filter is truly narrow, and both are seeded simulations rather than measurements.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="filter-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Recall against filter selectivity (log scale). Post-filter over-fetches roughly k/selectivity; pre-filter keeps the filter but loses the graph's edges.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Filter selectivity <span class="val">10</span></label><input type="range" id="filter-sel" min="1" max="100" step="1" value="10"></div>
+        <div class="g-field"><label>efSearch <span class="val">64</span></label><input type="range" id="filter-ef" min="4" max="128" step="4" value="64"></div>
+        <div class="g-readout" id="filter-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="ann-src-fusion"></p>
+    <div class="g-goal">💡 <span><b>The production answer:</b> if your filters are common and narrow, neither pre- nor post-filtering is enough. Partition the index by the filter — a tenant-partitioned or category-partitioned graph — so the filter is a routing decision, not a search constraint. When you cannot partition, budget for over-fetching and measure recall under the filter, not around it.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>Why keep a flat index?</td><td>It is the ground truth: recall 1.0 by construction, and fast enough below a few tens of thousands of vectors.</td></tr>
+        <tr><td>What do M and efConstruction do?</td><td>Build-time: they set the graph's degree and the quality of the neighbour lists. Changing them means rebuilding.</td></tr>
+        <tr><td>What does efSearch do?</td><td>Query-time: the size of the layer-0 candidate list. Raise it for recall, pay in latency, no rebuild.</td></tr>
+        <tr><td>What does nprobe do?</td><td>Query-time for IVF: how many cells to scan. Recall is capped by whether the true cell was probed.</td></tr>
+        <tr><td>What does PQ cost?</td><td>Memory, in exchange for compression error — reconstructions sit near the original, never on it.</td></tr>
+        <tr><td>Memory or latency bound?</td><td>Memory-bound: IVF-PQ or ScaNN. Latency- and recall-bound with RAM to spare: HNSW. Billions on one node: DiskANN.</td></tr>
+        <tr><td>Why is filtered ANN hard?</td><td>A filter can exclude the whole neighbourhood the graph would traverse; post-filtering collapses with selectivity and pre-filtering breaks connectivity.</td></tr>
+        <tr><td>What if filters are common?</td><td>Partition the index by the filter so it becomes routing. Otherwise over-fetch and measure recall under the filter.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Malkov &amp; Yashunin, <a href="https://arxiv.org/abs/1603.09320">"Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"</a>, 2016/2018 — HNSW, the graph the first demo animates.</li>
+      <li>Jégou, Douze &amp; Schmid, <a href="https://arxiv.org/abs/1102.3828">"Product Quantization for Nearest Neighbor Search"</a>, IEEE TPAMI 2011 — the compression half of IVF-PQ.</li>
+      <li>Guo et al., <a href="https://arxiv.org/abs/1908.10396">"Accelerating Large-Scale Inference with Anisotropic Vector Quantization"</a> (ScaNN), ICML 2020 — recall-optimised quantisation for inner-product search.</li>
+      <li>Subramanya et al., <a href="https://papers.nips.cc/paper/9527-rand-nsg-fast-accurate-and-cost-effective-approximate-nearest-neighbor-search-with-a-single-pass">"DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node"</a>, NeurIPS 2019 — the graph that lives on SSD.</li>
+      <li>Johnson, Douze &amp; Jégou, <a href="https://arxiv.org/abs/1702.08734">"Billion-scale similarity search with GPUs"</a> (Faiss), 2017 — the reference implementation of IVF, PQ and the flat baseline.</li>
+      <li>Cormack, Clarke &amp; Buettcher, <a href="https://dl.acm.org/doi/10.1145/1571941.1572114">"Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods"</a>, SIGIR 2009 — the fusion method Part 16 builds on.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A single ranking, dense or lexical, is rarely enough. Next: hybrid search — reciprocal rank fusion, learned sparse models, and the retrieve-wide-then-rerank-narrow shape.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    ann: {
+      source: "HNSW (Malkov & Yashunin, arXiv:1603.09320, 2016/2018), IVF and product quantization (Jégou et al., arXiv:1102.3828, IEEE TPAMI 2011), ScaNN (Guo et al., arXiv:1908.10396, ICML 2020), DiskANN (Subramanya et al., NeurIPS 2019). Offline order-of-magnitude fallback constants.",
+      methods: [
+        { method: "Flat (exact)", recall: "1.00", latency: "highest", memory: "highest", note: "Brute force. The correct baseline." },
+        { method: "IVF (probe nprobe)", recall: "0.90-0.98", latency: "low", memory: "index + data", note: "Cluster into nlist cells, probe the nearest nprobe." },
+        { method: "IVF + PQ", recall: "0.80-0.95", latency: "low", memory: "much lower", note: "Compress residuals into PQ codes." },
+        { method: "HNSW", recall: "0.95-0.99", latency: "very low", memory: "high (graph)", note: "Layered navigable graph." },
+        { method: "DiskANN / Vamana", recall: "0.95-0.99", latency: "low", memory: "fits on SSD", note: "Graph designed to live on disk." }
+      ],
+      hnswDefaults: { M: 16, efConstruction: 200, efSearch: 64 }
+    },
+    fusion: {
+      source: "Reciprocal Rank Fusion (Cormack, Clarke & Buettcher, SIGIR 2009). Cross-encoders rerank far more accurately than they retrieve. Offline fallback constants.",
+      rrfK: 60,
+      patterns: ["lexical + dense fused with RRF", "cross-encoder rerank of the top 50-100"]
+    }
+  };
+  var NUM = FALLBACK;
+
+  var GUIDE_ORDER = Object.keys(AppSim.GUIDE_LABELS);
+  var PAL = ['#2b5fff', '#d6006c', '#c9a227', '#5f8a3a', '#7a5c9e', '#b0552d', '#0b3cd0', '#5d85fd'];
+  function guideColor(g) {
+    var i = GUIDE_ORDER.indexOf(g);
+    return PAL[(i < 0 ? 0 : i) % PAL.length];
+  }
+  function titleOf(id) {
+    var d = AppSim.CORPUS_BY_ID[id];
+    return d ? d.title : String(id);
+  }
+  function guideOf(id) {
+    var d = AppSim.CORPUS_BY_ID[id];
+    return d ? AppSim.GUIDE_LABELS[d.guide] : '';
+  }
+
+  var PADL = 40, PADR = 40, PADT = 26, PADB = 40;
+  function mx(x, W) { return PADL + (x + 1) / 2 * (W - PADL - PADR); }
+  function my(y, H) { return (H - PADB) - (y + 1) / 2 * ((H - PADB) - PADT); }
+  function wx(px, W) { return ((px - PADL) / (W - PADL - PADR)) * 2 - 1; }
+  function wy(py, H) { return (((H - PADB) - py) / ((H - PADB) - PADT)) * 2 - 1; }
+
+  // ------------------------------------------------------------------
+  // Demo A — HNSW traversal (the teaching centrepiece)
+  // ------------------------------------------------------------------
+  var A = { M: el('hnsw-m'), ef: el('hnsw-ef'), q: AppSim.queryVector('kv cache'), label: 'kv cache', step: null, cache: null, cacheKey: '' };
+  var setupA = Guide.setupCanvas(el('hnsw-canvas'), 640, 380, drawA);
+  function hnswIndex() {
+    var key = A.M.value;
+    if (A.cache && A.cacheKey === key) return A.cache;
+    A.cache = AppSim.hnsw(AppSim.CORPUS, +A.M.value, 50, 3);
+    A.cacheKey = key;
+    return A.cache;
+  }
+  function descentPath(index, q) {
+    var cur = [index.entry], chain = [index.entry];
+    for (var lc = index.maxLevel; lc > 0; lc--) {
+      var r = index.searchLayer(lc, q, cur, 1);
+      if (r.length) { cur = [r[0]]; chain.push(r[0]); }
+    }
+    return chain;
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    var index = hnswIndex();
+    var res = AppSim.hnswSearch(index, A.q, +A.ef.value);
+    if (A.step == null) A.step = res.visits.length;
+    ctx.clearRect(0, 0, W, H);
+    var node = {};
+    index.nodes.forEach(function (n) { node[n.id] = n; });
+    // layer edges
+    function edgeKey(a, b) { return a < b ? a + '|' + b : b + '|' + a; }
+    for (var l = 0; l <= index.maxLevel; l++) {
+      var adj = index.adj[l] || {};
+      var seen = {};
+      var colour = l === 0 ? c.accent400 : (l === 1 ? c.accent2 : c.accent700);
+      ctx.strokeStyle = colour;
+      ctx.globalAlpha = l === 0 ? 0.16 : 0.5;
+      ctx.lineWidth = l === 0 ? 1 : 1.4;
+      Object.keys(adj).forEach(function (nid) {
+        (adj[nid] || []).forEach(function (nb) {
+          var k = edgeKey(nid, nb);
+          if (seen[k]) return;
+          seen[k] = 1;
+          ctx.beginPath();
+          ctx.moveTo(mx(node[nid].x, W), my(node[nid].y, H));
+          ctx.lineTo(mx(node[nb].x, W), my(node[nb].y, H));
+          ctx.stroke();
+        });
+      });
+      ctx.globalAlpha = 1;
+    }
+    // points
+    AppSim.CORPUS.forEach(function (d) {
+      ctx.beginPath();
+      ctx.arc(mx(d.x, W), my(d.y, H), 3.2, 0, 2 * Math.PI);
+      ctx.fillStyle = guideColor(d.guide); ctx.globalAlpha = 0.65; ctx.fill(); ctx.globalAlpha = 1;
+    });
+    // high-level nodes as rings
+    index.nodes.forEach(function (n) {
+      if (n.level < 1) return;
+      ctx.beginPath();
+      ctx.arc(mx(n.x, W), my(n.y, H), n.level >= 2 ? 9 : 6.5, 0, 2 * Math.PI);
+      ctx.strokeStyle = n.level >= 2 ? c.accent700 : c.accent2; ctx.lineWidth = 1.6; ctx.stroke();
+    });
+    // visited trace in order
+    var upto = Math.max(0, Math.min(A.step, res.visits.length));
+    ctx.strokeStyle = c.accent2; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    for (var i = 0; i < upto; i++) {
+      var nn = node[res.visits[i]];
+      if (!nn) continue;
+      var X = mx(nn.x, W), Y = my(nn.y, H);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+    for (var j = 0; j < upto; j++) {
+      var nd = node[res.visits[j]];
+      if (!nd) continue;
+      var isHead = j === upto - 1;
+      ctx.beginPath();
+      ctx.arc(mx(nd.x, W), my(nd.y, H), isHead ? 8 : 5.5, 0, 2 * Math.PI);
+      ctx.fillStyle = isHead ? c.accent700 : c.accent2;
+      ctx.globalAlpha = isHead ? 1 : 0.8; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.4; ctx.stroke();
+      if (j < 9 || isHead) {
+        ctx.fillStyle = '#fff'; ctx.font = '600 8.5px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText(String(j + 1), mx(nd.x, W), my(nd.y, H) + 3);
+      }
+    }
+    // greedy descent path
+    var chain = descentPath(index, A.q);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    chain.forEach(function (id, i) {
+      var nd = node[id]; if (!nd) return;
+      var X = mx(nd.x, W), Y = my(nd.y, H);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke(); ctx.setLineDash([]);
+    // true nearest vs returned
+    var trueNd = node[res.trueNearest];
+    if (trueNd) {
+      ctx.beginPath();
+      ctx.arc(mx(trueNd.x, W), my(trueNd.y, H), 11, 0, 2 * Math.PI);
+      ctx.strokeStyle = res.foundTrue ? '#5f8a3a' : c.accent2; ctx.lineWidth = 2; ctx.stroke();
+    }
+    if (res.result && node[res.result] && res.result !== res.trueNearest) {
+      var rnd = node[res.result];
+      ctx.beginPath();
+      ctx.arc(mx(rnd.x, W), my(rnd.y, H), 11, 0, 2 * Math.PI);
+      ctx.strokeStyle = '#c9a227'; ctx.lineWidth = 2; ctx.stroke();
+    }
+    // query
+    ctx.fillStyle = c.text;
+    ctx.beginPath();
+    ctx.arc(mx(A.q.x, W), my(A.q.y, H), 5.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(mx(A.q.x, W) - 10, my(A.q.y, H)); ctx.lineTo(mx(A.q.x, W) + 10, my(A.q.y, H));
+    ctx.moveTo(mx(A.q.x, W), my(A.q.y, H) - 10); ctx.lineTo(mx(A.q.x, W), my(A.q.y, H) + 10);
+    ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('entry: layer ' + index.maxLevel + ' · query "' + A.label + '"', 12, 16);
+    ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent400; ctx.fillText('layer-0 edges', W - 210, 16);
+    ctx.fillStyle = c.accent2; ctx.fillText('layer-1 edges / visited trace', W - 210, 28);
+    ctx.fillStyle = c.accent700; ctx.fillText('layer-2+ / greedy descent', W - 210, 40);
+    el('hnsw-readout').innerHTML =
+      '<div><span class="k">visited nodes</span> <span class="hi">' + res.visits.length + '</span> (layer 0: ' + res.visitsLayer0.length + ') · latency proxy</div>' +
+      '<div><span class="k">true nearest found</span> <span class="' + (res.foundTrue ? 'hi' : 'bad') + '">' + (res.foundTrue ? 'yes' : 'no') + '</span> · returned "' + titleOf(res.result) + '", true "' + titleOf(res.trueNearest) + '"</div>' +
+      '<div><span class="k">graph</span> M ' + index.M + ' · efConstruction 50 · ' + index.nodes.length + ' nodes · max level ' + index.maxLevel + ' · efSearch ' + res.efSearch + '</div>' +
+      '<div class="k">steps ' + upto + '/' + res.visits.length + ' of the trace shown. Raise efSearch to visit more and find more.</div>';
+  }
+  A.M.addEventListener('input', function () { A.step = null; drawA(); });
+  A.ef.addEventListener('input', function () { A.step = null; drawA(); });
+  function setHnswQuery(q) {
+    A.q = AppSim.queryVector(q); A.label = q; A.step = null; drawA();
+  }
+  el('hnsw-q-kv').addEventListener('click', function () { setHnswQuery('kv cache'); });
+  el('hnsw-q-rr').addEventListener('click', function () { setHnswQuery('reranking'); });
+  el('hnsw-q-tok').addEventListener('click', function () { setHnswQuery('tokens'); });
+  setupA.ctx.canvas.addEventListener('pointerdown', function (ev) {
+    var p = Guide.hitTest(setupA.ctx.canvas, ev);
+    A.q = { x: wx(p.x, 640), y: wy(p.y, 380) };
+    A.label = 'clicked point';
+    A.step = null; drawA();
+  });
+  var loopA;
+  A.visitsLen = function () {
+    return AppSim.hnswSearch(hnswIndex(), A.q, +A.ef.value).visits.length;
+  };
+  el('hnsw-play').addEventListener('click', function () {
+    if (!loopA.running()) { A.step = 0; drawA(); }
+  });
+  loopA = Guide.loop({
+    onStep: function () {
+      A.step = (A.step == null || A.step >= A.visitsLen()) ? 1 : A.step + 1;
+      drawA();
+    },
+    button: el('hnsw-play'), interval: 90, playLabel: 'Animate search', pauseLabel: 'Pause'
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — IVF + product quantisation
+  // ------------------------------------------------------------------
+  var B = { nlist: el('ivf-nlist'), nprobe: el('ivf-nprobe'), nbits: el('ivf-nbits'), q: AppSim.queryVector('kv cache'), cache: null, key: '' };
+  var setupB = Guide.setupCanvas(el('ivf-canvas'), 640, 360, drawB);
+  function ivfIndex() {
+    var key = B.nlist.value + '|' + B.nbits.value;
+    if (B.cache && B.key === key) return B.cache;
+    B.cache = AppSim.ivfpq(AppSim.CORPUS, { nlist: +B.nlist.value, m: 2, nbits: +B.nbits.value, seed: 4 });
+    B.key = key;
+    return B.cache;
+  }
+  function trueNNId(q) {
+    var best = null, bd = Infinity;
+    AppSim.CORPUS.forEach(function (d) {
+      var dd = AppSim.dist(q, d);
+      if (dd < bd) { bd = dd; best = d.id; }
+    });
+    return best;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 360;
+    var index = ivfIndex();
+    var nlist = index.nlist;
+    var nprobe = Math.max(1, Math.min(nlist, +B.nprobe.value));
+    var search = AppSim.ivfSearch(index, B.q, nprobe);
+    var probed = {};
+    search.probed.forEach(function (li) { probed[li] = 1; });
+    ctx.clearRect(0, 0, W, H);
+    // Voronoi-ish background by nearest centroid
+    var step = 10;
+    for (var px = PADL; px < W - PADR; px += step) {
+      for (var py = PADT; py < H - PADB; py += step) {
+        var wxv = wx(px + step / 2, W), wyv = wy(py + step / 2, H);
+        var bestL = 0, bd = Infinity;
+        index.centroids.forEach(function (cen, l) {
+          var dd = (cen[0] - wxv) * (cen[0] - wxv) + (cen[1] - wyv) * (cen[1] - wyv);
+          if (dd < bd) { bd = dd; bestL = l; }
+        });
+        ctx.fillStyle = PAL[bestL % PAL.length];
+        ctx.globalAlpha = probed[bestL] ? 0.22 : 0.07;
+        ctx.fillRect(px, py, step, step);
+      }
+    }
+    ctx.globalAlpha = 1;
+    // quantisation error lines + original/reconstruction
+    AppSim.CORPUS.forEach(function (d, i) {
+      var rec = index.reconstructed[i];
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+      ctx.beginPath(); ctx.moveTo(mx(d.x, W), my(d.y, H)); ctx.lineTo(mx(rec.x, W), my(rec.y, H)); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(mx(rec.x, W), my(rec.y, H), 3.4, 0, 2 * Math.PI);
+      ctx.fillStyle = PAL[index.assign[i] % PAL.length]; ctx.fill();
+      ctx.beginPath(); ctx.arc(mx(d.x, W), my(d.y, H), 2.2, 0, 2 * Math.PI);
+      ctx.fillStyle = c.text; ctx.globalAlpha = 0.6; ctx.fill(); ctx.globalAlpha = 1;
+    });
+    // centroids
+    index.centroids.forEach(function (cen, l) {
+      var on = probed[l];
+      ctx.fillStyle = on ? c.accent2 : c.text;
+      ctx.globalAlpha = on ? 1 : 0.5;
+      ctx.fillRect(mx(cen[0], W) - 4, my(cen[1], H) - 4, 8, 8);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = on ? c.accent2 : c.text; ctx.font = '600 9.5px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('L' + l, mx(cen[0], W), my(cen[1], H) - 8);
+    });
+    // top results
+    var top = search.results.slice(0, 5);
+    top.forEach(function (r, i) {
+      var rec = index.reconstructed[r.point];
+      ctx.beginPath(); ctx.arc(mx(rec.x, W), my(rec.y, H), 8 - i * 0.8, 0, 2 * Math.PI);
+      ctx.strokeStyle = i === 0 ? c.accent700 : c.accent; ctx.lineWidth = 1.6; ctx.stroke();
+    });
+    // query
+    ctx.fillStyle = c.text;
+    ctx.beginPath(); ctx.arc(mx(B.q.x, W), my(B.q.y, H), 5.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(mx(B.q.x, W) - 9, my(B.q.y, H)); ctx.lineTo(mx(B.q.x, W) + 9, my(B.q.y, H));
+    ctx.moveTo(mx(B.q.x, W), my(B.q.y, H) - 9); ctx.lineTo(mx(B.q.x, W), my(B.q.y, H) + 9);
+    ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    var trueId = trueNNId(B.q);
+    var gotId = search.results.length ? AppSim.CORPUS[search.results[0].point].id : null;
+    var top5 = search.results.slice(0, 5).map(function (r) { return AppSim.CORPUS[r.point].id; });
+    var inTop5 = top5.indexOf(trueId) >= 0;
+    var scanned = search.probed.reduce(function (a, li) { return a + index.lists[li].length; }, 0);
+    el('ivf-readout').innerHTML =
+      '<div><span class="k">nlist</span> ' + nlist + ' · <span class="k">nprobe</span> <span class="hi">' + nprobe + '</span> · lists probed ' + search.probed.join(', ') + '</div>' +
+      '<div><span class="k">true neighbour in top-5</span> <span class="' + (inTop5 ? 'hi' : 'bad') + '">' + (inTop5 ? 'yes' : 'no') + '</span> · top-1 returned "' + titleOf(gotId) + '" (exact was "' + titleOf(trueId) + '") · scanned ' + scanned + '/' + AppSim.CORPUS.length + '</div>' +
+      '<div><span class="k">mean quant error</span> ' + index.quantError.toFixed(4) + ' · code ' + (index.m * index.nbits) + ' bits vs 64-bit float pair ≈ ' + (64 / (index.m * index.nbits)).toFixed(0) + '× smaller</div>' +
+      '<div class="k">raise nprobe for recall (latency), lower nbits for memory (accuracy); even a full scan can flip a near-tie because it ranks reconstructions, not originals.</div>';
+  }
+  Guide.bindSliders([B.nlist, B.nprobe, B.nbits], function () { drawB(); });
+  B.nprobe.max = B.nlist.value;
+  B.nlist.addEventListener('input', function () { B.nprobe.max = B.nlist.value; drawB(); });
+
+  // ------------------------------------------------------------------
+  // Demo C — the four-way tradeoff and a picker
+  // ------------------------------------------------------------------
+  var C = { lat: el('trade-lat'), mem: el('trade-mem'), corpus: el('trade-corpus') };
+  var setupC = Guide.setupCanvas(el('trade-canvas'), 640, 360, drawC);
+  function parseRecall(s) {
+    if (typeof s === 'number') return s > 1 ? s / 100 : s;
+    var m = String(s).match(/[0-9.]+/g);
+    if (!m) return 0.9;
+    var v = m.map(Number);
+    var mid = v.length > 1 ? (v[0] + v[1]) / 2 : v[0];
+    return mid > 1 ? mid / 100 : mid;
+  }
+  function parseLat(s) {
+    var t = String(s).toLowerCase();
+    if (t.indexOf('very low') >= 0) return 6;
+    if (t.indexOf('highest') >= 0) return 100;
+    if (t.indexOf('low') >= 0) return 18;
+    return 40;
+  }
+  function parseMem(s) {
+    var t = String(s).toLowerCase();
+    if (t.indexOf('highest') >= 0) return 100;
+    if (t.indexOf('much lower') >= 0) return 12;
+    if (t.indexOf('fits on ssd') >= 0) return 30;
+    if (t.indexOf('high') >= 0) return 75;
+    if (t.indexOf('index + data') >= 0) return 60;
+    return 50;
+  }
+  function methods() {
+    var arr = (NUM && NUM.ann && NUM.ann.methods) || FALLBACK.ann.methods;
+    return arr.map(function (m) {
+      return { name: m.method, recall: parseRecall(m.recall), lat: parseLat(m.latency), mem: parseMem(m.memory), note: m.note };
+    });
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var latB = +C.lat.value, memB = +C.mem.value, exp = +C.corpus.value;
+    var xs = [0, 110], ys = [0, 108];
+    function px(v) { return PADL + (v - xs[0]) / (xs[1] - xs[0]) * (W - PADL - PADR); }
+    function py(v) { return (H - PADB) - (v - ys[0]) / (ys[1] - ys[0]) * ((H - PADB) - PADT); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PADL, PADT); ctx.lineTo(PADL, H - PADB); ctx.lineTo(W - PADR, H - PADB); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('relative latency →', PADL + (W - PADL - PADR) / 2, H - 6);
+    ctx.save(); ctx.translate(12, PADT + (H - PADT - PADB) / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('recall (%)', 0, 0); ctx.restore();
+    // latency budget band
+    ctx.fillStyle = c.accent100 || 'rgba(43,95,255,0.10)';
+    ctx.fillRect(PADL, PADT, Math.max(0, px(latB) - PADL), H - PADT - PADB);
+    ctx.strokeStyle = c.accent400; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(px(latB), PADT); ctx.lineTo(px(latB), H - PADB); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('latency budget ' + latB, px(latB) + 4, PADT + 10);
+    var M = methods();
+    var ranked = M.map(function (m) {
+      var penalty = Math.max(0, m.lat - latB) * 2 + Math.max(0, m.mem - memB) * 2;
+      var corpusBonus = 0;
+      if (exp >= 8 && m.name.indexOf('DiskANN') >= 0) corpusBonus = 6;
+      if (exp <= 6 && m.name.indexOf('HNSW') >= 0) corpusBonus = 4;
+      if (exp >= 8 && m.name.indexOf('IVF + PQ') >= 0) corpusBonus = 3;
+      m.score = m.recall * 100 - penalty + corpusBonus;
+      m.over = m.lat > latB || m.mem > memB;
+      return m;
+    }).sort(function (a, b) { return b.score - a.score; });
+    ranked.forEach(function (m) {
+      var R = 6 + m.mem / 9;
+      ctx.beginPath();
+      ctx.arc(px(m.lat), py(m.recall * 100), R, 0, 2 * Math.PI);
+      ctx.fillStyle = m.over ? c.accent2 : c.accent;
+      ctx.globalAlpha = m.over ? 0.25 : 0.35; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.strokeStyle = m === ranked[0] ? c.accent700 : (m.over ? c.accent2 : c.accent);
+      ctx.lineWidth = m === ranked[0] ? 2.4 : 1.4; ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(m.name.replace(/ \(.*\)/, ''), px(m.lat) + R + 3, py(m.recall * 100) + 3);
+    });
+    var pick = ranked[0];
+    var expLabel = (Math.pow(10, exp) >= 1e9 ? '1B' : Math.pow(10, exp) >= 1e6 ? (Math.pow(10, exp) / 1e6) + 'M' : (Math.pow(10, exp) / 1e3) + 'k');
+    el('trade-readout').innerHTML =
+      '<div><span class="k">pick</span> <span class="hi">' + pick.name + '</span> at recall ' + (pick.recall * 100).toFixed(0) + '%</div>' +
+      '<div><span class="k">budgets</span> latency ' + latB + ' · memory ' + memB + ' · corpus ~' + expLabel + ' vectors</div>' +
+      ranked.slice(0, 3).map(function (m) {
+        return '<div><span class="k">' + (m.over ? 'over budget' : 'in budget') + '</span> ' + m.name + ' · lat ' + m.lat + ' · mem ' + m.mem + '</div>';
+      }).join('') +
+      '<div class="k">bubbles sized by memory. Tighten a budget and the pick changes — that is the whole decision.</div>';
+  }
+  Guide.bindSliders([C.lat, C.mem, C.corpus], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — filtered ANN: pre- vs post-filter
+  // ------------------------------------------------------------------
+  var D = { sel: el('filter-sel'), ef: el('filter-ef') };
+  var BASE = 0.97;
+  var setupD = Guide.setupCanvas(el('filter-canvas'), 640, 320, drawD);
+  function preRecall(s) { return BASE * (0.55 + 0.45 * (1 - Math.exp(-s / 0.25))); }
+  function postRecall(s, ef) { return BASE * Math.min(1, s * (ef / 10)); }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 320;
+    var selPct = +D.sel.value, s = selPct / 100, ef = +D.ef.value;
+    var lo = Math.log10(0.005), hi = 0;
+    function lx(ss) { return lo + (hi - lo) * (Math.log10(Math.max(1e-4, ss)) - lo) / (hi - lo); }
+    var pts = 60, preS = [], postS = [];
+    for (var i = 0; i <= pts; i++) {
+      var v = Math.pow(10, lo + (hi - lo) * i / pts);
+      var r = AppSim.rng(400 + i);
+      preS.push({ x: lx(v), y: Math.max(0, Math.min(1, preRecall(v) + (r() - 0.5) * 0.03)) * 100 });
+      postS.push({ x: lx(v), y: Math.max(0, Math.min(1, postRecall(v, ef) + (r() - 0.5) * 0.03)) * 100 });
+    }
+    var axes = Guide.drawLines(ctx, W, H, [
+      { points: preS, color: c.accent, width: 2.2 },
+      { points: postS, color: c.accent2, width: 2.2, dashed: true }
+    ], [lo, hi], [0, 105], { xLabel: 'filter selectivity (log scale: 0.5% → 100%)', yLabel: 'recall %', padL: 56, padB: 34 });
+    [0.01, 0.1, 1].forEach(function (t) {
+      var X = axes.px(Math.log10(t));
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(X, axes.padT); ctx.lineTo(X, axes.padT + axes.plotH); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText((t * 100) + '%', X, axes.padT + axes.plotH + 14);
+    });
+    ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.fillText('pre-filter (filter-aware traversal)', axes.padL + 8, axes.padT + 12);
+    ctx.fillStyle = c.accent2; ctx.fillText('post-filter (over-fetch k/selectivity)', axes.padL + 8, axes.padT + 26);
+    var sx = axes.px(lx(s));
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(sx, axes.padT); ctx.lineTo(sx, axes.padT + axes.plotH); ctx.stroke();
+    var pre = preRecall(s), post = postRecall(s, ef);
+    ctx.beginPath(); ctx.arc(sx, axes.py(pre * 100), 4, 0, 2 * Math.PI); ctx.fillStyle = c.accent; ctx.fill();
+    ctx.beginPath(); ctx.arc(sx, axes.py(post * 100), 4, 0, 2 * Math.PI); ctx.fillStyle = c.accent2; ctx.fill();
+    el('filter-readout').innerHTML =
+      '<div><span class="k">selectivity</span> ' + selPct + '% · <span class="k">efSearch</span> ' + ef + '</div>' +
+      '<div><span class="k">pre-filter recall</span> <span class="hi">' + Guide.fmtPct(pre, 0) + '</span> · post-filter <span class="' + (post < pre ? 'bad' : 'hi') + '">' + Guide.fmtPct(post, 0) + '</span></div>' +
+      '<div><span class="k">candidates needed for 10 results</span> ≈ ' + Math.ceil(10 / Math.max(1e-4, s)) + ' (over-fetch 1/selectivity)</div>' +
+      '<div class="k">' + (selPct <= 5 ? 'narrow filter: post-filtering has collapsed; partition the index by the filter.' : 'loose filter: over-fetching is cheap and post-filtering is fine.') + '</div>';
+  }
+  Guide.bindSliders([D.sel, D.ef], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var f = el('ann-src-families'), t = el('ann-src-tradeoff'), u = el('ann-src-fusion');
+    var annSrc = (NUM.ann && NUM.ann.source) || FALLBACK.ann.source;
+    if (f) f.textContent = annSrc;
+    if (t) t.textContent = annSrc;
+    if (u) u.textContent = (NUM.fusion && NUM.fusion.source) || FALLBACK.fusion.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (resp) { return resp.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'ann-index-baseline',
+      kind: 'choice',
+      prompt: 'Why keep a flat (exact) index around at all?',
+      options: [
+        { label: 'It has recall 1.0 by construction, so it is the ground truth every approximation is measured against — and it is fast enough for small corpora.', correct: true },
+        { label: 'It is the fastest option for billions of vectors.' },
+        { label: 'It uses less memory than HNSW because it stores no graph.' },
+        { label: 'It is the only index that supports metadata filters.' }
+      ],
+      explanation: 'Flat search is exact and simple; its cost is linear in the corpus. It is both the reference for recall and the right answer below a few tens of thousands of vectors.'
+    },
+    {
+      id: 'ann-index-efsearch',
+      kind: 'choice',
+      prompt: 'Recall on an HNSW index is too low. What is the first thing to change?',
+      options: [
+        { label: 'Raise efSearch — it is a query-time knob and needs no rebuild.', correct: true },
+        { label: 'Raise M and rebuild immediately.' },
+        { label: 'Switch from cosine to euclidean distance.' },
+        { label: 'Reduce nlist so more cells are scanned.' }
+      ],
+      explanation: 'M and efConstruction are build-time decisions that shape the graph. efSearch expands the layer-0 candidate list at query time, so it is the cheap, reversible lever on recall — at the cost of latency.'
+    },
+    {
+      id: 'ann-index-visited',
+      kind: 'numeric',
+      prompt: 'An exact search over a corpus of 10,000 vectors examines all 10,000. An HNSW search visits 250 nodes. What fraction of the corpus does the HNSW search examine, as a percentage?',
+      answer: 2.5,
+      unit: '%',
+      tolerance: 0.1,
+      explanation: '250 / 10,000 = 0.025, so 2.5%. The visited-node count is the latency proxy: it is the work the search actually did, roughly one distance computation per visited node.'
+    },
+    {
+      id: 'ann-index-quant',
+      kind: 'numeric',
+      prompt: 'Two IVF-PQ configurations report mean squared quantisation errors of 0.004 and 0.012. How many times larger is the second error?',
+      answer: 3,
+      unit: '×',
+      tolerance: 0.05,
+      explanation: '0.012 / 0.004 = 3. Product quantisation replaces each vector with a codebook index, so reconstructions sit near the original; the compression error is the price, and it grows as nbits falls.'
+    },
+    {
+      id: 'ann-index-filtered',
+      kind: 'choice',
+      prompt: 'Why does post-filtering collapse as a metadata filter narrows?',
+      options: [
+        { label: 'The unfiltered search returns a fixed number of candidates, and at low selectivity almost none of them pass the filter — you must over-fetch roughly k/selectivity, which costs latency.', correct: true },
+        { label: 'The filter changes the distance metric, invalidating the graph.' },
+        { label: 'Post-filtering silently deletes edges from the graph.' },
+        { label: 'The filter blocks the entry point, so the search cannot start.' }
+      ],
+      explanation: 'Post-filtering applies the filter after the graph search, so the fraction that survives is the selectivity. Pre-filtering respects the filter during traversal but can lose the long edges it needs — both fail in different ways, which is why a partitioned index is the production answer.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

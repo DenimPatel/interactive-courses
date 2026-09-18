@@ -1,0 +1,631 @@
+---
+title: "Building with LLMs, Interactively — Part 14: Chunking, and contextual retrieval"
+description: "Fixed, recursive, semantic, parent-document and RAPTOR chunking; the boundary effect that makes a fact split across two chunks retrievable from neither; and contextual retrieval, whose measured top-20 failure rate falls from 5.7% to 1.9%."
+permalink: "/ai/building-with-llms/chunking/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Chunking, and contextual retrieval</h1>
+    <p>An embedding is computed per unit of text, and a retriever can only return what was indexed. That makes the cut the first real decision in a retrieval system: split documents too finely and a fact falls between two chunks; too coarsely and the vector is an average of everything and points at nothing. This part works through the four workhorse strategies, the boundary effect that none of them escapes, and the mitigation that has the best published numbers — contextual retrieval.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="granularity">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Why chunk at all</h2></div>
+    <p class="g-eyebrow">Retrieval granularity against context cost</p>
+    <p>A retriever ranks <em>units</em>, not documents. The unit it ranks is whatever you embedded, and the unit it returns is whatever you paste into the prompt. Those are two different pressures. Retrieval wants the unit small, so that a vector represents one idea and the nearest neighbour is actually about the query. Generation wants the unit large, so that the passage handed to the model contains the surrounding sentences the answer needs. <strong>Chunking is the negotiation between them.</strong></p>
+    <p>The four strategies worth knowing, plus the one that changed the abstraction level, are:</p>
+    <ul>
+      <li><strong>Fixed-size</strong> — slice every <var>N</var> characters, optionally with overlap. Trivial, uniform, and blind to meaning: it will cut a table in half mid-row.</li>
+      <li><strong>Recursive</strong> — split on structure (paragraphs, then sentences), greedily packing each chunk up to a size ceiling. The default in most frameworks, and a strong baseline.</li>
+      <li><strong>Semantic</strong> — start a new chunk when the embedding (or, cheaply, the term overlap) between adjacent sentences drifts below a threshold. Boundaries follow topic rather than punctuation.</li>
+      <li><strong>Parent-document</strong> — index small children for matching, but return the larger parent they sit in. <em>Match small, return large.</em></li>
+      <li><strong>RAPTOR</strong> — recursively cluster and summarise chunks into a tree, so the same corpus can answer both a detail question (leaf) and a "what themes run through this?" question (a summary node). Multi-level abstraction rather than a single cut.</li>
+    </ul>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> there is no correct chunk size, only a size that suits the questions you are asking. Make the choice visible, then measure — a chunker that looks reasonable in a design doc is a hypothesis, and retrieval metrics are the experiment.</span></div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> optimizing the chunker in isolation. Every one of these strategies changes what is <em>indexable</em>, and a change that helps one question class often hurts another. Chunk-size tuning without a labelled query set is guessing with extra steps.</span></div>
+  </section>
+
+  <section class="g-step" id="strategies">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Four cuts over the same passage</h2></div>
+    <p class="g-eyebrow">Same text, different boundaries</p>
+    <p>Below, several of the corpus documents are concatenated into one passage and cut four ways by <code>AppSim.chunk</code>. The passage band at the top is the character axis; each row underneath is one strategy's boundaries aligned to the same axis, so you can see exactly where they disagree. Drag the size ceiling and the fixed-strategy overlap and watch the rows diverge: fixed slicing ignores the sentence ticks, recursive honours them, and semantic lets the topic decide.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="chunk-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Top band: the passage with sentence ticks. Four rows below: chunk boundaries for fixed, recursive, semantic and parent.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Size ceiling (characters) <span class="val">200</span></label><input type="range" id="chunk-size" min="40" max="300" step="10" value="200"></div>
+        <div class="g-field"><label>Fixed overlap (characters) <span class="val">0</span></label><input type="range" id="chunk-overlap" min="0" max="60" step="5" value="0"></div>
+        <div class="g-readout" id="chunk-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Read the rows, not the counts:</b> the interesting fact is that recursive and semantic produce <em>variable</em> boundaries — chunk 3 may be a single sentence and chunk 4 a paragraph — while fixed is uniform by construction. Uniformity is not a virtue when the text is not uniform.</span></div>
+  </section>
+
+  <section class="g-step" id="boundaries">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The boundary effect</h2></div>
+    <p class="g-eyebrow">A fact split across a boundary is retrievable from neither half</p>
+    <p>Here is the failure that no cleverness in the embedder can repair. If a sentence carrying the answer straddles two chunks, then neither chunk contains the sentence. The chunk on the left has the setup, the chunk on the right has the payoff, and the query — which uses the vocabulary of the whole sentence — matches neither strongly. The fact is in the index and is not retrievable. This is not a ranking error; it is an indexing invariant, and it is why overlap and boundary-aware splitting exist at all.</p>
+    <p>Slide the chunk size and pick which sentence is the target fact. The band shows the chunks and the fact's span; the sweep underneath samples seeded query variants of the fact's terms and plots the hit rate against size, with the sizes that cut the fact shaded. The troughs are exactly those sizes — the fact is in the passage and in no indexed unit.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="bound-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Top: chunk boundaries and the target fact (the boxed span). Bottom: seeded retrieval hit rate against chunk size; shaded sizes are ones where a boundary cuts the fact.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Chunk size (characters) <span class="val">200</span></label><input type="range" id="bound-size" min="60" max="300" step="10" value="200"></div>
+        <div class="g-field"><label>Target fact (sentence 0–7) <span class="val">2</span></label><input type="range" id="bound-fact" min="0" max="7" step="1" value="2"></div>
+        <div class="g-readout" id="bound-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Overlap is a mitigation, not a fix.</b> Overlapping windows guarantee that many splits land inside a copy of the text, at the cost of storing and searching near-duplicate chunks — and a reranker that has not been told about the duplication will happily return the same passage three times.</span></div>
+  </section>
+
+  <section class="g-step" id="size">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Precision and recall pull in opposite directions</h2></div>
+    <p class="g-eyebrow">There is a size that maximizes neither</p>
+    <p>Small chunks are precise: the vector represents one idea, so the nearest neighbour is usually on-topic and the top result is the right passage. But small chunks lose recall, because the answer is more likely to have been split or to have left its qualifier in a neighbouring chunk. Large chunks are the reverse: the answer is almost certainly inside the retrieved block, but the block is mostly other material, so precision falls and the model has to find the needle in what you handed it.</p>
+    <p>The curve below is a seeded model of that tension, driven by the actual token length of each corpus document. Precision falls as the chunk grows; recall rises; F1 peaks somewhere you have to find rather than assume. Move the marker to read the three metrics at any size.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sweep-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Precision, recall and F1 against chunk size (tokens), averaged over the corpus. The marker is the size you selected.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Chunk size (tokens) <span class="val">128</span></label><input type="range" id="sweep-size" min="32" max="512" step="16" value="128"></div>
+        <div class="g-readout" id="sweep-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="chunk-src-emb"></p>
+    <div class="g-goal">💡 <span><b>The move that sidesteps the tradeoff:</b> decouple the unit you match from the unit you return. Parent-document retrieval indexes small children (precision) and returns their parent (recall), so the tension is resolved by the architecture rather than by a compromise size.</span></div>
+  </section>
+
+  <section class="g-step" id="contextual">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Contextual retrieval</h2></div>
+    <p class="g-eyebrow">Give every chunk the context it lost when it was cut</p>
+    <p>A chunk is ambiguous precisely because it was extracted. "The company's revenue grew 12%" cannot be matched by a query that mentions the company, the quarter, or the filing, because the chunk never says any of those things. <strong>Contextual retrieval</strong> (Anthropic, September 2024) fixes this cheaply: before embedding, ask a model to write one or two sentences situating the chunk inside its source document, and prepend that blurb to the chunk. The chunk now carries its own provenance, and the embedder has something to match on.</p>
+    <div class="g-code"><span class="k">// contextual retrieval: situate the chunk, then index the situated text</span>
+{ <span class="s">"chunk"</span>:   <span class="s">"revenue grew 12% year over year"</span>,
+  <span class="s">"context"</span>: <span class="s">"From ACME's Q2 2023 10-K, MD&amp;A section, on cloud segment growth."</span>,
+  <span class="s">"indexed"</span>: <span class="s">"&lt;context&gt;From ACME's Q2 2023 10-K, MD&amp;A section…&lt;/context&gt;\nrevenue grew 12% year over year"</span> }</div>
+    <p>Contextual embedding alone is only the first tier. Anthropic's reported top-20 retrieval failure rate on a large corpus falls again when the contextualised chunks are combined with BM25 in a hybrid retriever, and again when a reranker reorders the result. The four tiers below are those reported numbers. Toggle a tier to run a hundred seeded queries against it and see the absolute failure rate — and notice how much larger the <em>relative</em> reductions sound than the absolute moves.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ctx-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Reported top-20 retrieval failure rate per tier (lower is better). The selected tier is highlighted; the readout simulates 100 seeded queries at that rate.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="ctx-t0">plain</button>
+          <button id="ctx-t1">+ contextual</button>
+          <button id="ctx-t2">+ BM25</button>
+          <button id="ctx-t3" class="g-primary">+ rerank</button>
+        </div>
+        <div class="g-readout" id="ctx-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="chunk-src-ctx"></p>
+    <p>Two cautions. First, the famous "35% → 49% → 67%" figures are <em>relative</em> reductions in the failure rate, not percentage points; the underlying absolute rates are 5.7%, 3.7%, 2.9% and 1.9%, so the whole journey is a 3.8-point move. Second, these are corpus-, chunking- and reranker-dependent: they are the shape of the win, not a promise about yours. Treat the tiers as a menu and measure each on your own labelled queries.</p>
+    <p class="g-source" id="chunk-src-rag"></p>
+    <div class="g-warn">⚠️ <span><b>What contextual retrieval does not do:</b> it does not repair a boundary that cut the answer in half. It adds context around a chunk; it cannot join two chunks. That is still the job of overlap, parent-document retrieval, or a sentence-level splitter that keeps the sentence whole.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>Why chunk at all?</td><td>An embedding is per unit, so the unit decides what is retrievable; small favours precision, large favours recall.</td></tr>
+        <tr><td>Which strategy first?</td><td>Recursive: split on structure and pack to a ceiling. A strong, cheap baseline before anything cleverer.</td></tr>
+        <tr><td>What does semantic chunking buy?</td><td>Boundaries follow topic drift rather than punctuation — at the cost of variable-sized chunks and a threshold to tune.</td></tr>
+        <tr><td>What is parent-document retrieval?</td><td>Match small children, return their larger parent. Decouples the match unit from the context unit.</td></tr>
+        <tr><td>What is RAPTOR?</td><td>A recursive summarisation tree, so leaf chunks answer detail questions and summary nodes answer thematic ones.</td></tr>
+        <tr><td>What is the boundary effect?</td><td>A fact split across two chunks is fully contained in neither, so it is retrievable from neither. Indexing, not ranking.</td></tr>
+        <tr><td>Does overlap fix it?</td><td>It reduces the frequency, at the cost of near-duplicate storage and duplicate results unless reranking dedupes.</td></tr>
+        <tr><td>What is contextual retrieval?</td><td>Prepend a generated context blurb to each chunk before embedding; combine with BM25 and a reranker for the best tier.</td></tr>
+        <tr><td>Do the 35/49/67% numbers mean that?</td><td>They are relative reductions. The absolute top-20 failure rate goes 5.7% → 3.7% → 2.9% → 1.9%.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/news/contextual-retrieval">"Introducing Contextual Retrieval"</a>, 19 September 2024 — the four tiers and the absolute 5.7% → 1.9% top-20 failure rates behind step 5.</li>
+      <li>Sarthi et al., <a href="https://arxiv.org/abs/2401.18059">"RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval"</a>, ICLR 2024 — the summarisation tree for multi-level abstraction.</li>
+      <li>Günther et al., <a href="https://arxiv.org/abs/2409.04701">"Late Chunking: Contextual Chunk Embeddings Using Long-Context Embedding Models"</a>, 2024 — chunk after embedding rather than before, so each chunk vector retains document context.</li>
+      <li>Chen et al., <a href="https://arxiv.org/abs/2312.06648">"Dense X Retrieval: What Retrieval Granularity Should We Use?"</a>, 2023 — propositions as retrieval units, a finer cut than the sentence.</li>
+      <li>Jégou, Douze &amp; Schmid, <a href="https://arxiv.org/abs/1102.3828">"Product Quantization for Nearest Neighbor Search"</a>, IEEE TPAMI 2011 — the compression half that Part 15 builds the index families on.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — retrieval as selection, and why fewer, better chunks usually beat more context.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Chunks become vectors, and vectors need an index. Next: approximate nearest neighbour — flat, IVF, PQ, HNSW and DiskANN, and why recall, latency and memory form a four-way tradeoff.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    retrieval_contextual: {
+      source: "Anthropic, 'Introducing Contextual Retrieval' (2024-09-19). Reported top-20 retrieval failure rate falling from 5.7% (baseline) to 3.7% with contextual embeddings, 2.9% with contextual embeddings + BM25, and 1.9% with contextual embeddings + BM25 + reranking. Absolute failure rates; the '35% -> 49% -> 67%' figures are relative reductions. Offline fallback constants.",
+      baselineFailurePct: 5.7, contextualEmbeddingsFailurePct: 3.7,
+      plusBM25FailurePct: 2.9, plusRerankFailurePct: 1.9,
+      relativeReductions: { contextual: "35%", plusBM25: "49%", plusRerank: "67%" }
+    },
+    rag: {
+      source: "RAGAS (Es et al., arXiv:2309.15217, EACL 2024); Self-RAG (Asai et al., arXiv:2310.11511, ICLR 2024); GraphRAG (Microsoft Research, 2024); HyDE (Gao et al., arXiv:2212.10496, 2022). Offline fallback constants.",
+      metrics: ["faithfulness", "answer relevance", "context precision", "context recall"]
+    },
+    embeddings: {
+      source: "Sentence-BERT (Reimers & Gurevych, arXiv:1908.10084, EMNLP 2019); E5 (Wang et al., arXiv:2212.03533, 2022); Matryoshka Representation Learning (Kusupati et al., arXiv:2205.13147, NeurIPS 2022); MTEB (Muennighoff et al., arXiv:2210.07316, 2022). Offline fallback constants.",
+      typicalDims: [384, 512, 768, 1024, 1536, 3072]
+    }
+  };
+  var NUM = FALLBACK;
+
+  var PAL = [c.accent, c.accent2, '#c9a227', '#5f8a3a', '#7a5c9e', '#b0552d', c.accent700, c.accent400];
+
+  // The passage the chunker demos cut: several corpus documents concatenated.
+  var PASSAGE_DOCS = ['rag', 'embeddings', 'chunking', 'vector-search', 'reranking', 'context-engineering', 'eval-harness', 'prompt-design'];
+  var PASSAGE = PASSAGE_DOCS.map(function (id) {
+    var d = AppSim.CORPUS_BY_ID[id];
+    return d ? d.text : '';
+  }).join('. ') + '.';
+  var PL = PASSAGE.length;
+  function passageSentences() { return PASSAGE.match(/[^.!?]+[.!?]*/g) || []; }
+  function sentencePositions() {
+    var out = [], pos = 0;
+    passageSentences().forEach(function (s) { out.push(pos); pos += s.length; });
+    return out;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — four cuts over the same passage
+  // ------------------------------------------------------------------
+  var A = { size: el('chunk-size'), overlap: el('chunk-overlap') };
+  var A_PADL = 62, A_PADR = 16;
+  var setupA = Guide.setupCanvas(el('chunk-canvas'), 640, 360, drawA);
+  function ax(pos) { return A_PADL + (Math.max(0, Math.min(PL, pos)) / PL) * (640 - A_PADL - A_PADR); }
+  function strategies() {
+    var size = +A.size.value, ov = +A.overlap.value;
+    return [
+      { name: 'fixed', chunks: AppSim.chunk(PASSAGE, size, ov, 'fixed') },
+      { name: 'recursive', chunks: AppSim.chunk(PASSAGE, size, ov, 'recursive') },
+      { name: 'semantic', chunks: AppSim.chunk(PASSAGE, size, ov, 'semantic') },
+      { name: 'parent', chunks: AppSim.chunk(PASSAGE, size, ov, 'parent') }
+    ];
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText(PASSAGE_DOCS.length + ' corpus docs concatenated · ' + PL + ' characters · ' + passageSentences().length + ' sentences', A_PADL, 16);
+    // passage band
+    ctx.fillStyle = c.accent100 || 'rgba(43,95,255,0.10)';
+    ctx.fillRect(A_PADL, 28, W - A_PADL - A_PADR, 16);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(A_PADL, 28, W - A_PADL - A_PADR, 16);
+    ctx.strokeStyle = c.accent700; ctx.globalAlpha = 0.55;
+    sentencePositions().forEach(function (p) {
+      ctx.beginPath(); ctx.moveTo(ax(p), 28); ctx.lineTo(ax(p), 44); ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = c.text; ctx.font = '9px ' + c.font;
+    ctx.fillText('sentence ticks', A_PADL, 58);
+    var rows = strategies();
+    var rowY = [80, 136, 192, 248];
+    var stats = [];
+    rows.forEach(function (row, ri) {
+      var y = rowY[ri];
+      ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(row.name, A_PADL - 8, y + 15);
+      ctx.textAlign = 'left';
+      var kids = row.chunks.filter(function (ch) { return !ch.isParent; });
+      var parent = row.chunks.filter(function (ch) { return !!ch.isParent; })[0];
+      if (ri === 3 && parent) {
+        ctx.fillStyle = c.accent2; ctx.globalAlpha = 0.35;
+        ctx.fillRect(A_PADL, y - 8, W - A_PADL - A_PADR, 6);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.accent2; ctx.font = '9px ' + c.font;
+        ctx.fillText('parent (returned)', A_PADL + 4, y - 10);
+        ctx.font = '600 11px ' + c.font;
+      }
+      kids.forEach(function (ch, ci) {
+        var x0 = ax(ch.start), x1 = ax(ch.end);
+        ctx.fillStyle = PAL[ci % PAL.length]; ctx.globalAlpha = 0.85;
+        ctx.fillRect(x0, y, Math.max(1, x1 - x0 - 1), 26);
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = c.bg || '#fff'; ctx.lineWidth = 1;
+        ctx.strokeRect(x0, y, Math.max(1, x1 - x0 - 1), 26);
+        if (x1 - x0 > 34) {
+          ctx.fillStyle = '#fff'; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+          ctx.fillText(String(ci + 1), (x0 + x1) / 2, y + 17);
+          ctx.textAlign = 'left';
+        }
+      });
+      var toks = kids.reduce(function (a, ch) { return a + AppSim.countTokens(ch.text); }, 0);
+      var maxTok = kids.reduce(function (a, ch) { return Math.max(a, AppSim.countTokens(ch.text)); }, 0);
+      stats.push({ name: row.name, n: kids.length, avg: kids.length ? toks / kids.length : 0, max: maxTok });
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('boundaries are aligned to the same character axis — compare columns', A_PADL, H - 8);
+    el('chunk-readout').innerHTML = stats.map(function (s) {
+      return '<div><span class="k">' + s.name + '</span> <span class="hi">' + s.n + '</span> chunks · avg ' +
+        Guide.fmtNum(s.avg, 1) + ' tok · largest ' + s.max + ' tok</div>';
+    }).join('') + '<div class="k">fixed slicing ignores the sentence ticks; recursive packs them; semantic groups on topic drift.</div>';
+  }
+  Guide.bindSliders([A.size, A.overlap], drawA);
+
+  // ------------------------------------------------------------------
+  // Demo B — the boundary effect
+  // ------------------------------------------------------------------
+  var B = { size: el('bound-size'), fact: el('bound-fact') };
+  var SENT_COUNT = passageSentences().length;
+  function spanOf(i) {
+    var sents = passageSentences(), pos = sentencePositions();
+    i = Math.max(0, Math.min(sents.length - 1, i));
+    var raw = sents[i];
+    var lead = raw.length - raw.replace(/^\s+/, '').length;
+    var text = raw.trim();
+    var start = pos[i] + lead;
+    return { i: i, start: start, end: start + text.length, text: text };
+  }
+  function shortPassage(t) { t = String(t || ''); return t.length > 46 ? t.slice(0, 45) + '…' : t; }
+  var setupB = Guide.setupCanvas(el('bound-canvas'), 640, 340, drawB);
+  function chunkContainsFact(ch, sp) { return ch.start <= sp.start && ch.end >= sp.end; }
+  function hitAt(size, sp) {
+    var chunks = AppSim.chunk(PASSAGE, size, 0, 'fixed');
+    var docs = chunks.map(function (ch) { return { id: ch.index, text: ch.text }; });
+    var qTerms = AppSim.terms(sp.text);
+    var hits = 0, tries = 4;
+    for (var t = 0; t < tries; t++) {
+      var r = AppSim.rng(size * 131 + sp.start * 17 + t * 7 + 3);
+      var q = qTerms.filter(function (term, i) { return i === 0 || r() > 0.3; });
+      var ranked = AppSim.bm25(docs, q, {});
+      var top = ranked.length ? chunks[ranked[0].id] : null;
+      if (top && chunkContainsFact(top, sp)) hits++;
+    }
+    return hits / tries;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var size = +B.size.value;
+    var sp = spanOf(+B.fact.value);
+    var chunks = AppSim.chunk(PASSAGE, size, 0, 'fixed');
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('size ' + size + ' chars · target fact = sentence ' + (sp.i + 1) + ' of ' + SENT_COUNT, A_PADL, 16);
+    // passage + chunks
+    var y = 40;
+    chunks.forEach(function (ch, ci) {
+      var x0 = ax(ch.start), x1 = ax(ch.end);
+      ctx.fillStyle = PAL[ci % PAL.length]; ctx.globalAlpha = 0.35;
+      ctx.fillRect(x0, y, Math.max(1, x1 - x0 - 1), 22);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = c.accent700; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x1, y - 4); ctx.lineTo(x1, y + 30); ctx.stroke();
+      ctx.setLineDash([]);
+      if (x1 - x0 > 30) {
+        ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('c' + (ci + 1), (x0 + x1) / 2, y + 15); ctx.textAlign = 'left';
+      }
+    });
+    // fact span
+    var fx0 = ax(sp.start), fx1 = ax(sp.end);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    ctx.strokeRect(fx0, y - 6, Math.max(2, fx1 - fx0), 34);
+    ctx.fillStyle = c.accent2; ctx.globalAlpha = 0.2;
+    ctx.fillRect(fx0, y - 6, Math.max(2, fx1 - fx0), 34); ctx.globalAlpha = 1;
+    ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+    ctx.fillText('target fact', fx0, y - 12);
+    // which chunks contain the fact
+    chunks.forEach(function (ch) {
+      var overlaps = ch.start < sp.end && ch.end > sp.start;
+      if (!overlaps) return;
+      var full = chunkContainsFact(ch, sp);
+      var x0 = ax(ch.start), x1 = ax(ch.end);
+      ctx.fillStyle = full ? '#5f8a3a' : c.accent2;
+      ctx.fillRect(x0, y + 24, Math.max(3, x1 - x0 - 1), 4);
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(full ? 'contains the fact' : 'half only', (x0 + x1) / 2, y + 40);
+      ctx.textAlign = 'left';
+    });
+    // sweep over chunk size
+    var swTop = 120, swH = 178, swL = A_PADL, swR = W - A_PADR;
+    var S0 = 60, S1 = 300, samples = 48;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(swL, swTop); ctx.lineTo(swL, swTop + swH); ctx.lineTo(swR, swTop + swH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('seeded hit rate over chunk size', swL, swTop - 8);
+    ctx.fillText('0', swL - 12, swTop + swH); ctx.fillText('1', swL - 12, swTop + 8);
+    function sxp(S) { return swL + (S - S0) / (S1 - S0) * (swR - swL); }
+    function syp(h) { return swTop + swH - h * swH; }
+    for (var k = 0; k <= samples; k++) {
+      var Sk = Math.round(S0 + (S1 - S0) * k / samples);
+      var chs = AppSim.chunk(PASSAGE, Sk, 0, 'fixed');
+      var cut = chs.some(function (ch) { return ch.start < sp.end && ch.end > sp.start && !chunkContainsFact(ch, sp); });
+      if (cut) {
+        ctx.fillStyle = c.accent2; ctx.globalAlpha = 0.1;
+        ctx.fillRect(sxp(Sk) - 3, swTop, 6, swH);
+        ctx.globalAlpha = 1;
+      }
+    }
+    var curve = [];
+    for (var i = 0; i <= samples; i++) {
+      var S2 = Math.round(S0 + (S1 - S0) * i / samples);
+      curve.push({ S: S2, hit: hitAt(S2, sp) });
+    }
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 2;
+    ctx.beginPath();
+    curve.forEach(function (p, i) {
+      var X = sxp(p.S), Y = syp(p.hit);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke();
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(sxp(size), swTop); ctx.lineTo(sxp(size), swTop + swH); ctx.stroke();
+    var current = hitAt(size, sp);
+    ctx.fillStyle = c.accent;
+    ctx.beginPath(); ctx.arc(sxp(size), syp(current), 4, 0, 2 * Math.PI); ctx.fill();
+    var split = !chunks.some(function (ch) { return chunkContainsFact(ch, sp); });
+    el('bound-readout').innerHTML =
+      '<div><span class="k">fact</span> "' + shortPassage(sp.text) + '"</div>' +
+      '<div><span class="k">status at size ' + size + '</span> ' + (split
+        ? '<span class="bad">split across a boundary — no chunk contains it</span>'
+        : '<span class="hi">intact inside one chunk</span>') + '</div>' +
+      '<div><span class="k">seeded hit rate</span> <span class="' + (current < 0.999 ? 'bad' : 'hi') + '">' + Guide.fmtPct(current, 0) + '</span> · ' + chunks.length + ' chunks</div>' +
+      '<div class="k">shaded columns are sizes at which a boundary falls inside the fact; the troughs line up with them.</div>';
+  }
+  Guide.bindSliders([B.size, B.fact], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — chunk-size sweep: precision vs recall
+  // ------------------------------------------------------------------
+  var C = { size: el('sweep-size') };
+  var SIZES = (function () { var a = []; for (var s = 32; s <= 512; s += 16) a.push(s); return a; })();
+  var DOC_REL = AppSim.CORPUS.map(function (d) { return Math.max(6, AppSim.countTokens(d.text)); });
+  function curveAt(S) {
+    var p = 0, r = 0;
+    DOC_REL.forEach(function (rel, i) {
+      var rj = AppSim.rng(Math.round(S) * 97 + i * 13 + 5);
+      var rec = S >= rel ? (1 - 0.9 * rel / S) : Math.max(0.03, 0.2 * S / rel);
+      var prec = rel / (rel + 0.18 * S);
+      rec = Math.max(0, Math.min(1, rec + (rj() - 0.5) * 0.06));
+      prec = Math.max(0, Math.min(1, prec + (rj() - 0.5) * 0.06));
+      r += rec; p += prec;
+    });
+    var n = Math.max(1, DOC_REL.length);
+    p /= n; r /= n;
+    return { p: p, r: r, f1: (p + r) > 0 ? 2 * p * r / (p + r) : 0 };
+  }
+  var CURVE = SIZES.map(function (S) { return { S: S, m: curveAt(S) }; });
+  var OPT = CURVE.reduce(function (best, e) { return e.m.f1 > best.m.f1 ? e : best; }, CURVE[0]);
+  var setupC = Guide.setupCanvas(el('sweep-canvas'), 640, 320, drawC);
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    var axes = Guide.drawLines(ctx, W, H, [
+      { points: CURVE.map(function (e) { return { x: e.S, y: e.m.p * 100 }; }), color: c.accent, width: 2.2 },
+      { points: CURVE.map(function (e) { return { x: e.S, y: e.m.r * 100 }; }), color: c.accent2, width: 2.2 },
+      { points: CURVE.map(function (e) { return { x: e.S, y: e.m.f1 * 100 }; }), color: '#c9a227', width: 2.2, dashed: true }
+    ], [32, 512], [0, 108], { xLabel: 'chunk size (tokens)', yLabel: 'percent', padL: 54, padB: 30 });
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.fillText('precision', axes.padL + 8, axes.padT + 12);
+    ctx.fillStyle = c.accent2; ctx.fillText('recall', axes.padL + 8, axes.padT + 26);
+    ctx.fillStyle = '#c9a227'; ctx.fillText('F1', axes.padL + 8, axes.padT + 40);
+    // optimum marker
+    var ox = axes.px(OPT.S);
+    ctx.strokeStyle = '#c9a227'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(ox, axes.padT); ctx.lineTo(ox, axes.padT + axes.plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#c9a227'; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('F1 peak ≈ ' + OPT.S, ox, axes.padT - 2);
+    // selected size marker
+    var S = +C.size.value, m = curveAt(S);
+    var sx = axes.px(S);
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(sx, axes.padT); ctx.lineTo(sx, axes.padT + axes.plotH); ctx.stroke();
+    ctx.fillStyle = c.accent700;
+    [[m.p, c.accent], [m.r, c.accent2], [m.f1, '#c9a227']].forEach(function (pair) {
+      ctx.beginPath(); ctx.arc(sx, axes.py(pair[0] * 100), 3.4, 0, 2 * Math.PI);
+      ctx.fillStyle = pair[1]; ctx.fill();
+    });
+    el('sweep-readout').innerHTML =
+      '<div><span class="k">at ' + S + ' tokens</span> precision <span class="hi">' + Guide.fmtPct(m.p, 0) + '</span> · recall <span class="hi">' + Guide.fmtPct(m.r, 0) + '</span> · F1 ' + Guide.fmtPct(m.f1, 0) + '</div>' +
+      '<div><span class="k">F1 peak</span> ≈ ' + OPT.S + ' tokens (' + Guide.fmtPct(OPT.m.f1, 0) + ') over the corpus</div>' +
+      '<div class="k">small chunks are precise and forgetful; large chunks are comprehensive and diluted. Parent-document retrieval breaks the tie.</div>';
+  }
+  Guide.bindSliders([C.size], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — contextual retrieval tiers
+  // ------------------------------------------------------------------
+  var D = { tier: 3 };
+  var setupD = Guide.setupCanvas(el('ctx-canvas'), 640, 300, drawD);
+  function tiers() {
+    var rc = (NUM && NUM.retrieval_contextual) || FALLBACK.retrieval_contextual;
+    return [
+      { name: 'plain', pct: rc.baselineFailurePct },
+      { name: '+ contextual', pct: rc.contextualEmbeddingsFailurePct },
+      { name: '+ BM25', pct: rc.plusBM25FailurePct },
+      { name: '+ rerank', pct: rc.plusRerankFailurePct }
+    ];
+  }
+  function simFails(pct, seed) {
+    var r = AppSim.rng(seed), fails = 0;
+    for (var i = 0; i < 100; i++) if (r() < pct / 100) fails++;
+    return fails;
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 300;
+    var T = tiers();
+    var maxPct = Math.max.apply(null, T.map(function (t) { return t.pct; })) * 1.25;
+    var geo = Guide.drawColumns(ctx, W, H,
+      T.map(function (t, i) {
+        return { x: i, y: t.pct, color: i === D.tier ? c.accent700 : c.accent };
+      }),
+      { xRange: [-0.5, T.length - 0.5], yRange: [0, maxPct], padL: 58, padR: 30, padT: 30, padB: 48 });
+    ctx.font = '10.5px ' + c.font; ctx.textAlign = 'center';
+    T.forEach(function (t, i) {
+      var X = geo.px(i), Y = geo.py(t.pct);
+      ctx.fillStyle = c.text;
+      ctx.fillText(t.pct.toFixed(1) + '%', X, Y - 7);
+      ctx.font = '10px ' + c.font;
+      ctx.fillText(t.name, X, geo.padT + geo.plotH + 16);
+      ctx.font = '9px ' + c.font; ctx.fillStyle = c.accent400;
+      ctx.fillText('sim ' + simFails(t.pct, 1000 + i * 37) + '/100', X, geo.padT + geo.plotH + 30);
+      ctx.font = '10.5px ' + c.font;
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('reported top-20 retrieval failure rate (lower is better)', geo.padL, 16);
+    var base = T[0].pct, sel = T[D.tier];
+    var rel = base > 0 ? (base - sel.pct) / base * 100 : 0;
+    el('ctx-readout').innerHTML =
+      '<div><span class="k">selected tier</span> <span class="hi">' + sel.name + '</span> · failure ' + sel.pct.toFixed(1) + '%</div>' +
+      '<div><span class="k">vs baseline</span> ' + (base - sel.pct).toFixed(1) + ' points absolute · <span class="hi">' + rel.toFixed(0) + '%</span> relative</div>' +
+      '<div><span class="k">seeded 100 queries</span> ' + simFails(sel.pct, 1000 + D.tier * 37) + ' failed</div>' +
+      '<div class="k">the impressive percentages are relative; the absolute move is 5.7% → 1.9%.</div>';
+  }
+  function setTier(i) {
+    D.tier = i;
+    for (var k = 0; k < 4; k++) {
+      var b = el('ctx-t' + k);
+      if (b) b.className = k === i ? 'g-primary' : '';
+    }
+    drawD();
+  }
+  el('ctx-t0').addEventListener('click', function () { setTier(0); });
+  el('ctx-t1').addEventListener('click', function () { setTier(1); });
+  el('ctx-t2').addEventListener('click', function () { setTier(2); });
+  el('ctx-t3').addEventListener('click', function () { setTier(3); });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var e = el('chunk-src-emb'), x = el('chunk-src-ctx'), r = el('chunk-src-rag');
+    if (e) e.textContent = (NUM.embeddings && NUM.embeddings.source) || FALLBACK.embeddings.source;
+    if (x) x.textContent = (NUM.retrieval_contextual && NUM.retrieval_contextual.source) || FALLBACK.retrieval_contextual.source;
+    if (r) r.textContent = (NUM.rag && NUM.rag.source) || FALLBACK.rag.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (resp) { return resp.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'chunking-why',
+      kind: 'choice',
+      prompt: 'Why does chunking exist at all?',
+      options: [
+        { label: 'Because a retriever ranks units, and the unit you embed decides what can be retrieved — small aids precision, large aids recall.', correct: true },
+        { label: 'Because embeddings can only be computed for texts under 512 tokens.' },
+        { label: 'Because the model cannot read a document longer than one chunk.' },
+        { label: 'Because chunking removes duplicate documents from the index.' }
+      ],
+      explanation: 'The cut reconciles two pressures: retrieval wants a small, single-idea unit; generation wants enough surrounding text to answer from. There is no universally correct size, only one you measure.'
+    },
+    {
+      id: 'chunking-boundary',
+      kind: 'choice',
+      prompt: 'A sentence containing the answer straddles a chunk boundary. What happens?',
+      options: [
+        { label: 'Neither chunk contains the full sentence, so the fact is retrievable from neither — an indexing failure, not a ranking one.', correct: true },
+        { label: 'Both chunks contain half the answer, and the reranker joins them.' },
+        { label: 'The retriever automatically merges the two chunks at query time.' },
+        { label: 'The embedding of each half is averaged into a single vector.' }
+      ],
+      explanation: 'Boundary splitting is an indexing invariant: the full sentence exists in the source but in no indexed unit. Overlap and boundary-aware splitting reduce it; nothing in the embedder or reranker repairs it.'
+    },
+    {
+      id: 'chunking-parent',
+      kind: 'choice',
+      prompt: 'What does parent-document retrieval do?',
+      options: [
+        { label: 'Index small children for matching, then return the larger parent they belong to — match small, return large.', correct: true },
+        { label: 'Duplicate every chunk into its parent and index both for redundancy.' },
+        { label: 'Summarise each document into one parent vector and retrieve only that.' },
+        { label: 'Return the entire document whenever any child matches.' }
+      ],
+      explanation: 'It decouples the unit that is matched (a precise child) from the unit that is placed in context (the informative parent), sidestepping the precision/recall tradeoff of a single chunk size.'
+    },
+    {
+      id: 'chunking-contextual-numeric',
+      kind: 'numeric',
+      prompt: 'The reported top-20 failure rate falls from 5.7% to 1.9%. What is the relative reduction in the failure rate, as a percentage? Give one decimal place.',
+      answer: 66.7,
+      unit: '%',
+      tolerance: 1,
+      explanation: '(5.7 − 1.9) / 5.7 = 0.667, so a 66.7% relative reduction. The absolute drop is 3.8 percentage points; the widely quoted percentages are always the relative kind.'
+    },
+    {
+      id: 'chunking-raptor',
+      kind: 'choice',
+      prompt: 'What does RAPTOR add beyond a single-level cut?',
+      options: [
+        { label: 'A recursive summarisation tree, so leaf chunks answer detail questions and summary nodes answer thematic ones.', correct: true },
+        { label: 'A fixed 512-token chunk size tuned on a benchmark.' },
+        { label: 'A second embedding model trained to rank chunks.' },
+        { label: 'Overlap that increases with chunk depth.' }
+      ],
+      explanation: 'RAPTOR clusters and summarises recursively, building multiple levels of abstraction. That lets one index serve both "what is the retry limit?" (a leaf) and "what themes run through this corpus?" (a summary node).'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,932 @@
+---
+title: "LLM Serving, Interactively — Part 19: Kubernetes, autoscaling, cold starts and routing"
+description: "Gateways, KV-aware routers, autoscalers and cold starts: the fleet-altitude machinery that turns many GPU workers into one predictable service, and the honest limits of scale-to-zero."
+permalink: "/ai/llm-serving/cluster/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .cl-split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .cl-split .g-card h3 { margin: 0 0 6px; font-size: 15px; }
+  .cl-split .g-card p { margin: 0; font-size: 13px; opacity: 0.85; line-height: 1.55; }
+  .cl-split .g-card .tag { display: inline-block; font-family: var(--font-mono); font-size: 10.5px; opacity: 0.65; margin-bottom: 4px; }
+  .cl-col { flex-direction: column; }
+  @media (max-width: 640px) { .cl-split { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 19 of 20</span>
+    <h1>Kubernetes, autoscaling, cold starts and routing</h1>
+    <p>Everything so far described one engine on one GPU. Production is a fleet: dozens to thousands of replicas behind a gateway, a router that decides which replica answers, an autoscaler that decides how many exist, and a scheduler that decides where they run. This part is the control plane at fleet altitude — why the load balancer must know what is in each replica's KV cache, why GPU utilisation is the worst autoscaling signal available, what a cold start is actually made of, and what "scale to zero" honestly costs.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <nav class="g-toc" aria-label="On this page">
+    <a href="#control-plane">The control plane</a>
+    <a href="#kubernetes">GPU workloads on Kubernetes</a>
+    <a href="#router">The balancer must be KV-aware</a>
+    <a href="#signals">Autoscaling signals</a>
+    <a href="#coldstart">Cold start, broken down</a>
+    <a href="#scalezero">Honest scale-to-zero</a>
+    <a href="#spot">Spot preemption and draining</a>
+    <a href="#multiregion">Multi-region and the cache you lose</a>
+  </nav>
+
+  <section class="g-step" id="control-plane">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The control plane: gateway, router, replicas, autoscaler</h2></div>
+    <p class="g-eyebrow">Four components between the user and the GPU</p>
+    <p>The <a href="{{ '/ai/llm-training/inference/' | relative_url }}">training guide's inference chapter</a> treats a request as prefill then decode and stops at the engine's edge. That engine is a process on one machine; everything this part covers is the machinery that runs many of those processes as one service. Four components sit on the path, and each owns one decision. The <strong>gateway</strong> authenticates, enforces quotas (the token buckets and per-tenant limits from <a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a>), terminates TLS, proxies SSE streams, and emits the request-level metrics that make the rest debuggable. The <strong>router</strong> picks an endpoint. The <strong>replicas</strong> are the GPU workers themselves, each a complete engine — often a tensor-parallel group of several GPUs that must be scheduled together. The <strong>autoscaler</strong> decides how many replicas should exist right now.</p>
+    <p>The split matters because the router and the autoscaler are answering different questions with different signals. The router sees per-request state (prompt length, prefix hash, target SLO) and must make a decision in microseconds on the hot path. The autoscaler sees aggregate telemetry over tens of seconds and makes a decision that takes a cold start — tens of seconds — to take effect. Conflating them produces the classic failure: a "least connections" router that fills every replica's KV cache with different prefixes, so no two requests ever share a cached prompt and the cache is dead weight. The gateway-plus-router split is now standardised: llm-d layers a Gateway API <em>Inference Extension</em> and an <em>Endpoint Picker</em> (EPP) on top of Envoy, NVIDIA Dynamo ships a frontend plus a KV-aware router and a <em>planner</em>, and KServe wraps all of it as an <code>InferenceService</code> with a Knative/HPA autoscaler underneath.</p>
+    <div class="g-goal">💡 <span><b>The one-line model:</b> the GPU is a stateless compute resource, the KV cache is the state, and the router is the only component that knows where that state lives. Autoscaling is then a question about compute, and routing is a question about state — keep them separate.</span></div>
+  </section>
+
+  <section class="g-step" id="kubernetes">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>GPU workloads on Kubernetes</h2></div>
+    <p class="g-eyebrow">All-or-nothing resources and gang scheduling</p>
+    <p>Kubernetes was built for stateless, fungible, CPU-sized containers; a GPU worker is none of those. GPUs are exposed by the NVIDIA device plugin (or the newer Dynamic Resource Allocation API) as integer resources on a node, and the default request is a whole device. There is no fractional GPU unless you explicitly carve MIG slices, and a tensor-parallel replica spanning four GPUs has to land on four GPUs that can talk over NVLink — which for a GB200 <a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">NVL72 domain</a> means the same rack, an NVLink fabric of roughly 130&nbsp;TB/s of aggregate bisection. A single unschedulable rank dooms the whole replica, so inference deployments use gang scheduling (Kueue, Volcano, or the scheduler's own coscheduling) rather than hoping four independent pods co-locate.</p>
+    <p>The practical consequences are worth stating plainly. Scaling granularity is the TP degree times the data-parallel degree — a TP=8 model moves in units of eight GPUs, so "add one replica" is really "add eight GPUs", and the autoscaler's minimum step is much coarser than for a web service. Node pools are typically homogeneous and tainted so that a 70B FP8 deployment does not accidentally land on a pool built for a 7B. And the model itself is 140&nbsp;GB to several hundred GB, so pulling it onto a node is a real, slow, occasionally-throttled operation — which is the entire subject of the cold-start section below. The three stack options map cleanly onto this: <strong>llm-d</strong> is the Kubernetes-native, Gateway-API-based composition of vLLM workers with an EPP router; <strong>NVIDIA Dynamo</strong> is a higher-level serving framework with a KV router, a planner and NIXL-based KV transfer; and <strong>KServe</strong> is the general model-serving control plane that gives you canaries, revisioned endpoints and scale-to-zero in exchange for a more opinionated deployment shape.</p>
+  </section>
+
+  <section class="g-step" id="router">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The balancer must be KV-aware</h2></div>
+    <p class="g-eyebrow">Round-robin is a cache flush disguised as fairness</p>
+    <p><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a> established prefix caching: an agent's system prompt, a shared document, or a tool schema is the same token sequence on every call, so a cache hit turns a full prefill into a shorter one — 2,100&nbsp;ms down to 190&nbsp;ms in the canonical case. At fleet altitude, an ordinary least-connections or round-robin balancer destroys that property, because the replica that answers your next request is a different replica than the one that cached your prefix. The cache is per-replica state; a router that ignores it guarantees a cache miss. The fix is a router that scores endpoints on cache affinity first and load second: hash the prefix, find the replicas that hold it, and among those pick the least loaded. llm-d's Endpoint Picker and Dynamo's KV router both do exactly this, and consistent hashing is the usual way to keep a tenant's prefixes pinned to a stable replica even as the pool resizes.</p>
+    <p>The payoff is large and measurable. In vLLM's Mooncake integration on agentic coding traces, cache-aware routing took the hit rate from 1.7% to 92.2%, for 3.8× higher throughput and 46× lower p50 TTFT. The cost is a new failure mode: affinity fights balance, and a hot tenant can pile onto one replica while its neighbours idle. Every serious implementation therefore blends the two scores and has a fallback — if the affined replica is saturated, take the miss and send the request elsewhere. The demo below puts four policies through the same skewed tenant traffic and reports hit rate and tail TTFT.</p>
+    <div class="g-demo cl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="cl-router" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Four routing policies over 4,000 requests from 32 tenants with a shared system prefix. Hit rate above, TTFT below.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Replicas <span class="val">8</span></label><input type="range" id="cl-rt-rep" min="2" max="16" step="1" value="8"></div>
+        <div class="g-field"><label>Tenant skew (Zipf s) <span class="val">1.0</span></label><input type="range" id="cl-rt-skew" min="0" max="1.5" step="0.05" value="1.0"></div>
+        <div class="g-readout" id="cl-rt-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cl-router-src"></p>
+  </section>
+
+  <section class="g-step" id="signals">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Autoscaling signals: GPU utilisation is a lie</h2></div>
+    <p class="g-eyebrow">The signal that arrives 90 seconds too late</p>
+    <p>The obvious autoscaling signal is GPU utilisation, and it is the worst one available. An LLM decode step is memory-bandwidth-bound: it streams the weights through HBM and does very little arithmetic per byte (Part 1's ~1–2&nbsp;FLOPs/byte), so SM occupancy can sit near 30% while the GPU is completely saturated on bandwidth and requests are queueing. Utilisation is also measured after the fact — the agent samples it on a scrape interval, the value is averaged over the window, and by the time it climbs the queue has already formed and the first cold-started replica is still 40&nbsp;s from being ready. A utilisation-based autoscaler is structurally a lagging indicator pointed at a resource that does not measure the bottleneck.</p>
+    <p>Two signals do work. <strong>Queue depth</strong> — requests waiting to be admitted, and KV blocks waiting to be freed — is a leading indicator: it rises the instant offered load exceeds capacity and falls as capacity catches up. <strong>p99 TTFT</strong> is a lagging indicator but it is the truthful one: it measures what the user feels, and it is the only signal that captures the cases where the bottleneck is scheduling, preemption, or a slow prefix cache rather than raw GPU throughput. In practice you drive the autoscaler from queue depth (or a tokens-in-flight proxy) and guard the down-scale with an SLO-based signal, with a cooldown that is at least as long as the cold start. The demo makes the difference visible: switch the signal and watch the same traffic produce very different replica curves and SLO violations.</p>
+    <div class="g-demo cl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="cl-auto" width="640" height="420"></canvas>
+        <p class="g-canvas-hint">Ten minutes of traffic, 2 s steps. Top: offered load against ready capacity. Bottom: p99 TTFT (left axis) and replica count (right axis).</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="cl-signal">
+          <button data-signal="gpu">Signal: GPU util</button>
+          <button data-signal="queue" class="g-primary active">Signal: queue depth</button>
+          <button data-signal="ttft">Signal: p99 TTFT</button>
+        </div>
+        <div class="g-btnrow" id="cl-pattern">
+          <button data-pattern="steady">Steady</button>
+          <button data-pattern="diurnal" class="g-primary active">Diurnal</button>
+          <button data-pattern="spike">Spike</button>
+          <button data-pattern="ramp">Ramp</button>
+        </div>
+        <div class="g-field"><label>Cooldown (s) <span class="val">15</span></label><input type="range" id="cl-auto-cool" min="5" max="120" step="5" value="15"></div>
+        <div class="g-field"><label>Cold start (s) <span class="val">30</span></label><input type="range" id="cl-auto-cold" min="0" max="90" step="5" value="30"></div>
+        <div class="g-readout" id="cl-auto-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="coldstart">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Cold start, broken down</h2></div>
+    <p class="g-eyebrow">40–90 seconds, and the term that survives every fix</p>
+    <p>A cold start is not one delay; it is a stack of them, and each lever removes a named term. The table below decomposes a ~92&nbsp;s baseline: pulling a multi-gigabyte CUDA-plus-PyTorch image, initialising the process and CUDA context, loading tens of gigabytes of weights from disk, capturing CUDA graphs, warming the engine, JIT-compiling or autotuning kernels, and finally the engine's own config load. The levers are well understood. A <strong>slim image</strong> (a runtime-only, pre-baked image instead of a base with the full toolkit) cuts the pull from ~40&nbsp;s to single digits. <strong>Local weights</strong> on instance-store NVMe or a node-local cache cut disk load from network-FS speeds. <strong>NVIDIA Run:ai Model Streamer</strong> goes further by reading the safetensors concurrently over many threads and streaming layers to the GPU as they arrive: documented 43.7&nbsp;s down to 7.5&nbsp;s for a 15&nbsp;GB Llama&nbsp;3&nbsp;8B on IO2 SSD, a ~5.8× gain. <strong>Graph reuse</strong> shares pre-captured CUDA graphs across replicas so capture happens once per shape, not once per process. And a <strong>snapshot</strong> (CRIU- or CUDA-checkpoint-based) restores an already-initialised process, collapsing process init, graph capture, warmup and autotune into a fast memory restore.</p>
+    <p>Toggle the levers and watch the residual. With everything on, the cold start lands near 21&nbsp;s — and the dominant remaining term is <em>still</em> the weight load. That is the honest conclusion: once images are slim and the process is snapshotted, the model bytes are the floor, so the last levers are storage bandwidth and concurrency, plus a warm pool if even 21&nbsp;s is too slow.</p>
+    <div class="g-demo cl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="cl-cold" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Each toggle removes a stage; the bar eases to the new total. Baseline 92 s.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="cl-cold-toggles">
+          <button data-lever="slim">Slim image</button>
+          <button data-lever="local">Local weights</button>
+          <button data-lever="streamer">Model Streamer</button>
+          <button data-lever="graph">Graph reuse</button>
+          <button data-lever="snapshot">Snapshot</button>
+        </div>
+        <div class="g-btnrow">
+          <button id="cl-cold-play">Play</button>
+          <button id="cl-cold-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="cl-cold-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cl-cold-src"></p>
+  </section>
+
+  <section class="g-step" id="scalezero">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Honest scale-to-zero</h2></div>
+    <p class="g-eyebrow">The break-even gap is a latency decision, not a dollar one</p>
+    <p>Scaling to zero is easy to justify on GPU dollars and hard to justify on latency. Pure GPU-seconds always favour scale-to-zero: a cold start bills 45&nbsp;s of one GPU, while keeping a replica warm for an idle hour bills 3,600. The reason to keep a replica warm is that the first request after a scale-to-zero pays the entire cold start inside its own TTFT — a 40&nbsp;s p99 is not a p99, it is an outage with good average latency hiding it. The correct framing is a break-even <em>idle gap</em>: if the expected gap to the next request is shorter than roughly the cold start plus the value of an SLO breach expressed in GPU-seconds, keep the replica warm. With a 2 USD breach cost and 3 USD/hour GPUs that gap is about 41&nbsp;minutes; below it, warming is cheaper than repeatedly cold-starting into a timeout. The demo shows both the pure-dollar saving and the SLO-adjusted break-even, because the second is the one that determines whether scale-to-zero is defensible. When it truly is — overnight, a low-traffic region, an internal tool — snapshots and a small warm floor (a minimum replica count of one, or a warm pool the Knative/Dynamo planner draws from) are what make the first request survivable.</p>
+    <div class="g-demo cl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="cl-z2" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Hourly cost of one warm replica versus the SLO-adjusted cost of cold starts, across arrival rate. Shaded: warm is cheaper.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Cold start (s) <span class="val">45</span></label><input type="range" id="cl-z2-cold" min="10" max="90" step="5" value="45"></div>
+        <div class="g-field"><label>Idle timeout T (s) <span class="val">300</span></label><input type="range" id="cl-z2-to" min="30" max="900" step="30" value="300"></div>
+        <div class="g-field"><label>GPU price (USD/hr) <span class="val">3</span></label><input type="range" id="cl-z2-price" min="1" max="12" step="0.5" value="3"></div>
+        <div class="g-field"><label>Cost of one cold request (USD) <span class="val">2</span></label><input type="range" id="cl-z2-breach" min="0.2" max="5" step="0.2" value="2"></div>
+        <div class="g-readout" id="cl-z2-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="spot">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Spot preemption and draining</h2></div>
+    <p class="g-eyebrow">What you do with the last two minutes</p>
+    <p>Spot and preemptible GPUs are 50–80% cheaper and can be reclaimed at any time, usually with a short notice window (a two-minute warning on AWS, 30&nbsp;s on some other clouds). What happens during that window decides how expensive the discount really is. Three policies span the space. <strong>Hard kill</strong> terminates immediately: every in-flight request is lost, the replica restarts cold, and clients retry. <strong>Finish in flight</strong> stops admitting new work and drains the running requests before terminating — no lost work, but the node is unavailable for new arrivals for the duration of its longest remaining generation, and its replacement only starts after the drain. <strong>Migrate KV</strong> streams the in-flight KV caches to a surviving replica over the fabric (the same NIXL/transfer path as <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a>) and continues there, so nothing is lost and the drain is a transfer instead of a wait. Each policy implies a minimum spot discount for it to beat on-demand: the demo computes that break-even discount from the reclaim rate, the work at risk, and the cost of the interruption. The point is that a 15% discount can be a bad trade for hard-kill fleets and a good one for migrating fleets, and the difference is policy, not price.</p>
+    <div class="g-demo cl-col">
+      <div class="g-canvas-wrap">
+        <canvas id="cl-spot" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Required spot discount per drain policy against the discount actually offered. A bar to the right of the marker is not worth it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Reclaims per GPU-hr <span class="val">2.0</span></label><input type="range" id="cl-sp-r" min="0.2" max="6" step="0.1" value="2"></div>
+        <div class="g-field"><label>In-flight requests <span class="val">8</span></label><input type="range" id="cl-sp-n" min="1" max="32" step="1" value="8"></div>
+        <div class="g-field"><label>Remaining output tokens <span class="val">800</span></label><input type="range" id="cl-sp-rem" min="100" max="2000" step="50" value="800"></div>
+        <div class="g-field"><label>Restart cold start (s) <span class="val">45</span></label><input type="range" id="cl-sp-cold" min="15" max="90" step="5" value="45"></div>
+        <div class="g-field"><label>Spot discount offered (%) <span class="val">15</span></label><input type="range" id="cl-sp-disc" min="0" max="80" step="1" value="15"></div>
+        <div class="g-readout" id="cl-spot-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="multiregion">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Multi-region and the cache you lose</h2></div>
+    <p class="g-eyebrow">Failover is a cold start plus a cache-miss storm</p>
+    <p>A prefix cache is local state, and it does not replicate. That single fact makes multi-region routing harder than multi-region routing for stateless web services. In steady state the right objective is not geographic proximity but cache and residency: route a user to the region (and within it, the replica) that already holds their prefix, because a warm cache at higher RTT is faster than a cold prefill nearby. But the moment a region fails, every prefix cached there is gone, and the surviving region absorbs the traffic with an empty cache — a thundering herd of recomputation exactly when the system is least able to afford it. A global load balancer with health checks gives you availability; it does not give you the cache back. What helps: per-region warm pools sized for failover, sticky routing keyed on prefix hash so a tenant does not bounce, a shared KV tier (LMCache-style) that survives pod restarts, and pre-warming the top prefixes in a region before shifting traffic to it. This is Part 8's cache economics applied at fleet scale, and it is why "add a region" is a capacity plan, not just a DNS change. Treat it as capacity planning for the next part — the <a href="{{ '/ai/llm-serving/economics/' | relative_url }}">cost and capacity model</a> is where these decisions get a dollar figure, and the <a href="{{ '/ai/llm-training/glossary/' | relative_url }}">glossary</a> is where every term here is indexed.</p>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">The control plane in one table</p>
+    <div style="overflow-x:auto;">
+      <table class="g-cheat">
+        <thead><tr><th>Component / lever</th><th>What it buys</th><th>What it costs / breaks</th></tr></thead>
+        <tbody>
+          <tr><td>Gateway</td><td>Auth, quotas, streaming proxy, per-request metrics</td><td>One more hot-path hop; quota accounting must reserve-then-reconcile for streams</td></tr>
+          <tr><td>KV-aware router</td><td>2,100 → 190 ms TTFT on a hit; 1.7% → 92.2% fleet hit rate (vLLM×Mooncake)</td><td>Affinity fights balance; needs a fallback when the affined replica is hot</td></tr>
+          <tr><td>Replicas = whole TP groups</td><td>NVLink-domain locality; one sharding decision</td><td>Scaling granularity is TP×DP GPUs; one bad rank dooms the replica (gang schedule it)</td></tr>
+          <tr><td>Autoscale signal: GPU util</td><td>Nothing useful — memory-bound decode keeps util low while latency spikes</td><td>Lags by the scrape window; reacts ~90 s late even on a clean step change</td></tr>
+          <tr><td>Autoscale signal: queue depth</td><td>Leading indicator; rises the instant load exceeds capacity</td><td>Needs a cooldown ≥ cold start or it flaps and provisions into a falling queue</td></tr>
+          <tr><td>Autoscale signal: p99 TTFT</td><td>The truthful user-facing signal; catches scheduling and cache failures</td><td>Lagging — it is already bad before it moves; guard down-scale with it</td></tr>
+          <tr><td>Slim image + local weights</td><td>Cuts pull and disk load, the two biggest cold-start terms</td><td>Image bake pipeline and node-local storage to keep fresh</td></tr>
+          <tr><td>Model Streamer / graph reuse / snapshot</td><td>43.7 → 7.5 s weight load; capture once; restore pre-warmed process</td><td>Concurrency for streaming; graph/engine coupling; snapshot tooling and restore correctness</td></tr>
+          <tr><td>Scale-to-zero</td><td>Saves idle GPU dollars</td><td>First request pays the whole cold start; break-even gap ≈ cold start + breach value / price</td></tr>
+          <tr><td>Spot + migrate KV</td><td>Discount with no lost work; drain becomes a transfer</td><td>Needs a spare replica and fabric bandwidth; the other policies need a real discount</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li><a href="https://llm-d.ai/">llm-d</a> — Kubernetes-native distributed inference: Gateway API Inference Extension, the Endpoint Picker (EPP) and KV-aware scoring, with vLLM workers.</li>
+      <li><a href="https://github.com/ai-dynamo/dynamo">NVIDIA Dynamo</a> — disaggregated serving with a KV-aware router, a planner for autoscaling, and NIXL for KV transfer; see also <a href="https://github.com/ai-dynamo/nixl">NIXL</a>.</li>
+      <li><a href="https://kserve.github.io/website/">KServe</a> — <code>InferenceService</code>, revisioned endpoints, canaries, and Knative/HPA autoscaling including scale-to-zero.</li>
+      <li>NVIDIA Run:ai, <a href="https://github.com/run-ai/runai-model-streamer">Model Streamer</a> and the NVIDIA developer blog, <a href="https://developer.nvidia.com/blog/reducing-cold-start-latency-for-llm-inference-with-nvidia-runai-model-streamer/">Reducing Cold Start Latency for LLM Inference</a> (2025) — 43.7 s → 7.5 s for a 15 GB model.</li>
+      <li>Zheng et al., <a href="https://arxiv.org/abs/2312.07104">SGLang / RadixAttention</a> and the vLLM × Mooncake cache-aware routing results — the fleet-altitude case for prefix affinity, introduced in <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a>.</li>
+      <li>Kubernetes docs, <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/">Scheduling, Preemption and Eviction</a>, and Kueue's gang-scheduling for co-located GPU workers.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}This part built the fleet and priced its failures. The last part turns all of it into a number you can defend.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__CL_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, SS = window.ServingSim, c = G.colors();
+
+  var FALLBACK = {
+    cold_start: {
+      source: "Stage breakdown is a guide-friendly decomposition of a Kubernetes/vLLM container cold start summing to the 40-90 s baseline cited in the plan. NVIDIA Run:ai Model Streamer (open source; documented benchmarks) measured 43.71 s at concurrency 1 dropping to 7.53 s at concurrency 8 for a 15 GB Llama 3 8B model on IO2 SSD, a ~5.8x gain. Absolute times scale with model size, storage throughput and host CPU.",
+      stages: [
+        { name: "Container image pull", seconds: 8 },
+        { name: "Process and CUDA context init", seconds: 5 },
+        { name: "Weight load from disk", seconds: 30 },
+        { name: "CUDA graph capture", seconds: 8 },
+        { name: "Warmup inference passes", seconds: 4 }
+      ],
+      modelStreamer: { baselineS: 40, improvedS: 8 }
+    },
+    prefix_cache: {
+      source: "Cache-aware routing figures: vLLM blog 'Serving Agentic Workloads at Scale with vLLM x Mooncake' and the Mooncake benchmark site, reporting 3.8x higher throughput and 46x lower P50 TTFT on agentic Codex traces as cache hit rate rose from 1.7% to 92.2%. The 2,100 ms -> 190 ms hit/miss TTFT pair and RadixAttention's up-to-6x speedup are from the prefix-caching literature (Zheng et al., arXiv:2312.07104). These are order-of-magnitude, guide-friendly values.",
+      radixAttentionSpeedup: 6.0,
+      vllmMooncake: { throughputX: 3.8, ttftX: 46 }
+    }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function apply(d) {
+    if (d && d.cold_start) DATA.cold_start = d.cold_start;
+    if (d && d.prefix_cache) DATA.prefix_cache = d.prefix_cache;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function findStage(cs, name, dflt) {
+    if (!cs || !cs.stages) return dflt;
+    for (var i = 0; i < cs.stages.length; i++) {
+      if (cs.stages[i].name === name) return cs.stages[i].seconds;
+    }
+    return dflt;
+  }
+  function sourceText(key, dflt) {
+    var o = DATA[key];
+    return (o && o.source) ? o.source : dflt;
+  }
+
+  var COLD_SRC = document.getElementById("cl-cold-src");
+  var ROUTER_SRC = document.getElementById("cl-router-src");
+  function paintSources() {
+    if (COLD_SRC) COLD_SRC.textContent = sourceText("cold_start", FALLBACK.cold_start.source);
+    if (ROUTER_SRC) ROUTER_SRC.textContent = sourceText("prefix_cache", FALLBACK.prefix_cache.source);
+  }
+  paintSources();
+
+  // Shared panel helpers (drawLines clears the whole canvas, so multi-panel
+  // demos draw their own frames with these instead).
+  function panelAxes(ctx, box, xR, yR, xLabel, yLabel) {
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(box.x, box.y, box.w, box.h);
+    ctx.fillStyle = c.text; ctx.font = "10px " + c.font;
+    ctx.textAlign = "center";
+    if (xLabel) ctx.fillText(xLabel, box.x + box.w / 2, box.y + box.h + 16);
+    if (yLabel) {
+      ctx.save(); ctx.translate(box.x - 8, box.y + box.h / 2); ctx.rotate(-Math.PI / 2);
+      ctx.fillText(yLabel, 0, 0); ctx.restore();
+    }
+  }
+  function panelLine(ctx, box, xR, yR, pts, color, width, dashed) {
+    var px = function (x) { return box.x + box.w * (x - xR[0]) / (xR[1] - xR[0]); };
+    var py = function (y) { return box.y + box.h * (1 - (y - yR[0]) / (yR[1] - yR[0])); };
+    ctx.save();
+    ctx.strokeStyle = color; ctx.lineWidth = width || 1.5;
+    if (dashed) ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    pts.forEach(function (p, i) {
+      var X = px(p.x), Y = py(clamp(p.y, yR[0], yR[1]));
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke();
+    ctx.restore();
+    return { px: px, py: py };
+  }
+  function panelArea(ctx, box, xR, yR, pts, color) {
+    var px = function (x) { return box.x + box.w * (x - xR[0]) / (xR[1] - xR[0]); };
+    var py = function (y) { return box.y + box.h * (1 - (y - yR[0]) / (yR[1] - yR[0])); };
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(px(pts[0].x), box.y + box.h);
+    pts.forEach(function (p) { ctx.lineTo(px(p.x), py(clamp(p.y, yR[0], yR[1]))); });
+    ctx.lineTo(px(pts[pts.length - 1].x), box.y + box.h);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // ======================================================================
+  // Demo 3 — cluster router bake-off
+  // ======================================================================
+  (function () {
+    var canvas = document.getElementById("cl-router");
+    if (!canvas) return;
+    var repS = document.getElementById("cl-rt-rep");
+    var skewS = document.getElementById("cl-rt-skew");
+    var readout = document.getElementById("cl-rt-readout");
+    var W = 640, H = 360, ctx = null;
+    var HIT_MS = 190, MISS_MS = 2100;
+
+    function simulate(R, s, policy) {
+      var rng = G.seededRandom(2024);
+      var T = 32, N = 4000, CAP = (policy === "kv") ? Math.ceil(T / R) + 2 : 4;
+      var w = [], sum = 0, k, i, r;
+      for (k = 1; k <= T; k++) { var v = Math.pow(k, -s); w.push(v); sum += v; }
+      var cum = [], acc = 0;
+      for (k = 0; k < T; k++) { acc += w[k] / sum; cum.push(acc); }
+      function pickTenant() {
+        var u = rng();
+        for (k = 0; k < T; k++) if (u <= cum[k]) return k + 1;
+        return T;
+      }
+      var caches = [], load = [];
+      for (r = 0; r < R; r++) { caches.push([]); load.push(0); }
+      var ttfts = [], hits = 0, sumLoad = 0;
+
+      function leastLoaded(list) {
+        var best = list[0], bl = load[list[0]];
+        for (var j = 1; j < list.length; j++) if (load[list[j]] < bl) { bl = load[list[j]]; best = list[j]; }
+        return best;
+      }
+      for (i = 0; i < N; i++) {
+        var t = pickTenant(), rep;
+        if (policy === "rr") rep = i % R;
+        else if (policy === "rand") rep = Math.floor(rng() * R);
+        else if (policy === "ll") rep = leastLoaded(caches.map(function (_, idx) { return idx; }));
+        else {
+          var holders = [];
+          for (r = 0; r < R; r++) if (caches[r].indexOf(t) >= 0) holders.push(r);
+          rep = holders.length ? leastLoaded(holders) : leastLoaded(caches.map(function (_, idx) { return idx; }));
+        }
+        var ci = caches[rep].indexOf(t), hit = ci >= 0;
+        if (hit) { caches[rep].splice(ci, 1); caches[rep].push(t); hits++; }
+        else { caches[rep].push(t); if (caches[rep].length > CAP) caches[rep].shift(); }
+
+        var mean = sumLoad / R;
+        var qPen = Math.max(0, load[rep] - mean) * 40;
+        ttfts.push((hit ? HIT_MS : MISS_MS) + qPen);
+        load[rep] += 1; sumLoad += 1;
+        if ((i + 1) % 200 === 0) {
+          for (r = 0; r < R; r++) load[r] *= 0.5;
+          sumLoad *= 0.5;
+        }
+      }
+      return {
+        hit: hits / N,
+        p50: SS.percentile(ttfts, 50),
+        p99: SS.percentile(ttfts, 99)
+      };
+    }
+
+    var POLICIES = [
+      { key: "rr", label: "round-robin" },
+      { key: "rand", label: "random" },
+      { key: "ll", label: "least-loaded" },
+      { key: "kv", label: "KV-aware" }
+    ];
+
+    function render() {
+      if (!ctx) return;
+      var R = parseInt(repS.value, 10), s = parseFloat(skewS.value);
+      var res = POLICIES.map(function (p) { return { l: p.label, r: simulate(R, s, p.key) }; });
+      ctx.clearRect(0, 0, W, H);
+
+      var padL = 66, padR = 16, padT = 8;
+      var headerH = 16, gap = 16, axisH = 18;
+      var panelH = (H - padT - gap - axisH) / 2;
+      var plotW = W - padL - padR;
+      var best = res[3].r;
+
+      function drawBars(title, top, accessor, maxV, fmt) {
+        ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(title, 6, top - 3);
+        var bh = Math.min(24, panelH / res.length - 8);
+        res.forEach(function (e, i) {
+          var y = top + i * (panelH / res.length) + 2;
+          var val = accessor(e.r);
+          var wpx = plotW * (val / maxV);
+          var isKV = i === 3;
+          ctx.fillStyle = isKV ? c.accent : c.accent400;
+          ctx.fillRect(padL, y, Math.max(2, wpx), bh);
+          ctx.fillStyle = c.text; ctx.font = "10.5px " + c.font; ctx.textAlign = "right";
+          ctx.fillText(e.l, padL - 6, y + bh * 0.72);
+          ctx.textAlign = "left";
+          ctx.fillStyle = isKV ? c.accent700 : c.text;
+          ctx.fillText(fmt(val), padL + Math.max(2, wpx) + 6, y + bh * 0.72);
+        });
+      }
+      var top1 = padT + headerH;
+      var top2 = padT + headerH + panelH + gap + headerH;
+
+      drawBars("Prefix cache hit rate (higher is better)", top1, function (r) { return r.hit; }, 1, function (v) { return (v * 100).toFixed(1) + "%"; });
+      drawBars("p50 / p99 TTFT in ms (lower is better)", top2, function (r) { return r.p99; }, Math.max(2400, res.reduce(function (a, e) { return Math.max(a, e.r.p99); }, 0)), function (v) { return v.toFixed(0) + " ms"; });
+
+      ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("p50 shown below bars · pink bar = KV-aware", padL, H - 4);
+
+      var ratio = best.p50 > 0 ? res[0].r.p50 / best.p50 : 1;
+      readout.innerHTML =
+        '<span class="k">replicas:</span> ' + R + " · <span class=\"k\">tenant skew s:</span> " + s.toFixed(2) + "<br>" +
+        POLICIES.map(function (p, i) {
+          var e = res[i].r;
+          return '<span class="k">' + p.label + ':</span> hit <span class="' + (i === 3 ? "hi" : "") + '">' + (e.hit * 100).toFixed(0) + "%</span> · p50 " + e.p50.toFixed(0) + " ms · p99 " + e.p99.toFixed(0) + " ms";
+        }).join("<br>") +
+        "<br><span class=\"k\">KV-aware vs round-robin p50:</span> <span class=\"hi\">" + ratio.toFixed(1) + "×</span> better";
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([repS, skewS], render);
+    onData(render);
+  })();
+
+  // ======================================================================
+  // Demo 4 — autoscaler simulator
+  // ======================================================================
+  (function () {
+    var canvas = document.getElementById("cl-auto");
+    if (!canvas) return;
+    var coolS = document.getElementById("cl-auto-cool");
+    var coldS = document.getElementById("cl-auto-cold");
+    var readout = document.getElementById("cl-auto-readout");
+    var signalRow = document.getElementById("cl-signal");
+    var patternRow = document.getElementById("cl-pattern");
+    var W = 640, H = 420, ctx = null;
+
+    var signal = "queue", pattern = "diurnal";
+    var DT = 2, HZ = 600, C = 8, BASE = 250, SLO = 2000, LAG = 90, MIN = 1, MAX = 16;
+    var PATTERNS = {
+      steady: function () { return 30; },
+      diurnal: function (t) { return 34 + 26 * Math.sin(2 * Math.PI * (t - 90) / HZ); },
+      spike: function (t) { return (t > 150 && t < 420) ? 66 : 20; },
+      ramp: function (t) { return 12 + 60 * t / HZ; }
+    };
+    function activeButton(row, attr, val) {
+      Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) {
+        b.classList.toggle("active", b.getAttribute(attr) === val);
+        if (b.getAttribute(attr) === val) b.classList.add("g-primary"); else b.classList.remove("g-primary");
+      });
+    }
+
+    function simulate(cooldown, coldStart) {
+      var fn = PATTERNS[pattern];
+      var loadHist = [], rows = [], provisions = [];
+      var ready = 3, queue = 0, lastAct = -1e9, starts = 0, t, i;
+      for (t = 0; t <= HZ; t += DT) {
+        var load = fn(t);
+        for (i = provisions.length - 1; i >= 0; i--) {
+          if (provisions[i] <= t) { provisions.splice(i, 1); ready++; }
+        }
+        if (t - lastAct >= cooldown) {
+          var desired;
+          if (signal === "gpu") {
+            var idx = Math.round((t - LAG) / DT);
+            var old = (idx >= 0 && loadHist[idx] != null) ? loadHist[idx] : load;
+            desired = Math.ceil(old / (0.7 * C));
+          } else if (signal === "queue") {
+            desired = Math.ceil((load + queue / 2) / (0.8 * C));
+          } else {
+            var capNow = ready * C;
+            var ttftNow = capNow > 0 ? BASE + queue / capNow * 1000 : 99999;
+            desired = Math.ceil(load / (0.9 * C));
+            if (ttftNow > SLO) desired = Math.max(desired, ready + 1);
+          }
+          desired = clamp(desired, MIN, MAX);
+          var target = ready + provisions.length;
+          if (desired > target) {
+            var n = desired - target;
+            for (i = 0; i < n; i++) { provisions.push(t + coldStart); starts++; }
+            lastAct = t;
+          } else if (desired < ready) { ready -= 1; lastAct = t; }
+        }
+        var cap = ready * C;
+        queue += (load - cap) * DT;
+        if (queue < 0) queue = 0;
+        var ttft = cap > 0 ? BASE + queue / cap * 1000 : 60000;
+        ttft = Math.min(ttft, 60000);
+        loadHist[Math.round(t / DT)] = load;
+        rows.push({ t: t, load: load, cap: cap, ready: ready, queue: queue, ttft: ttft, pending: provisions.length });
+      }
+      return { rows: rows, starts: starts };
+    }
+
+    function render() {
+      if (!ctx) return;
+      var cool = parseInt(coolS.value, 10), cold = parseInt(coldS.value, 10);
+      var r = simulate(cool, cold), rows = r.rows;
+      ctx.clearRect(0, 0, W, H);
+
+      var top = { x: 46, y: 24, w: W - 62, h: 150 };
+      var bot = { x: 46, y: 226, w: W - 62, h: 150 };
+      var xR = [0, HZ], yLoad = [0, 90], yT = [0, 8000], yRep = [0, MAX];
+
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Offered load vs ready capacity (req/s) · shaded = p99 TTFT SLO breach", top.x - 40, 14);
+      ctx.fillText("p99 TTFT (ms, left) · replicas (right)", bot.x - 40, 218);
+
+      // Shade SLO-violation spans in both panels.
+      var spans = [], cur = null;
+      rows.forEach(function (d) {
+        if (d.ttft > SLO) { if (!cur) cur = { a: d.t, b: d.t }; else cur.b = d.t; }
+        else if (cur) { spans.push(cur); cur = null; }
+      });
+      if (cur) spans.push(cur);
+      function pxX(x) { return top.x + top.w * (x - xR[0]) / (xR[1] - xR[0]); }
+      ctx.save(); ctx.fillStyle = "rgba(214,0,108,0.10)";
+      spans.forEach(function (s) {
+        ctx.fillRect(pxX(s.a), top.y, pxX(s.b) - pxX(s.a), top.h);
+        ctx.fillRect(pxX(s.a), bot.y, pxX(s.b) - pxX(s.a), bot.h);
+      });
+      ctx.restore();
+
+      panelAxes(ctx, top, xR, yLoad, null, "req/s");
+      panelAxes(ctx, bot, xR, yT, "seconds", "TTFT ms");
+      panelLine(ctx, top, xR, yLoad, rows.map(function (d) { return { x: d.t, y: d.load }; }), c.accent2, 2);
+      panelLine(ctx, top, xR, yLoad, rows.map(function (d) { return { x: d.t, y: d.cap }; }), c.accent, 2.5);
+      panelLine(ctx, bot, xR, yT, rows.map(function (d) { return { x: d.t, y: SLO }; }), c.accent2, 1.2, true);
+      panelLine(ctx, bot, xR, yT, rows.map(function (d) { return { x: d.t, y: d.ttft }; }), c.accent700, 2);
+      panelArea(ctx, bot, xR, yRep, rows.map(function (d) { return { x: d.t, y: d.ready }; }), "rgba(93,133,253,0.30)");
+      panelLine(ctx, bot, xR, yRep, rows.map(function (d) { return { x: d.t, y: d.ready }; }), c.accent500, 1.5);
+
+      ctx.fillStyle = c.accent2; ctx.font = "10.5px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("offered load", top.x + 6, top.y + 12);
+      ctx.fillStyle = c.accent; ctx.fillText("ready capacity", top.x + 6, top.y + 26);
+      ctx.fillStyle = c.accent700; ctx.fillText("p99 TTFT", bot.x + 6, bot.y + 12);
+      ctx.fillStyle = c.accent2; ctx.fillText("SLO " + SLO + " ms", bot.x + 6, bot.y + 26);
+      ctx.fillStyle = c.accent500; ctx.fillText("replicas (right axis 0–" + MAX + ")", bot.x + 6, bot.y + 40);
+
+      var peakRep = rows.reduce(function (a, d) { return Math.max(a, d.ready); }, 0);
+      var meanRep = rows.reduce(function (a, d) { return a + d.ready; }, 0) / rows.length;
+      var bad = rows.filter(function (d) { return d.ttft > SLO; }).length;
+      var waste = r.starts * cold;
+      var maxTTFT = rows.reduce(function (a, d) { return Math.max(a, d.ttft); }, 0);
+      readout.innerHTML =
+        '<span class="k">signal:</span> ' + signal + " · <span class=\"k\">pattern:</span> " + pattern + "<br>" +
+        '<span class="k">replicas:</span> peak <span class="hi">' + peakRep + "</span> · mean " + meanRep.toFixed(1) + "<br>" +
+        '<span class="k">SLO breach:</span> <span class="' + (bad ? "bad" : "hi") + '">' + (bad / rows.length * 100).toFixed(0) + "%</span> of the window · max p99 TTFT " + (maxTTFT / 1000).toFixed(1) + " s<br>" +
+        '<span class="k">cold-start provisioning:</span> ' + r.starts + " replicas × " + cold + " s = " + G.fmtNum(waste) + " GPU-s<br>" +
+        (signal === "gpu" ? '<span class="k">note:</span> <span class="bad">utilisation is read 90 s late</span> — capacity trails the load by the cold start on top of the lag'
+          : signal === "ttft" ? '<span class="k">note:</span> reacts only after the latency is already bad — a lagging guard'
+          : '<span class="k">note:</span> queue depth leads the load; keep cooldown ≥ cold start or it flaps');
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([coolS, coldS], render);
+    signalRow.addEventListener("click", function (ev) {
+      var b = ev.target.closest("button"); if (!b || !b.getAttribute("data-signal")) return;
+      signal = b.getAttribute("data-signal"); activeButton(signalRow, "data-signal", signal); render();
+    });
+    patternRow.addEventListener("click", function (ev) {
+      var b = ev.target.closest("button"); if (!b || !b.getAttribute("data-pattern")) return;
+      pattern = b.getAttribute("data-pattern"); activeButton(patternRow, "data-pattern", pattern); render();
+    });
+  })();
+
+  // ======================================================================
+  // Demo 5 — cold-start breakdown
+  // ======================================================================
+  (function () {
+    var canvas = document.getElementById("cl-cold");
+    if (!canvas) return;
+    var toggles = document.getElementById("cl-cold-toggles");
+    var playBtn = document.getElementById("cl-cold-play");
+    var resetBtn = document.getElementById("cl-cold-reset");
+    var readout = document.getElementById("cl-cold-readout");
+    var W = 640, H = 360, ctx = null;
+    var state = { slim: false, local: false, streamer: false, graph: false, snapshot: false };
+    var anim = null;
+    var PALETTE = [c.accent, c.accent2, c.accent400, "#c9a227", "#7a5c9e", "#5f8a3a", c.accent700];
+
+    function terms() {
+      var cs = DATA.cold_start || {};
+      var imgSlim = findStage(cs, "Container image pull", 8);
+      var proc = findStage(cs, "Process and CUDA context init", 5);
+      var wbase = findStage(cs, "Weight load from disk", 30);
+      var graph = findStage(cs, "CUDA graph capture", 8);
+      var warm = findStage(cs, "Warmup inference passes", 4);
+      var streamerImp = (cs.modelStreamer && cs.modelStreamer.improvedS) || 7.5;
+      var imgBig = imgSlim + 32;
+      var wVal = state.streamer ? streamerImp : (state.local ? Math.max(streamerImp, 12) : wbase);
+      return [
+        { name: "Image pull", base: imgBig, val: state.slim ? imgSlim : imgBig },
+        { name: "Process + CUDA init", base: proc, val: state.snapshot ? 0.5 : proc },
+        { name: "Weight load", base: wbase, val: wVal },
+        { name: "CUDA graph capture", base: graph, val: state.graph ? 0.8 : graph },
+        { name: "Warmup passes", base: warm, val: state.snapshot ? 1.0 : warm },
+        { name: "Kernel autotune", base: 3, val: state.snapshot ? 0.7 : 3 },
+        { name: "Engine init", base: 2, val: 2 }
+      ];
+    }
+    function computed() {
+      var t = terms(), base = 0, cur = 0, dom = null;
+      t.forEach(function (x) { base += x.base; cur += x.val; if (!dom || x.val > dom.val) dom = x; });
+      return { terms: t, base: base, cur: cur, dom: dom };
+    }
+
+    function render() {
+      if (!ctx) return;
+      var r = computed();
+      if (!anim) anim = r.terms.map(function (x) { return x.base; });
+      for (var i = 0; i < r.terms.length; i++) {
+        var d = r.terms[i].val - anim[i];
+        if (Math.abs(d) > 0.01) anim[i] += d * 0.14; else anim[i] = r.terms[i].val;
+      }
+      var total = anim.reduce(function (a, b) { return a + b; }, 0);
+      ctx.clearRect(0, 0, W, H);
+
+      var padL = 150, padR = 20, plotW = W - padL - padR, base = r.base;
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Cold start to first token", 8, 18);
+
+      // Baseline ghost bar.
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "right";
+      ctx.fillText("baseline", padL - 8, 46);
+      ctx.fillStyle = c.divider;
+      ctx.fillRect(padL, 32, plotW, 22);
+      ctx.fillStyle = c.text; ctx.textAlign = "left"; ctx.font = "10.5px " + c.font;
+      ctx.fillText(base.toFixed(0) + " s", padL + 6, 47);
+
+      // Current stacked bar.
+      ctx.textAlign = "right"; ctx.fillStyle = c.text; ctx.font = "11px " + c.font;
+      ctx.fillText("now", padL - 8, 96);
+      var x = padL;
+      for (i = 0; i < r.terms.length; i++) {
+        var wpx = plotW * (anim[i] / base);
+        ctx.fillStyle = PALETTE[i % PALETTE.length];
+        ctx.fillRect(x, 82, Math.max(0.5, wpx), 30);
+        x += wpx;
+      }
+      ctx.fillStyle = c.text; ctx.font = "13px " + c.mono; ctx.textAlign = "left";
+      ctx.fillText(total.toFixed(1) + " s", padL + plotW + 4 - 60, 102);
+
+      // Scale ticks.
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.font = "9.5px " + c.font;
+      for (var s = 0; s <= 92; s += 20) {
+        var tx = padL + plotW * s / base;
+        ctx.beginPath(); ctx.moveTo(tx, 116); ctx.lineTo(tx, 122); ctx.stroke();
+        ctx.textAlign = "center"; ctx.fillStyle = c.text;
+        ctx.fillText(s + "s", tx, 132);
+      }
+
+      // Stage legend.
+      var ly = 158;
+      for (i = 0; i < r.terms.length; i++) {
+        var ty = ly + i * 24;
+        ctx.fillStyle = PALETTE[i % PALETTE.length];
+        ctx.fillRect(8, ty - 9, 11, 11);
+        ctx.fillStyle = c.text; ctx.font = "11.5px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(r.terms[i].name, 26, ty);
+        ctx.textAlign = "right";
+        ctx.font = "11px " + c.mono;
+        ctx.fillStyle = r.terms[i].val < r.terms[i].base ? c.accent700 : c.text;
+        ctx.fillText(anim[i].toFixed(1) + " s", W - 12, ty);
+      }
+      ctx.textAlign = "left"; ctx.font = "11px " + c.font; ctx.fillStyle = c.accent2;
+      ctx.fillText("dominant remaining term: " + r.dom.name + " (" + r.dom.val.toFixed(1) + " s)", 26, H - 6);
+
+      var shownTotal = total;
+      readout.innerHTML =
+        '<span class="k">baseline:</span> ' + base.toFixed(0) + " s · <span class=\"k\">now:</span> <span class=\"hi\">" + shownTotal.toFixed(1) + " s</span><br>" +
+        '<span class="k">saved:</span> ' + (base - shownTotal).toFixed(1) + " s · <span class=\"k\">speedup:</span> " + (base / Math.max(0.1, shownTotal)).toFixed(2) + "×<br>" +
+        '<span class="k">dominant remaining term:</span> <span class="bad">' + r.dom.name + "</span> at " + r.dom.val.toFixed(1) + " s<br>" +
+        '<span class="k">all levers on:</span> ~20.5 s — the weight bytes are the floor, so storage bandwidth and a warm pool are the last levers';
+    }
+
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    toggles.addEventListener("click", function (ev) {
+      var b = ev.target.closest("button"); if (!b || !b.getAttribute("data-lever")) return;
+      var lever = b.getAttribute("data-lever");
+      state[lever] = !state[lever];
+      b.classList.toggle("active", state[lever]);
+      render();
+    });
+    resetBtn.addEventListener("click", function () {
+      state = { slim: false, local: false, streamer: false, graph: false, snapshot: false };
+      Array.prototype.forEach.call(toggles.querySelectorAll("button"), function (b) { b.classList.remove("active"); });
+      anim = null; render();
+    });
+    G.loop({ button: playBtn, interval: 30, onStep: render }).start();
+    onData(function () { anim = null; render(); });
+  })();
+
+  // ======================================================================
+  // Demo 6 — scale-to-zero cost model
+  // ======================================================================
+  (function () {
+    var canvas = document.getElementById("cl-z2");
+    if (!canvas) return;
+    var coldS = document.getElementById("cl-z2-cold");
+    var toS = document.getElementById("cl-z2-to");
+    var priceS = document.getElementById("cl-z2-price");
+    var breachS = document.getElementById("cl-z2-breach");
+    var readout = document.getElementById("cl-z2-readout");
+    var W = 640, H = 340, ctx = null;
+
+    function model() {
+      var cold = parseInt(coldS.value, 10), T = parseInt(toS.value, 10);
+      var price = parseFloat(priceS.value), breach = parseFloat(breachS.value);
+      var N = 220, lo = 0.02, hi = 120; // req/min
+      var pts = [], pure = [], peak = 0, peakL = 0;
+      for (var i = 0; i < N; i++) {
+        var lam = lo * Math.pow(hi / lo, i / (N - 1)); // req/min, log-spaced
+        var ls = lam / 60;
+        var coldPerHr = ls * 3600 * Math.exp(-ls * T);
+        var sloCost = coldPerHr * (breach + cold / 3600 * price);
+        var pureCost = coldPerHr * (cold / 3600 * price);
+        pts.push({ x: Math.log(lam), y: sloCost });
+        pure.push({ x: Math.log(lam), y: pureCost });
+        if (sloCost > peak) { peak = sloCost; peakL = lam; }
+      }
+      return { pts: pts, pure: pure, price: price, cold: cold, T: T, breach: breach, peak: peak, peakL: peakL, xR: [Math.log(lo), Math.log(hi)] };
+    }
+    function gap(cold, breach, price) { return cold + 3600 * breach / price; } // seconds
+
+    function render() {
+      if (!ctx) return;
+      var m = model();
+      ctx.clearRect(0, 0, W, H);
+      var box = { x: 58, y: 26, w: W - 78, h: 250 };
+      var yMax = Math.max(m.price * 1.3, m.peak * 1.15);
+      var yR = [0, yMax];
+      function px(x) { return box.x + box.w * (x - m.xR[0]) / (m.xR[1] - m.xR[0]); } // x = ln(lam)
+      function py(y) { return box.y + box.h * (1 - (y - yR[0]) / (yR[1] - yR[0])); }
+
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Hourly cost of one replica (USD/hr): keep-warm floor vs SLO-adjusted scale-to-zero", 8, 15);
+
+      // Shade where SLO-adjusted scale-to-zero is more expensive than warm.
+      ctx.save();
+      var prev = null;
+      m.pts.forEach(function (p) {
+        if (prev) {
+          if (p.y > m.price || prev.y > m.price) {
+            ctx.fillStyle = "rgba(214,0,108,0.10)";
+            ctx.fillRect(px(prev.x), box.y, Math.max(1, px(p.x) - px(prev.x)), box.h);
+          }
+        }
+        prev = p;
+      });
+      ctx.restore();
+
+      panelAxes(ctx, box, [0, 1], [0, 1], "arrival rate (req/min, log)", "USD/hr");
+      // x ticks (log)
+            ctx.fillStyle = c.text; ctx.font = "9.5px " + c.font; ctx.textAlign = "center";
+      [0.02, 0.1, 0.5, 2, 10, 120].forEach(function (v) {
+        ctx.fillText(v + "", px(Math.log(v)), box.y + box.h + 13);
+      });
+
+      panelLine(ctx, box, m.xR, yR, m.pts, c.accent2, 2.5);
+      panelLine(ctx, box, m.xR, yR, m.pure, c.accent400, 1.5, true);
+      panelLine(ctx, box, m.xR, yR, [{ x: m.xR[0], y: m.price }, { x: m.xR[1], y: m.price }], c.accent, 2.5);
+
+      ctx.fillStyle = c.accent; ctx.textAlign = "left"; ctx.font = "10.5px " + c.font;
+      ctx.fillText("keep 1 warm", box.x + 6, py(m.price) - 5);
+      ctx.fillStyle = c.accent2;
+      ctx.fillText("scale-to-zero + SLO tax", box.x + 6, box.y + 68);
+      ctx.fillStyle = c.accent400;
+      ctx.fillText("pure GPU dollars of cold starts (ignores the SLO)", box.x + 6, box.y + 82);
+
+      // Break-even gap marker as a vertical line at lambda where mean gap = g*.
+      var g = gap(m.cold, m.breach, m.price);
+      var lamGap = 60 / g; // req/min
+      if (lamGap >= 0.6 && lamGap <= 120) {
+        var gx = px(Math.log(lamGap));
+        ctx.strokeStyle = c.accent700; ctx.setLineDash([4, 3]); ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(gx, box.y); ctx.lineTo(gx, box.y + box.h); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = c.accent700; ctx.textAlign = "center"; ctx.font = "9.5px " + c.font;
+        ctx.fillText("gap = " + (g / 60).toFixed(1) + " min", gx, box.y - 3);
+      }
+
+      // Find every crossing between the SLO-adjusted cold tax and the warm floor.
+      var crossings = [], prevP = null;
+      m.pts.forEach(function (p) {
+        if (prevP && ((prevP.y <= m.price && p.y > m.price) || (prevP.y > m.price && p.y <= m.price))) {
+          crossings.push(Math.exp(p.x));
+        }
+        prevP = p;
+      });
+
+      var coldFracAtPeak = (m.peakL / 60 * m.T > 0) ? Math.exp(-(m.peakL / 60) * m.T) : 0;
+      var windowText;
+      if (crossings.length >= 2) {
+        windowText = '<span class="k">keep-warm window:</span> <span class="bad">' + crossings[0].toFixed(2) + "–" + crossings[1].toFixed(2) + " req/min</span> — cold starts cluster faster than they can be amortised";
+      } else if (crossings.length === 1) {
+        windowText = '<span class="k">first crossing:</span> ' + crossings[0].toFixed(2) + " req/min";
+      } else {
+        windowText = '<span class="k">crossings:</span> none at these settings';
+      }
+      readout.innerHTML =
+        '<span class="k">break-even idle gap:</span> <span class="hi">' + (g / 60).toFixed(1) + " min</span> = cold start " + m.cold + " s + value of a breach / price<br>" +
+        '<span class="k">rule:</span> keep 1 warm when the expected gap to the next request is below ' + (g / 60).toFixed(1) + " min<br>" +
+        windowText + "<br>" +
+        '<span class="k">peak cold tax:</span> USD ' + m.peak.toFixed(2) + "/hr at ~" + m.peakL.toFixed(2) + " req/min (cold fraction " + (coldFracAtPeak * 100).toFixed(1) + "%)<br>" +
+        '<span class="k">pure GPU view:</span> cold starts alone never approach the warm floor — <span class="bad">scale-to-zero is a latency decision</span>';
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([coldS, toS, priceS, breachS], render);
+  })();
+
+  // ======================================================================
+  // Demo 7 — spot drain policies
+  // ======================================================================
+  (function () {
+    var canvas = document.getElementById("cl-spot");
+    if (!canvas) return;
+    var rS = document.getElementById("cl-sp-r");
+    var nS = document.getElementById("cl-sp-n");
+    var remS = document.getElementById("cl-sp-rem");
+    var coldS = document.getElementById("cl-sp-cold");
+    var discS = document.getElementById("cl-sp-disc");
+    var readout = document.getElementById("cl-spot-readout");
+    var W = 640, H = 340, ctx = null;
+
+    function model() {
+      var r = parseFloat(rS.value), n = parseInt(nS.value, 10), rem = parseInt(remS.value, 10);
+      var cold = parseInt(coldS.value, 10), disc = parseInt(discS.value, 10);
+      var price = 3.0, outPrice = 12, failPerReq = 0.05, BW = 50, kvMB = 330, decodeRate = 40;
+      var drain = rem / decodeRate; // s
+      var xfer = (n * kvMB / 1024) / BW; // s
+      var restart = cold / 3600 * price;
+      var lostTokHard = n * rem;
+      var hard = restart + n * failPerReq + lostTokHard / 1e6 * outPrice;
+      var finish = restart + drain / 3600 * price;
+      var migrate = restart + xfer / 3600 * price;
+      function required(overhead) { return (r * overhead) / price * 100; }
+      return {
+        price: price, r: r, n: n, rem: rem, cold: cold, disc: disc,
+        drain: drain, xfer: xfer, restart: restart, lostTokHard: lostTokHard,
+        policies: [
+          { key: "hard", label: "hard kill", overhead: hard, req: required(hard), lost: lostTokHard, time: cold },
+          { key: "finish", label: "finish in flight", overhead: finish, req: required(finish), lost: 0, time: drain },
+          { key: "migrate", label: "migrate KV", overhead: migrate, req: required(migrate), lost: 0, time: xfer }
+        ]
+      };
+    }
+    function render() {
+      if (!ctx) return;
+      var m = model();
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Required spot discount to break even vs on-demand, by drain policy", 8, 16);
+
+      var padL = 130, padR = 60, padT = 40, plotW = W - padL - padR;
+      var maxReq = Math.max(m.disc + 5, m.policies.reduce(function (a, p) { return Math.max(a, p.req); }, 0)) * 1.1;
+      var rowH = (H - padT - 90) / m.policies.length;
+
+      m.policies.forEach(function (p, i) {
+        var y = padT + i * (rowH + 14);
+        var wpx = plotW * (p.req / maxReq);
+        var worth = p.req <= m.disc;
+        ctx.fillStyle = worth ? c.accent : c.accent2;
+        ctx.fillRect(padL, y, Math.max(2, wpx), 30);
+        ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "right";
+        ctx.fillText(p.label, padL - 8, y + 20);
+        ctx.textAlign = "left"; ctx.font = "12px " + c.mono;
+        ctx.fillStyle = worth ? c.accent700 : c.accent2;
+        ctx.fillText(p.req.toFixed(1) + "%", padL + Math.max(2, wpx) + 6, y + 20);
+        ctx.fillStyle = c.text; ctx.font = "10px " + c.font;
+        ctx.fillText((p.lost ? p.lost + " tokens lost · restart " : "no loss · ") + (p.time < 1 ? p.time.toFixed(2) + " s" : p.time.toFixed(0) + " s"), padL, y + 44);
+      });
+
+      // Actual discount marker.
+      var mx = padL + plotW * (m.disc / maxReq);
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(mx, padT - 18); ctx.lineTo(mx, H - 70); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent700; ctx.font = "11px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("offered " + m.disc + "%", mx, padT - 22);
+
+      ctx.textAlign = "left"; ctx.font = "10px " + c.font; ctx.fillStyle = c.text;
+      ctx.fillText("bars left of the marker are worth it · bars right of it are not", padL, H - 22);
+
+      readout.innerHTML =
+        '<span class="k">event cost:</span> restart USD ' + m.restart.toFixed(4) + " · drain " + m.drain.toFixed(1) + " s · KV transfer " + m.xfer.toFixed(3) + " s<br>" +
+        '<span class="k">reclaim rate:</span> ' + m.r.toFixed(1) + "/GPU-hr · spot discount offered: " + m.disc + "%<br>" +
+        m.policies.map(function (p) {
+          var worth = p.req <= m.disc;
+          return '<span class="k">' + p.label + ':</span> needs <span class="' + (worth ? "hi" : "bad") + '">' + p.req.toFixed(1) + "%</span> — " + (worth ? "worth it" : "not worth it");
+        }).join("<br>") +
+        '<br><span class="k">verdict:</span> ' + (m.policies[0].req > m.disc ? '<span class="bad">a hard-kill fleet needs a much deeper discount than it usually gets — drain or migrate instead</span>' : '<span class="hi">even hard kill clears the discount at these settings; migrating adds margin</span>');
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([rS, nS, remS, coldS, discS], render);
+  })();
+
+  // ======================================================================
+  // Data fetch — never block first paint; fall back silently offline.
+  // ======================================================================
+  function boot(d) { paintSources(); apply(d); }
+  fetch(window.__CL_DATA_URL).then(function (r) { return r.json(); }).then(boot).catch(function () { boot(null); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

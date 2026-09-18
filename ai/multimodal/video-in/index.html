@@ -1,0 +1,440 @@
+---
+title: "Video in, long context"
+description: "Frame sampling against a token budget, temporal position encoding, streaming memory, and the KV-cache arithmetic a clip implies."
+permalink: "/ai/multimodal/video-in/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-demo-stack { display: flex; flex-direction: column; gap: 14px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Video in, long context</h1>
+    <p>A still image is one grid of patches &mdash; patches being the equal square tiles an image is cut into, each of which the model treats as one token, the smallest unit it reads and writes. A video is that grid repeated in time, and time does not compress for free: thirty seconds at 24 frames per second is 720 pictures, where a <em>frame</em> is one still image from the sequence and <em>fps</em>, short for frames per second, is how many of them each second of video contains. If each of those pictures costs hundreds of tokens the sequence is longer than most context windows were ever built for. The <em>context window</em> is the fixed maximum number of tokens the model can hold in front of itself at once, the fixed-size suitcase every request has to be packed into, and a video very quickly becomes too bulky for the case. Every video-capable model is therefore a story about sampling &mdash; which frames to keep, how to encode their positions, what to hold in memory while the user is still <em>streaming</em>, meaning sending the video in as it arrives rather than all at once, and how large the key-value cache grows behind it all. The <em>KV cache</em> is easiest to picture as a running notebook of keys and values the model keeps so that it does not reread the whole prompt for every new token, and video fills that notebook faster than any other input. This part does that arithmetic with the sliders doing the counting.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="long">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A video is a long sequence</h2></div>
+    <p class="g-eyebrow">Frames, resolution and rate all multiply</p>
+    <p>Start with the frame count. A <em>clip</em> &mdash; a short stretch of video treated as a single input &mdash; that is sampled at the full rate contributes one image's worth of tokens per frame, and the count grows with duration &times; frame rate &times; spatial resolution. The reason is that all three factors multiply the sequence: twice the length, twice the frame rate or twice the pixels per side each push the token count up, and they compound rather than add. A three-dimensional tokeniser softens this by compressing time as well as space, where a <em>tokeniser</em> is the rule that chops a continuous signal into discrete units the model can read. Two compressions are stacked here. A causal video <em>VAE</em> &mdash; a variational autoencoder, a network that learns to squeeze an input into a small code and then reconstruct it &mdash; collapses a small group of frames into one <em>latent frame</em>, a single compressed summary standing in for several raw frames. A spatial compression then shrinks each frame's grid before it is patchified, meaning before it is cut into the square tiles the transformer expects. Both steps help, and the result is still large, because video multiplies the token count along three axes at once where an image multiplies it along two. The bars below put one clip on the same axis as a single image and a page of text, and the gap is what makes video the modality that forces context-window engineering.</p>
+    <p>The three sliders chain directly, and the chain is worth spelling out because it is the whole cost model in miniature. Frames set the duration, meaning how many raw frames you keep before any compression happens. Resolution sets the spatial grid per frame, so it decides how many patches each kept frame contributes. The frame rate sets how many raw frames the duration contains, because duration is chosen in seconds while the model counts in frames. The token count, the prefill cost &mdash; the one-time first pass in which the model reads the whole prompt before generating anything &mdash; and the KV footprint all update together, because they are three views of the same sequence length.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="vid-seq-canvas" width="520" height="200"></canvas>
+        <p class="g-canvas-hint">One clip against one image and one page of text, drawn with <code>Guide.drawStacked</code>. The clip's token count comes from <code>GenMedia.cost.videoTokens</code>, the image's from <code>Multimodal.cost.imageTokens</code>.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-controls">
+          <div class="g-field"><label>Raw frames <span class="val">128</span></label><input type="range" id="vid-frames" min="8" max="512" step="8" value="128"></div>
+          <div class="g-field"><label>Resolution <span class="val">384</span> px</label><input type="range" id="vid-res" min="0" max="3" step="1" value="1"></div>
+          <div class="g-field"><label>Frame rate <span class="val">24</span> fps</label><input type="range" id="vid-fps" min="4" max="30" step="1" value="24"></div>
+          <div class="g-readout" id="vid-seq-readout"></div>
+        </div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> turn frames, resolution and rate into a token count, decide a sampling stride from a token budget, explain temporal position encoding and streaming memory, and say how much KV cache a clip commits the server to. Those four skills are one chain: sampling sets the token count, the budget caps it, position encoding keeps the order straight, and the cache is the memory bill for every token that stays in context.</span></div>
+    <div class="g-toc">
+      <a href="#sample">2 · Sampling frames against a budget</a>
+      <a href="#temporal">3 · Temporal position and streaming memory</a>
+      <a href="#kv">4 · The KV arithmetic</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="sample">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Sampling frames against a budget</h2></div>
+    <p class="g-eyebrow">Keep every Nth frame, not every frame</p>
+    <p>The first lever is temporal subsampling, also called frame sampling: instead of feeding the model every frame the camera recorded, you keep one frame out of every few and set the rest aside. Keeping every frame at 24 fps is faithful and unaffordable past a few seconds; keeping every fourth frame is a quarter of the tokens and usually still enough, because most of what changes between adjacent frames is motion the model can infer from the frames it does see. The gap between kept frames is the <em>stride</em>, so a stride of four means one frame kept out of every four. The bars compare three policies for the same clip: every frame, every Nth frame at the stride on the slider, and a fixed token budget that the model is allowed to spend on video &mdash; the fixed-size suitcase the clip has to be packed into, however long it turns out to be. The stride does not have to be uniform. <em>Keyframe sampling</em> keeps the frames where the scene changes most and drops the quiet ones, and motion-aware selection does the same by watching how much the picture moves; both are the same idea applied unevenly rather than at a fixed interval. Whatever the schedule, the arithmetic is the same, and it is a direct trade of temporal detail for sequence length.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vid-sample-canvas" width="480" height="260"></canvas>
+        <p class="g-canvas-hint">Token counts for the full-rate clip, the strided clip and the budget, from <code>GenMedia.cost.videoTokens</code> with temporal compression 1 for the full-rate case and the strided frame count for the sampled case.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sampling stride N <span class="val">4</span></label><input type="range" id="vid-stride" min="1" max="16" step="1" value="4"></div>
+        <div class="g-readout" id="vid-sample-readout"></div>
+        <p class="g-mini">A stride of 1 is every frame. The budget line is the point of the exercise: choose N so the sampled count fits, and spend what is left on resolution or on keeping a second clip in context.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Uniform subsampling loses exactly the wrong frames.</b> A fast gesture or a single-word subtitle can live entirely between two sampled frames, and the model is not wrong about what it saw &mdash; it never saw the moment at all. Production video models therefore mix a low frame rate for the whole clip with a denser sample around detected motion or around regions the question mentions &mdash; the same token budget spent unevenly.</span></div>
+  </section>
+
+  <section class="g-step" id="temporal">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Temporal position and streaming memory</h2></div>
+    <p class="g-eyebrow">Order in time, and what to forget</p>
+    <p>Once a clip is a sequence, the trunk has to know not just <em>which</em> token it is but <em>when</em> it was. Attention is order-blind by construction: it weighs how relevant tokens are to one another but has no built-in sense of where any of them came from, which is why position embeddings exist at all. The useful mental picture is seat numbers written on each token after a shuffle, so the model can tell a patch from the top-left corner from one in the middle. A still-image patch carries a position in space only. A video token carries a position in space and in time, so the position encoding gains a third axis &mdash; the <em>temporal axis</em>, the direction running from the start of the clip to its end. The straightforward choice appends a temporal index to the row-and-column indices and encodes all three together. The more careful choice, used by models such as Qwen2-VL, gives each axis its own rotary frequency ranges, where a rotary encoding writes the position in by rotating a token's vector by an angle that depends on where the token sits, so that a token's time offset stays distinguishable from its spatial offset even when both are large. Without an explicit temporal index a patch from the first second and the nine-hundredth look identical to attention, because nothing in the mechanism can tell them apart, which is the video version of the problem position embeddings were invented to fix.</p>
+    <p>The heatmap shows the sinusoidal temporal encoding as a function of the frame index: each row is a frame, each column a frequency, and the periodic bands are what let attention read "two frames apart" rather than "two tokens apart". "Sinusoidal" here means the pattern is built from sine and cosine waves at several frequencies rather than from a learned table, so the signature of a given frame index is a smooth function of its time, and comparing two signatures is enough to recover how far apart in time the two frames sit.</p>
+    <p>Qwen3-VL extends the same idea in two directions. It interleaves the M-RoPE frequency bands so the temporal component is spread through the whole embedding rather than living in a reserved slice, which keeps time legible without setting aside a fixed block of dimensions for it and lets the spatial and temporal ranges be traded against each other. It also feeds explicit text-based timestamp tokens &mdash; a marker written out as ordinary text, such as <code>&lt;3.2 seconds&gt;</code> &mdash; into the sequence, so the model reads elapsed time from a token it can see as well as from the position encoding. The two routes are complementary: position encoding supplies a smooth, continuous sense of how far apart two frames sit, and the timestamp token gives the model a coarse, discrete anchor it can name, so a question that asks what happened after a given moment can be answered by matching text rather than by decoding a position signature.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="vid-pos-canvas" width="470" height="280"></canvas>
+        <p class="g-canvas-hint">Sinusoidal temporal position encoding from <code>Multimodal.vit.positional</code>, one row per frame and one column per frequency. The rate of the bands is the model's only handle on elapsed time.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="vid-mem-canvas" width="470" height="280"></canvas>
+        <p class="g-canvas-hint">A sliding-window cache over a long stream: each row is a decode step, each column a latent frame, and the bright diagonal band is the window of frames still resident. Built from <code>GenMedia.cost.kvCacheBytes</code> in the readout.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-controls">
+          <div class="g-field"><label>Frames shown <span class="val">24</span></label><input type="range" id="vid-tpos" min="8" max="64" step="8" value="24"></div>
+          <div class="g-field"><label>Memory window <span class="val">8</span> frames</label><input type="range" id="vid-window" min="2" max="24" step="1" value="8"></div>
+          <div class="g-readout" id="vid-pos-readout"></div>
+        </div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>A stream has no natural end, so a model that keeps every token it has ever seen will eventually run out of memory. Streaming memory is the discipline of holding state over an input that keeps arriving, and it is easier to picture as passing notes in a relay: each stage hands a summary forward instead of every stage carrying the whole history. The standard answers are a sliding window that keeps the most recent frames, a summary that compresses older ones into fewer tokens, or attention sinks that retain a few early tokens as anchors, where an <em>attention sink</em> is a token kept on purpose because later attention tends to lean on it. All three are policy choices about what a video model is allowed to forget.</span></div>
+  </section>
+
+  <section class="g-step" id="kv">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The KV arithmetic</h2></div>
+    <p class="g-eyebrow">Every token is paid for at every layer</p>
+    <p>Prefill is a one-off cost, but the key-value cache is not: for every token in context the model stores a key and a value for every layer and every KV head, and it keeps them for as long as the conversation lasts. The <em>KV heads</em> are the parallel attention heads that each hold their own slice of those keys and values. The running-notebook picture is the right one here: every token the model has read stays written down, and the notebook is not torn up between turns. The formula is short and unforgiving. Bytes are $2 \times L \times H_{kv} \times d_{head} \times n_{tokens} \times \text{bytes per value}$, with the leading $2$ for the key and the value, L the number of layers, H_kv the number of KV heads, d_head the width of each head, and n_tokens the context length. At 32 layers, 8 KV heads and 128-dimensional heads in fp16 &mdash; fp16 meaning each stored number takes two bytes &mdash; that is about 128 KB per token, so a clip of fifty thousand tokens commits roughly six gigabytes of cache &mdash; per sequence, and before batching, meaning before the same memory is multiplied across every request the server handles at once. The curve is linear in context length, which is why video is a memory problem as much as a compute one.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vid-kv-canvas" width="520" height="300"></canvas>
+        <p class="g-canvas-hint">KV cache in gigabytes against context length in tokens, from <code>GenMedia.cost.kvCacheBytes</code> via <code>Multimodal.cost.kvBytes</code>. The dashed marker is the current clip's token count.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="vid-kv-readout"></div>
+        <p class="g-mini">Prefill FLOPs come from <code>Multimodal.cost.prefillFlops</code>. Attention itself scales with the square of the sequence, so doubling the clip doubles the cache and roughly quadruples the attention work.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The cache is the reason video and long context are the same conversation.</b> Long context here just means a context window stretched to tens or hundreds of thousands of tokens, and the cache does not care what filled it. A serving stack that can hold a hundred thousand tokens of text can hold the same count of video tokens; nothing about the modality changes the arithmetic. What video changes is how quickly you reach that number, which is why the sampling stride from step 2 is really a memory decision in disguise.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">From video QA to generation</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Understanding</div>
+        <h3 style="margin:6px 0;">Video question answering</h3>
+        <p style="margin-bottom:0;">A clip and a question enter the same trunk, and the answer is a text token. Everything in this part is on the critical path: sampling decides what the model can see, temporal encoding decides whether it can order events, and the KV cache decides how long a clip the server will accept. Each of the three can be the thing that fails. Miss the moment in sampling and no later stage can recover it; drop the temporal index and "before" and "after" collapse into "somewhere in the clip"; run out of cache and the request is refused rather than answered slowly. The spatiotemporal encoder &mdash; the network that reads space and time together rather than treating each frame as an independent picture &mdash; is the video case of <a href="{{ '/ai/multimodal/vit/' | relative_url }}">the patch transformer</a>.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Generation</div>
+        <h3 style="margin:6px 0;">Video as token prediction</h3>
+        <p style="margin-bottom:0;">The reverse direction, video out, is the same latent token stream decoded instead of encoded: a video tokeniser supplies the vocabulary, meaning the fixed set of discrete units the model is allowed to emit, and a transformer predicts it. The word "latent" is doing real work here &mdash; these are compressed codes standing in for patches of pixels, not pixels themselves, so the model predicts in a compact space and a decoder turns the result back into frames. That is the generative-media volume's <a href="{{ '/ai/generative-media/video-basics/' | relative_url }}">video chapter</a>, and the sampling and cache arithmetic are shared between the two directions: whichever way the tokens flow, the sequence length and the memory it implies are the same.</p>
+      </div>
+    </div>
+    <p>The next part takes the same questions to the modality with no frames at all. Audio arrives as a continuous waveform &mdash; a pressure signal that varies smoothly in time, with no natural grid the way video has frames &mdash; whose token rate and temporal structure are set by the codec rather than by a frame rate, where the <em>codec</em> is the compressor that decides how that waveform is chopped into discrete units. That difference matters because there is no obvious stride to turn down when the budget is tight: the compression decision has already been made, by the codec, before the trunk sees anything. The choice between an encoder's transcript and native audio tokens &mdash; the codec's own units, kept as sound rather than converted into written words &mdash; changes what the trunk can hear, because a transcript has already thrown away tone, emphasis and everything else a listener would notice but a reader would not.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers mark the path from treating video as a stack of images to treating it as one long sequence with a temporal axis, and they supply the position and caching machinery the arithmetic above depends on. Read in order, they move from factorising space and time in a small video transformer, through attention designs that divide the work between the two axes, to a token-based generator, and finally to the position encoding and long-context framing that today's models rely on. The thread running through them is the same question the sliders above answer: how do you preserve the order of a long sequence without paying separately for every frame?</p>
+    <ul class="g-refs">
+      <li>Anurag Arnab, Mostafa Dehghani, Georg Heigold and coauthors, <a href="https://arxiv.org/abs/2103.15691">"ViViT: A Video Vision Transformer"</a>, 2021 &mdash; factorising space and time in a video transformer.</li>
+      <li>Gedas Bertasius, Heng Wang and Lorenzo Torresani, <a href="https://arxiv.org/abs/2102.05095">"Is Space-Time Attention All You Need for Video Understanding?"</a>, 2021 &mdash; TimeSformer and the divided-attention variants.</li>
+      <li>Dan Kondratyuk, Lijun Yu, Xiuye Gu and coauthors, <a href="https://arxiv.org/abs/2312.14125">"VideoPoet: A Large Language Model for Zero-Shot Video Generation"</a>, 2023 &mdash; video generated as a token sequence by a decoder-only model.</li>
+      <li>Peng Wang, Shuai Bai, Sinan Tan and coauthors, <a href="https://arxiv.org/abs/2409.12191">"Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution"</a>, 2024 &mdash; multidimensional rotary position encoding for image and video tokens.</li>
+      <li>Shuai Bai, Yuxuan Cai, Ruizhe Chen and coauthors, <a href="https://arxiv.org/abs/2511.21631">"Qwen3-VL Technical Report"</a>, 2025 &mdash; interleaved M-RoPE and text-based timestamps for temporal structure.</li>
+      <li>OpenAI, <a href="https://openai.com/index/video-generation-models-as-world-simulators/">"Video generation models as world simulators"</a>, 2024 &mdash; the patched-spacetime and variable-duration framing that makes clips sequences.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Frames &times; tokens</td><td>A clip's length is duration &times; frame rate &times; tokens per frame</td></tr>
+        <tr><td>3-D tokeniser</td><td>Spatial and temporal compression before patchification; a VAE collapses frame groups</td></tr>
+        <tr><td>Sampling stride</td><td>Keep every Nth frame; the direct lever on token count</td></tr>
+        <tr><td>Token budget</td><td>A fixed number of video tokens the model may spend, whatever the clip</td></tr>
+        <tr><td>Temporal position</td><td>A third position axis, or a third rotary frequency range, so order survives</td></tr>
+        <tr><td>Streaming memory</td><td>Sliding windows, summaries and attention sinks: a policy for what to forget</td></tr>
+        <tr><td>KV per token</td><td>$2 \times L \times H_{kv} \times d_{head} \times \text{bytes}$ — about 128 KB/token at 32&times;8&times;128 in fp16</td></tr>
+        <tr><td>Prefill scaling</td><td>Attention work grows with the square of the sequence; the cache grows linearly</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Video gave the trunk a temporal axis and a memory problem, and the two turn out to be the same problem: the longer the sequence, the more positions to encode and the more cache to carry. Audio has neither a frame grid nor a natural boundary: it is a continuous waveform whose tokens are set by a codec, and the model has to decide whether to hear it directly or only through a transcript. There is no frame rate to sample down, so the whole compression question lands on the codec instead &mdash; which is exactly the lever the next part puts under the sliders.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var RES = [256, 384, 512, 768];
+  var PATCH = 2, T_COMP = 4, S_COMP = 8;
+  var LAYERS = 32, KV_HEADS = 8, HEAD_DIM = 128, BYTES = 2;
+
+  var frames = 128, resIdx = 1, fps = 24;
+  var stride = 4;
+  var vidTpos = 24, vidWindow = 8;
+  var BUDGET = 8192;
+
+  function res() { return RES[resIdx]; }
+
+  function fmtFlops(f) {
+    if (f >= 1e15) return (f / 1e15).toFixed(1) + ' PFLOP';
+    if (f >= 1e12) return (f / 1e12).toFixed(1) + ' TFLOP';
+    if (f >= 1e9) return (f / 1e9).toFixed(1) + ' GFLOP';
+    return Guide.fmtNum(f);
+  }
+  function kvGB(tokens) {
+    return MM.cost.kvBytes(tokens, LAYERS, KV_HEADS, HEAD_DIM, BYTES) / 1e9;
+  }
+  function clipTokens(fr) { return GM.cost.videoTokens(fr, res(), res(), PATCH, T_COMP, S_COMP); }
+
+  function ordinal(n) {
+    var m = n % 100;
+    if (m >= 11 && m <= 13) return n + 'th';
+    var l = n % 10;
+    if (l === 1) return n + 'st';
+    if (l === 2) return n + 'nd';
+    if (l === 3) return n + 'rd';
+    return n + 'th';
+  }
+
+  // ---- 1. clip against image and text -------------------------------------
+  var seqSetup = Guide.setupCanvas(document.getElementById('vid-seq-canvas'), 520, 200, function () { drawSeq(); });
+  function drawSeq() {
+    if (!seqSetup) return;
+    var vt = clipTokens(frames);
+    var imgTok = MM.cost.imageTokens(336, 14);
+    var rows = [
+      { label: 'this clip', segments: [{ value: vt.tokens, color: c.accent2, name: 'video' }] },
+      { label: 'one image', segments: [{ value: imgTok, color: c.accent400, name: 'image' }] },
+      { label: 'one page text', segments: [{ value: 4096, color: c.accent, name: 'text' }] }
+    ];
+    var geo = Guide.drawStacked(seqSetup.ctx, 520, 200, rows, { padL: 118, padT: 16, padB: 28, maxTotal: vt.tokens });
+    var ctx = seqSetup.ctx;
+    ctx.fillStyle = c.text;
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'left';
+    ctx.fillText(Guide.fmtNum(vt.tokens) + ' video tokens = ' + vt.latentFrames + ' latent frames × ' + vt.gridH + ' × ' + vt.gridW, geo.padL + 6, geo.padT + geo.barH + 30);
+    var el = document.getElementById('vid-seq-readout');
+    if (el) {
+      var secs = frames / fps;
+      var prefill = MM.cost.prefillFlops(vt.tokens, LAYERS, 4096);
+      el.innerHTML =
+        '<div><span class="k">duration</span> ' + secs.toFixed(2) + ' s at ' + fps + ' fps</div>' +
+        '<div><span class="k">latent frames</span> ' + vt.latentFrames + ' (time &divide; ' + T_COMP + ')</div>' +
+        '<div><span class="k">grid per frame</span> ' + vt.gridH + ' × ' + vt.gridW + '</div>' +
+        '<div><span class="k">tokens</span> <span class="hi">' + Guide.fmtNum(vt.tokens) + '</span></div>' +
+        '<div><span class="k">prefill</span> ' + fmtFlops(prefill) + '</div>' +
+        '<div><span class="k">KV cache</span> ' + Guide.fmtBytes(kvGB(vt.tokens) * 1e9) + '</div>' +
+        '<div class="g-mini">' + Guide.fmtNum(vt.tokens / (secs || 1)) + ' tokens per second of video. The image is ' + Guide.fmtNum(imgTok) + ' tokens for comparison.</div>';
+    }
+  }
+
+  // ---- 2. sampling stride --------------------------------------------------
+  var sampleSetup = Guide.setupCanvas(document.getElementById('vid-sample-canvas'), 480, 260, function () { drawSample(); });
+  function drawSample() {
+    if (!sampleSetup) return;
+    var full = GM.cost.videoTokens(frames, res(), res(), PATCH, 1, S_COMP).tokens;
+    var stridedFrames = Math.max(1, Math.ceil(frames / stride));
+    var strided = GM.cost.videoTokens(stridedFrames, res(), res(), PATCH, T_COMP, S_COMP).tokens;
+    var data = [
+      { label: 'every frame', value: full, valueLabel: Guide.fmtNum(full), color: c.accent700 },
+      { label: 'every ' + ordinal(stride) + ' frame', value: strided, valueLabel: Guide.fmtNum(strided), color: c.accent },
+      { label: 'token budget', value: BUDGET, valueLabel: Guide.fmtNum(BUDGET), color: c.accent2 }
+    ];
+    Guide.drawBars(sampleSetup.ctx, 480, 260, data, { padL: 122, gap: 16, fontSize: 11 });
+    var el = document.getElementById('vid-sample-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">stride</span> ' + stride + '</div>' +
+        '<div><span class="k">frames kept</span> ' + stridedFrames + ' of ' + frames + '</div>' +
+        '<div><span class="k">every frame</span> ' + Guide.fmtNum(full) + ' tokens</div>' +
+        '<div><span class="k">strided</span> <span class="hi">' + Guide.fmtNum(strided) + '</span> tokens</div>' +
+        '<div><span class="k">versus budget</span> <span class="' + (strided > BUDGET ? 'bad' : 'hi') + '">' + Guide.fmtPct(strided / BUDGET, 0) + '</span></div>' +
+        '<div class="g-mini">' + (strided > BUDGET ? 'Over budget: raise the stride or lower the resolution.' : 'Fits the budget: the remainder can go to a second clip or higher resolution.') + '</div>';
+    }
+  }
+
+  // ---- 3. temporal position and streaming memory ---------------------------
+  var posSetup = Guide.setupCanvas(document.getElementById('vid-pos-canvas'), 470, 280, function () { drawPos(); });
+  function drawPos() {
+    if (!posSetup) return;
+    var k = Math.min(24, vidTpos);
+    var P = MM.vit.positional(k, 12);
+    var lo = Infinity, hi = -Infinity;
+    P.forEach(function (row) { row.forEach(function (v) { if (v < lo) lo = v; if (v > hi) hi = v; }); });
+    Guide.drawHeatmap(posSetup.ctx, 470, 280, P, {
+      min: lo, max: hi, colorLow: [234, 240, 255], colorHigh: [43, 95, 255], fontSize: 9
+    });
+  }
+
+  var memSetup = Guide.setupCanvas(document.getElementById('vid-mem-canvas'), 470, 280, function () { drawMem(); });
+  function memMatrix() {
+    var n = 40, win = Math.min(vidWindow, n), M = [];
+    for (var t = 0; t < n; t++) {
+      var row = [];
+      for (var k = 0; k < n; k++) {
+        var kept = (k <= t && k > t - win) ? 1 : 0.05;
+        row.push(kept);
+      }
+      M.push(row);
+    }
+    return M;
+  }
+  function drawMem() {
+    if (!memSetup) return;
+    Guide.drawHeatmap(memSetup.ctx, 470, 280, memMatrix(), {
+      min: 0, max: 1, colorLow: [240, 240, 244], colorHigh: [43, 95, 255], fontSize: 9
+    });
+    var vt = clipTokens(frames);
+    var perFrame = vt.tokens / Math.max(1, vt.latentFrames);
+    var retained = Math.round(vidWindow * perFrame);
+    var el = document.getElementById('vid-pos-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">frames shown (position)</span> ' + Math.min(24, vidTpos) + '</div>' +
+        '<div><span class="k">memory window</span> <span class="hi">' + vidWindow + ' frames</span></div>' +
+        '<div><span class="k">tokens retained</span> ' + Guide.fmtNum(retained) + '</div>' +
+        '<div><span class="k">window KV</span> ' + Guide.fmtBytes(kvGB(retained) * 1e9) + '</div>' +
+        '<div class="g-mini">A sliding window bounds memory regardless of stream length: the diagonal band is narrow when the window is short and thick when it is long, and what falls outside it is forgotten.</div>';
+    }
+  }
+
+  // ---- 4. KV growth --------------------------------------------------------
+  var kvPlot = GM.plot(document.getElementById('vid-kv-canvas'), {
+    W: 520, H: 300, xRange: [0, 131072], yRange: [0, 20],
+    xLabel: 'context length (tokens)', yLabel: 'KV cache (GB)',
+    onResize: function () { drawKv(); }
+  });
+  function drawKv() {
+    if (!kvPlot) return;
+    var vt = clipTokens(frames);
+    var maxTok = Math.max(2 * vt.tokens, 65536);
+    var maxGB = Math.max(1, kvGB(maxTok) * 1.05);
+    kvPlot.xRange[0] = 0;
+    kvPlot.xRange[1] = maxTok;
+    kvPlot.yRange[0] = 0;
+    kvPlot.yRange[1] = maxGB;
+    kvPlot.clear();
+    kvPlot.axes({
+      xLabel: 'context length (tokens)', yLabel: 'KV cache (GB)',
+      xFormat: function (t) { return Guide.fmtNum(t); },
+      yFormat: function (t) { return t.toFixed(1); }
+    });
+    kvPlot.curve(function (x) { return kvGB(x); }, { color: c.accent, width: 2.4, samples: 64 });
+    kvPlot.vline(vt.tokens, { color: c.accent2, dashed: true, width: 1.4, label: 'this clip', labelY: maxGB * 0.88 });
+    kvPlot.legend([
+      { label: 'KV cache (GB) vs context', color: c.accent },
+      { label: 'current clip', color: c.accent2, dashed: true }
+    ], { dy: 6 });
+    var perSec = GM.cost.videoTokens(fps, res(), res(), PATCH, T_COMP, S_COMP).tokens;
+    var el = document.getElementById('vid-kv-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">layers × KV heads × head dim</span> ' + LAYERS + ' × ' + KV_HEADS + ' × ' + HEAD_DIM + '</div>' +
+        '<div><span class="k">bytes per token</span> ' + Guide.fmtBytes(2 * LAYERS * KV_HEADS * HEAD_DIM * BYTES) + '</div>' +
+        '<div><span class="k">clip tokens</span> ' + Guide.fmtNum(vt.tokens) + '</div>' +
+        '<div><span class="k">clip KV</span> <span class="hi">' + Guide.fmtBytes(kvGB(vt.tokens) * 1e9) + '</span></div>' +
+        '<div><span class="k">KV per second</span> ' + Guide.fmtBytes(kvGB(perSec) * 1e9) + '</div>' +
+        '<div class="g-mini">Linear in tokens, linear in layers and heads. Batching multiplies it again, which is why long video and long context share their serving bottlenecks.</div>';
+    }
+  }
+
+  function redraw() { drawSeq(); drawSample(); drawPos(); drawMem(); drawKv(); }
+
+  Guide.bindSliders(document.querySelectorAll('#vid-frames'), function (el) {
+    frames = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vid-res'), function (el) {
+    resIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vid-fps'), function (el) {
+    fps = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vid-stride'), function (el) {
+    stride = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vid-tpos'), function (el) {
+    vidTpos = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vid-window'), function (el) {
+    vidWindow = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'video-frames-sampled',
+      kind: 'numeric',
+      prompt: 'A 60-second clip is shot at 24 fps and the model keeps every fourth frame. How many frames are sampled?',
+      answer: 360,
+      tolerance: 0.5,
+      explanation: '60 s × 24 fps = 1440 raw frames, and keeping every fourth gives 1440/4 = 360 frames. That frame count, not the duration, sets the token budget.'
+    },
+    {
+      id: 'video-temporal-position',
+      kind: 'choice',
+      prompt: 'Why does a video trunk need an explicit temporal position signal?',
+      options: [
+        { label: 'Because attention is order-invariant, so without a time index tokens from different moments look identical.', correct: true },
+        { label: 'Because audio tokens share the same vocabulary as video tokens.', correct: false },
+        { label: 'Because the KV cache stores tokens in arrival order and must be re-sorted.', correct: false }
+      ],
+      explanation: 'Space and time both need indices. A patch carries a spatial position and a video token carries a temporal one as well, whether as a third sinusoidal axis or as a separate rotary frequency range so time and space stay distinguishable.'
+    },
+    {
+      id: 'video-kv-growth',
+      kind: 'choice',
+      prompt: 'How does the KV cache scale with context length?',
+      options: [
+        { label: 'Linearly: a fixed number of bytes per token, multiplied by layers, KV heads and head dimension.', correct: true },
+        { label: 'Quadratically, the same as the attention score matrix.', correct: false },
+        { label: 'It depends only on the number of layers and not on the token count.', correct: false }
+      ],
+      explanation: 'Attention scores scale with the square of the sequence during prefill, but the stored cache is linear: 2 × layers × KV heads × head dim × tokens × bytes. Video reaches awkward cache sizes quickly because it reaches large token counts quickly.'
+    },
+    {
+      id: 'video-sampling',
+      kind: 'choice',
+      prompt: 'What does the sampling stride buy you?',
+      options: [
+        { label: 'Fewer tokens per second of video, at the risk of missing detail that lives between sampled frames.', correct: true },
+        { label: 'A shorter KV cache without changing which frames the model sees.', correct: false },
+        { label: 'Free temporal position encoding, because fewer frames need positions.', correct: false }
+      ],
+      explanation: 'A larger stride keeps every Nth frame, cutting the token count and the cache, but a gesture or a single word can fall entirely between samples. Production systems spend the same budget unevenly, sampling denser around motion or regions the question names.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

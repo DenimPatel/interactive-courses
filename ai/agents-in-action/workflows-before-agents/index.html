@@ -1,0 +1,578 @@
+---
+title: "Agents in Action, Interactively — Part 1: Workflows before agents"
+description: "The five workflow patterns, the complexity/value/viability/cost-of-error gate, and why most things called an agent should have been a workflow with a code path you can read."
+permalink: "/ai/agents-in-action/workflows-before-agents/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Workflows before agents</h1>
+    <p>An agent is the most expensive, hardest-to-debug thing you can build out of an LLM call, so the first question is never “how do I build an agent?” but “does this task need one?”. Most products that call themselves agentic are workflows: a fixed code path through one or more model calls. This part names the five workflow patterns, gives you a gate for deciding whether the path really is unknowable, and shows the arithmetic behind the claim that a bounded task is better served by two deterministic steps than by a twenty-step loop.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="two-things">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Two things people both call an agent</h2></div>
+    <p class="g-eyebrow">A code path you can read, versus a loop the model directs</p>
+    <p>A <strong>workflow</strong> is a predefined code path through LLM calls and tools: you decide the sequence, the branches and the exit conditions, and the model fills in the content of each step. An <strong>agent</strong> is a loop: the model chooses which tool to call next, decides when it has enough, and stops when it says so. The distinction is not about how clever the model is or how many tools are attached — it is about who owns the control flow. In a workflow, you do. In an agent, the model does.</p>
+    <p>That ownership is why the trade is so lopsided at the small end. A workflow’s behaviour can be read off the source, tested step by step, and reasoned about by someone who has never seen the prompt. An agent’s behaviour is a trajectory: it emerges at runtime from the model’s choices, so the unit of debugging is a trace, and the failure modes are the ones this volume spends three acts on.</p>
+    <div class="g-code"><span class="k">// a workflow: the path is yours, in code</span>
+draft = llm("draft the section", brief)
+<span class="k">if</span> passes_checks(draft): <span class="k">return</span> finalise(draft)
+<span class="k">return</span> finalise(llm("revise against the checklist", draft))
+
+<span class="k">// an agent: the path is chosen at runtime, by the model</span>
+<span class="k">while</span> not done:
+    step = llm(context, tools)          <span class="s">// may be a tool call, or an answer</span>
+    context += run(step.tool) if step.tool</div>
+    <div class="g-goal">💡 <span><b>The question that decides everything:</b> can you write down the path in advance? If yes, you have a workflow and you should build a workflow. The model still does the hard part — the writing, the classifying, the extracting — but your code stays in charge of what happens next.</span></div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> reaching for the agent because the problem feels fuzzy. Fuzzy inputs are not the same as an unknowable path. “Classify this ticket into one of six queues” is fuzzy, and it is one model call. Reserve the loop for tasks where the <em>next step genuinely depends on what the last step returned</em> and you cannot enumerate the possibilities ahead of time.</span></div>
+  </section>
+
+  <section class="g-step" id="patterns">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The five workflow patterns</h2></div>
+    <p class="g-eyebrow">Pick the task shape, and the pattern follows</p>
+    <p>Anthropic’s December 2024 essay “Building effective agents” names five ways to wire LLM calls together without giving up control flow. They are not a ladder of sophistication; they are answers to different structural questions about a task. Most real systems are one or two of them glued along a boundary.</p>
+    <p>Click a task below. The track shows the pattern that fits it, and pressing play animates the calls in order. Watch how few of these need a model deciding what to do next — and note the last one, which genuinely does.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wba-choose-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">One node per model or tool call. The highlighted node is the call currently being made.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="wba-task-row">
+          <button id="wba-task-0" class="g-primary">Ticket → route</button>
+          <button id="wba-task-1">Draft → check → polish</button>
+          <button id="wba-task-2">Summarise 20 docs</button>
+          <button id="wba-task-3">Report from sources</button>
+          <button id="wba-task-4">Revise till approved</button>
+          <button id="wba-task-5">Investigate an unknown bug</button>
+        </div>
+        <div class="g-btnrow">
+          <button id="wba-choose-play">Play trace</button>
+        </div>
+        <div class="g-readout" id="wba-choose-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="wba-src-agents"></p>
+    <p>Two of the five deserve a second look because they are easy to confuse. <strong>Parallelisation</strong> has two flavours: <em>sectioning</em> breaks one task into independent subtasks run at once, while <em>voting</em> runs the same task several times and aggregates. <strong>Orchestrator-worker</strong> looks like sectioning but the subtasks are not known when you write the code — a lead call reads the task and decides how many workers to spawn and what each should do. That is still a workflow: a human designed the shape, and the orchestration step has a fixed contract, even though its output is dynamic.</p>
+    <div class="g-goal">💡 <span><b>Routing versus an agent, in one line:</b> a router picks a branch from a <em>known, finite set you wrote</em>; an agent picks the next action from whatever its tools happen to allow. The router’s failure mode is a wrong label you can count. The agent’s failure mode is a trajectory.</span></div>
+  </section>
+
+  <section class="g-step" id="gate">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The gate: complexity, value, viability, cost of error</h2></div>
+    <p class="g-eyebrow">Four questions before you write a loop</p>
+    <p>Four properties decide whether a bounded workflow or a self-directed loop is the better engineering tool. <strong>Path predictability</strong> — can you enumerate the steps in advance? <strong>Required flexibility</strong> — does the task change shape part-way through in ways you cannot foresee? <strong>Task value</strong> — is the outcome worth the extra calls, latency and surface area an agent brings? <strong>Cost of error</strong> — what does a wrong answer cost, and can it be caught mechanically?</p>
+    <p>The gate is deliberately biased toward the boring answer. If the path is predictable and an error is cheap, a workflow wins: there is nothing for a loop to figure out, and a bounded pipeline fails in bounded, countable ways. An agent earns its complexity only when the path cannot be specified and the loop’s self-correction is what produces the value — and even then, expensive errors demand an explicit check step rather than an unattended loop.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wba-gate-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Each factor pushes the verdict left (toward a workflow) or right (toward an agent). The marker is the combined verdict.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Path predictability <span class="val">80</span></label><input type="range" id="wba-path" min="0" max="100" step="5" value="80"></div>
+        <div class="g-field"><label>Cost of an error <span class="val">30</span></label><input type="range" id="wba-err" min="0" max="100" step="5" value="30"></div>
+        <div class="g-field"><label>Task value per run <span class="val">60</span></label><input type="range" id="wba-val" min="0" max="100" step="5" value="60"></div>
+        <div class="g-field"><label>Required flexibility <span class="val">40</span></label><input type="range" id="wba-flex" min="0" max="100" step="5" value="40"></div>
+        <div class="g-readout" id="wba-gate-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Cost of error is not “high means agent”.</b> Expensive errors argue for more predictability, not less — which is why they push the verdict back toward a workflow with an explicit verification step. The pattern that carries both is <em>evaluator-optimiser</em>: a producer and a critic in a bounded loop, with you owning the loop.</span></div>
+  </section>
+
+  <section class="g-step" id="reliability">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Reliability is arithmetic, and it compounds</h2></div>
+    <p class="g-eyebrow">Why a twenty-step loop is not five times worse than a four-step one</p>
+    <p>If a step succeeds 95% of the time, a run of ten steps succeeds 0.95<sup>10</sup> ≈ 0.60 of the time — and a run of twenty, ≈ 0.36. That is not a model quality problem; it is multiplication. The same arithmetic applies to a workflow, but a workflow’s step count is a design choice you make and can keep small, while an agent’s step count is decided at runtime by the model and is usually larger than you hoped.</p>
+    <p>For a <em>bounded</em> task, the comparison is therefore stark: a two-step workflow against a loop that happens to take a dozen. Drag the per-step reliability and the loop length and watch the two lines separate. The pale dashed line is the two-step workflow.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wba-reliability-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">End-to-end success against run length. The marker is the loop length you chose; the dashed line is a two-step workflow at the same per-step reliability.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Per-step success (%) <span class="val">95</span></label><input type="range" id="wba-perstep" min="80" max="100" step="1" value="95"></div>
+        <div class="g-field"><label>Steps in the agent loop <span class="val">8</span></label><input type="range" id="wba-steps" min="2" max="20" step="1" value="8"></div>
+        <div class="g-readout" id="wba-reliability-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="wba-src-cost"></p>
+    <div class="g-goal">💡 <span><b>The number to remember:</b> 0.95<sup>20</sup> ≈ 0.36. A harness that can pass an individual step 95% of the time is still more likely than not to fail a twenty-step task. Shorten the run, verify the expensive steps, or both — that is what the rest of this volume is about.</span></div>
+  </section>
+
+  <section class="g-step" id="orchestrator">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The same task, two ways</h2></div>
+    <p class="g-eyebrow">Orchestrator-worker against one big prompt</p>
+    <p>Take one task — “read a set of documents and write a report” — and run it two ways. The single-prompt version puts every document in one context and asks for the report: one call, one big prefill, one long generation. The orchestrator-worker version spends one call planning the sections, runs the section workers in parallel, then spends one call assembling their output. It makes far more calls and moves more tokens, but the workers run concurrently and each worker sees a much smaller context than the single prompt did.</p>
+    <p>Which wins depends on what you are paying for. The bars compare calls, tokens and wall-clock latency for the same task; the readout totals each side and names the winner per metric.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wba-orchestrator-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Three metrics, two approaches. Latency assumes the section workers run in parallel, so the loop’s cost is the slowest worker, not their sum.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sections in the report <span class="val">4</span></label><input type="range" id="wba-subtasks" min="2" max="8" step="1" value="4"></div>
+        <div class="g-field"><label>Source tokens per section <span class="val">1800</span></label><input type="range" id="wba-doc" min="400" max="4000" step="100" value="1800"></div>
+        <div class="g-readout" id="wba-orchestrator-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Parallelism changes the cost, not the correctness.</b> The orchestrator’s workers never see each other’s output, so decisions that need to be consistent across sections have to be made by the orchestrator up front. That is the same coordination problem the multi-agent part runs into later, in a smaller package.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that keeps the system boring</th></tr></thead>
+      <tbody>
+        <tr><td>Workflow or agent?</td><td>Workflow unless the path genuinely cannot be written down in advance.</td></tr>
+        <tr><td>Who owns control flow in a workflow?</td><td>Your code. The model fills in the content of each step.</td></tr>
+        <tr><td>Who owns it in an agent?</td><td>The model, subject to the tools and the harness you gave it.</td></tr>
+        <tr><td>The five workflow patterns?</td><td>Prompt chaining, routing, parallelisation, orchestrator-worker, evaluator-optimiser.</td></tr>
+        <tr><td>Routing versus an agent?</td><td>The router picks from a finite branch set you wrote; the agent picks the next action at runtime.</td></tr>
+        <tr><td>When is an agent worth it?</td><td>When the path is unknowable and self-correction is where the value lives.</td></tr>
+        <tr><td>Why is a long loop unreliable?</td><td>Success multiplies: 0.95<sup>20</sup> ≈ 0.36, no matter how good each step looks.</td></tr>
+        <tr><td>What does an error cost buy you?</td><td>Demand for verification. Expensive errors argue for a check step, not an unattended loop.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">“Building effective agents”</a>, December 2024 — the workflow-versus-agent split and the five patterns this part is built on.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">“Effective context engineering for AI agents”</a>, 29 September 2025 — the write/select/compress/isolate taxonomy and the reliability arithmetic that follows from it.</li>
+      <li>Cognition, <a href="https://cognition.ai/blog/dont-build-multi-agents">“Don’t Build Multi-Agents”</a>, June 2025 — the case for owning context and control flow rather than delegating them to a fleet.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/multi-agent-research-system">“How we built our multi-agent research system”</a>, 13 June 2025 — an orchestrator-worker deployment with the token and latency bill measured, not estimated.</li>
+      <li>Wu, Terry &amp; Cai, <a href="https://arxiv.org/abs/2201.11903">“AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation”</a>, 2022 — the framework view, useful for reading claims about “agents” critically.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Once you have decided a workflow is not enough, the model still has to act on the world. Next: the tool-use loop, and tool design as the craft that decides whether the loop works.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    agents: {
+      source: "Anthropic, “Effective context engineering for AI agents” (2025-09-29) for the write/select/compress/isolate taxonomy and “Building effective agents” (2024-12) for the workflow-versus-agent split; Anthropic, “How we built our multi-agent research system” (2025-06-13); Cognition, “Don’t Build Multi-Agents” (2025-06). Reliability compounding is arithmetic: 0.95^20 ≈ 0.36. Offline fallback constants.",
+      workflowPatterns: ["prompt chaining", "routing", "parallelisation", "orchestrator-worker", "evaluator-optimiser"],
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    }
+  };
+  var NUM = FALLBACK;
+
+  // ------------------------------------------------------------------
+  // Demo A — the five-pattern chooser
+  // ------------------------------------------------------------------
+  var PATTERNS = {
+    chain: {
+      name: "Prompt chaining", calls: 4,
+      steps: ["draft", "check", "refine", "publish"],
+      why: "One call per transformation, with a programmatic gate between them deciding whether to continue."
+    },
+    route: {
+      name: "Routing", calls: 2,
+      steps: ["classify", "branch A", "branch B"],
+      why: "A cheap classifier call sends the task down one of several specialised paths you wrote."
+    },
+    parallel: {
+      name: "Parallelisation (sectioning)", calls: 5,
+      steps: ["split", "worker 1", "worker 2", "worker 3", "join"],
+      why: "Independent subtasks run at once; latency is the slowest worker, not the sum of all of them."
+    },
+    orchestrator: {
+      name: "Orchestrator-worker", calls: 5,
+      steps: ["orchestrate", "worker 1", "worker 2", "worker 3", "aggregate"],
+      why: "A lead call decides the subtasks at runtime; the workers never talk to each other."
+    },
+    evaluator: {
+      name: "Evaluator-optimiser", calls: 4,
+      steps: ["produce", "evaluate", "revise", "ship"],
+      why: "One bounded loop with explicit evaluation criteria beats one long generation."
+    },
+    agent: {
+      name: "Agent (a loop, not a workflow)", calls: 5,
+      steps: ["reason", "tool", "reason", "tool", "answer"],
+      why: "The path is unknowable in advance: the model decides its own next call until it stops."
+    }
+  };
+  var TASKS = [
+    { label: "A support ticket needs a queue", p: "route" },
+    { label: "Draft, fact-check, then polish an article", p: "chain" },
+    { label: "Summarise twenty documents independently", p: "parallel" },
+    { label: "Assemble a report from a pile of sources", p: "orchestrator" },
+    { label: "Revise an answer until an editor approves", p: "evaluator" },
+    { label: "Investigate a bug whose cause is unknown", p: "agent" }
+  ];
+  var A = { idx: 0, active: 0, play: null };
+  var setupA = Guide.setupCanvas(el("wba-choose-canvas"), 640, 300, drawA);
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 300;
+    var task = TASKS[A.idx], pat = PATTERNS[task.p];
+    var steps = pat.steps.map(function (s, i) {
+      return { label: s, state: i < A.active ? "done" : (i === A.active ? "active" : "pending") };
+    });
+    Guide.drawTraceTrack(ctx, W, H, steps, {
+      active: A.active, nodeR: 10, padT: 104, padB: 118,
+      axisLabel: pat.name, labelColor: c.text
+    });
+    ctx.fillStyle = c.text; ctx.font = "600 13px " + c.font; ctx.textAlign = "left";
+    ctx.fillText(task.label, 18, 22);
+    ctx.fillStyle = c.accent700; ctx.font = "11px " + c.font;
+    ctx.fillText("pattern: " + pat.name, 18, 42);
+    ctx.fillStyle = c.text; ctx.font = "10.5px " + c.font;
+    ctx.fillText("calls: " + pat.calls, 18, 60);
+    var words = pat.why.split(" ");
+    var line = "", ly = 206;
+    words.forEach(function (w) {
+      var test = line ? line + " " + w : w;
+      if (ctx.measureText(test).width > 560) { ctx.fillText(line, 18, ly); ly += 15; line = w; }
+      else line = test;
+    });
+    if (line) ctx.fillText(line, 18, ly);
+    var isAgent = task.p === "agent";
+    el("wba-choose-readout").innerHTML =
+      '<div><span class="k">task</span> ' + task.label + '</div>' +
+      '<div><span class="k">fits</span> <span class="hi">' + pat.name + '</span> · ' + pat.calls + ' calls to first answer</div>' +
+      (isAgent
+        ? '<div class="bad">this is the only task here that needs a loop: the next step depends on what the last call returns, and you cannot enumerate the branches in advance.</div>'
+        : '<div class="k">a workflow, not an agent: your code owns the sequence, so the failure modes are countable.</div>');
+  }
+  function selectTask(i) {
+    A.idx = i; A.active = 0;
+    for (var j = 0; j < TASKS.length; j++) {
+      var b = el("wba-task-" + j);
+      if (b) b.className = (j === i) ? "g-primary" : "";
+    }
+    drawA();
+  }
+  TASKS.forEach(function (t, i) {
+    var b = el("wba-task-" + i);
+    if (b) b.addEventListener("click", function () { selectTask(i); });
+  });
+  A.play = Guide.loop({
+    onStep: function () {
+      var n = PATTERNS[TASKS[A.idx].p].steps.length;
+      A.active = (A.active + 1) % n;
+      drawA();
+    },
+    button: el("wba-choose-play"), interval: 620,
+    playLabel: "Play trace", pauseLabel: "Pause"
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — the decision gate
+  // ------------------------------------------------------------------
+  var B = { path: el("wba-path"), err: el("wba-err"), val: el("wba-val"), flex: el("wba-flex") };
+  var setupB = Guide.setupCanvas(el("wba-gate-canvas"), 640, 340, drawB);
+  function gate() {
+    var P = +B.path.value, E = +B.err.value, V = +B.val.value, F = +B.flex.value;
+    var u = (100 - P) / 100, e = E / 100, v = V / 100, f = F / 100;
+    var parts = [
+      { name: "path unpredictability", value: 0.40 * u, max: 0.40,
+        agent: "the path cannot be written down in advance",
+        flow: "the path is enumerable, so a workflow can own it" },
+      { name: "required flexibility", value: 0.30 * f, max: 0.30,
+        agent: "the task changes shape mid-run and the loop must adapt",
+        flow: "the task is stable, so a fixed sequence is enough" },
+      { name: "task value per run", value: 0.15 * v, max: 0.15,
+        agent: "the outcome justifies extra calls and latency",
+        flow: "the outcome does not justify an agent's overhead" },
+      { name: "cost of error (workflow side)", value: -0.25 * e, max: 0.25,
+        agent: "errors are cheap, so a self-directed loop is tolerable",
+        flow: "errors are expensive, which argues for determinism and verification" }
+    ];
+    var score = parts.reduce(function (a, p) { return a + p.value; }, 0);
+    if (score < 0) score = 0;
+    if (score > 0.9) score = 0.9;
+    return { parts: parts, score: score };
+  }
+  function verdictOf(score) {
+    if (score >= 0.50) return { label: "Agent loop", cls: "bad",
+      text: "The path genuinely cannot be specified and the value is in self-correction. Build the loop — and instrument it, because everything after this part is about making it survive." };
+    if (score >= 0.30) return { label: "Workflow with a reflection step", cls: "hi",
+      text: "Borderline. Start with evaluator-optimiser: a producer and a critic in a loop your code owns. Only promote it to an agent if that loop still cannot express the task." };
+    return { label: "Workflow", cls: "hi",
+      text: "The task is bounded and the path is knowable. Write the sequence down; you get testability and a countable failure surface for free." };
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var g = gate();
+    var cx = 320, half = 240, rowH = 46, y0 = 44;
+    ctx.font = "10.5px " + c.font;
+    ctx.fillStyle = c.accent700; ctx.textAlign = "right";
+    ctx.fillText("← workflow", cx - 6, 16);
+    ctx.fillStyle = c.accent2; ctx.textAlign = "left";
+    ctx.fillText("agent →", cx + 6, 16);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, 22); ctx.lineTo(cx, y0 + 4 * rowH - 14); ctx.stroke();
+    g.parts.forEach(function (p, i) {
+      var y = y0 + i * rowH;
+      var w = half * (Math.abs(p.value) / 0.40);
+      ctx.fillStyle = p.value >= 0 ? c.accent2 : c.accent;
+      ctx.fillRect(p.value >= 0 ? cx : cx - w, y, Math.max(2, w), 18);
+      ctx.fillStyle = c.text; ctx.textAlign = "left"; ctx.font = "10.5px " + c.font;
+      ctx.fillText(p.name, 12, y + 13);
+      ctx.textAlign = "right";
+      ctx.fillStyle = p.value >= 0 ? c.accent2 : c.accent700;
+      ctx.fillText((p.value >= 0 ? "+" : "") + p.value.toFixed(2), 632, y + 13);
+    });
+    // verdict gauge
+    var gy = 262, gx0 = 40, gx1 = 600;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 10; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(gx0, gy); ctx.lineTo(gx1, gy); ctx.stroke();
+    var bA = gx0 + (gx1 - gx0) * 0.30, bB = gx0 + (gx1 - gx0) * 0.50;
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.moveTo(gx0, gy); ctx.lineTo(bA, gy); ctx.stroke();
+    ctx.strokeStyle = "#c9a227"; ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.moveTo(bA, gy); ctx.lineTo(bB, gy); ctx.stroke();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 10; ctx.lineCap = "butt";
+    ctx.beginPath(); ctx.moveTo(bB, gy); ctx.lineTo(gx1, gy); ctx.stroke();
+    var mx = gx0 + (gx1 - gx0) * (g.score / 0.9);
+    ctx.fillStyle = c.text;
+    ctx.beginPath(); ctx.arc(mx, gy, 8, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("workflow", gx0, gy + 22);
+    ctx.textAlign = "center"; ctx.fillText("reflection loop", (bA + bB) / 2, gy + 22);
+    ctx.textAlign = "right"; ctx.fillText("agent loop", gx1, gy + 22);
+    var vd = verdictOf(g.score);
+    var reasons = g.parts.map(function (p) {
+      var why = p.value >= 0 ? p.agent : p.flow;
+      return '<div><span class="k">' + p.name + '</span> ' + why + '</div>';
+    }).join("");
+    el("wba-gate-readout").innerHTML =
+      '<div><span class="k">combined pressure toward an agent</span> <span class="' + vd.cls + '">' + g.score.toFixed(2) + ' / 0.90</span></div>' +
+      '<div><span class="k">verdict</span> <span class="hi">' + vd.label + '</span></div>' +
+      reasons + '<div class="k">' + vd.text + '</div>';
+  }
+  Guide.bindSliders([B.path, B.err, B.val, B.flex], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — reliability compounding
+  // ------------------------------------------------------------------
+  var C = { p: el("wba-perstep"), k: el("wba-steps") };
+  var setupC = Guide.setupCanvas(el("wba-reliability-canvas"), 640, 320, drawC);
+  function e2eCurve(p, n) {
+    var pts = [];
+    for (var i = 1; i <= n; i++) pts.push({ x: i, y: Math.pow(p, i) * 100 });
+    return pts;
+  }
+  function sampleLoop(p, k, trials) {
+    var r = AppSim.rng(17), hits = 0;
+    for (var t = 0; t < trials; t++) {
+      var ok = true;
+      for (var s = 0; s < k; s++) { if (r() > p) { ok = false; break; } }
+      if (ok) hits++;
+    }
+    return hits / trials;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var p = (+C.p.value) / 100, k = +C.k.value;
+    var geo = Guide.drawLines(setupC.ctx, 640, 320,
+      [
+        { points: e2eCurve(p, 20), color: c.accent, width: 2.4 },
+        { points: [{ x: 1, y: Math.pow(p, 2) * 100 }, { x: 20, y: Math.pow(p, 2) * 100 }], color: c.accent2, width: 1.6, dashed: true }
+      ],
+      [1, 20], [0, 105],
+      { xLabel: "steps in the run", yLabel: "end-to-end success (%)", padL: 54, padB: 30 });
+    var ctx = setupC.ctx;
+    var Y = geo.py(Math.pow(p, k) * 100);
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(geo.px(k), geo.padT); ctx.lineTo(geo.px(k), geo.padT + geo.plotH); ctx.stroke();
+    ctx.fillStyle = c.accent700;
+    ctx.beginPath(); ctx.arc(geo.px(k), Y, 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.font = "10px " + c.font; ctx.textAlign = "left";
+    ctx.fillStyle = c.accent; ctx.fillText("agent loop of n steps", geo.padL + 10, geo.padT + 14);
+    ctx.fillStyle = c.accent2; ctx.fillText("two-step workflow", geo.padL + 10, geo.padT + 28);
+    var wf = Math.pow(p, 2), loop = Math.pow(p, k);
+    var mc = sampleLoop(p, k, 2000);
+    el("wba-reliability-readout").innerHTML =
+      '<div><span class="k">per-step</span> ' + (p * 100).toFixed(0) + '% · two-step workflow <span class="hi">' + (wf * 100).toFixed(1) + '%</span></div>' +
+      '<div><span class="k">' + k + '-step loop (arithmetic)</span> <span class="hi">' + (loop * 100).toFixed(1) + '%</span></div>' +
+      '<div><span class="k">' + k + '-step loop (2,000 seeded trials)</span> ' + (mc * 100).toFixed(1) + '%</div>' +
+      '<div class="k">the two-step workflow is ' + (wf > 0 ? (loop / wf).toFixed(2) : '—') + '× the loop\'s end-to-end success — that multiplicative gap is the argument for a bounded path.</div>';
+  }
+  Guide.bindSliders([C.p, C.k], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — orchestrator-worker against one big prompt
+  // ------------------------------------------------------------------
+  var D = { n: el("wba-subtasks"), doc: el("wba-doc") };
+  var setupD = Guide.setupCanvas(el("wba-orchestrator-canvas"), 640, 340, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var N = +D.n.value, doc = +D.doc.value;
+    // single prompt
+    var sIn = 500 + N * doc, sOut = 600;
+    var sCalls = 1;
+    var sTokens = sIn + sOut;
+    var sLat = AppSim.latencyModel({ prefixTokens: sIn, outputTokens: sOut }).e2eMs;
+    // orchestrator-worker: plan, N parallel workers, synthesise
+    var oIn = 800, oOut = 200, wIn = 200 + doc, wOut = 400;
+    var synIn = 400 + N * wOut, synOut = 600;
+    var oCalls = N + 2;
+    var oTokens = (oIn + oOut) + N * (wIn + wOut) + (synIn + synOut);
+    var oLat = AppSim.latencyModel({ prefixTokens: oIn, outputTokens: oOut }).e2eMs +
+      AppSim.latencyModel({ prefixTokens: wIn, outputTokens: wOut }).e2eMs +
+      AppSim.latencyModel({ prefixTokens: synIn, outputTokens: synOut }).e2eMs;
+    var panels = [
+      { title: "model calls", a: sCalls, b: oCalls, unit: "", fmt: function (x) { return Guide.fmtNum(x); } },
+      { title: "total tokens", a: sTokens, b: oTokens, unit: "", fmt: function (x) { return Guide.fmtNum(x); } },
+      { title: "wall-clock latency", a: sLat, b: oLat, unit: "ms", fmt: function (x) { return Guide.fmtMs(x); } }
+    ];
+    var rowY = [44, 140, 236];
+    panels.forEach(function (p, i) {
+      var max = Math.max(p.a, p.b) || 1;
+      var y = rowY[i];
+      ctx.fillStyle = c.text; ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText(p.title, 16, y - 6);
+      var barW = 400;
+      ctx.fillStyle = c.accent; ctx.fillRect(150, y, Math.max(2, barW * (p.a / max)), 22);
+      ctx.fillStyle = c.accent700; ctx.font = "10.5px " + c.font; ctx.textAlign = "right";
+      ctx.fillText("single prompt", 142, y + 15);
+      ctx.fillStyle = c.text; ctx.textAlign = "left";
+      ctx.fillText(p.fmt(p.a), 150 + barW * (p.a / max) + 8, y + 15);
+      ctx.fillStyle = c.accent2; ctx.fillRect(150, y + 30, Math.max(2, barW * (p.b / max)), 22);
+      ctx.fillStyle = c.accent700; ctx.textAlign = "right";
+      ctx.fillText("orchestrator", 142, y + 45);
+      ctx.fillStyle = c.text; ctx.textAlign = "left";
+      ctx.fillText(p.fmt(p.b), 150 + barW * (p.b / max) + 8, y + 45);
+      var win = p.a < p.b ? "single prompt" : "orchestrator-worker";
+      ctx.fillStyle = c.accent700; ctx.font = "10px " + c.font;
+      ctx.fillText("cheaper: " + win, 150, y + 66);
+    });
+    el("wba-orchestrator-readout").innerHTML =
+      '<div><span class="k">calls</span> single ' + sCalls + ' · orchestrator <span class="hi">' + oCalls + '</span> (' + N + ' worker sections)</div>' +
+      '<div><span class="k">tokens</span> single ' + Guide.fmtNum(sTokens) + ' · orchestrator <span class="hi">' + Guide.fmtNum(oTokens) + '</span></div>' +
+      '<div><span class="k">latency</span> single ' + Guide.fmtMs(sLat) + ' · orchestrator <span class="hi">' + Guide.fmtMs(oLat) + '</span></div>' +
+      '<div class="k">'+ (oTokens > sTokens ? 'the orchestrator moves more tokens' : 'the orchestrator moves fewer tokens') +
+      ' and ' + (oLat < sLat ? 'wins on latency because the workers run in parallel' : 'loses on latency because the section workers are serial') + '.</div>';
+  }
+  Guide.bindSliders([D.n, D.doc], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var sa = el("wba-src-agents"), sc = el("wba-src-cost");
+    if (sa) sa.textContent = (NUM.agents && NUM.agents.source) || FALLBACK.agents.source;
+    if (sc) sc.textContent = (NUM.cost_latency && NUM.cost_latency.source) || FALLBACK.cost_latency.source;
+    if (NUM.agents && NUM.agents.reliabilityExample && NUM.agents.reliabilityExample.perStep) {
+      var ex = NUM.agents.reliabilityExample;
+      var pr = Math.round(ex.perStep * 100);
+      if (pr >= 80 && pr <= 100) C.p.value = pr;
+    }
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: "workflows-before-agents-distinction",
+      kind: "choice",
+      prompt: "What actually separates a workflow from an agent?",
+      options: [
+        { label: "Who owns the control flow: your code in a workflow, the model in an agent.", correct: true },
+        { label: "The number of tools attached to the call." },
+        { label: "Whether the underlying model was trained with reinforcement learning." },
+        { label: "The size of the context window." }
+      ],
+      explanation: "A workflow is a predefined code path through model calls; an agent is a loop where the model chooses the next action. Tools and model choice matter, but control flow is the dividing line."
+    },
+    {
+      id: "workflows-before-agents-routing",
+      kind: "choice",
+      prompt: "A task says “read this ticket and send it to one of six queues”. Which pattern is it, and why is it not an agent?",
+      options: [
+        { label: "Routing — the branches are a finite set you wrote, so it is a workflow.", correct: true },
+        { label: "An agent — the input is free text, so the path is unknowable." },
+        { label: "Prompt chaining — every ticket passes through all six queues." },
+        { label: "Evaluator-optimiser — a critic scores each queue." }
+      ],
+      explanation: "Free-text input does not make a path unknowable. A router picks from a known, finite set of branches, which is exactly what your code can own and test."
+    },
+    {
+      id: "workflows-before-agents-compounding",
+      kind: "numeric",
+      prompt: "Each step of a loop succeeds with probability 0.95, independently. What is the end-to-end success probability of an 8-step run? Give three decimals.",
+      answer: 0.663,
+      tolerance: 0.01,
+      explanation: "0.95^8 ≈ 0.6634. End-to-end success is the product of per-step successes, which is why the run length is the variable you control and the one an agent does not."
+    },
+    {
+      id: "workflows-before-agents-gate",
+      kind: "choice",
+      prompt: "A bounded task has cheap, mechanically checkable errors and a path you can enumerate. What does the gate say?",
+      options: [
+        { label: "Build a workflow: nothing is left for a loop to discover, and the failure surface stays countable.", correct: true },
+        { label: "Build an agent, because errors are cheap so exploration is free." },
+        { label: "Add more tools until the agent can find its own path." },
+        { label: "It depends only on which model is cheapest." }
+      ],
+      explanation: "Predictable path plus cheap error is the definition of a workflow. An agent adds calls, latency and an emergent failure surface in exchange for adaptability the task does not need."
+    }
+  ];
+  GuideQuiz.init(document.getElementById("quiz-root"), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,791 @@
+---
+title: "LLM Serving, Interactively — Part 5: PagedAttention: block tables, fragmentation and preemption"
+description: "Why contiguous KV reservation wastes most of the GPU's memory, how paged block tables reclaim it, copy-on-write sharing across samples, watermarks, and the recompute-versus-swap preemption trade."
+permalink: "/ai/llm-serving/paged-memory/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 5 of 20</span>
+    <h1>PagedAttention</h1>
+    <p>Every token a model has already seen has to keep its key and value vectors resident for the rest of the request. The KV cache is therefore the single resource that decides how many users one GPU can hold — and the naive way to hand it out wastes most of it. This part measures the waste, replaces reservation with <b>blocks and block tables</b>, and follows the consequences all the way down to copy-on-write sharing, watermarks, and what a preemption actually costs.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="waste">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The three kinds of waste</h2></div>
+    <p class="g-eyebrow">Why 100 GB of HBM holds 40 GB of cache</p>
+    <p>The KV cache sizing formula is Part&nbsp;4's; the interesting question is what an engine does with the bytes once it has them. The pre-PagedAttention design is the obvious one: when a request arrives, reserve one <b>contiguous</b> span large enough for the maximum sequence it might ever produce, and hand the attention kernel that single pointer. It is simple, it makes the kernel's addressing trivial, and it wastes memory in three independent ways at once.</p>
+    <p><b>Reserved-but-unused.</b> A request that reserves 2,048 slots but generates 180 tokens holds 1,868 slots hostage for its whole lifetime. On chat-shaped traffic this dominates everything else. <b>Internal fragmentation</b> is the sliver left at the end of the reservation that rounding to a convenient size made unusable. <b>External fragmentation</b> is the Swiss cheese that is left after sequences of different lengths come and go: the free memory may be large in total and still be split into holes no new sequence fits. The PagedAttention paper measured production traces where existing systems used only 20–38% of their KV memory; this page's own simulation lands on the same order of magnitude.</p>
+    <p>Below, the same 24-request stream runs twice: once with a 560-slot contiguous reservation per request, once with 16-token blocks allocated as the tokens actually arrive. Play it, then read the two ending percentages.</p>
+
+    <div class="g-goal">💡 <span><b>Watch the light space.</b> The left panel's gaps are memory that no other request can use; the right panel's only slack is the partial final block of each sequence. That contrast is the entire idea.</span></div>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="frag-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Two allocators, one request stream. The animation grows each request's real tokens from zero to its final length.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="frag-play" class="g-primary">Play</button>
+          <button id="frag-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="frag-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="blocks">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Blocks and block tables</h2></div>
+    <p class="g-eyebrow">Virtual memory, for attention keys and values</p>
+    <p>PagedAttention borrows the operating system's answer: stop pretending the cache is one object per sequence. Cut the KV cache into fixed-size <b>blocks</b> — 16 tokens is the vLLM default, and every choice of block size is a trade between table overhead and internal fragmentation. A sequence's logical tokens are grouped into logical blocks; a per-sequence <b>block table</b> maps each logical block to whichever physical block currently holds it. Nothing requires those physical blocks to be adjacent, or to arrive in order.</p>
+    <p>The attention kernel gathers the physical blocks a sequence owns and computes over them; the block table is just an array of 32-bit indices, so for a 16-token block on a model that caches 1 KB per token the table costs about 2 bytes per 32 KB cached — well under 0.1%. Allocation becomes a free-list pop, freeing becomes a push, and allocating tokens to grow a sequence never has to move anything. The cost shows up as non-contiguous memory access in the kernel, which is the last section's subject.</p>
+    <p>Click any token in the logical strip to follow its block table entry to a physical block, and move the block-size slider to watch internal fragmentation change.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="walker-canvas" width="640" height="400"></canvas>
+        <p class="g-canvas-hint">Click a logical token. The highlighted logical block is traced through the table to its physical block.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Block size (tokens) <span class="val">16</span></label><input type="range" id="walker-bs" min="4" max="64" step="4" value="16"></div>
+        <div class="g-field"><label>Sequence length (tokens) <span class="val">96</span></label><input type="range" id="walker-len" min="16" max="256" step="16" value="96"></div>
+        <div class="g-readout" id="walker-readout"></div>
+      </div>
+    </div>
+
+    <div class="g-goal">💡 <span><b>The table is the interface.</b> Because the mapping is indirect, prefix caching, copy-on-write, swap and recompute all become block-table rewrites rather than memcpys of the whole cache. Everything in the rest of this part is a consequence of that indirection.</span></div>
+  </section>
+
+  <section class="g-step" id="cow">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Copy-on-write across beams and parallel samples</h2></div>
+    <p class="g-eyebrow">One prefix, many futures</p>
+    <p>Beam search, best-of-<var>n</var> sampling and any parallel-decoding scheme produce several continuations from the same prompt. The prompt's KV blocks are bitwise identical across all of them, so the engine points every sequence's block table at the same physical blocks and keeps a <b>reference count</b> per block. Cost of the shared prefix: one copy, regardless of how many samples ride on it.</p>
+    <p>The instant two samples diverge, a write lands in a shared block. The engine copies that one block — the classic <b>copy-on-write</b> — gives the writer a private block, drops the old block's reference count, and leaves every other sample pointing at the shared original. Only the partial final block of the prefix is ever at risk: earlier blocks are full and immutable. So the copy is always exactly one block, which is why beam search in a paged engine costs a few blocks per beam rather than a full prompt-sized cache. Write a token below and watch the refcounts.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cow-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Shared prefix blocks carry a refcount. A write to a shared partial block forks it; later writes append to the private copy.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Parallel samples <span class="val">3</span></label><input type="range" id="cow-beams" min="2" max="5" step="1" value="3"></div>
+        <div class="g-btnrow">
+          <button id="cow-write" class="g-primary">Write next token</button>
+          <button id="cow-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="cow-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="watermarks">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Watermarks and the block pool</h2></div>
+    <p class="g-eyebrow">When free blocks run out</p>
+    <p>A serving engine runs one global <b>block pool</b>, shared by every resident sequence, plus a free list. Decode consumes one new block every 16 tokens per sequence (and prefill consumes the prompt's blocks up front), so the pool drains steadily even when no new request arrives. The engine watches the free-block count against two thresholds. Crossing the <b>low watermark</b> makes it shed load: preempt a resident sequence to reclaim its blocks. Staying above the <b>high watermark</b> lets it resume admitting. The band between them is hysteresis — without it, an engine would admit and evict at the same boundary every step, which is exactly the thrashing pattern in section 6.</p>
+    <p>The thresholds are small by design: vLLM's default low watermark is 4% of the pool and the high watermark 8%. Cross the low line and the engine must find a victim; the only question is what to do with that victim's cache.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wm-canvas" width="640" height="170"></canvas>
+        <p class="g-canvas-hint">Fewer pool blocks, or more concurrent sequences, pushes the free list toward the low watermark.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Block pool size <span class="val">512</span></label><input type="range" id="wm-pool" min="128" max="1024" step="32" value="512"></div>
+        <div class="g-field"><label>Concurrent sequences <span class="val">48</span></label><input type="range" id="wm-seqs" min="8" max="96" step="4" value="48"></div>
+        <div class="g-readout" id="wm-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="preempt">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Recompute vs swap</h2></div>
+    <p class="g-eyebrow">Two ways to evict a sequence</p>
+    <p>When a sequence is preempted, its blocks are reclaimed. Its KV values are not free to reconstruct, so the engine chooses between two losses. <b>Recompute</b> throws the cache away and re-prefills the sequence from scratch when it is rescheduled: it pays <span class="g-math" style="display:inline-block;padding:2px 6px;margin:0;">2 &times; params</span> FLOPs per token, at prefill's compute-bound rate. <b>Swap</b> copies the KV blocks to CPU DRAM and back: it pays <span class="g-math" style="display:inline-block;padding:2px 6px;margin:0;">2 &times; bytes</span> over PCIe per token, plus a fixed pinned-buffer setup, at PCIe's bandwidth.</p>
+    <p>Both are roughly linear in sequence length, so the comparison is decided by their slopes and a constant. Recompute's per-token cost depends on the model and the prefill efficiency; swap's depends on how many bytes a token occupies and how fast the host link is. That means there is always a <b>crossover length</b>: below it recompute is cheaper, above it swap is — and moving the PCIe bandwidth slider moves the crossover. The model here is Llama&nbsp;3.1&nbsp;8B geometry at 40% of H100 SXM dense BF16 peak, with a 20&nbsp;ms fixed swap setup.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="preempt-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Cost to evict and later restore one sequence, as a function of how many cached tokens it holds.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>PCIe bandwidth (GB/s) <span class="val">32</span></label><input type="range" id="pe-bw" min="8" max="64" step="4" value="32"></div>
+        <div class="g-field"><label>Sequence length (tokens) <span class="val">1024</span></label><input type="range" id="pe-len" min="64" max="4096" step="64" value="1024"></div>
+        <div class="g-readout" id="preempt-readout"></div>
+      </div>
+    </div>
+
+    <div class="g-goal">💡 <span><b>Why recompute is nevertheless the default.</b> During decode the GPU is bandwidth-bound and its compute units sit idle, so recompute's FLOPs are often nearly free, while a swap competes with decode for the same PCIe link and host memory. The cost curves ignore that overlap; production engines do not.</span></div>
+  </section>
+
+  <section class="g-step" id="thrash">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Thrashing and the preemption rate</h2></div>
+    <p class="g-eyebrow">The failure mode that looks like a slowdown but is a loop</p>
+    <p>If the working set of live sequences is slightly larger than the block pool, every admission forces an eviction and every eviction is followed by a re-admission. The scheduler runs continuously and makes no forward progress: GPU util stays high, throughput collapses, and tail latency explodes. This is <b>thrashing</b>, and it is the paging analogue of a cache miss storm.</p>
+    <p>The honest metric is not preemptions per second — that rises with load on a healthy system too. It is the <b>preemption rate per request</b>: how many times the average request is evicted over its lifetime. Engine dashboards expose it as <code>preemptions</code> or <code>num_preemptions_total</code>, and the operating rule is boring but effective: keep the pool large enough that the rate stays near zero at your target concurrency, and shed load at the gateway instead of letting the scheduler thrash. The chart below runs the same workload against shrinking KV pools.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="thrash-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Same arrival stream, varying total KV block count. Below a knee, requests are evicted repeatedly instead of finishing.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>KV pool (16-token blocks) <span class="val">1536</span></label><input type="range" id="thrash-pool" min="256" max="4096" step="128" value="1536"></div>
+        <div class="g-readout" id="thrash-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="kernel">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>What paging costs in the kernel</h2></div>
+    <p class="g-eyebrow">The bill comes due in memory access, not in bookkeeping</p>
+    <p>Block tables are almost free as data. They are expensive as an <i>indirection</i>. A contiguous KV cache is a handful of large, aligned, prefetch-friendly reads; a paged cache is a gather over 16-token pages whose physical addresses are scattered by allocation order. Attention over the prompt becomes a loop over blocks, and the decode kernel must fuse the block-table lookup into the same kernel that computes $QK^\top$ — the original PagedAttention work writes a custom CUDA kernel for exactly this, and engines since have fused it into FlashAttention-style tiling so the table is read once per block rather than once per token. The cost is real but second-order: it is memory-level parallelism lost to scattered access, not extra bytes moved. Block size is the tuning knob — larger blocks amortise the table and improve coalescing, at the price of more internal fragmentation and coarser sharing.</p>
+    <p>Two practical constraints follow. First, block sizes must be powers of two and small enough that the last partial block is not wasteful, which is why 16 dominates. Second, the kernel's grid is sized by the number of blocks in the batch, so a batch of sequences with wildly different lengths produces a ragged, imbalanced grid; chunked prefill (Part&nbsp;6) exists partly to smooth it. The thing that made PagedAttention worth a custom kernel is not that paging is free — it is that the memory it saves buys concurrency that more than pays for the scattered reads.</p>
+    <div class="g-goal">💡 <span><b>The recap you already have.</b> The KV cache, prefill versus decode and the memory wall are from <a href="{{ '/ai/llm-training/inference/#kvcache' | relative_url }}">the training guide's inference chapter</a>. What is new here is the allocator: blocks, tables, watermarks and eviction, none of which a single-GPU training loop ever needed.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Concept</th><th>Rule of thumb</th><th>Where it bites</th></tr></thead>
+      <tbody>
+        <tr><td>Contiguous reservation</td><td>Reserves max sequence length per request; production traces use 20–38% of KV memory</td><td>Throws away concurrency you paid for in HBM</td></tr>
+        <tr><td>Block size</td><td>16 tokens is the default; power of two</td><td>Small blocks: table and kernel overhead. Large blocks: internal fragmentation and coarse sharing</td></tr>
+        <tr><td>Block table cost</td><td>~2 bytes per block per sequence; &lt;0.1% of cached bytes at 1 KB/token</td><td>Negligible, but must be read inside the attention kernel</td></tr>
+        <tr><td>Copy-on-write</td><td>Only the partial last prefix block is shared-and-writable; a fork copies exactly one block</td><td>Beam search without it duplicates the whole prompt per beam</td></tr>
+        <tr><td>Watermarks</td><td>Low ~4% free, high ~8% free</td><td>Too narrow a band admits and evicts at the same boundary (thrashing)</td></tr>
+        <tr><td>Preemption rate</td><td>Preemptions per request; keep near zero at target concurrency</td><td>Rising rate with flat throughput means the pool is too small</td></tr>
+        <tr><td>Recompute vs swap</td><td>Recompute: 2 &times; params FLOPs/token. Swap: 2 &times; bytes/token over PCIe</td><td>Crossover length moves with PCIe bandwidth and model size</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang, Stoica, <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for Large Language Model Serving with PagedAttention</a>, SOSP 2023.</li>
+      <li>vLLM documentation, <a href="https://docs.vllm.ai/en/latest/design/kernel/paged_attention.html">Paged Attention</a> and <a href="https://docs.vllm.ai/en/latest/configuration/conserving_memory.html">conserving memory</a> (watermark behaviour).</li>
+      <li>Yu, Jeong, Kim, Kim, Chun, <a href="https://www.usenix.org/conference/osdi22/presentation/yu">Orca: A Distributed Serving System for Transformer-Based Generative Models</a>, OSDI 2022 — iteration-level scheduling, the context this part's memory manager feeds.</li>
+    </ul>
+    <p class="g-source" id="pm-source"></p>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The memory manager now hands a full batch to the scheduler every step. Next: how that batch is assembled and why prefill keeps interrupting it.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var C = Guide.colors();
+
+  var FALLBACK = {
+    modelName: "Llama 3.1 8B",
+    layers: 32, kvHeads: 8, headDim: 128, bytesPerToken: 131072,
+    paramsB: 8.03, bwTBs: 3.35, peakTFLOPs: 989,
+    source: "KV geometry from the official Llama 3.1 8B config (32 layers, 8 KV heads, head_dim 128): 2 x 32 x 8 x 128 x 2 bytes = 131,072 bytes per token. Recompute cost uses 2 x params FLOPs per token at 40% of H100 SXM dense BF16 peak."
+  };
+  var NUM = FALLBACK;
+  var DATA_URL = {% endraw %}"{{ '/assets/data/llm-serving-numbers.json' | relative_url }}"{% raw %};
+  var srcEl = document.getElementById("pm-source");
+  srcEl.textContent = FALLBACK.source;
+
+  fetch(DATA_URL)
+    .then(function (r) { return r.json(); })
+    .then(function (json) {
+      var m = (json.model_configs && json.model_configs.items || []).filter(function (x) { return /Llama 3\.1 8B/.test(x.name); })[0];
+      var acc = (json.accelerators && json.accelerators.items || []).filter(function (x) { return /H100 SXM/.test(x.name); })[0];
+      if (m) {
+        var bpt = 2 * m.layers * m.n_kv_heads * m.d_head * 2;
+        NUM = {
+          modelName: m.name, layers: m.layers, kvHeads: m.n_kv_heads, headDim: m.d_head,
+          bytesPerToken: bpt, paramsB: m.activeParamsB || m.totalParamsB,
+          bwTBs: acc ? acc.bwTBs : FALLBACK.bwTBs,
+          peakTFLOPs: acc ? acc.bf16TFLOPs : FALLBACK.peakTFLOPs,
+          source: (json.kv_scheme_savings && json.kv_scheme_savings.source) || FALLBACK.source
+        };
+      }
+      if (acc) { NUM.bwTBs = acc.bwTBs; NUM.peakTFLOPs = acc.bf16TFLOPs; }
+      srcEl.textContent = NUM.source;
+      redrawAll();
+    })
+    .catch(function () { srcEl.textContent = FALLBACK.source; });
+
+  function pct(x) { return (100 * x).toFixed(1) + "%"; }
+  function hue(i) { return "hsl(" + ((i * 47 + 190) % 360) + ", 42%, 52%)"; }
+
+  // =====================================================================
+  // Demo 1 — fragmentation race
+  // =====================================================================
+  var N_FRAG = 24, RESERVE = 560, FRAG_BLOCK = 16;
+  var fragSeqs = (function () {
+    var r = Guide.seededRandom(7);
+    var out = [];
+    for (var i = 0; i < N_FRAG; i++) {
+      var p = ServingSim.lognormal(r, 120, 0.5);
+      var o = ServingSim.lognormal(r, 45, 0.6);
+      out.push({ total: p + o, arrival: 0.04 + 0.66 * (i / (N_FRAG - 1)) });
+    }
+    return out;
+  })();
+  var fragT = 0;
+  var fragTotals = (function () {
+    var used = 0, reserved = 0, alloc = 0;
+    fragSeqs.forEach(function (s) {
+      used += s.total; reserved += RESERVE;
+      alloc += Math.ceil(s.total / FRAG_BLOCK) * FRAG_BLOCK;
+    });
+    return { used: used, reserved: reserved, alloc: alloc };
+  })();
+  var fragCanvas = document.getElementById("frag-canvas");
+  var fragReadout = document.getElementById("frag-readout");
+  var fragPlay = document.getElementById("frag-play");
+  var fragReset = document.getElementById("frag-reset");
+  var fragSetup = Guide.setupCanvas(fragCanvas, 640, 360, function () { if (fragSetup) fragDraw(); });
+
+  function fragUsed(s, t) {
+    if (t <= s.arrival) return 0;
+    var f = Math.min(1, (t - s.arrival) / 0.24);
+    return Math.round(s.total * f);
+  }
+
+  function fragDraw() {
+    var ctx = fragSetup.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var pad = 12, gap = 20, pw = (W - pad * 2 - gap) / 2;
+    var xL = pad, xR = pad + pw + gap;
+    var top = 46, bottom = H - 34;
+    ctx.font = "600 12px " + C.font;
+    ctx.textAlign = "left";
+    ctx.fillStyle = C.text;
+    ctx.fillText("Contiguous reservation · 560 slots/request", xL, 22);
+    ctx.fillText("Paged · 16-token blocks", xR, 22);
+    ctx.font = "11px " + C.font;
+    ctx.fillStyle = C.text;
+    ctx.globalAlpha = 0.6;
+    ctx.fillText("used tokens", xL, 36);
+    ctx.fillText("used blocks (slack = partial last block)", xR, 36);
+    ctx.globalAlpha = 1;
+
+    // ---- left: contiguous rows
+    var usedL = 0, reservedL = 0;
+    var rowGap = 1.5;
+    var rowH = (bottom - top) / N_FRAG - rowGap;
+    for (var i = 0; i < N_FRAG; i++) {
+      var s = fragSeqs[i];
+      var u = fragUsed(s, fragT);
+      usedL += u; reservedL += RESERVE;
+      var y = top + i * (rowH + rowGap);
+      ctx.fillStyle = "#e7e2d9";
+      ctx.fillRect(xL, y, pw, rowH);
+      ctx.fillStyle = hue(i);
+      ctx.fillRect(xL, y, pw * (u / RESERVE), rowH);
+      ctx.strokeStyle = "rgba(0,0,0,0.06)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(xL + 0.5, y + 0.5, pw - 1, rowH - 1);
+    }
+    ctx.beginPath();
+    ctx.strokeStyle = C.accent2; ctx.lineWidth = 2;
+    ctx.moveTo(xL, top); ctx.lineTo(xL, bottom); ctx.stroke();
+
+    // ---- right: paged block grid
+    var cols = 24;
+    var totalCap = 0;
+    fragSeqs.forEach(function (q) { totalCap += Math.ceil(q.total / FRAG_BLOCK); });
+    var rows = Math.ceil(totalCap / cols);
+    var cw = pw / cols, ch = (bottom - top) / rows;
+    var usedR = 0, allocR = 0;
+    var idx = 0;
+    for (var j = 0; j < N_FRAG; j++) {
+      var q = fragSeqs[j];
+      var uq = fragUsed(q, fragT);
+      usedR += uq;
+      var need = Math.ceil(uq / FRAG_BLOCK);
+      var cap = Math.ceil(q.total / FRAG_BLOCK);
+      allocR += need * FRAG_BLOCK;
+      for (var b = 0; b < cap; b++) {
+        var col = idx % cols, row = Math.floor(idx / cols);
+        var bx = xR + col * cw, by = top + row * ch;
+        ctx.fillStyle = "#eeeae2";
+        ctx.fillRect(bx, by, cw - 1, ch - 1);
+        if (b < need) {
+          var fill = Math.min(1, (uq - b * FRAG_BLOCK) / FRAG_BLOCK);
+          ctx.fillStyle = hue(j);
+          ctx.fillRect(bx, by, (cw - 1) * (fill > 0 ? 1 : 0), ch - 1);
+          if (fill < 1) {
+            ctx.fillStyle = "#d9d3c8";
+            ctx.fillRect(bx + (cw - 1) * fill, by, (cw - 1) * (1 - fill), ch - 1);
+          }
+        }
+        idx++;
+      }
+    }
+
+    var cw1 = reservedL > 0 ? 1 - usedL / reservedL : 0;
+    var pw2 = allocR > 0 ? 1 - usedR / allocR : 0;
+    fragReadout.innerHTML =
+      '<div><span class="k">contiguous waste</span> = <span class="bad">' + pct(fragTotals.reserved ? 1 - fragTotals.used / fragTotals.reserved : 0) + '</span> at end</div>' +
+      '<div><span class="k">paged slack</span> = <span class="hi">' + pct(fragTotals.alloc ? 1 - fragTotals.used / fragTotals.alloc : 0) + '</span> at end</div>' +
+      '<div><span class="k">live</span> contiguous ' + pct(cw1) + ' · paged ' + pct(pw2) + '</div>' +
+      '<div><span class="k">progress</span> ' + Math.round(fragT * 100) + '%</div>';
+  }
+
+  var fragLoop = Guide.loop({
+    button: fragPlay, interval: 40, playLabel: "Play", pauseLabel: "Pause",
+    onStep: function () {
+      fragT += 0.013;
+      if (fragT >= 1) { fragT = 1; fragDraw(); fragLoop.stop(); return; }
+      fragDraw();
+    }
+  });
+  fragPlay.addEventListener("click", function () {
+    if (fragT >= 1) { fragT = 0; fragDraw(); }
+  });
+  fragReset.addEventListener("click", function () { fragLoop.stop(); fragT = 0; fragDraw(); });
+  fragDraw();
+
+  // =====================================================================
+  // Demo 2 — block table walker
+  // =====================================================================
+  var walkerCanvas = document.getElementById("walker-canvas");
+  var walkerBs = document.getElementById("walker-bs");
+  var walkerLen = document.getElementById("walker-len");
+  var walkerReadout = document.getElementById("walker-readout");
+  var walkerSel = 6;
+  var walkerRects = [];
+  var walkerTable = [];
+  var walkerSetup = Guide.setupCanvas(walkerCanvas, 640, 400, function () { if (walkerSetup) walkerDraw(); });
+
+  function walkerBuild() {
+    var bs = parseInt(walkerBs.value, 10);
+    var len = parseInt(walkerLen.value, 10);
+    var n = Math.ceil(len / bs);
+    var pool = [];
+    for (var i = 0; i < n; i++) pool.push(i);
+    var r = Guide.seededRandom(90 + bs * 7 + len);
+    for (var k = pool.length - 1; k > 0; k--) {
+      var j = Math.floor(r() * (k + 1));
+      var tmp = pool[k]; pool[k] = pool[j]; pool[j] = tmp;
+    }
+    walkerTable = pool;
+    if (walkerSel >= len) walkerSel = len - 1;
+  }
+
+  function walkerDraw() {
+    var ctx = walkerSetup.ctx, W = 640, H = 400;
+    ctx.clearRect(0, 0, W, H);
+    var bs = parseInt(walkerBs.value, 10);
+    var len = parseInt(walkerLen.value, 10);
+    var n = Math.ceil(len / bs);
+    var pad = 14;
+    var cols = Math.min(len, 32);
+    var rows = Math.ceil(len / cols);
+    var cellW = (W - pad * 2) / cols;
+    var cellH = Math.min(24, 110 / rows);
+    var top = 26;
+    ctx.font = "600 11px " + C.font;
+    ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("logical tokens", pad, 16);
+    walkerRects = [];
+    var selBlock = Math.floor(walkerSel / bs);
+    for (var i = 0; i < len; i++) {
+      var col = i % cols, row = Math.floor(i / cols);
+      var x = pad + col * cellW, y = top + row * cellH;
+      var blk = Math.floor(i / bs);
+      var isSel = i === walkerSel;
+      ctx.fillStyle = isSel ? C.accent2 : (blk % 2 ? "#dbe9f0" : "#eef3f6");
+      ctx.fillRect(x, y, cellW - 1, cellH - 1);
+      if (blk === selBlock) {
+        ctx.strokeStyle = C.accent; ctx.lineWidth = 1.4;
+        ctx.strokeRect(x + 0.5, y + 0.5, cellW - 2, cellH - 2);
+      }
+      if (i % bs === 0) {
+        ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(x, y - 2); ctx.lineTo(x, y + cellH + 1); ctx.stroke();
+        ctx.fillStyle = C.text; ctx.font = "9px " + C.font; ctx.textAlign = "left";
+        ctx.fillText("L" + blk, x + 2, y - 3);
+      }
+      walkerRects.push({ x: x, y: y, w: cellW, h: cellH, i: i });
+    }
+    var logicalBottom = top + rows * cellH;
+    ctx.font = "600 11px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("block table (logical → physical)", pad, logicalBottom + 22);
+
+    // table string with selected highlighted
+    var tx = pad, ty = logicalBottom + 40;
+    ctx.font = "11px " + C.mono;
+    for (var b = 0; b < n; b++) {
+      var str = "L" + b + "→P" + walkerTable[b];
+      var w = ctx.measureText(str).width + 10;
+      if (tx + w > W - pad) { tx = pad; ty += 18; }
+      ctx.fillStyle = b === selBlock ? C.accent : "#e7e2d9";
+      ctx.fillRect(tx, ty - 11, w, 15);
+      ctx.fillStyle = b === selBlock ? "#fff" : C.text;
+      ctx.fillText(str, tx + 5, ty);
+      tx += w + 6;
+    }
+
+    // physical pool
+    var py = ty + 34;
+    ctx.font = "600 11px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("physical blocks in the pool", pad, py - 6);
+    var pcols = Math.min(n, 16);
+    var pcellW = (W - pad * 2) / pcols, pcellH = 26;
+    var selPhys = walkerTable[selBlock];
+    for (var p = 0; p < n; p++) {
+      var pc = p % pcols, pr = Math.floor(p / pcols);
+      var px = pad + pc * pcellW, pyy = py + pr * pcellH;
+      ctx.fillStyle = p === selPhys ? C.accent : "#e7e2d9";
+      ctx.fillRect(px, pyy, pcellW - 2, pcellH - 4);
+      ctx.fillStyle = p === selPhys ? "#fff" : C.text;
+      ctx.font = "10px " + C.mono; ctx.textAlign = "center";
+      ctx.fillText("P" + p, px + (pcellW - 2) / 2, pyy + pcellH * 0.65);
+    }
+
+    var frag = (n * bs - len) / (n * bs);
+    var off = walkerSel % bs;
+    walkerReadout.innerHTML =
+      '<div><span class="k">token</span> #' + walkerSel + ' → <span class="hi">L' + selBlock + '</span> offset ' + off + '</div>' +
+      '<div><span class="k">physical</span> <span class="hi">P' + walkerTable[selBlock] + '</span></div>' +
+      '<div><span class="k">blocks</span> ' + n + ' × ' + bs + ' = ' + (n * bs) + '</div>' +
+      '<div><span class="k">internal frag</span> <span class="bad">' + pct(frag) + '</span></div>';
+  }
+
+  walkerCanvas.addEventListener("click", function (ev) {
+    var h = Guide.hitTest(walkerCanvas, ev);
+    for (var i = 0; i < walkerRects.length; i++) {
+      var r = walkerRects[i];
+      if (h.x >= r.x && h.x <= r.x + r.w && h.y >= r.y && h.y <= r.y + r.h) {
+        walkerSel = r.i; walkerDraw(); return;
+      }
+    }
+  });
+  Guide.bindSliders([walkerBs, walkerLen], function () { walkerBuild(); walkerDraw(); });
+  walkerBuild();
+  walkerDraw();
+
+  // =====================================================================
+  // Demo 3 — copy-on-write
+  // =====================================================================
+  var COW_BS = 8, COW_SHARED = 20;
+  var cowBeamsEl = document.getElementById("cow-beams");
+  var cowWrite = document.getElementById("cow-write");
+  var cowReset = document.getElementById("cow-reset");
+  var cowReadout = document.getElementById("cow-readout");
+  var cowCanvas = document.getElementById("cow-canvas");
+  var cowSetup;
+  var cowState, cowNext = 0;
+
+  function prefixBlocks() { return Math.ceil(COW_SHARED / COW_BS); }
+
+  function cowInit() {
+    var beams = parseInt(cowBeamsEl.value, 10);
+    var pb = prefixBlocks();
+    var phys = [];
+    for (var i = 0; i < pb; i++) {
+      var tok = Math.min(COW_BS, COW_SHARED - i * COW_BS);
+      phys.push({ refs: beams, owner: -1, tokens: tok, shared: true });
+    }
+    var beamsArr = [];
+    for (var b = 0; b < beams; b++) {
+      var blocks = [];
+      for (var j = 0; j < pb; j++) blocks.push(j);
+      beamsArr.push({ blocks: blocks, tokens: COW_SHARED });
+    }
+    cowState = { phys: phys, beams: beamsArr, copies: 0, log: "shared prefix: " + COW_SHARED + " tokens in " + pb + " blocks" };
+    cowNext = 0;
+  }
+
+  function cowWriteOne() {
+    var b = cowNext % cowState.beams.length;
+    cowNext++;
+    var beam = cowState.beams[b];
+    var li = Math.floor(beam.tokens / COW_BS);
+    if (li < beam.blocks.length) {
+      var p = beam.blocks[li];
+      if (cowState.phys[p].refs > 1) {
+        var np = cowState.phys.length;
+        cowState.phys.push({ refs: 1, owner: b, tokens: cowState.phys[p].tokens, shared: false });
+        cowState.phys[p].refs--;
+        beam.blocks[li] = np;
+        cowState.copies++;
+        cowState.log = "beam " + b + ": copied 1 block (P" + p + "→P" + np + ")";
+      }
+    } else {
+      var np2 = cowState.phys.length;
+      cowState.phys.push({ refs: 1, owner: b, tokens: 0, shared: false });
+      beam.blocks.push(np2);
+      cowState.log = "beam " + b + ": allocated new block P" + np2;
+    }
+    beam.tokens++;
+    var lb = Math.floor((beam.tokens - 1) / COW_BS);
+    var used = beam.tokens - lb * COW_BS;
+    if (cowState.phys[beam.blocks[lb]]) cowState.phys[beam.blocks[lb]].tokens = Math.min(COW_BS, used);
+  }
+
+  function cowDraw() {
+    var ctx = cowSetup.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var pad = 14;
+    ctx.font = "600 11px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("physical blocks (refcount)", pad, 16);
+    var pb = prefixBlocks();
+    var bw = 54, bh = 26, bgap = 8;
+    ctx.font = "10px " + C.mono;
+    cowState.phys.forEach(function (p, i) {
+      var x = pad + i * (bw + bgap);
+      if (x + bw > W - pad) return;
+      ctx.fillStyle = p.shared ? "#cfe7f1" : "#f6d3e2";
+      ctx.fillRect(x, 26, bw, bh);
+      ctx.strokeStyle = p.refs > 1 ? C.accent2 : C.divider;
+      ctx.lineWidth = p.refs > 1 ? 1.6 : 1;
+      ctx.strokeRect(x + 0.5, 26.5, bw - 1, bh - 1);
+      ctx.fillStyle = C.text; ctx.textAlign = "center";
+      ctx.fillText("P" + i, x + bw / 2, 38);
+      ctx.fillText("×" + p.refs, x + bw / 2, 49);
+      ctx.textAlign = "left";
+    });
+
+    var y0 = 86;
+    ctx.font = "600 11px " + C.font; ctx.fillStyle = C.text;
+    ctx.fillText("beams (block tables, last block highlighted)", pad, y0 - 8);
+    cowState.beams.forEach(function (beam, b) {
+      var y = y0 + b * 42;
+      ctx.font = "11px " + C.mono; ctx.fillStyle = C.text;
+      ctx.fillText("beam " + b + " · " + beam.tokens + " tok", pad, y + 18);
+      var x = pad + 108;
+      beam.blocks.forEach(function (p, li) {
+        var isLast = li === beam.blocks.length - 1;
+        ctx.fillStyle = isLast ? C.accent : "#e7e2d9";
+        ctx.fillRect(x, y, 40, 26);
+        ctx.fillStyle = isLast ? "#fff" : C.text;
+        ctx.font = "10px " + C.mono; ctx.textAlign = "center";
+        ctx.fillText("P" + p, x + 20, y + 17);
+        x += 46;
+      });
+    });
+    cowReadout.innerHTML =
+      '<div><span class="k">blocks copied</span> <span class="hi">' + cowState.copies + '</span></div>' +
+      '<div><span class="k">physical blocks</span> ' + cowState.phys.length + '</div>' +
+      '<div><span class="k">last action</span> ' + cowState.log + '</div>';
+  }
+
+  cowWrite.addEventListener("click", function () { cowWriteOne(); cowDraw(); });
+  cowReset.addEventListener("click", function () { cowInit(); cowDraw(); });
+  cowInit();
+  cowSetup = Guide.setupCanvas(cowCanvas, 640, 320, function () { if (cowSetup) cowDraw(); });
+  cowDraw();
+  Guide.bindSliders([cowBeamsEl], function () { cowInit(); cowDraw(); });
+
+  // =====================================================================
+  // Demo 4 — watermarks
+  // =====================================================================
+  var wmPool = document.getElementById("wm-pool");
+  var wmSeqs = document.getElementById("wm-seqs");
+  var wmReadout = document.getElementById("wm-readout");
+  var wmCanvas = document.getElementById("wm-canvas");
+  var wmSetup = Guide.setupCanvas(wmCanvas, 640, 170, function () { if (wmSetup) wmDraw(); });
+
+  function wmDraw() {
+    var ctx = wmSetup.ctx, W = 640, H = 170;
+    ctx.clearRect(0, 0, W, H);
+    var pool = parseInt(wmPool.value, 10);
+    var seqs = parseInt(wmSeqs.value, 10);
+    var perSeq = Math.ceil(512 / 16);
+    var used = Math.min(pool, seqs * perSeq);
+    var free = pool - used;
+    var low = Math.max(1, Math.round(0.04 * pool));
+    var high = Math.max(low + 1, Math.round(0.08 * pool));
+    var need = perSeq;
+    var freeAfter = free - need;
+    var preempted = 0;
+    if (freeAfter < low && seqs > 0) {
+      preempted = Math.ceil((high - freeAfter) / perSeq);
+      preempted = Math.min(preempted, seqs);
+    }
+    var pad = 16, barY = 54, barH = 40, barW = W - pad * 2;
+    ctx.font = "600 12px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("block pool: " + pool + " blocks", pad, 24);
+    ctx.font = "11px " + C.font; ctx.globalAlpha = 0.6;
+    ctx.fillText("4 KB per block at 1 KB/token cache", pad, 40);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#e7e2d9"; ctx.fillRect(pad, barY, barW, barH);
+    ctx.fillStyle = C.accent; ctx.fillRect(pad, barY, barW * (used / pool), barH);
+    function xOf(v) { return pad + barW * (v / pool); }
+    ctx.setLineDash([4, 3]); ctx.lineWidth = 1.4;
+    ctx.strokeStyle = C.accent2; ctx.beginPath(); ctx.moveTo(xOf(pool - low), barY - 8); ctx.lineTo(xOf(pool - low), barY + barH + 8); ctx.stroke();
+    ctx.strokeStyle = C.accent700; ctx.beginPath(); ctx.moveTo(xOf(pool - high), barY - 8); ctx.lineTo(xOf(pool - high), barY + barH + 8); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = "10px " + C.mono; ctx.fillStyle = C.accent2; ctx.textAlign = "center";
+    ctx.fillText("low " + low, xOf(pool - low), barY - 12);
+    ctx.fillStyle = C.accent700;
+    ctx.fillText("high " + high, xOf(pool - high), barY - 12);
+    ctx.font = "11px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("used " + used + " · free " + free, pad, barY + barH + 26);
+    wmReadout.innerHTML =
+      '<div><span class="k">free blocks</span> ' + free + ' (low ' + low + ', high ' + high + ')</div>' +
+      '<div><span class="k">new request needs</span> ' + need + ' blocks</div>' +
+      '<div><span class="k">preempted to make room</span> <span class="' + (preempted ? "bad" : "hi") + '">' + (preempted || "none") + '</span></div>';
+  }
+  Guide.bindSliders([wmPool, wmSeqs], wmDraw);
+  wmDraw();
+
+  // =====================================================================
+  // Demo 5 — recompute vs swap crossover
+  // =====================================================================
+  var peBw = document.getElementById("pe-bw");
+  var peLen = document.getElementById("pe-len");
+  var peReadout = document.getElementById("preempt-readout");
+  var peCanvas = document.getElementById("preempt-canvas");
+  var peSetup = Guide.setupCanvas(peCanvas, 640, 340, function () { if (peSetup) peDraw(); });
+
+  function prefillMsPerToken() {
+    return 2 * NUM.paramsB * 1e9 / (NUM.peakTFLOPs * 1e12 * 0.40) * 1000;
+  }
+  function swapMsPerToken(pcie) {
+    return 2 * NUM.bytesPerToken / (pcie * 1e9) * 1000;
+  }
+  function recomputeCost(t) { return t * prefillMsPerToken(); }
+  function swapCost(t, pcie) { return 20 + t * swapMsPerToken(pcie); }
+  function crossover(pcie) {
+    var d = prefillMsPerToken() - swapMsPerToken(pcie);
+    if (d <= 1e-9) return Infinity;
+    return 20 / d;
+  }
+
+  function peDraw() {
+    var ctx = peSetup.ctx, W = 640, H = 340;
+    var pcie = parseInt(peBw.value, 10);
+    var len = parseInt(peLen.value, 10);
+    var tMax = 4096;
+    var yMax = Math.max(recomputeCost(tMax), swapCost(tMax, pcie)) * 1.05;
+    var rec = [], sw = [];
+    for (var t = 0; t <= tMax; t += 64) {
+      rec.push({ x: t, y: recomputeCost(t) });
+      sw.push({ x: t, y: swapCost(t, pcie) });
+    }
+    var geo = Guide.drawLines(ctx, W, H,
+      [{ points: rec, color: C.accent, width: 2.4 }, { points: sw, color: C.accent2, width: 2.4 }],
+      [0, tMax], [0, yMax],
+      { xLabel: "cached sequence length (tokens)", yLabel: "eviction + restore cost (ms)", padL: 52, padB: 34 });
+    var tStar = crossover(pcie);
+    if (tStar <= tMax) {
+      var xs = geo.px(tStar);
+      ctx.setLineDash([5, 4]); ctx.strokeStyle = C.text; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(xs, geo.padT); ctx.lineTo(xs, geo.padT + geo.plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = C.text; ctx.font = "10px " + C.font; ctx.textAlign = "center";
+      ctx.fillText("crossover " + Math.round(tStar), xs, geo.padT + 10);
+    }
+    var xl = geo.px(len);
+    ctx.strokeStyle = C.accent700; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(xl, geo.padT); ctx.lineTo(xl, geo.padT + geo.plotH); ctx.stroke();
+    function dot(pts, color) {
+      var y = pts[Math.round(len / 64)] ? pts[Math.round(len / 64)].y : pts[0].y;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(geo.px(len), geo.py(y), 4, 0, Math.PI * 2); ctx.fill();
+    }
+    dot(rec, C.accent); dot(sw, C.accent2);
+    ctx.font = "11px " + C.font; ctx.textAlign = "left";
+    ctx.fillStyle = C.accent; ctx.fillText("recompute (prefill FLOPs)", geo.padL + 8, geo.padT + 14);
+    ctx.fillStyle = C.accent2; ctx.fillText("swap to CPU (PCIe)", geo.padL + 8, geo.padT + 30);
+
+    var rc = recomputeCost(len), sc = swapCost(len, pcie);
+    var win = rc <= sc ? "recompute" : "swap";
+    peReadout.innerHTML =
+      '<div><span class="k">recompute</span> <span class="hi">' + Guide.fmtMs(rc) + '</span> (' + prefillMsPerToken().toFixed(4) + ' ms/tok)</div>' +
+      '<div><span class="k">swap</span> <span class="hi">' + Guide.fmtMs(sc) + '</span> (' + swapMsPerToken(pcie).toFixed(4) + ' ms/tok + 20 ms)</div>' +
+      '<div><span class="k">cheaper at ' + len + '</span> <span class="' + (win === "swap" ? "bad" : "hi") + '">' + win + '</span></div>' +
+      '<div><span class="k">crossover</span> ' + (tStar === Infinity ? "none" : Math.round(tStar) + " tokens") + '</div>';
+  }
+  Guide.bindSliders([peBw, peLen], peDraw);
+  peDraw();
+
+  // =====================================================================
+  // Demo 6 — preemption rate vs pool size
+  // =====================================================================
+  var thrashPool = document.getElementById("thrash-pool");
+  var thrashReadout = document.getElementById("thrash-readout");
+  var thrashCanvas = document.getElementById("thrash-canvas");
+  var thrashWork = ServingSim.workload({ seed: 13, rate: 3, promptMean: 300, promptCV: 0.6, decodeMean: 100, decodeCV: 0.7, horizon: 15000 });
+  var thrashPools = [256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
+  var thrashCurve = null;
+  var thrashSetup = Guide.setupCanvas(thrashCanvas, 640, 300, function () { if (thrashSetup) thrashDraw(); });
+
+  function runPool(blocks) {
+    return ServingSim.run({
+      requests: thrashWork.requests, horizon: 15000, policy: "fcfs",
+      capacity: 32, kvBlocks: blocks, blockSize: 16, stepMs: 20, preempt: "recompute"
+    });
+  }
+  function thrashSweep() {
+    thrashCurve = thrashPools.map(function (b) {
+      var r = runPool(b);
+      var pre = 0;
+      Object.keys(r.perReq).forEach(function (k) { pre += r.perReq[k].preemptions; });
+      return { x: b * 16, y: r.finished.length ? pre / r.finished.length : 0, blocks: b };
+    });
+  }
+
+  function thrashDraw() {
+    var blocks = parseInt(thrashPool.value, 10);
+    if (!thrashCurve) thrashCurve = [];
+    var cur = runPool(blocks);
+    var pre = 0, maxPre = 0;
+    Object.keys(cur.perReq).forEach(function (k) {
+      pre += cur.perReq[k].preemptions;
+      if (cur.perReq[k].preemptions > maxPre) maxPre = cur.perReq[k].preemptions;
+    });
+    var rate = cur.finished.length ? pre / cur.finished.length : 0;
+    var yMax = Math.max.apply(null, thrashCurve.map(function (p) { return p.y; })) || 1;
+    yMax = Math.max(yMax, rate) * 1.1 + 0.3;
+    var xMax = thrashPools[thrashPools.length - 1] * 16;
+    var geo = Guide.drawLines(thrashSetup.ctx, 640, 300,
+      [{ points: thrashCurve, color: C.accent400, width: 2 }],
+      [0, xMax], [0, yMax],
+      { xLabel: "KV pool (tokens)", yLabel: "preemptions / request", padL: 52, padB: 34 });
+    var xp = blocks * 16;
+    thrashSetup.ctx.setLineDash([5, 4]); thrashSetup.ctx.strokeStyle = C.accent700; thrashSetup.ctx.lineWidth = 1.2;
+    thrashSetup.ctx.beginPath(); thrashSetup.ctx.moveTo(geo.px(xp), geo.padT); thrashSetup.ctx.lineTo(geo.px(xp), geo.padT + geo.plotH); thrashSetup.ctx.stroke();
+    thrashSetup.ctx.setLineDash([]);
+    thrashSetup.ctx.fillStyle = C.accent2;
+    thrashSetup.ctx.beginPath(); thrashSetup.ctx.arc(geo.px(xp), geo.py(Math.min(yMax, rate)), 4, 0, Math.PI * 2); thrashSetup.ctx.fill();
+    thrashReadout.innerHTML =
+      '<div><span class="k">preemptions</span> ' + pre + ' over ' + cur.finished.length + ' finished</div>' +
+      '<div><span class="k">rate</span> <span class="' + (rate > 0.5 ? "bad" : "hi") + '">' + rate.toFixed(2) + ' / request</span></div>' +
+      '<div><span class="k">worst request</span> ' + maxPre + ' evictions</div>' +
+      '<div><span class="k">throughput</span> ' + cur.stats.throughput.toFixed(0) + ' tok/s</div>';
+  }
+  Guide.bindSliders([thrashPool], thrashDraw);
+  thrashSweep();
+  thrashDraw();
+
+  // =====================================================================
+  function redrawAll() {
+    fragDraw(); walkerDraw(); cowDraw(); wmDraw(); peDraw(); thrashDraw();
+  }
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

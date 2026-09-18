@@ -1,0 +1,636 @@
+---
+title: "LLM Serving, Interactively — Part 1: The decode loop and the memory wall"
+description: "Why a single decode step is a bandwidth problem, not a compute problem — the bytes moved per token, the roofline that separates prefill from decode, and why doubling FLOPs barely helps."
+permalink: "/ai/llm-serving/decode-loop/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-verdict { font-family: var(--font-mono); font-size: 12px; margin-top: 8px; }
+  .g-verdict .mem { color: var(--color-accent-2-700); font-weight: 600; }
+  .g-verdict .cmp { color: var(--color-accent-700); font-weight: 600; }
+  .g-partcard { text-decoration: none; color: inherit; display: block; }
+  .g-partcard:hover { box-shadow: var(--shadow-md); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 1 of 20</span>
+    <h1>The decode loop and the memory wall</h1>
+    <p>Training produces one fixed function. Serving it turns that function into a factory: requests arrive, tokens stream out, and the bill is set by which resource each phase starves. This part builds the smallest model that predicts what a token costs — and shows why the first fix most people reach for, more FLOPs, does almost nothing.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="loop">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The autoregressive loop as a systems problem</h2></div>
+    <p class="g-eyebrow">One token at a time</p>
+    <p>Part 11 of the <a href="{{ '/ai/llm-training/inference/' | relative_url }}">training guide's inference chapter</a> introduced the KV cache and the prefill/decode split. That page answers <em>what</em> happens. This series answers <em>how much</em>: how many bytes move, how many FLOPs exist to hide them, and where a real machine actually spends its time.</p>
+    <p>A decoder-only transformer emits token <var>t+1</var> by running a forward pass over all tokens so far, reading the final logits, sampling, and appending. The load-bearing phrase is <em>all tokens so far</em>: attention needs the keys and values of every earlier position, so an engine caches them and computes only the newest position each step. That cache is why generation is linear in output length instead of quadratic. It is also, as this page shows, why generation is slow.</p>
+    <p>Strip a decode step to its bones and three things happen. Every weight in the model is read from HBM to multiply the single new activation vector. Every resident sequence's KV cache is read for attention. A tiny number of FLOPs is issued — roughly <var>2P</var> per token for <var>P</var> parameters. The step time is therefore set by bytes, not arithmetic:</p>
+    <div class="g-math g-katex">$$T_{\text{step}} \;\approx\; \frac{P \cdot b_p \;+\; \text{KV}_{\text{read}}}{\text{BW}} \;+\; T_{\text{overhead}}$$</div>
+    <p>where <var>P</var> is parameters, <var>b<sub>p</sub></var> is bytes per parameter, and <var>BW</var> is HBM bandwidth. For a 70B model in bf16 that numerator starts at 140 GB, before any KV. At H100 bandwidth (3.35 TB/s) the floor is about 42 ms per token — roughly 24 tokens/s for one stream, no matter how fast the tensor cores are. This is the memory wall: generation is a bandwidth problem wearing a compute costume.</p>
+    <div class="g-goal">💡 <span><b>Carry one number through the series:</b> a decode step is worth on the order of <b>1–2 FLOPs per byte</b> of memory traffic. Every optimization from here — batching, quantization, speculation, disaggregation — is a way of changing that ratio or the traffic it multiplies.</span></div>
+    <p class="g-source" id="decode-source"></p>
+  </section>
+
+  <section class="g-step" id="two-programs">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Prefill and decode are two different programs</h2></div>
+    <p class="g-eyebrow">Same weights, opposite bottlenecks</p>
+    <p><strong>Prefill</strong> consumes the whole prompt at once. It is one large matrix multiplication over <var>P<sub>prompt</sub></var> tokens: weights are read once and reused <var>P<sub>prompt</sub></var> times, so the arithmetic intensity is enormous and the GPU runs compute-bound near its tensor-core ceiling. <strong>Decode</strong> consumes one token per sequence per step. Weights are read once and reused once, so intensity collapses and the GPU stalls on HBM. The <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">GQA and MLA mechanisms</a> shrink the KV term — the second term above — but they cannot touch the weight term, which is why they buy concurrency rather than raw single-stream speed.</p>
+    <p>The practical consequence is that one request is two workloads with a phase change in the middle, and the two phases want different hardware. Watch the shape of the work: prefill fills a grid of positions in a single sweep; decode adds positions one at a time.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="anim-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">2,000 positions. Prefill processes all of them in one pass; decode adds exactly one per tick. This is why TTFT and TPOT are measured separately — they are different machines.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="anim-prefill" class="g-primary">Prefill (one flash)</button>
+          <button id="anim-decode">Decode (one token at a time)</button>
+          <button id="anim-play">Play</button>
+        </div>
+        <div class="g-readout" id="anim-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="intensity">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Arithmetic intensity</h2></div>
+    <p class="g-eyebrow">FLOPs per byte decides everything</p>
+    <p>Arithmetic intensity is FLOPs divided by bytes moved from HBM. For a decode step, FLOPs are <var>2P·B</var> for batch <var>B</var> and bytes are roughly <var>P·b<sub>p</sub></var> for the weights; the <var>P</var> cancels, leaving intensity that depends only on precision and batch:</p>
+    <div class="g-math g-katex">$$\text{AI}_{\text{decode}} \;\approx\; \frac{2B}{b_p}\text{ FLOPs/byte},\qquad \text{AI}_{\text{prefill}} \;\approx\; \frac{2P_{\text{prompt}}}{b_p}\text{ FLOPs/byte}$$</div>
+    <p>In bf16, single-stream decode sits at about <strong>1 FLOP/byte</strong>. A 2,048-token prefill sits near <strong>2,048 FLOPs/byte</strong> — a gap of three orders of magnitude inside the same call. Raising batch is the one knob that moves decode intensity without changing the model: each extra sequence in the batch reuses the same weight read for another set of FLOPs. The KV cache, though, grows with batch <em>and</em> context, so it eventually reclaims the byte budget. Move the sliders below to watch weights dominate at low batch and KV take over at high batch.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="budget-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Bytes read per decode step, split into weights (accent) and KV cache (magenta). Shared linear scale, so the bars show absolute traffic.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Parameters (B) <span class="val">70</span></label><input type="range" id="budget-params" min="1" max="405" step="1" value="70"></div>
+        <div class="g-field"><label>Bytes per parameter <span class="val">2</span></label><input type="range" id="budget-bpp" min="0.5" max="2" step="0.5" value="2"></div>
+        <div class="g-field"><label>Batch <span class="val">1</span></label><input type="range" id="budget-batch" min="1" max="256" step="1" value="1"></div>
+        <div class="g-field"><label>HBM bandwidth (TB/s) <span class="val">3.35</span></label><input type="range" id="budget-bw" min="0.8" max="8" step="0.05" value="3.35"></div>
+        <div class="g-field"><label>KV bytes per token per sequence <span id="budget-kv-val">328 KB</span></label><input type="range" id="budget-kv" min="4096" max="1048576" step="4096" value="327680"></div>
+        <div class="g-readout" id="budget-readout"></div>
+      </div>
+    </div>
+    <div class="g-verdict" id="budget-verdict"></div>
+  </section>
+
+  <section class="g-step" id="roofline">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The roofline</h2></div>
+    <p class="g-eyebrow">Two ceilings, one knee</p>
+    <p>A roofline plots attainable throughput against arithmetic intensity. On the left of the knee the bandwidth line <var>AI · BW</var> binds; on the right the flat compute ceiling <var>peak</var> binds. The knee sits at <var>peak / BW</var>, the ridge point. For an H100 that ridge is <strong>295 FLOPs/byte</strong> (989 TFLOP/s ÷ 3.35 TB/s); for a B200 it is about <strong>281</strong> (2,250 ÷ 8). Faster silicon moves the ceilings but not the shape, and decode at batch 1 lives far to the left of the knee on every accelerator ever built.</p>
+    <p>Prefill and decode are two points on this same curve, and batching slides the decode point rightward. Drag either point: the decode point changes batch, the prefill point changes prompt length. The verdict under the canvas says which ceiling owns each point.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="roof-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Log–log axes. Drag the prefill point horizontally to change prompt length; drag the decode point to change batch.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch (decode point) <span class="val">8</span></label><input type="range" id="roof-batch" min="1" max="1024" step="1" value="8"></div>
+        <div class="g-field"><label>Prompt tokens (prefill point) <span class="val">2048</span></label><input type="range" id="roof-prompt" min="128" max="16384" step="128" value="2048"></div>
+        <div class="g-readout" id="roof-readout"></div>
+      </div>
+    </div>
+    <div class="g-verdict" id="roof-verdict"></div>
+  </section>
+
+  <section class="g-step" id="batching">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Batching as the way up it</h2></div>
+    <p class="g-eyebrow">Reuse the weight read</p>
+    <p>If one decode step must read 140 GB of weights, the obvious move is to amortize that read over more work. Batching <var>B</var> sequences does exactly that: the same weight sweep produces <var>B</var> tokens. Aggregate throughput therefore rises almost linearly with batch while the step stays memory-bound — and then stops rising once the batch is large enough to push the step over the ridge into compute-bound territory. From that point on, more batch adds KV traffic and queueing delay without adding throughput. The <a href="{{ '/ai/llm-training/long-context/' | relative_url }}">long-context chapter</a> owns what happens when the KV term is the dominant one.</p>
+    <p>The curve below is the whole argument in one picture. It uses the same bytes-vs-FLOPs model as the rest of the page and marks the batch where decode crosses the ridge.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="batch-canvas" width="640" height="280"></canvas>
+        <p class="g-canvas-hint">Aggregate tokens/s across a batch of resident sequences, computed with the step-time model. The dashed line is the ridge crossing.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch <span class="val">128</span></label><input type="range" id="batch-slider" min="1" max="512" step="1" value="128"></div>
+        <div class="g-readout" id="batch-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The batching rule:</b> throughput scales with batch until the step becomes compute-bound, then flattens. Part 6 turns this static picture into continuous batching, where the batch is refilled every iteration rather than fixed per group.</span></div>
+  </section>
+
+  <section class="g-step" id="mfu-mbu">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>MFU vs MBU</h2></div>
+    <p class="g-eyebrow">Two utilizations, one honest dashboard</p>
+    <p>Model FLOPs utilization (MFU) is achieved FLOPs over peak FLOPs; memory-bandwidth utilization (MBU) is achieved bytes/s over peak bandwidth. A memory-bound workload cannot have both. At batch 1 the decode step above runs at roughly <strong>100% MBU and well under 1% MFU</strong> — the HBM is saturated while the tensor cores idle. Reporting MFU alone therefore makes a perfectly tuned decode server look broken, and chasing MFU leads straight into the trap below.</p>
+    <p>Toggle the two levers on a single decode step and watch which one moves the needle. Doubling peak FLOPs changes step time by a rounding error; doubling HBM bandwidth nearly halves it. The readout reports the change in aggregate tokens/s and the live MFU/MBU split.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="trap-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Aggregate tokens/s for the selected batch under four hardware assumptions.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch <span class="val">1</span></label><input type="range" id="trap-batch" min="1" max="512" step="1" value="1"></div>
+        <div class="g-btnrow">
+          <button id="trap-flops">2× peak FLOPs</button>
+          <button id="trap-bw">2× HBM bandwidth</button>
+        </div>
+        <div class="g-readout" id="trap-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The "twice the FLOPs" trap:</b> at low batch an accelerator with double the tensor-core peak buys a fraction of a percent on decode, while double the memory bandwidth buys nearly 2×. Match the chip to the phase; prefill wants FLOPs, decode wants bytes. Part 2 maps the accelerator zoo around exactly this split.</span></div>
+  </section>
+
+  <section class="g-step" id="map">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Map of the series</h2></div>
+    <p class="g-eyebrow">Where each remaining part fits</p>
+    <p>Everything after this page is a lever on one of the three terms above: the weight bytes (quantization, parallelism, MoE), the KV bytes (paging, prefix caching, GQA/MLA, long context), or the effective batch and its scheduling (continuous batching, schedulers, disaggregation). The glossary collects every constant cited here.</p>
+    <div class="g-grid3" style="margin-top:14px;">
+      {% for part in site.data.series.llm_serving.parts %}
+      <a class="g-card g-partcard reveal" href="{{ part.permalink | relative_url }}">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">{{ part.short }}</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.35;">{{ part.title }}</div>
+      </a>
+      {% endfor %}
+      {% for extra in site.data.series.llm_serving.appendix %}
+      <a class="g-card g-partcard reveal" href="{{ extra.permalink | relative_url }}">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">Reference</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.35;">{{ extra.title }}</div>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Quantity</th><th>Decode</th><th>Prefill</th></tr></thead>
+      <tbody>
+        <tr><td>Arithmetic intensity (bf16)</td><td>≈ batch, ~1 FLOP/byte at batch 1</td><td>≈ prompt tokens, thousands of FLOPs/byte</td></tr>
+        <tr><td>Bottleneck</td><td>HBM bandwidth</td><td>Tensor-core FLOPs</td></tr>
+        <tr><td>Bytes per step</td><td><var>P·b<sub>p</sub></var> + KV(batch, context)</td><td><var>P·b<sub>p</sub></var> once, reused <var>P<sub>prompt</sub></var>×</td></tr>
+        <tr><td>Ridge point</td><td colspan="2">peak ÷ bandwidth ≈ 295 FLOPs/byte on H100, ≈ 281 on B200</td></tr>
+        <tr><td>Right utilization metric</td><td>MBU (want ~100%), MFU is misleading</td><td>MFU (want high), bandwidth rarely binds</td></tr>
+        <tr><td>Main lever</td><td>Batch to amortize the weight read, then quantize</td><td>Faster tensor cores, chunking to protect ITL</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Williams, Waterman &amp; Patterson, <a href="https://doi.org/10.1145/1498765.1498785">"Roofline: An Insightful Visual Performance Model for Multicore Architectures"</a>, CACM 2009.</li>
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">"Efficient Memory Management for Large Language Model Serving with PagedAttention"</a>, SOSP 2023.</li>
+      <li>Yu et al., <a href="https://www.usenix.org/conference/osdi22/presentation/yu">"Orca: A Distributed Serving System for Transformer-Based Generative Models"</a>, OSDI 2022.</li>
+      <li>Pope et al., <a href="https://arxiv.org/abs/2211.05102">"Efficiently Scaling Transformer Inference"</a>, MLSys 2023.</li>
+      <li>Zhong et al., <a href="https://arxiv.org/abs/2401.09670">"DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving"</a>, OSDI 2024.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Bandwidth is the headline number. Next: the machines that supply it, the interconnect that bounds them, and the energy each token costs.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.__SERVING_NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var c = Guide.colors();
+
+  var FALLBACK = {
+    accelerators: {
+      source: "Vendor datasheets. H100 SXM: 989 dense BF16 TFLOP/s, 3.35 TB/s HBM, 80 GB. B200: 2,250 dense BF16 TFLOP/s, 8 TB/s HBM3e. Offline fallback constants.",
+      items: [
+        { name: "NVIDIA H100 SXM", bwTBs: 3.35, bf16TFLOPs: 989 },
+        { name: "NVIDIA B200", bwTBs: 8.0, bf16TFLOPs: 2250 }
+      ]
+    },
+    model_configs: {
+      source: "Official model configs. Llama 3.1 70B: 80 layers, 8 KV heads, head_dim 128, GQA. Offline fallback constants.",
+      items: [
+        { name: "Llama 3.1 70B", layers: 80, n_kv_heads: 8, d_head: 128, totalParamsB: 70.6 }
+      ]
+    }
+  };
+
+  var CFG = {
+    paramsB: 70,
+    bytesPerParam: 2,
+    peakTFLOPs: 989,
+    bwTBs: 3.35,
+    kvPerToken: 327680,
+    context: 4096
+  };
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(n, d) { return Guide.fmtNum(n, d == null ? 0 : d); }
+
+  // ------------------------------------------------------------------
+  // Demo A — decode step budget
+  // ------------------------------------------------------------------
+  var A = {
+    params: el('budget-params'), bpp: el('budget-bpp'), batch: el('budget-batch'),
+    bw: el('budget-bw'), kv: el('budget-kv')
+  };
+  var setupA = Guide.setupCanvas(el('budget-canvas'), 640, 360, drawA);
+
+  function aVals() {
+    return {
+      params: parseFloat(A.params.value),
+      bpp: parseFloat(A.bpp.value),
+      batch: parseInt(A.batch.value, 10),
+      bw: parseFloat(A.bw.value),
+      kv: parseFloat(A.kv.value)
+    };
+  }
+  function weightsAt(v) { return v.params * 1e9 * v.bpp; }
+  function kvAt(v, b) { return v.kv * b * CFG.context; }
+  function totalAt(v, b) { return weightsAt(v) + kvAt(v, b); }
+  function tokAt(v, b) { return b * v.bw * 1e12 / totalAt(v, b); }
+
+  function drawA() {
+    if (!setupA) return;
+    var v = aVals();
+    el('budget-kv-val').textContent = Guide.fmtBytes(v.kv);
+    function row(label, b) {
+      var w = weightsAt(v), k = kvAt(v, b);
+      return {
+        label: label,
+        segments: [
+          { value: w, color: c.accent, name: 'weights' },
+          { value: k, color: c.accent2, name: 'KV' }
+        ]
+      };
+    }
+    // The middle row tracks the slider; drop it when it would duplicate a reference row.
+    var rows = [row('B = 1', 1)];
+    if (v.batch !== 1 && v.batch !== 256) rows.push(row('B = ' + v.batch, v.batch));
+    rows.push(row('B = 256', 256));
+    Guide.drawStacked(setupA.ctx, 640, 360, rows, {
+      padL: 74, padR: 18, padT: 22, padB: 40, gap: 18,
+      showSegmentLabels: true, axisLabel: 'bytes read per decode step — weights + KV (shared linear scale)'
+    });
+    // legend
+    var ctx = setupA.ctx;
+    ctx.font = '11px ' + c.font;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.fillRect(74, 8, 10, 10);
+    ctx.fillStyle = c.text; ctx.fillText('weights', 88, 17);
+    ctx.fillStyle = c.accent2; ctx.fillRect(150, 8, 10, 10);
+    ctx.fillStyle = c.text; ctx.fillText('KV cache', 164, 17);
+
+    var tw = weightsAt(v), tk = kvAt(v, v.batch), tot = tw + tk;
+    var wpct = 100 * tw / tot, kpct = 100 * tk / tot;
+    var t1 = tokAt(v, 1), tc = tokAt(v, v.batch), t256 = tokAt(v, 256);
+    el('budget-readout').innerHTML =
+      '<div><span class="k">bytes / step @ B=' + v.batch + '</span> <span class="hi">' + Guide.fmtBytes(tot) + '</span></div>' +
+      '<div><span class="k">weights</span> ' + Guide.fmtBytes(tw) + ' (' + wpct.toFixed(1) + '%) &nbsp; <span class="k">KV</span> ' + Guide.fmtBytes(tk) + ' (' + kpct.toFixed(1) + '%)</div>' +
+      '<div><span class="k">aggregate tokens/s</span> B=1: <span class="hi">' + t1.toFixed(1) + '</span>' +
+        (v.batch === 1 || v.batch === 256 ? '' : ' &nbsp; B=' + v.batch + ': <span class="hi">' + tc.toFixed(1) + '</span>') +
+        ' &nbsp; B=256: <span class="hi">' + t256.toFixed(1) + '</span></div>' +
+      '<div><span class="k">per-sequence tokens/s @ B=' + v.batch + '</span> ' + (tc / v.batch).toFixed(2) + '</div>';
+
+    var ai = 2 * v.batch / v.bpp;
+    var ridge = CFG.peakTFLOPs / v.bw;
+    el('budget-verdict').innerHTML = 'decode intensity ≈ <b>' + ai.toFixed(1) + ' FLOPs/byte</b> · ridge (this BW) ≈ <b>' +
+      ridge.toFixed(0) + '</b> · ' + (ai < ridge
+        ? '<span class="mem">memory-bound</span> — weights dominate at B=1 (' + wpct.toFixed(0) + '%)'
+        : '<span class="cmp">compute-bound</span> — batch has passed the ridge');
+  }
+
+  Guide.bindSliders([A.params, A.bpp, A.batch, A.bw, A.kv], drawA);
+
+  // ------------------------------------------------------------------
+  // Demo B — draggable roofline
+  // ------------------------------------------------------------------
+  var B = { batch: el('roof-batch'), prompt: el('roof-prompt'), drag: null };
+  var R = { xMin: 0.5, xMax: 4000, yMin: 0.5, yMax: 2000, padL: 52, padR: 18, padT: 34, padB: 34 };
+  var setupB = Guide.setupCanvas(el('roof-canvas'), 640, 380, drawB);
+
+  function bPts() {
+    var rf = ServingSim.roofline({ peakTFLOPs: CFG.peakTFLOPs, bwTBs: CFG.bwTBs });
+    var aiD = 2 * parseInt(B.batch.value, 10) / CFG.bytesPerParam;
+    var aiP = 2 * parseInt(B.prompt.value, 10) / CFG.bytesPerParam;
+    return {
+      rf: rf,
+      aiD: Math.max(1e-3, aiD), aiP: Math.max(1e-3, aiP),
+      perfD: rf.attainable(aiD), perfP: rf.attainable(aiP)
+    };
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 380;
+    var p = bPts();
+    ctx.clearRect(0, 0, W, H);
+    var plotW = W - R.padL - R.padR, plotH = H - R.padT - R.padB;
+    function lx(ai) { return R.padL + plotW * Math.log(ai / R.xMin) / Math.log(R.xMax / R.xMin); }
+    function ly(t) { return R.padT + plotH * (1 - Math.log(Math.max(R.yMin, t) / R.yMin) / Math.log(R.yMax / R.yMin)); }
+    function invLx(x) { return R.xMin * Math.pow(R.xMax / R.xMin, (x - R.padL) / plotW); }
+
+    // regions
+    var xr = lx(Math.max(R.xMin, Math.min(R.xMax, p.rf.ridge)));
+    ctx.fillStyle = 'rgba(214,0,108,0.05)';
+    ctx.fillRect(R.padL, R.padT, xr - R.padL, plotH);
+    ctx.fillStyle = 'rgba(43,95,255,0.06)';
+    ctx.fillRect(xr, R.padT, R.padL + plotW - xr, plotH);
+
+    // grid + ticks
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    var decade;
+    for (decade = 1; decade <= 1000; decade *= 10) {
+      var gx = lx(decade);
+      if (gx >= R.padL && gx <= R.padL + plotW) {
+        ctx.beginPath(); ctx.moveTo(gx, R.padT); ctx.lineTo(gx, R.padT + plotH); ctx.stroke();
+        ctx.textAlign = 'center'; ctx.fillText(String(decade), gx, H - 8);
+      }
+      var gy = ly(decade);
+      if (gy >= R.padT && gy <= R.padT + plotH) {
+        ctx.beginPath(); ctx.moveTo(R.padL, gy); ctx.lineTo(R.padL + plotW, gy); ctx.stroke();
+        ctx.textAlign = 'right'; ctx.fillText(String(decade), R.padL - 6, gy + 3);
+      }
+    }
+    ctx.textAlign = 'center'; ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.fillText('arithmetic intensity (FLOPs / byte, log)', R.padL + plotW / 2, H - 2);
+    ctx.save(); ctx.translate(12, R.padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('attainable TFLOP/s (log)', 0, 0); ctx.restore();
+
+    // roofline curve
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 2.4; ctx.beginPath();
+    var started = false;
+    for (var i = 0; i <= 160; i++) {
+      var ai = R.xMin * Math.pow(R.xMax / R.xMin, i / 160);
+      var perf = p.rf.attainable(ai);
+      var X = lx(ai), Y = ly(perf);
+      if (!started) { ctx.moveTo(X, Y); started = true; } else ctx.lineTo(X, Y);
+    }
+    ctx.stroke();
+
+    // ridge
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(xr, R.padT); ctx.lineTo(xr, R.padT + plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.textAlign = 'left'; ctx.font = '10px ' + c.font;
+    ctx.fillText('ridge = peak/BW ≈ ' + p.rf.ridge.toFixed(0), Math.min(xr + 4, W - 130), R.padT + 12);
+
+    // points
+    function point(ai, perf, label, color) {
+      var X = lx(Math.max(R.xMin, Math.min(R.xMax, ai)));
+      var Y = ly(Math.max(R.yMin, Math.min(R.yMax, perf)));
+      ctx.beginPath(); ctx.arc(X, Y, 7, 0, 2 * Math.PI);
+      ctx.fillStyle = color; ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(X, Y, 7, 0, 2 * Math.PI);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+      var left = X > R.padL + plotW * 0.62;
+      ctx.textAlign = left ? 'right' : 'left';
+      ctx.fillText(label, X + (left ? -9 : 9), Y - 10);
+    }
+    point(p.aiD, p.perfD, 'decode · ' + (p.rf.bound(p.aiD) === 'memory' ? 'memory-bound' : 'compute-bound'), c.accent2);
+    point(p.aiP, p.perfP, 'prefill · ' + (p.rf.bound(p.aiP) === 'memory' ? 'memory-bound' : 'compute-bound'), c.accent);
+
+    el('roof-readout').innerHTML =
+      '<div><span class="k">decode</span> AI=' + p.aiD.toFixed(1) + ' → <span class="hi">' + p.perfD.toFixed(1) + ' TFLOP/s</span> (' + p.rf.bound(p.aiD) + ')</div>' +
+      '<div><span class="k">prefill</span> AI=' + p.aiP.toFixed(0) + ' → <span class="hi">' + p.perfP.toFixed(0) + ' TFLOP/s</span> (' + p.rf.bound(p.aiP) + ')</div>' +
+      '<div><span class="k">ridge</span> ' + p.rf.ridge.toFixed(0) + ' FLOPs/byte</div>';
+    el('roof-verdict').innerHTML = 'AI = 2·tokens / bytes-per-parameter, so batch and prompt length map directly to the x-axis.';
+  }
+
+  Guide.bindSliders([B.batch, B.prompt], drawB);
+
+  function roofDragStart(ev) {
+    var h = Guide.hitTest(el('roof-canvas'), ev);
+    var p = bPts();
+    var plotW = 640 - R.padL - R.padR, plotH = 380 - R.padT - R.padB;
+    function lx(ai) { return R.padL + plotW * Math.log(ai / R.xMin) / Math.log(R.xMax / R.xMin); }
+    function ly(t) { return R.padT + plotH * (1 - Math.log(Math.max(R.yMin, t) / R.yMin) / Math.log(R.yMax / R.yMin)); }
+    var dD = Math.hypot(h.x - lx(p.aiD), h.y - ly(p.perfD));
+    var dP = Math.hypot(h.x - lx(p.aiP), h.y - ly(p.perfP));
+    if (Math.min(dD, dP) > 22) return;
+    B.drag = dD <= dP ? 'decode' : 'prefill';
+    if (ev.preventDefault) ev.preventDefault();
+    window.addEventListener('pointermove', roofDragMove);
+    window.addEventListener('pointerup', roofDragEnd);
+  }
+  function roofDragMove(ev) {
+    if (!B.drag) return;
+    var h = Guide.hitTest(el('roof-canvas'), ev);
+    var plotW = 640 - R.padL - R.padR;
+    var ai = R.xMin * Math.pow(R.xMax / R.xMin, (h.x - R.padL) / plotW);
+    var tokens = Math.max(1, Math.round(ai * CFG.bytesPerParam / 2));
+    if (B.drag === 'decode') B.batch.value = Math.max(1, Math.min(1024, tokens));
+    else B.prompt.value = Math.max(128, Math.min(16384, Math.round(tokens / 128) * 128));
+    drawB();
+  }
+  function roofDragEnd() {
+    B.drag = null;
+    window.removeEventListener('pointermove', roofDragMove);
+    window.removeEventListener('pointerup', roofDragEnd);
+  }
+  el('roof-canvas').addEventListener('pointerdown', roofDragStart);
+
+  // ------------------------------------------------------------------
+  // Demo C — prefill vs decode animation
+  // ------------------------------------------------------------------
+  var ROWS = 40, COLS = 50, CELLS = ROWS * COLS;
+  var grid = [];
+  var cursor = 0, animMode = 'prefill';
+  var setupC = Guide.setupCanvas(el('anim-canvas'), 640, 300, drawC);
+  function resetGrid() { grid = []; for (var r = 0; r < ROWS; r++) { var row = []; for (var q = 0; q < COLS; q++) row.push(0); grid.push(row); } cursor = 0; }
+  resetGrid();
+
+  function animReadout(extra) {
+    var filled = cursor;
+    el('anim-readout').innerHTML =
+      '<div><span class="k">mode</span> <span class="hi">' + (animMode === 'prefill' ? 'prefill' : 'decode') + '</span></div>' +
+      '<div><span class="k">tokens materialised</span> ' + filled + ' / ' + CELLS + '</div>' +
+      '<div><span class="k">engine steps</span> ' + (animMode === 'prefill' && filled === CELLS ? '1' : filled) + '</div>' +
+      (extra ? '<div>' + extra + '</div>' : '');
+  }
+  function drawC() {
+    if (!setupC) return;
+    Guide.drawHeatmap(setupC.ctx, 640, 300, grid, {
+      min: 0, max: 1, rowLabels: null, colLabels: null, padL: 8, padB: 8
+    });
+    var ctx = setupC.ctx;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(8, 6, 624, 286);
+    animReadout(animMode === 'decode' && cursor < CELLS ? 'one token per tick — this is why inter-token latency exists' : '');
+  }
+  var animLoop = Guide.loop({
+    onStep: function () {
+      if (animMode === 'prefill') {
+        for (var r = 0; r < ROWS; r++) for (var q = 0; q < COLS; q++) grid[r][q] = 1;
+        cursor = CELLS; drawC(); animLoop.stop(); return;
+      }
+      if (cursor < CELLS) {
+        var idx = cursor;
+        grid[Math.floor(idx / COLS)][idx % COLS] = 1;
+        cursor++;
+      } else { animLoop.stop(); }
+      drawC();
+    },
+    button: el('anim-play'), interval: 5, playLabel: 'Play', pauseLabel: 'Pause'
+  });
+  el('anim-prefill').addEventListener('click', function () {
+    animLoop.stop(); animMode = 'prefill';
+    el('anim-prefill').className = 'g-primary'; el('anim-decode').className = '';
+    resetGrid(); cursor = CELLS;
+    for (var r = 0; r < ROWS; r++) for (var q = 0; q < COLS; q++) grid[r][q] = 1;
+    drawC();
+  });
+  el('anim-decode').addEventListener('click', function () {
+    animLoop.stop(); animMode = 'decode';
+    el('anim-decode').className = 'g-primary'; el('anim-prefill').className = '';
+    resetGrid(); drawC();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — the "twice the FLOPs" trap
+  // ------------------------------------------------------------------
+  var D = { batch: el('trap-batch'), flops: false, bw: false };
+  var setupD = Guide.setupCanvas(el('trap-canvas'), 640, 300, drawD);
+  function stepFor(batch, mulPeak, mulBw) {
+    return ServingSim.stepTime({
+      paramsB: CFG.paramsB, bytesPerParam: CFG.bytesPerParam,
+      kvBytes: CFG.kvPerToken * batch * CFG.context,
+      bwTBs: CFG.bwTBs * mulBw, peakTFLOPs: CFG.peakTFLOPs * mulPeak, batch: batch
+    });
+  }
+  function drawD() {
+    if (!setupD) return;
+    var b = parseInt(D.batch.value, 10);
+    var mp = D.flops ? 2 : 1, mb = D.bw ? 2 : 1;
+    var base = stepFor(b, 1, 1), vf = stepFor(b, 2, 1), vb = stepFor(b, 1, 2), vboth = stepFor(b, 2, 2);
+    function tps(s) { return b * 1000 / s.totalMs; }
+    var data = [
+      { label: 'baseline', value: tps(base), valueLabel: tps(base).toFixed(0) + ' tok/s' },
+      { label: '2× peak FLOPs', value: tps(vf), valueLabel: tps(vf).toFixed(0) + ' tok/s' },
+      { label: '2× HBM BW', value: tps(vb), valueLabel: tps(vb).toFixed(0) + ' tok/s' },
+      { label: 'both', value: tps(vboth), valueLabel: tps(vboth).toFixed(0) + ' tok/s' }
+    ];
+    Guide.drawBars(setupD.ctx, 640, 300, data, { maxV: tps(vboth) * 1.08, padL: 108 });
+
+    var flops = 2 * CFG.paramsB * 1e9 * b;
+    var bytes = CFG.paramsB * 1e9 * CFG.bytesPerParam + CFG.kvPerToken * b * CFG.context;
+    var mfu = (flops / (base.totalMs / 1000)) / (CFG.peakTFLOPs * 1e12) * 100;
+    var mbu = (bytes / (base.totalMs / 1000)) / (CFG.bwTBs * 1e12) * 100;
+    var dF = (tps(vf) / tps(base) - 1) * 100, dB = (tps(vb) / tps(base) - 1) * 100;
+    el('trap-readout').innerHTML =
+      '<div><span class="k">step time</span> ' + Guide.fmtMs(base.totalMs) + ' (' + base.bound + '-bound)</div>' +
+      '<div><span class="k">2× FLOPs → tokens/s</span> <span class="hi">' + (dF >= 0 ? '+' : '') + dF.toFixed(1) + '%</span></div>' +
+      '<div><span class="k">2× bandwidth → tokens/s</span> <span class="hi">' + (dB >= 0 ? '+' : '') + dB.toFixed(1) + '%</span></div>' +
+      '<div><span class="k">MFU</span> ' + mfu.toFixed(2) + '% &nbsp; <span class="k">MBU</span> ' + mbu.toFixed(0) + '%</div>';
+  }
+  el('trap-flops').addEventListener('click', function () {
+    D.flops = !D.flops; this.className = D.flops ? 'g-primary' : ''; drawD();
+  });
+  el('trap-bw').addEventListener('click', function () {
+    D.bw = !D.bw; this.className = D.bw ? 'g-primary' : ''; drawD();
+  });
+  Guide.bindSliders([D.batch], drawD);
+
+  // ------------------------------------------------------------------
+  // Demo E — throughput vs batch curve
+  // ------------------------------------------------------------------
+  var E = { batch: el('batch-slider') };
+  var setupE = Guide.setupCanvas(el('batch-canvas'), 640, 280, drawE);
+  function aggTok(b) { var s = stepFor(b, 1, 1); return b * 1000 / s.totalMs; }
+  function drawE() {
+    if (!setupE) return;
+    var pts = [], perPts = [], ridgeB = null;
+    for (var b = 1; b <= 512; b += 4) {
+      var s = stepFor(b, 1, 1);
+      pts.push({ x: b, y: b * 1000 / s.totalMs });
+      perPts.push({ x: b, y: 1000 / s.totalMs });
+      if (ridgeB == null && s.bound === 'compute') ridgeB = b;
+    }
+    var maxY = 0;
+    pts.forEach(function (p) { if (p.y > maxY) maxY = p.y; });
+    var axes = Guide.drawLines(setupE.ctx, 640, 280,
+      [{ points: pts, color: c.accent, width: 2.4 }],
+      [0, 512], [0, maxY * 1.12],
+      { xLabel: 'batch (resident sequences)', yLabel: 'tokens / s', padL: 52, padB: 30 });
+    var ctx = setupE.ctx;
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6; ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    perPts.forEach(function (p, i) {
+      var X = axes.px(p.x), Y = axes.py(Math.max(0, Math.min(maxY * 1.12, p.y)));
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke(); ctx.setLineDash([]);
+    if (ridgeB != null) {
+      var rx = axes.px(ridgeB);
+      ctx.strokeStyle = c.accent2; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(rx, axes.padT); ctx.lineTo(rx, 280 - 30); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('compute-bound past B≈' + ridgeB, Math.min(rx + 4, 470), axes.padT + 12);
+    }
+    var cur = parseInt(E.batch.value, 10);
+    var cx = axes.px(cur);
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1; ctx.globalAlpha = 0.4;
+    ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, 280 - 30); ctx.stroke(); ctx.globalAlpha = 1;
+
+    var agg = aggTok(cur), per = 1000 / stepFor(cur, 1, 1).totalMs;
+    el('batch-readout').innerHTML =
+      '<div><span class="k">batch</span> ' + cur + '</div>' +
+      '<div><span class="k">aggregate</span> <span class="hi">' + agg.toFixed(0) + ' tok/s</span></div>' +
+      '<div><span class="k">per sequence</span> ' + per.toFixed(2) + ' tok/s</div>' +
+      '<div><span class="k">speedup vs B=1</span> ' + (agg / aggTok(1)).toFixed(1) + '×</div>' +
+      '<div class="k">solid = aggregate · dashed = per sequence</div>';
+  }
+  Guide.bindSliders([E.batch], drawE);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    if (data && data.accelerators && data.accelerators.items) {
+      var h100 = null;
+      data.accelerators.items.forEach(function (a) {
+        if (/H100/i.test(a.name)) h100 = a;
+      });
+      if (h100) {
+        CFG.peakTFLOPs = h100.bf16TFLOPs || CFG.peakTFLOPs;
+        CFG.bwTBs = h100.bwTBs || CFG.bwTBs;
+      }
+    }
+    if (data && data.model_configs && data.model_configs.items) {
+      var m = null;
+      data.model_configs.items.forEach(function (x) {
+        if (/Llama 3\.1 70B/i.test(x.name)) m = x;
+      });
+      if (m && m.layers && m.n_kv_heads && m.d_head) {
+        CFG.kvPerToken = 2 * m.layers * m.n_kv_heads * m.d_head * 2;
+        el('budget-kv').value = CFG.kvPerToken;
+      }
+    }
+    var src = [];
+    if (data && data.accelerators && data.accelerators.source) src.push(data.accelerators.source);
+    if (data && data.model_configs && data.model_configs.source) src.push(data.model_configs.source);
+    el('decode-source').textContent = src.join(' ') || FALLBACK.accelerators.source;
+    drawA(); drawB(); drawD(); drawE();
+  }
+
+  fetch(window.__SERVING_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawD(); drawE(); drawC();
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,557 @@
+---
+title: "Agents in Action, Interactively — Part 19: The frontier, and what's unsolved"
+description: "Multimodal and voice and the roughly 800 ms realtime budget; the small-model and on-device shift; what MCP, A2A, AP2 and x402 standardise and what protocols cannot express; reliability compounding; and how to keep up without chasing."
+permalink: "/ai/agents-in-action/frontier/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>The frontier, and what's unsolved</h1>
+    <p>Every part before this one was about a system you can measure: a loop, a tool, a context budget, an eval set. This part is about the edge, where the measurements get harder. Voice and multimodal agents live or die inside a latency budget that has no slack. Small models are moving onto the device, changing what "good enough" costs. Protocols are standardising tools, agent-to-agent handoff and payments, and yet cannot express the things that actually go wrong. And reliability compounds, so a per-step number that looks fine is a product that fails. We finish on the one durable skill in a field that resets every few months: telling the fundamentals apart from the dated facts, and reading rather than chasing.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="voice">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Multimodal and voice: a budget with no slack</h2></div>
+    <p class="g-eyebrow">Roughly 500–1000 ms end-to-end, commonly cited as ~800 ms</p>
+    <p>A voice agent is a pipeline with a hard user-facing contract: the gap between the moment a person stops talking and the moment the agent starts talking back has to feel like a reply, not a lookup. That rules out most of what makes a text agent comfortable. There is no time to retrieve a large candidate set, no time to run a verification pass, and no time for a second model to read the first model's output. The budget is roughly <strong>500–1000 ms end-to-end</strong>, commonly cited as about 800 ms, and it has to cover the whole loop: <strong>turn detection</strong>, <strong>ASR</strong> (speech to text), the <strong>language model's time to first token</strong>, <strong>TTS</strong> (text to speech), and the <strong>network</strong> in both directions.</p>
+    <p>The cited figures below are illustrative — a shape, not a spec — but the shape is the lesson. The four ordinary stages already consume the entire 800 ms: roughly 150 ms of ASR, 300 ms to first token, 250 ms of speech synthesis and 100 ms of network. That leaves nothing for the genuinely hard part. <strong>Turn detection</strong> — deciding that the user has finished speaking rather than merely paused — is where the variability lives. Be too eager and you interrupt a person mid-thought; be too slow and every reply feels sluggish. It is hard because human turn-taking is not a silence threshold: people pause to think, they backchannel ("mm-hm") while you are talking, and the agent's own voice must not be mistaken for input. Every millisecond a detector spends being careful is a millisecond added to the experience.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="voice-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">A waterfall of the realtime budget. Each bar starts where the previous stage ended; the shaded band is the 500–1000 ms conversational range; the dashed line is the ~800 ms target. Drag any stage past the target and the overrun turns red.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Turn detection <span class="val">60</span></label><input type="range" id="voice-turn" min="0" max="400" step="10" value="60"></div>
+        <div class="g-field"><label>ASR <span class="val">150</span></label><input type="range" id="voice-asr" min="50" max="300" step="10" value="150"></div>
+        <div class="g-field"><label>LLM time to first token <span class="val">300</span></label><input type="range" id="voice-llm" min="100" max="800" step="10" value="300"></div>
+        <div class="g-field"><label>TTS <span class="val">250</span></label><input type="range" id="voice-tts" min="50" max="500" step="10" value="250"></div>
+        <div class="g-field"><label>Network round trip <span class="val">100</span></label><input type="range" id="voice-net" min="10" max="300" step="10" value="100"></div>
+        <div class="g-readout" id="voice-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="frontier-voice-source"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> treating the latency budget as a per-component target instead of a total one. Each stage can hit its number and the loop still overrun, because they add up — and turn detection is the term nobody budgeted for. The only honest way to design a voice agent is to measure the end-to-end gap in the conditions people actually use it: bad networks, interruptions, background noise.</span></div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> a realtime interface is a <b>latency allocation problem</b>. You decide how much of the gap each stage may spend before you choose any model, and then every design decision — how small the model, how short the answer, whether to stream — is made against that allocation.</span></div>
+  </section>
+
+  <section class="g-step" id="on-device">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Small models on the device</h2></div>
+    <p class="g-eyebrow">Distilled, quantised, and close to the user</p>
+    <p>The other half of the realtime story is not a faster network, it is not needing the network. A model that runs locally erases three costs at once: the round trip and the queue (<strong>latency</strong>), the per-token bill (<strong>cost</strong>), and the trip to someone else's servers (<strong>privacy</strong>). What it does not erase is the quality gap. Two techniques close most of it for a narrow job. <strong>Distillation</strong> trains a small student model to reproduce the outputs — or the reasoning traces — of a large teacher on your task, so the student inherits competence on that task rather than on everything. <strong>Quantisation</strong> stores weights at lower precision (4-bit or 8-bit) so the model fits in the memory of a phone or a laptop's NPU, at a small, measurable accuracy cost.</p>
+    <p>The productive framing is not "small versus large" but "which quality does <em>this step</em> need". Most agent traffic is easy: classify an intent, extract a field, decide whether to call a tool, reformat a result. A distilled model that clears the eval bar on that 80% of traffic is not a compromise — it is a product. The hard 20% escalates. That is a <strong>routing cascade</strong>: try the cheap local model first, check a confidence or verification signal, and hand the remainder to a large remote model. It is the same retrieve-wide-then-rerank-narrow shape from earlier parts, applied to model choice.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="device-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Quality against latency for the cloud-large, cloud-small and on-device options; bubble size is cost per million output tokens and the ring marks the selected row. The faint points are other points on the same curve — the tradeoff is a continuum, not three buckets.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="device-large">Cloud, large</button>
+          <button id="device-small" class="g-primary">Cloud, small / distilled</button>
+          <button id="device-local">On-device, quantised</button>
+        </div>
+        <div class="g-readout" id="device-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> run <b>the cheapest model that clears the eval bar for each step</b>, and escalate on a measured signal. The eval set you built in Act II is what makes that decision safe; without it, "small enough" is a guess.</span></div>
+  </section>
+
+  <section class="g-step" id="protocols">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Protocols: MCP, A2A, AP2, x402</h2></div>
+    <p class="g-eyebrow">What they standardise, and what they cannot express</p>
+    <p>The protocol layer has been filling in fast. <strong>MCP</strong> (the Model Context Protocol) standardises how a model discovers and calls tools and resources, so a tool written once can be used by many clients; its spec revisions are dated, and the 2026 revision streamlines the core toward a stateless request/response model with explicit session handles. <strong>A2A</strong> standardises agent-to-agent communication: how one agent advertises its capabilities and delegates a task to another. <strong>AP2</strong> and <strong>x402</strong> standardise the money: agent-initiated payment mandates and authorisation (AP2), and an HTTP-native payment handshake (x402). Each one removes a class of bespoke integration work, and that is real.</p>
+    <p>None of them, however, standardises the things that actually break. A protocol can carry the bytes of a request; it cannot tell you whether the request expressed the user's <strong>intent</strong>, whether the counterparty deserves <strong>trust</strong>, who carries <strong>liability</strong> when the action was wrong, or what a <strong>promise</strong> means. Those are semantic and institutional problems wearing a technical costume. Two agents can exchange perfectly well-formed messages and still be in complete disagreement about what was agreed — because the message said "I will book the cheaper flight" and the verifier, the user and the airline each read a different commitment into it. Protocols move syntax and transport. The unsolved layer is meaning, and it will not be closed by a spec revision.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="proto-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Each protocol standardises a different interface. The band underneath is what none of them standardises — and it is where the interesting failures live. Select a protocol to highlight it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="proto-mcp" class="g-primary">MCP</button>
+          <button id="proto-a2a">A2A</button>
+          <button id="proto-pay">AP2 / x402</button>
+        </div>
+        <div class="g-readout" id="proto-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="frontier-mcp-source"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> assuming that because two systems speak the same protocol they share the same <em>meaning</em>. Interoperability of transport is not interoperability of intent, and an agent that pays a counterparty correctly is not thereby authorised, trusted or indemnified.</span></div>
+  </section>
+
+  <section class="g-step" id="reliability">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Reliability compounds</h2></div>
+    <p class="g-eyebrow">A good per-step number is a bad product</p>
+    <p>A text system fails one time. An agent fails at every step, and a task is only a success if <em>every</em> step succeeds. If each step is independent with success probability <var>p</var>, the chance the whole task succeeds is <var>p<sup>n</sup></var> for an <var>n</var>-step task — and that exponent is brutal. A step that succeeds 95% of the time sounds excellent in isolation. Twenty of them in a row succeed <strong>0.95²⁰ ≈ 0.36</strong>: the agent fails most of the tasks it attempts. This is arithmetic, not pessimism, and it explains why harness design — a step budget, loop detection, verification between steps, checkpoints you can resume from — is load-bearing rather than polish.</p>
+    <div class="g-grid2" style="margin: 4px 0 14px;">
+      <div class="g-card reveal">
+        <div class="g-math g-katex">$$P_{\text{task}} \;=\; p^{\,n}$$</div>
+        <p>End-to-end success for an <var>n</var>-step task at per-step reliability <var>p</var>, assuming independence. It is the same compounding that makes a small per-step improvement worth more than it looks.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="g-math g-katex">$$\frac{P_{p+\delta}}{P_p} \;=\; \left(1+\frac{\delta}{p}\right)^{n}$$</div>
+        <p>Raising the per-step rate by a small <var>δ</var> is amplified by the exponent. Moving 0.95 to 0.97 turns 0.36 into 0.54 — a per-step gain of two points, a task gain of eighteen.</p>
+      </div>
+    </div>
+    <p>Move the per-step reliability and watch the curve fall away, then note how much the dashed "improved by two points" line buys. The lesson is the same one the deployment parts made: the lever is rarely a bigger model — it is removing steps, verifying them, and retrying the ones you can.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rel-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">End-to-end success <var>p<sup>n</sup></var> against task length. The solid line is the current per-step rate; the dashed line is the same task with the per-step rate improved by two points.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Per-step success rate <span class="val">0.95</span></label><input type="range" id="rel-p" min="0.8" max="0.999" step="0.001" value="0.95"></div>
+        <div class="g-readout" id="rel-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="frontier-agents-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> with an exponent in the path, <b>step count is a first-class quality metric</b>. A change that removes two steps or makes one of them verifiable can beat a model upgrade outright — and it is measurable on your own held-out set.</span></div>
+  </section>
+
+  <section class="g-step" id="keep-up">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>How to keep up without chasing</h2></div>
+    <p class="g-eyebrow">Fundamentals versus dated facts</p>
+    <p>The field resets its surface every few months and its foundations almost never. The practical skill is telling the two apart. Durable: the loop is still a loop, the context window is still a budget reassembled every turn, tools still need non-overlapping schemas and errors written for the model, retrieval still trades recall against precision, evaluation is still a labelled set plus a check, and cost is still arithmetic you can do on a napkin. Dated: prices, context-window sizes, benchmark scores, leaderboard positions and spec revisions. Every one of those changes, and every one of them is checkable — so memorising them is a way of being confidently wrong within a quarter.</p>
+    <p>A reading strategy beats a hype cycle. Prefer <strong>primary sources with dates</strong> — a spec revision, a model card, a paper — over a launch post or a thread interpreting one. Keep a <strong>dated reference card</strong> rather than a memorised leaderboard: record what each benchmark measures, how it is graded and its main weakness, and fill in live numbers with the date you read them. When a claim arrives — "X is dead", "Y solves prompt injection", "Z makes agents reliable" — restate it as a hypothesis and test it against <strong>your own held-out set</strong>, because that is the only thing your change can be measured on. And when you cite a volatile number in a design doc, write the date next to it; an undated figure is indistinguishable from a wrong one once the next release ships.</p>
+    <p class="g-source" id="frontier-bench-source"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> following the surface. A team that rebuilds its stack around each new model or framework never accumulates the one asset that compounds — the eval set, the traces and the failure taxonomy that tell them what actually works for their task.</span></div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> invest in the parts that survive a model swap — <b>the harness, the eval set, the traces, the failure taxonomy</b> — and read the volatile parts with a date attached. The frontier moves; the fundamentals are the raft.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that keeps you oriented</th></tr></thead>
+      <tbody>
+        <tr><td>What is the voice latency target?</td><td>Roughly 500–1000 ms end-to-end, commonly cited as ~800 ms — a total budget, not a per-stage one.</td></tr>
+        <tr><td>What fills it?</td><td>Turn detection, ASR, LLM time to first token, TTS and network. The four ordinary stages already spend the 800 ms.</td></tr>
+        <tr><td>What is the hard, variable part?</td><td>Turn detection. Human turn-taking is not a silence threshold; interruptions and backchannels make it a moving target.</td></tr>
+        <tr><td>What buys on-device?</td><td>Latency, privacy and cost. Distillation and quantisation close most of the quality gap for a narrow task.</td></tr>
+        <tr><td>Which model should I run?</td><td>The smallest that clears the eval bar for that step; escalate the hard fraction in a routing cascade.</td></tr>
+        <tr><td>What does MCP standardise?</td><td>How a model discovers and calls tools and resources. Spec revisions are dated.</td></tr>
+        <tr><td>What does A2A standardise?</td><td>Agent-to-agent discovery and task handoff.</td></tr>
+        <tr><td>What do AP2 and x402 standardise?</td><td>Agent payment mandates, authorisation and an HTTP-native payment handshake.</td></tr>
+        <tr><td>What can no protocol express?</td><td>Intent, trust, liability and the semantics of a promise. Protocols move syntax; meaning is unsolved.</td></tr>
+        <tr><td>Why does reliability matter so much?</td><td>Tasks require every step to succeed: 0.95²⁰ ≈ 0.36. Step count is a quality metric.</td></tr>
+        <tr><td>How do I keep up?</td><td>Read primary sources with dates, keep a dated benchmark card, and measure claims on your own held-out set.</td></tr>
+        <tr><td>What compounds?</td><td>The eval set, the traces and the failure taxonomy — the assets that survive a model swap.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">"Building effective agents"</a>, December 2024 — the workflow-versus-agent split that still frames which frontier capability you actually need.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — the write/select/compress/isolate taxonomy, and why the loop outlives any single model.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/built-multi-agent-research-system">"How we built our multi-agent research system"</a>, 13 June 2025 — a worked account of delegation, cost and the harness around a long-horizon agent.</li>
+      <li>Model Context Protocol, <a href="https://modelcontextprotocol.io">specification and revision history</a>, 2024-11-05 through 2026 — the dated revisions behind the tool-interface section.</li>
+      <li>Hinton, Vinyals &amp; Dean, <a href="https://arxiv.org/abs/1503.02531">"Distilling the Knowledge in a Neural Network"</a>, 2015 — the original teacher/student distillation idea behind the small-model shift.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — pass^k, the reliability counterpart to pass@k, and the arithmetic this part leans on.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The five acts are done. The decision tables collect what the volume argued: which of prompt, RAG or tuning to reach for first, which metric matches which failure mode, which defense stops which attack, and a dated card of what the benchmarks actually measure. Next: the reference page.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function setSource(id, text) { var e = el(id); if (e) e.textContent = text || ""; }
+  function setSlider(input, v) {
+    if (!input || v == null) return;
+    input.value = v;
+    var s = input.parentElement ? input.parentElement.querySelector('.val') : null;
+    if (s) s.textContent = input.value;
+  }
+
+  var FALLBACK = {
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The voice budget figures are illustrative of realtime voice pipelines (500-1000 ms end-to-end is the commonly cited target, with turn detection contributing a large, variable share); treat them as a shape, not a spec. Offline fallback constants.",
+      voiceBudgetMs: { total: 800, asr: 150, llmTtft: 300, tts: 250, network: 100 }
+    },
+    mcp: {
+      source: "Model Context Protocol, introduced by Anthropic 2024-11-25 and donated to the Linux Foundation; spec revisions are dated (2024-11-05, 2025-03-26, 2025-06-18). The 2026 revision streamlines the core toward a stateless request/response model with explicit session handles. Offline fallback constants.",
+      specRevisions: ["2024-11-05", "2025-03-26", "2025-06-18", "2026 (stateless core)"]
+    },
+    agents: {
+      source: "Anthropic, 'Effective context engineering for AI agents' (2025-09-29) and 'Building effective agents' (2024-12). Reliability compounding is arithmetic: 0.95^20 \u2248 0.36. Offline fallback constants.",
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    },
+    benchmark_card: {
+      source: "Dated reference card, retrieved 2026-09. Scores are deliberately omitted where they change weekly; the card records what each benchmark measures, how it is graded, and its main failure as a signal. Offline fallback constants.",
+      rows: []
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — voice latency waterfall
+  // ------------------------------------------------------------------
+  var VOICE_BUDGET = 800;
+  var A = { turn: el('voice-turn'), asr: el('voice-asr'), llm: el('voice-llm'), tts: el('voice-tts'), net: el('voice-net') };
+  var setupA = Guide.setupCanvas(el('voice-canvas'), 640, 320, drawA);
+  function voiceStages() {
+    return [
+      { name: 'turn detection', v: +A.turn.value, color: c.accent2 },
+      { name: 'ASR', v: +A.asr.value, color: c.accent },
+      { name: 'LLM TTFT', v: +A.llm.value, color: c.accent400 },
+      { name: 'TTS', v: +A.tts.value, color: '#c9a227' },
+      { name: 'network', v: +A.net.value, color: '#5f8a3a' }
+    ];
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var stages = voiceStages();
+    var total = stages.reduce(function (a, s) { return a + s.v; }, 0);
+    var maxMs = Math.max(1000, total) * 1.08;
+    var padL = 118, padR = 74, padT = 42, padB = 26;
+    var plotW = W - padL - padR;
+    function x(ms) { return padL + plotW * (ms / maxMs); }
+    // conversational band 500-1000 ms
+    ctx.fillStyle = 'rgba(43,95,255,0.07)';
+    ctx.fillRect(x(500), padT - 10, Math.max(0, x(1000) - x(500)), 5 * 34 + 4 * 8 + 10);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('500\u20131000 ms conversational band', (x(500) + x(1000)) / 2, padT - 16);
+    var rowH = 34, gap = 8, cum = 0;
+    var budgetX = x(VOICE_BUDGET);
+    stages.forEach(function (s, i) {
+      var y = padT + i * (rowH + gap);
+      var x0 = x(cum), x1 = x(cum + s.v);
+      ctx.fillStyle = s.color;
+      ctx.fillRect(x0, y, Math.max(1, x1 - x0), rowH);
+      if (x1 > budgetX) {
+        var ox = Math.max(x0, budgetX);
+        ctx.fillStyle = 'rgba(214,0,108,0.85)';
+        ctx.fillRect(ox, y, Math.max(0, x1 - ox), rowH);
+      }
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(s.name, padL - 8, y + rowH * 0.65);
+      ctx.textAlign = 'left';
+      ctx.fillText(Guide.fmtMs(s.v), x1 + 5, y + rowH * 0.65);
+      cum += s.v;
+    });
+    var bottom = padT + stages.length * (rowH + gap) - gap;
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(budgetX, padT - 10); ctx.lineTo(budgetX, bottom + 8); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('target ' + VOICE_BUDGET + ' ms', budgetX, bottom + 22);
+    var over = total - VOICE_BUDGET;
+    el('voice-readout').innerHTML =
+      '<div><span class="k">end-to-end</span> <span class="' + (over > 0 ? 'bad' : 'hi') + '">' + Guide.fmtMs(total) + '</span> vs ' + VOICE_BUDGET + ' ms target</div>' +
+      '<div><span class="k">four standard stages</span> ' + Guide.fmtMs(total - (+A.turn.value)) + ' \u00b7 <span class="k">turn detection</span> ' + Guide.fmtMs(+A.turn.value) + '</div>' +
+      (over > 0
+        ? '<div class="bad">over by ' + Guide.fmtMs(over) + ' \u2014 the pipeline stages alone already spend the target</div>'
+        : '<div class="k">inside the target with ' + Guide.fmtMs(-over) + ' of slack for turn-taking</div>') +
+      '<div class="k">turn detection is the variable term; everything else is a budget line</div>';
+  }
+  Guide.bindSliders([A.turn, A.asr, A.llm, A.tts, A.net], drawA);
+
+  // ------------------------------------------------------------------
+  // Demo B — small model / on-device tradeoff
+  // ------------------------------------------------------------------
+  var CONFIGS = [
+    { id: 'cloud-large', name: 'cloud, large', latency: 1400, quality: 0.89, cost: 15.0, privacy: 0.15 },
+    { id: 'cloud-small', name: 'cloud, small / distilled', latency: 520, quality: 0.79, cost: 1.2, privacy: 0.45 },
+    { id: 'on-device', name: 'on-device, quantised', latency: 170, quality: 0.66, cost: 0.05, privacy: 0.98 },
+    // faint points on the same curve — the tradeoff is continuous
+    { id: 'x1', name: '', latency: 1180, quality: 0.86, cost: 9.0, privacy: 0.25, faint: true },
+    { id: 'x2', name: '', latency: 900, quality: 0.83, cost: 4.0, privacy: 0.32, faint: true },
+    { id: 'x3', name: '', latency: 700, quality: 0.81, cost: 2.1, privacy: 0.40, faint: true },
+    { id: 'x4', name: '', latency: 380, quality: 0.75, cost: 0.6, privacy: 0.58, faint: true },
+    { id: 'x5', name: '', latency: 260, quality: 0.71, cost: 0.2, privacy: 0.75, faint: true },
+    { id: 'x6', name: '', latency: 120, quality: 0.61, cost: 0.05, privacy: 0.95, faint: true }
+  ];
+  var KEYS = ['cloud-large', 'cloud-small', 'on-device'];
+  var DSEL = { id: 'cloud-small' };
+  var setupB = Guide.setupCanvas(el('device-canvas'), 640, 340, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 62, padR = 24, padT = 26, padB = 42;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    function px(ms) { return padL + plotW * (ms / 1600); }
+    function py(q) { return padT + plotH * (1 - (q - 0.55) / 0.45); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('end-to-end latency (ms) \u2192', padL + plotW / 2, H - 6);
+    ctx.save(); ctx.translate(14, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('task quality (pass rate) \u2192', 0, 0); ctx.restore();
+    ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+    [400, 800, 1200, 1600].forEach(function (v) { ctx.fillText(String(v), px(v), padT + plotH + 13); });
+    ctx.textAlign = 'right';
+    [0.6, 0.7, 0.8, 0.9].forEach(function (v) { ctx.fillText(v.toFixed(1), padL - 6, py(v) + 3); });
+    CONFIGS.forEach(function (cfg) {
+      var r = 5 + 15 * Math.sqrt(cfg.cost / 15);
+      var selected = cfg.id === DSEL.id;
+      ctx.beginPath(); ctx.arc(px(cfg.latency), py(cfg.quality), r, 0, 2 * Math.PI);
+      ctx.fillStyle = cfg.faint ? c.accent400 : (cfg.id === 'on-device' ? '#5f8a3a' : c.accent);
+      ctx.globalAlpha = cfg.faint ? 0.22 : (selected ? 0.9 : 0.45);
+      ctx.fill(); ctx.globalAlpha = 1;
+      if (selected) {
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(px(cfg.latency), py(cfg.quality), r + 5, 0, 2 * Math.PI); ctx.stroke();
+      }
+    });
+    var sel = CONFIGS.filter(function (k) { return k.id === DSEL.id; })[0];
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(sel.name, px(sel.latency) + 14, py(sel.quality) - 2);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('quality ' + Guide.fmtPct(sel.quality, 0) + ' \u00b7 ' + Guide.fmtMs(sel.latency) + ' \u00b7 $' + sel.cost.toFixed(2) + '/M out', px(sel.latency) + 14, py(sel.quality) + 12);
+    el('device-readout').innerHTML =
+      '<div><span class="k">selected</span> <span class="hi">' + sel.name + '</span></div>' +
+      '<div><span class="k">quality</span> ' + Guide.fmtPct(sel.quality, 0) + ' \u00b7 <span class="k">latency</span> ' + Guide.fmtMs(sel.latency) + '</div>' +
+      '<div><span class="k">cost</span> $' + sel.cost.toFixed(2) + ' per 1M output tokens \u00b7 <span class="k">stays on device</span> ' + Guide.fmtPct(sel.privacy, 0) + '</div>' +
+      '<div class="k">bubble size = cost; on-device trades ~13 quality points for latency, privacy and a near-zero marginal bill</div>';
+  }
+  function pickDevice(id) {
+    DSEL.id = id; drawB();
+    el('device-large').className = id === 'cloud-large' ? 'g-primary' : '';
+    el('device-small').className = id === 'cloud-small' ? 'g-primary' : '';
+    el('device-local').className = id === 'on-device' ? 'g-primary' : '';
+  }
+  el('device-large').addEventListener('click', function () { pickDevice('cloud-large'); });
+  el('device-small').addEventListener('click', function () { pickDevice('cloud-small'); });
+  el('device-local').addEventListener('click', function () { pickDevice('on-device'); });
+
+  // ------------------------------------------------------------------
+  // Demo C — protocols diagram
+  // ------------------------------------------------------------------
+  var PROTOS = [
+    { id: 'mcp', label: 'MCP', std: 'Model \u2194 tools', lines: ['tool & resource discovery', 'one server, many clients', 'stateless core (2026 revision)'] },
+    { id: 'a2a', label: 'A2A', std: 'Agent \u2194 agent', lines: ['capability advertisement', 'task delegation & handoff', 'long-running task state'] },
+    { id: 'ap2-x402', label: 'AP2 / x402', std: 'Agent \u2194 money', lines: ['payment mandates & auth', 'HTTP-native settlement', 'who may charge whom'] }
+  ];
+  var PSEL = { id: 'mcp' };
+  var setupC = Guide.setupCanvas(el('proto-canvas'), 640, 340, drawC);
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var colW = 190, gap = 23, padL = 10, y = 20, boxH = 150;
+    PROTOS.forEach(function (p, i) {
+      var x = padL + i * (colW + gap);
+      var selected = p.id === PSEL.id;
+      ctx.fillStyle = selected ? 'rgba(43,95,255,0.10)' : 'rgba(0,0,0,0.03)';
+      ctx.fillRect(x, y, colW, boxH);
+      ctx.strokeStyle = selected ? c.accent : c.divider; ctx.lineWidth = selected ? 2 : 1;
+      ctx.strokeRect(x, y, colW, boxH);
+      ctx.fillStyle = selected ? c.accent700 : c.text; ctx.font = '600 14px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(p.label, x + 12, y + 24);
+      ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+      ctx.fillText(p.std, x + 12, y + 42);
+      ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.font;
+      p.lines.forEach(function (ln, j) { ctx.fillText('\u00b7 ' + ln, x + 12, y + 66 + j * 18); });
+      if (selected) {
+        ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+        ctx.fillText('standardised here', x + 12, y + boxH - 12);
+      }
+    });
+    // the band nothing standardises
+    var bandY = 192;
+    ctx.fillStyle = 'rgba(214,0,108,0.08)';
+    ctx.fillRect(padL, bandY, W - padL - 20, 62);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1; ctx.strokeRect(padL, bandY, W - padL - 20, 62);
+    ctx.fillStyle = c.accent2; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('what protocols cannot express', padL + 12, bandY + 20);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.fillText('intent (\u201cwhat they actually wanted\u201d)   \u00b7   trust (may this party act?)   \u00b7   liability (who pays?)', padL + 12, bandY + 40);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('and the semantics of a promise \u2014 a well-formed message is not a shared commitment.', padL + 12, bandY + 55);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('protocols move syntax and transport; the unsolved layer is meaning.', padL, bandY + 76);
+    var sel = PROTOS.filter(function (p) { return p.id === PSEL.id; })[0];
+    el('proto-readout').innerHTML =
+      '<div><span class="k">selected</span> <span class="hi">' + sel.label + '</span> \u00b7 ' + sel.std + '</div>' +
+      '<div class="k">standardises: ' + sel.lines.join('; ') + '</div>' +
+      '<div class="k">cannot express: intent, trust, liability, the semantics of a promise \u2014 the four failure classes that are semantic, not syntactic</div>';
+  }
+  function pickProto(id) {
+    PSEL.id = id; drawC();
+    el('proto-mcp').className = id === 'mcp' ? 'g-primary' : '';
+    el('proto-a2a').className = id === 'a2a' ? 'g-primary' : '';
+    el('proto-pay').className = id === 'ap2-x402' ? 'g-primary' : '';
+  }
+  el('proto-mcp').addEventListener('click', function () { pickProto('mcp'); });
+  el('proto-a2a').addEventListener('click', function () { pickProto('a2a'); });
+  el('proto-pay').addEventListener('click', function () { pickProto('ap2-x402'); });
+
+  // ------------------------------------------------------------------
+  // Demo D — reliability compounding
+  // ------------------------------------------------------------------
+  var REL = { perStep: 0.95, steps: 20 };
+  var setupD = Guide.setupCanvas(el('rel-canvas'), 640, 320, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 320;
+    var p = +el('rel-p').value;
+    var p2 = Math.min(0.999, p + 0.02);
+    var base = [], better = [];
+    for (var n = 1; n <= 40; n++) {
+      base.push({ x: n, y: Math.pow(p, n) });
+      better.push({ x: n, y: Math.pow(p2, n) });
+    }
+    var axes = Guide.drawLines(ctx, W, H,
+      [
+        { points: base, color: c.accent, width: 2.4 },
+        { points: better, color: c.accent2, width: 2.4, dashed: true }
+      ],
+      [1, 40], [0, 1], { xLabel: 'steps in the task n', yLabel: 'end-to-end success p\u207f', padL: 56, padB: 32 });
+    var x20 = axes.px(REL.steps);
+    ctx.strokeStyle = c.divider; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(x20, axes.padT); ctx.lineTo(x20, axes.padT + axes.plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText(REL.steps + ' steps', x20, axes.padT - 4);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.font = '11px ' + c.font;
+    ctx.fillText('p = ' + p.toFixed(3), axes.padL + 8, axes.padT + 14);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('p + 0.02 = ' + p2.toFixed(3), axes.padL + 8, axes.padT + 30);
+    var e = Math.pow(p, REL.steps), e2 = Math.pow(p2, REL.steps);
+    el('rel-readout').innerHTML =
+      '<div><span class="k">at ' + REL.steps + ' steps</span> <span class="hi">' + Guide.fmtPct(e, 1) + '</span> \u00b7 improved ' + Guide.fmtPct(e2, 1) + '</div>' +
+      '<div><span class="k">per-step gain</span> +2.0 pts \u00b7 <span class="k">task gain</span> +' + ((e2 - e) * 100).toFixed(1) + ' pts, amplified by the exponent</div>' +
+      '<div class="k">cited example: 0.95^20 \u2248 0.358 \u2014 a 95%-per-step agent fails most 20-step tasks</div>';
+  }
+  Guide.bindSliders([el('rel-p')], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — sets slider defaults, the cited sources, then redraws
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var d = data || FALLBACK;
+    var vb = (d.cost_latency && d.cost_latency.voiceBudgetMs) || FALLBACK.cost_latency.voiceBudgetMs;
+    if (vb) {
+      VOICE_BUDGET = vb.total || 800;
+      setSlider(A.asr, vb.asr);
+      setSlider(A.llm, vb.llmTtft);
+      setSlider(A.tts, vb.tts);
+      setSlider(A.net, vb.network);
+    }
+    var rel = (d.agents && d.agents.reliabilityExample) || FALLBACK.agents.reliabilityExample;
+    if (rel) {
+      REL.perStep = rel.perStep; REL.steps = rel.steps || 20;
+      setSlider(el('rel-p'), String(rel.perStep));
+    }
+    setSource('frontier-voice-source', (d.cost_latency && d.cost_latency.source) || FALLBACK.cost_latency.source);
+    setSource('frontier-mcp-source', (d.mcp && d.mcp.source) || FALLBACK.mcp.source);
+    setSource('frontier-agents-source', (d.agents && d.agents.source) || FALLBACK.agents.source);
+    setSource('frontier-bench-source', (d.benchmark_card && d.benchmark_card.source) || FALLBACK.benchmark_card.source);
+    drawA(); drawB(); drawC(); drawD();
+  }
+  drawA(); drawB(); drawC(); drawD();
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'frontier-voice-budget',
+      kind: 'choice',
+      prompt: 'In the roughly 800 ms realtime voice budget, which term is the hard, variable one?',
+      options: [
+        { label: 'Turn detection — deciding that the user has actually finished speaking.' },
+        { label: 'ASR — transcribing speech to text is the least predictable stage.' },
+        { label: 'TTS — speech synthesis latency varies most between vendors.' },
+        { label: 'Network — the round trip is the only uncontrolled term.' }
+      ],
+      explanation: 'ASR, LLM time to first token, TTS and network each have a rough floor you can budget against. Turn detection is the variable one: human turn-taking is not a silence threshold, users pause and backchannel, and the agent must not hear its own voice as input.'
+    },
+    {
+      id: 'frontier-reliability-calc',
+      kind: 'numeric',
+      prompt: 'An agent performs each of 10 steps independently with success probability 0.90. What is its end-to-end task success probability? (Round to three decimals.)',
+      answer: 0.349,
+      unit: 'probability',
+      tolerance: 0.005,
+      explanation: 'Every step must succeed, so the task succeeds with probability 0.9\u00b9\u2070 = 0.3487 \u2248 0.349. A 90%-per-step number reads as reliable and is a coin flip for a ten-step task — the same arithmetic as 0.95\u00b2\u2070 \u2248 0.36.'
+    },
+    {
+      id: 'frontier-on-device',
+      kind: 'choice',
+      prompt: 'What does running a distilled, quantised model on-device genuinely buy, and at what price?',
+      options: [
+        { label: 'Latency, privacy and cost; the price is some task quality, closed by distillation and quantisation.' },
+        { label: 'Better quality than the cloud model, at the price of memory.' },
+        { label: 'Nothing measurable; on-device models are a toy.' },
+        { label: 'Lower latency only; privacy and cost are unchanged.' }
+      ],
+      explanation: 'A local model removes the network round trip, keeps data on the device, and avoids a per-token bill. Distillation and quantisation close most of the quality gap for a narrow task, which is why the right question is which quality each step needs.'
+    },
+    {
+      id: 'frontier-protocols-limits',
+      kind: 'choice',
+      prompt: 'MCP, A2A, AP2 and x402 each standardise an interface. What can none of them express?',
+      options: [
+        { label: 'Intent, trust, liability and the semantics of a promise.' },
+        { label: 'Tool schemas and argument types.' },
+        { label: 'Agent capability advertisement and task handoff.' },
+        { label: 'Payment authorisation and settlement.' }
+      ],
+      explanation: 'The protocols standardise tool calls, agent-to-agent handoff and payment. What they cannot carry is meaning: whether the request reflected the user intent, whether the counterparty is trusted, who bears liability, and what a stated promise actually commits anyone to.'
+    },
+    {
+      id: 'frontier-keep-up',
+      kind: 'choice',
+      prompt: 'Which of these is a durable fundamental rather than a dated fact?',
+      options: [
+        { label: 'The loop, the context budget, the eval set and the cost arithmetic.' },
+        { label: 'The current price per million tokens from each vendor.' },
+        { label: 'The top score on a public leaderboard this week.' },
+        { label: 'The latest spec revision number of a protocol.' }
+      ],
+      explanation: 'Prices, context windows, benchmark scores and spec revisions all rot and are checkable; the durable parts are the harness, the eval set, the traces, the failure taxonomy, and the arithmetic. Read the volatile parts with a date attached and measure claims on your own held-out set.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

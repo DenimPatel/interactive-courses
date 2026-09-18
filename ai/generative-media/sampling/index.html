@@ -1,0 +1,397 @@
+---
+title: "Sampling: noise to picture"
+description: "The reverse loop from noise to a sample, ancestral DDPM against deterministic DDIM, a step-count slider, and the trajectory traced on a toy distribution."
+permalink: "/ai/generative-media/sampling/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Sampling: noise to picture</h1>
+    <p>Training taught a network to remove noise at one step. Generation is that skill used over and over: start from pure static, ask the network what it thinks the noise is, take a small step toward the data, and repeat until the static resolves into something. This part runs that loop in two different ways on a two-dimensional toy distribution &mdash; one that injects fresh randomness at every step and one that does not &mdash; and shows what the difference costs and buys.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="reverse">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The reverse process</h2></div>
+    <p class="g-eyebrow">Walking downhill in probability, one noisy step at a time</p>
+    <p>The forward process defines a chain of distributions $q(x_t)$ that starts at the data and ends at noise. The reverse process tries to walk that chain backwards. At each step the network estimates the noise $\varepsilon_\theta(x_t,t)$, and that estimate converts into an estimate of the clean point, $\hat{x}_0 = (x_t - \sqrt{1-\bar\alpha_t}\,\varepsilon_\theta)/\sqrt{\bar\alpha_t}$. A small step is then taken toward that estimate, scaled down so it does not overshoot the noise that is still present.</p>
+    <p>Every sampler in this volume is a variation on that one move, and they differ in one question: <em>how much randomness is re-injected at each step?</em> Re-inject the full amount dictated by the forward process and you get the ancestral sampler; re-inject none and you get a deterministic ordinary differential equation; re-inject something in between and you get a whole family in between.</p>
+    <p>The canvas below shows the target distribution as a blue density &mdash; three Gaussian modes &mdash; with the sampler's trajectory drawn over it in pink. The black dot is the starting noise. Press <em>Reseed</em> for a different start, switch methods, and drag the step slider to watch the path get coarser or finer.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sm-trajectory-canvas" width="520" height="420"></canvas>
+        <p class="g-canvas-hint">Blue shading is the target density. The big pink line is the sampled trajectory from the black start dot; the outlined dot is where it ends. Under DDPM, five fainter runs from the same start are drawn to show the spread.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Reverse steps <span class="val">40</span></label>
+          <input type="range" id="sm-steps" min="5" max="200" step="1" value="40">
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="sm-ddim" class="active">DDIM (deterministic)</button>
+          <button type="button" id="sm-ddpm">DDPM (ancestral)</button>
+          <button type="button" id="sm-reseed">Reseed</button>
+        </div>
+        <div class="g-readout" id="sm-readout"></div>
+        <p class="g-mini">The analytic oracle is the exact posterior mean of the toy mixture, so what you see is the sampler, not a network's error. Part 3 trained the network; this part isolates the loop.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> write the reverse update, say exactly what ancestral DDPM adds that DDIM removes, and reason about the trade between step count, sample quality and compute.</span></div>
+    <div class="g-toc">
+      <a href="#ddpm">2 · Ancestral DDPM</a>
+      <a href="#ddim">3 · Deterministic DDIM</a>
+      <a href="#steps">4 · Step count and what it costs</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="ddpm">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Ancestral DDPM</h2></div>
+    <p class="g-eyebrow">Add the noise back, on purpose</p>
+    <p>The ancestral sampler is the reverse process written down literally. At each step it computes the mean of $q(x_{t-1}\mid x_t)$ using the network's noise estimate, and then samples around that mean with the variance the forward process prescribes. In symbols, with $\beta_t$ the step's noise and $\bar\alpha$ the cumulative signal,</p>
+    <p>$$ x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\Big(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\varepsilon_\theta(x_t,t)\Big) + \sigma_t z, \qquad z\sim\mathcal{N}(0,I) $$</p>
+    <p>That final $\sigma_t z$ is the part people find strange. The model has just estimated the noise, so why put noise back? Because the goal is not to recover one particular clean point &mdash; that information is gone &mdash; but to sample from the conditional distribution. The true reverse distribution is not a spike at its mean; it has a spread, and ignoring that spread produces samples that are too smooth and too similar to one another. Injecting the prescribed variance is what keeps the sampler honest about its own uncertainty.</p>
+    <p>Switch the demo to DDPM and press Reseed a few times. The same starting noise gives a different trajectory and a different endpoint every time, and the faint runs on the canvas show why: the randomness at each step is a real degree of freedom. This is also the property that makes DDPM expensive in practice, because the noise must be integrated carefully across the whole trajectory for the sample to be valid.</p>
+    <div class="g-warn">⚠ <span><b>Ancestral does not mean accurate.</b> Injecting the correct variance makes the sampler a valid draw from the model distribution only if the network is perfect. With a learned model the injected noise can amplify errors, which is one reason deterministic samplers are usually preferred once quality matters more than diversity.</span></div>
+  </section>
+
+  <section class="g-step" id="ddim">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Deterministic DDIM</h2></div>
+    <p class="g-eyebrow">Set the variance to zero and lose nothing but the dice</p>
+    <p>DDIM is what happens when you notice that the reverse process does not have to be Markovian or stochastic. The same network, evaluated at a sparse set of timesteps, can define a deterministic map from noise to sample:</p>
+    <p>$$ x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat{x}_0 + \sqrt{1-\bar\alpha_{t-1}}\,\varepsilon_\theta(x_t,t) $$</p>
+    <p>Read it as two endpoints: reconstruct the clean point $\hat{x}_0$, then re-noise it to the next noise level using the network's own noise estimate. There is no $\sigma_t z$, so the whole trajectory is fixed once the starting noise is fixed. Run the sampler twice with the same seed and you get bit-identical output, which is why DDIM is the usual choice for interpolation, inversion and editing: the map is a function, and functions can be differentiated and inverted.</p>
+    <p>The histogram below is the experiment that makes the difference unmistakable. It takes one fixed starting noise and runs the reverse process 120 times, recording the final $x$-coordinate each time. Under DDIM every run follows the same path, so all 120 land on the same value and the histogram is a single spike. Under DDPM each run draws fresh noise at every step, so the endpoints scatter around the mode &mdash; the same fixed start has become a distribution.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sm-spread-canvas" width="520" height="260"></canvas>
+        <p class="g-canvas-hint">Final $x$-coordinate over 120 runs from one fixed starting point, using the method and step count selected above.</p>
+      </div>
+      <div class="g-controls">
+        <p>DDIM concentrates all 120 runs into one bar because it is deterministic; DDPM spreads them into a bell because it is not. Neither is wrong &mdash; they are two answers to "how much of the reverse process should be randomness?"</p>
+        <p class="g-mini">The spread canvas recomputes when you change the method or the step count, so you can also see DDPM's spread shrink as the steps get finer.</p>
+      </div>
+    </div>
+    <p>A useful way to hold the two samplers in your head: DDPM integrates a stochastic differential equation with the noise left in, and DDIM integrates the probability-flow ODE that has the same marginals. They agree in the limit of infinitely many steps and diverge in how they spend a finite budget, and both are special cases of the $\eta$-parameterised family where $\eta$ interpolates between them.</p>
+  </section>
+
+  <section class="g-step" id="steps">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Step count and what it costs</h2></div>
+    <p class="g-eyebrow">The slider everyone wants to move left</p>
+    <p>Training touches a thousand noise levels; sampling can use far fewer because DDIM does not need to follow the chain one step at a time. Drag the slider down to ten steps and the trajectory becomes a jagged polyline that hops between noise levels; drag it to two hundred and it hugs a smooth curve. The sample quality follows the same pattern: too few steps and the path cuts corners, missing modes or overshooting them, while past a point extra steps cost compute and change almost nothing.</p>
+    <p>This is the central engineering trade of diffusion inference. Every step is one forward pass of the network, so halving the steps halves the latency, and the entire distillation literature exists to buy back the quality lost. The number that matters is not the count of steps but the size of the jump each step takes in noise level, which is why schedules with rapidly changing SNR need denser sampling there.</p>
+    <p>There is a subtlety the demo makes visible. Because DDIM is deterministic, a coarse run does not average out its own error over many stochastic steps &mdash; it commits to a path, and if that path is wrong it stays wrong. Ancestral DDPM has more chances to correct itself but pays in noise. Practical systems often use a deterministic sampler with a good schedule and accept a modest step count, because the wall-clock is what users feel.</p>
+    <div class="g-warn">⚠ <span><b>Steps are not free even when the canvas is small.</b> At 512&times;512 pixels with a U-Net, one step is a few hundred milliseconds on a datacentre GPU, so the difference between 50 and 20 steps is a visible wait. The toy here is instant; the reasoning about the trade is the same.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Sampler choice is a product decision</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Latent diffusion</div>
+        <h3 style="margin:6px 0;">Sampling in a smaller space</h3>
+        <p style="margin-bottom:0;">Most image systems run this loop in a compressed latent rather than in pixels, so one step costs far less and the step-count trade moves in the user's favour. The <a href="{{ '/ai/generative-media/' | relative_url }}">later parts of this volume</a> build that compressor.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Serving</div>
+        <h3 style="margin:6px 0;">Latency is the whole game</h3>
+        <p style="margin-bottom:0;">A generation request is a long-running job whose cost is steps times per-step latency. The <a href="{{ '/ai/llm-serving/' | relative_url }}">LLM serving guide</a> reasons about batching, queues and tail latency for exactly this kind of workload; the sampling loop is the compute kernel it schedules.</p>
+      </div>
+    </div>
+    <p>Two threads lead out of this part. The first is the score function, which explains why the network's noise estimate is also a gradient and why the deterministic and stochastic samplers describe the same object; the second is the machinery of conditioning, which turns an unconditional sampler into one that follows a prompt. The next part takes the first thread.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The sampling literature is where diffusion stopped being slow. These four papers are the arc: the ancestral sampler, the deterministic one, the unification, and the distillation that made interactive generation possible.</p>
+    <p>If you read one, read DDIM, because it is the paper that reframed sampling as an ODE and every fast sampler since has been a variation on that idea.</p>
+    <ul class="g-refs">
+      <li>Jonathan Ho, Ajay Jain and Pieter Abbeel, <a href="https://arxiv.org/abs/2006.11239">"Denoising Diffusion Probabilistic Models"</a>, 2020 &mdash; the ancestral reverse process.</li>
+      <li>Jiaming Song, Chenlin Meng and Stefano Ermon, <a href="https://arxiv.org/abs/2010.02502">"Denoising Diffusion Implicit Models"</a>, 2020 &mdash; the deterministic sampler and the $\eta$ family.</li>
+      <li>Yang Song, Jascha Sohl-Dickstein and coauthors, <a href="https://arxiv.org/abs/2011.13456">"Score-Based Generative Modeling through Stochastic Differential Equations"</a>, 2020 &mdash; the probability-flow ODE that DDIM discretises.</li>
+      <li>Tim Salimans and Jonathan Ho, <a href="https://arxiv.org/abs/2202.00512">"Progressive Distillation for Fast Sampling of Diffusion Models"</a>, 2022 &mdash; halving the step count by distillation.</li>
+      <li>Alexia Jolicoeur-Martineau and coauthors, <a href="https://arxiv.org/abs/2106.00132">"Gotta Go Fast When Generating Data with Score-Based Models"</a>, 2021 &mdash; practical step-count selection and adaptive solvers.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Reverse process</td><td>Iteratively denoise from $x_T$ down to $x_0$</td></tr>
+        <tr><td>$\hat{x}_0$</td><td>Current estimate of the clean point, from $x_t$ and $\varepsilon_\theta$</td></tr>
+        <tr><td>DDPM</td><td>Ancestral: add variance $\sigma_t z$ at every step; stochastic</td></tr>
+        <tr><td>DDIM</td><td>Deterministic: no added noise; same seed gives the same sample</td></tr>
+        <tr><td>$\eta$ family</td><td>Interpolates between DDIM ($\eta=0$) and DDPM ($\eta=1$)</td></tr>
+        <tr><td>Step count</td><td>Forward passes at generation time; the main latency dial</td></tr>
+        <tr><td>Probability-flow ODE</td><td>The deterministic equation whose marginals match the forward chain</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The network's noise estimate turns out to be a gradient &mdash; the gradient of the log density with respect to the input. The next part draws that field as arrows and follows it to the modes.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+  var sch = D.schedule('cosine', 1000);
+  var CS = [[-1.6, -0.6], [1.5, 0.9], [0.1, -1.7]];
+  var SD = 0.55;
+  var method = 'ddim';
+  var steps = 40;
+  var seedBase = 1234;
+
+  var trajPlot = GM.plot(document.getElementById('sm-trajectory-canvas'), {
+    W: 520, H: 420, xRange: [-4, 4], yRange: [-4, 4],
+    xLabel: 'x', yLabel: 'y', onResize: redrawTrajectory
+  });
+  var spreadPlot = GM.plot(document.getElementById('sm-spread-canvas'), {
+    W: 520, H: 260, xRange: [-4, 4], yRange: [0, 1],
+    xLabel: 'final x-coordinate', yLabel: 'runs', onResize: redrawSpread
+  });
+
+  function densityAt(x, y) {
+    var s = 0, i;
+    for (i = 0; i < CS.length; i++) {
+      var dx = x - CS[i][0], dy = y - CS[i][1];
+      s += Math.exp(-(dx * dx + dy * dy) / (2 * SD * SD));
+    }
+    return s;
+  }
+
+  function predict(x, t) {
+    var a = D.abAt(sch, t);
+    var sa = Math.sqrt(a);
+    var k = Math.sqrt(Math.max(1e-9, 1 - a));
+    var m = D.mixturePosteriorMean(x, a, CS, SD);
+    return [(x[0] - sa * m[0]) / k, (x[1] - sa * m[1]) / k];
+  }
+
+  function startPoint() {
+    var r = GM.rng(seedBase);
+    return [GM.gauss(r), GM.gauss(r)];
+  }
+
+  function reverse(m, n, seed, start) {
+    var r = GM.rng(seed);
+    var x = start ? [start[0], start[1]] : [GM.gauss(r), GM.gauss(r)];
+    var ts = D.timesteps(sch.T, n);
+    var path = [{ t: sch.T, x: [x[0], x[1]] }], i;
+    for (i = 0; i + 1 < ts.length; i++) {
+      var t = ts[i], tp = ts[i + 1];
+      var abT = D.abAt(sch, t);
+      var abP = tp <= 0 ? 1 : D.abAt(sch, tp);
+      var eps = predict(x, t);
+      if (m === 'ddpm') {
+        var sx = D.ddpmStep(x[0], abT, abP, eps[0], tp > 0 ? r : null);
+        var sy = D.ddpmStep(x[1], abT, abP, eps[1], tp > 0 ? r : null);
+        x = [sx.x, sy.x];
+      } else {
+        x = [D.ddimStep(x[0], abT, abP, eps[0]), D.ddimStep(x[1], abT, abP, eps[1])];
+      }
+      path.push({ t: tp, x: [x[0], x[1]] });
+    }
+    return path;
+  }
+
+  function redrawTrajectory() {
+    if (!trajPlot) return;
+    trajPlot.clear();
+    trajPlot.raw(function (ctx) {
+      var cell = 7, X, Y;
+      for (X = 0; X + cell <= trajPlot.plotW; X += cell) {
+        for (Y = 0; Y + cell <= trajPlot.plotH; Y += cell) {
+          var wx = trajPlot.wx(trajPlot.padL + X + cell / 2);
+          var wy = trajPlot.wy(trajPlot.padT + Y + cell / 2);
+          var dd = densityAt(wx, wy);
+          if (dd < 0.02) continue;
+          ctx.fillStyle = 'rgba(43,95,255,' + Math.min(0.4, dd * 0.38) + ')';
+          ctx.fillRect(trajPlot.padL + X, trajPlot.padT + Y, cell, cell);
+        }
+      }
+    });
+    trajPlot.axes({ xLabel: 'x', yLabel: 'y' });
+    var start = startPoint();
+    var k;
+    if (method === 'ddpm') {
+      for (k = 0; k < 5; k++) {
+        var alt = reverse('ddpm', steps, seedBase + 100 + k * 37, start);
+        trajPlot.curve(alt.map(function (q) { return q.x; }), { color: 'rgba(214,0,108,0.3)', width: 1.2 });
+      }
+    }
+    var main = reverse(method, steps, seedBase + 5, start);
+    trajPlot.curve(main.map(function (q) { return q.x; }), { color: c.accent2, width: 2.2 });
+    trajPlot.points([start], { color: c.text, r: 4.5, stroke: '#ffffff' });
+    var end = main[main.length - 1].x;
+    trajPlot.points([end], { color: c.accent700, r: 5, stroke: '#ffffff' });
+    trajPlot.legend([
+      { label: 'target density', color: '#9dbcff', fill: true },
+      { label: 'start (pure noise)', color: c.text },
+      { label: method === 'ddpm' ? 'DDPM trajectory (+ 5 alt runs)' : 'DDIM trajectory', color: c.accent2 },
+      { label: 'endpoint', color: c.accent700 }
+    ], { dy: 6 });
+    redrawReadout(main);
+  }
+
+  function redrawSpread() {
+    if (!spreadPlot) return;
+    spreadPlot.clear();
+    var start = startPoint();
+    var bins = 34, lo = -4, hi = 4, counts = [], i, k;
+    for (i = 0; i < bins; i++) counts.push(0);
+    var runs = 120, uniq = {}, distinct = 0;
+    for (k = 0; k < runs; k++) {
+      var p = reverse(method, steps, seedBase + 900 + k * 13, start);
+      var xf = p[p.length - 1].x[0];
+      var b = Math.floor((xf - lo) / (hi - lo) * bins);
+      if (b < 0) b = 0;
+      if (b >= bins) b = bins - 1;
+      counts[b]++;
+      var key = xf.toFixed(3);
+      if (!uniq[key]) { uniq[key] = true; distinct++; }
+    }
+    var maxC = 1;
+    for (i = 0; i < bins; i++) if (counts[i] > maxC) maxC = counts[i];
+    spreadPlot.yRange[0] = 0;
+    spreadPlot.yRange[1] = maxC * 1.15;
+    spreadPlot.axes({ xLabel: 'final x-coordinate', yLabel: 'runs' });
+    var w = (hi - lo) / bins, cols = [];
+    for (i = 0; i < bins; i++) {
+      cols.push({ x0: lo + w * i, x1: lo + w * (i + 1), h: counts[i], color: method === 'ddpm' ? c.accent2 : c.accent });
+    }
+    spreadPlot.columns(cols, { alpha: 0.8 });
+    spreadPlot.legend([{ label: runs + ' runs, ' + distinct + ' distinct endpoints', color: method === 'ddpm' ? c.accent2 : c.accent, fill: true }], { dy: 6 });
+  }
+
+  function redrawReadout(main) {
+    var el = document.getElementById('sm-readout');
+    if (!el) return;
+    var end = main[main.length - 1].x;
+    el.innerHTML =
+      '<div><span class="k">method</span> <span class="hi">' + method.toUpperCase() + '</span></div>' +
+      '<div><span class="k">reverse steps</span> ' + steps + '</div>' +
+      '<div><span class="k">path points</span> ' + main.length + '</div>' +
+      '<div><span class="k">endpoint</span> (' + end[0].toFixed(2) + ', ' + end[1].toFixed(2) + ')</div>' +
+      '<div><span class="k">deterministic</span> ' + (method === 'ddim' ? 'yes — same seed, same sample' : 'no — fresh noise each step') + '</div>' +
+      '<div class="g-mini">Nearest mode is ' + nearestMode(end) + '.</div>';
+  }
+
+  function nearestMode(p) {
+    var best = 0, bd = Infinity, i;
+    for (i = 0; i < CS.length; i++) {
+      var d = Math.hypot(p[0] - CS[i][0], p[1] - CS[i][1]);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return 'mode ' + (best + 1) + ' at (' + CS[best][0] + ', ' + CS[best][1] + '), distance ' + bd.toFixed(2);
+  }
+
+  function refresh() {
+    redrawTrajectory();
+    redrawSpread();
+  }
+
+  function setMethod(m) {
+    method = m;
+    var a = document.getElementById('sm-ddim');
+    var b = document.getElementById('sm-ddpm');
+    if (a) a.className = (m === 'ddim') ? 'active' : '';
+    if (b) b.className = (m === 'ddpm') ? 'active' : '';
+    refresh();
+  }
+
+  var ddimBtn = document.getElementById('sm-ddim');
+  if (ddimBtn) ddimBtn.addEventListener('click', function () { setMethod('ddim'); });
+  var ddpmBtn = document.getElementById('sm-ddpm');
+  if (ddpmBtn) ddpmBtn.addEventListener('click', function () { setMethod('ddpm'); });
+  var reseedBtn = document.getElementById('sm-reseed');
+  if (reseedBtn) reseedBtn.addEventListener('click', function () { seedBase += 101; refresh(); });
+
+  Guide.bindSliders(document.querySelectorAll('#sm-steps'), function (el) {
+    steps = parseInt(el.value, 10);
+    refresh();
+  });
+
+  refresh();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'sampling-reverse-update',
+      kind: 'choice',
+      prompt: 'What does the reverse update do at each step, in one sentence?',
+      options: [
+        { label: 'Estimate the clean point from the current noisy point and the predicted noise, then move toward it and re-noise to the next level.', correct: true },
+        { label: 'Apply the forward process again to corrupt the sample further.', correct: false },
+        { label: 'Run the training loss backwards to recover the original noise.', correct: false }
+      ],
+      explanation: 'The update forms $\\hat{x}_0$ from $x_t$ and $\\varepsilon_\\theta$, then steps to the next noise level. DDIM does exactly this with no added noise; DDPM adds the prescribed variance.'
+    },
+    {
+      id: 'sampling-ddpm-noise',
+      kind: 'numeric',
+      prompt: 'A study runs the reverse process 120 times from one fixed starting point. Under deterministic DDIM, how many distinct final endpoints are observed?',
+      answer: 1,
+      tolerance: 0.001,
+      explanation: 'DDIM is deterministic, so a fixed start and a fixed step schedule give exactly one trajectory and one endpoint. Under DDPM the same experiment gives up to 120 distinct endpoints, because each run draws its own noise at every step.'
+    },
+    {
+      id: 'sampling-why-ancestral',
+      kind: 'choice',
+      prompt: 'Why does ancestral DDPM inject noise $\\sigma_t z$ at each step, if the network has just estimated the noise?',
+      options: [
+        { label: 'Because the true reverse distribution has a spread; sampling only its mean would collapse diversity.', correct: true },
+        { label: 'Because the network is wrong, and the noise hides its errors.', correct: false },
+        { label: 'Because otherwise the forward process cannot be unrolled.', correct: false }
+      ],
+      explanation: 'The reverse conditional is a Gaussian, not a spike. Ignoring its variance gives samples that are too smooth and too similar. The injected noise is the sampler being honest about what the model does not know.'
+    },
+    {
+      id: 'sampling-steps',
+      kind: 'choice',
+      prompt: 'You halve the number of reverse steps. What is the immediate consequence?',
+      options: [
+        { label: 'Roughly half the latency, at the cost of coarser trajectories and usually lower sample quality.', correct: true },
+        { label: 'Half the latency and identical quality, because DDIM is exact at any step count.', correct: false },
+        { label: 'The model must be retrained for the new step count.', correct: false }
+      ],
+      explanation: 'Each step is one network forward pass, so fewer steps means less compute. DDIM is exact only in the limit of infinitely many steps; a coarse schedule cuts corners and can miss modes. No retraining is needed \u2014 the same weights serve any schedule.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

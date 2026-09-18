@@ -1,0 +1,542 @@
+---
+title: "Probability in Action, Interactively — Part 1: Likelihood and maximum likelihood"
+description: "Given data, which parameter values explain it best? Build a surface over the parameter from the observed sample, and fit a model by maximising its logarithm."
+permalink: "/math/probability-in-action/likelihood/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #mle-data-canvas, #mle-log-canvas, #mle-like-canvas { margin-bottom: 2px; }
+  #coin-canvas, #area-canvas { margin-bottom: 2px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>Likelihood and maximum likelihood</h1>
+    <p>Probability runs forwards: give me a model, and I will tell you how likely a result is. Inference runs the other way. You have already seen the result &mdash; a list of numbers, a sequence of coin flips, a corpus of sentences &mdash; and you want the model. Which parameter values would have made this particular data unsurprising? That question has a one-line answer, the <strong>likelihood</strong>, and the answer is not a probability in the usual sense at all. It is a function of the parameter with the data held fixed, and it is exactly the quantity that training a language model, fitting a robot sensor, and estimating an effect size all maximise. This part builds the likelihood, watches it move, and follows it to its peak.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">You have the data; which world produced it?</p>
+    <p>Suppose sixty-four readings come off a sensor. They cluster around some value, with some spread, and the engineering story says the readings are independent draws from a normal distribution whose centre you do not know. The true centre exists &mdash; it is a fixed physical quantity &mdash; but you never see it. You see only the sample. The forward question, "given the centre, what readings are plausible?", is the probability question you already know how to answer. The inverse question is the one that matters in practice: given these sixty-four numbers, which centres are plausible?</p>
+    <p>It is tempting to say the centre is just the average of the readings. That is the right answer for this model, but it is a conclusion, not a definition, and it will not survive a change of model. Swap the normal for a Laplace or a Cauchy, or make one of the readings a wild outlier, and the average stops being the natural estimate. What we need is a general principle that takes a model family and a dataset and returns a best-fit parameter, whatever the family is. The principle should reduce to the average where the average is correct, and tell us what to do where it is not.</p>
+    <p>The principle is to ask, for every candidate parameter value, how well that value would have explained the data we actually got. A model that assigns high probability to the observed sample is a model that had a good chance of producing it. A model that assigns almost no probability to the observed sample is one that calls the data a miracle. Rank the candidate parameters by that score, and take the best. No averaging, no appeal to a prior belief about the parameter, no repeated experiments &mdash; just the raw data and the model, compared.</p>
+    <p>This is a subtle inversion of the direction of explanation. In the forward direction the sample is random and the parameter is fixed. In the inverse direction the sample is fixed &mdash; it is the one you have &mdash; and we sweep the parameter across its range. The same numbers are involved, but which one varies has changed, and everything downstream depends on keeping that straight. The likelihood is precisely the forward probability, read backwards, with the roles swapped.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the likelihood is a function of the parameter and not a probability over it, why we maximise its logarithm instead, where the maximum sits for a Gaussian, and why that one idea is the loss function behind modern machine learning.</span></div>
+    <div class="g-toc">
+      <a href="#likelihood">2 · The likelihood function</a>
+      <a href="#loglik">3 · The log-likelihood</a>
+      <a href="#not-probability">4 · Not a probability over θ</a>
+      <a href="#properties">5 · Properties and asymptotics</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="likelihood">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The likelihood function</h2></div>
+    <p class="g-eyebrow">Flip the roles of data and parameter</p>
+    <p>Write <var>$x = (x_1,\dots,x_n)$</var> for the observed data and <var>$\theta$</var> for the parameter, which may be a number or a vector. The model says each observation is a draw from a distribution <var>$p(\cdot;\theta)$</var>, and that the draws are independent and identically distributed. The probability of the whole sample, under that model, is the product of the per-observation probabilities. Now read that product as a function of <var>$\theta$</var> with <var>x</var> frozen. That is the definition.</p>
+    <div class="g-math g-katex">$$L(\theta;x)=\prod_{i=1}^{n}p(x_i;\theta),\qquad \text{data }x\text{ fixed, }\theta\text{ varying.}$$</div>
+    <p>The semicolon is doing real work. It separates the argument, <var>$\theta$</var>, from the fixed data, <var>x</var>. If you swap them you get the sampling distribution <var>$p(x;\theta)$</var>, the ordinary probability of the data for a known parameter. The likelihood is that same expression with the emphasis moved. Same formula, different question, and the notation has to keep them apart because the answers are different kinds of thing.</p>
+    <p>For the Gaussian sensor story, <var>$p(x_i;\mu,\sigma)$</var> is the bell curve density centred at <var>$\mu$</var> with width <var>$\sigma$</var>, and the likelihood is the product of sixty-four such densities, one evaluated at each reading. A <var>$\mu$</var> sitting in the middle of the cloud makes every factor reasonably large. A <var>$\mu$</var> far off to one side forces many factors towards zero, and their product collapses. The likelihood rewards agreement between the model and the whole sample at once, not any single point.</p>
+    <p>Independence is what makes the product legitimate, and it is worth noticing how strong a simplification it is. For time series, spatial data, or the tokens of a sentence, observations are not independent, and the product is replaced by a chain of conditional probabilities. The machine-learning story does exactly this: the probability of a document factorises into one conditional distribution per token, given everything before it. The shape of the likelihood changes, but the principle &mdash; evaluate the model on the data it actually saw &mdash; does not.</p>
+    <p>Here is the same idea on the simplest possible model, a coin. Flip it twenty times and count <var>k</var> heads. The parameter is the bias <var>p</var>, the probability of heads, and the likelihood is <var>L(p)=p^k(1-p)^{n-k}</var>. Move the slider for the number of heads you observed and watch where the peak of the curve sits. It is always at <var>k/n</var>, the observed frequency: the value of <var>p</var> that makes the data you saw most probable. That peak is the maximum likelihood estimate.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="coin-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">The curve is the likelihood of the coin bias <var>p</var> after seeing <var>k</var> heads in twenty flips. The marker is the MLE, <var>p̂ = k/n</var>, always at the peak.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Heads observed, k (of 20) <span class="val">8</span></label><input type="range" id="coin-k" min="0" max="20" step="1" value="8"></div>
+        <div class="g-readout" id="coin-readout"></div>
+      </div>
+    </div>
+    <p>Two features of that picture recur everywhere. First, the curve is not symmetric in general; at the edges <var>k=0</var> and <var>k=n</var> it is monotone and its peak sits exactly on the boundary of the parameter space, which is a warning that the "derivative equals zero" recipe has exceptions. Second, the height of the peak is not a probability. It is a density evaluated at one point, and its numerical value depends on how you measured <var>p</var> &mdash; as a probability, as an odds, as a log-odds. The peak's <em>location</em> is meaningful; its height is bookkeeping. That distinction is the whole of section four.</p>
+  </section>
+
+  <section class="g-step" id="loglik">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The log-likelihood and why we maximise it</h2></div>
+    <p class="g-eyebrow">Turn a product into a sum, then turn the sum over to calculus</p>
+    <p>Sixty-four densities multiplied together is a number around <var>10^{-40}</var>. A million tokens is a number underflowing to zero in double precision long before the product finishes. Multiplying probabilities is numerically hopeless and algebraically awkward: the derivative of a product is a mess of terms. Take the logarithm instead. Logarithm is strictly increasing, so it cannot move the location of a maximum, and it converts the product into a sum. Maximising the product and maximising the sum are the same problem, and the sum is far easier.</p>
+    <div class="g-math g-katex">$$\ell(\theta;x)=\log L(\theta;x)=\sum_{i=1}^{n}\log p(x_i;\theta),\qquad \hat\theta=\arg\max_\theta \ell(\theta;x).$$</div>
+    <p>The sum is the reason likelihood is practical. Each observation contributes one additive term, <var>$\log p(x_i;\theta)$</var>, so the total is a sum of identical-shaped pieces and its derivatives are sums of derivatives. Under independence, observations combine by addition, which is exactly the structure gradient descent likes. It also ties the likelihood to information: the expected log-likelihood per observation is a cross-entropy, and maximising it is the same as minimising that cross-entropy, which is the loss printed by every training loop.</p>
+    <p>If the log-likelihood is smooth and the maximum is interior, the derivative at the peak vanishes. That derivative is called the <strong>score</strong>, and the stationarity condition is the first-order optimality condition you would write for any optimisation problem.</p>
+    <div class="g-math g-katex">$$\ell'(\theta)=\sum_{i=1}^{n}\frac{\partial}{\partial\theta}\log p(x_i;\theta)=0\quad\Longrightarrow\quad \theta=\hat\theta \text{ (for a concave } \ell\text{)}.$$</div>
+    <p>For a concave log-likelihood there is a single peak and the equation <var>$\ell'(\theta)=0$</var> pins it down. A big family of models has this property: Gaussian means, Bernoulli and multinomial parameters, exponential families in their natural parametrisation. For them the MLE is found by solving the score equation, and a gradient step walks straight uphill. Where the log-likelihood is not concave, the same equation still defines candidate stationary points, but you must check which are maxima; that is why fitting Gaussian mixtures, neural networks, and latent-variable models needs care, and why this volume comes back to optimisation again and again.</p>
+    <p>The demo below is the heart of this part, so take a moment with it. Three linked views respond to one parameter pair <var>$(\mu,\sigma)$</var>. The top panel superimposes the model density on the histogram of the data, so you can see the fit. The middle panel is the log-likelihood <var>$\ell(\mu)$</var> with <var>$\sigma$</var> held at its current value: the marker is where you are, and the dark marker at the peak is the MLE. The bottom panel redraws the identical function as a likelihood on a linear scale, so you can watch the peak sharpen and the tails vanish. Drag the two round handles on the top panel, or the sliders, and every view moves together; press <em>Snap to MLE</em> and the markers collapse onto the peak.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mle-data-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">The histogram is the data; the curve is <var>$N(\mu,\sigma)$</var> at the current parameters. Drag the handles at the curve peak (for <var>$\mu$</var>) and one standard deviation to its right (for <var>$\sigma$</var>).</p>
+        <canvas id="mle-log-canvas" width="640" height="260"></canvas>
+        <p class="g-canvas-hint">The log-likelihood <var>$\ell(\mu)=\sum_i\log p(x_i;\mu,\sigma)$</var>, shifted so the peak sits at zero for the current <var>$\sigma$</var>. The marker follows your <var>$\mu$</var>; the dark marker is <var>$\hat\mu=\bar x$</var>.</p>
+        <canvas id="mle-like-canvas" width="640" height="260"></canvas>
+        <p class="g-canvas-hint">The same function as a likelihood, scaled to peak at one. Shaded area is <var>$\int L(\mu)\,d\mu$</var> over the plotted range &mdash; the readout insists it is not 1.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Mean μ <span class="val">1.00</span></label><input type="range" id="mu-slider" min="-2.2" max="4.2" step="0.02" value="1"></div>
+        <div class="g-field"><label>Standard deviation σ <span class="val">1.00</span></label><input type="range" id="sigma-slider" min="0.25" max="3" step="0.02" value="1"></div>
+        <div class="g-btnrow">
+          <button type="button" id="mle-snap" class="g-primary">Snap to MLE</button>
+          <button type="button" id="mle-reseed">New data</button>
+        </div>
+        <div class="g-readout" id="mle-readout"></div>
+      </div>
+    </div>
+    <p>For the Gaussian, the score equation solves in closed form. The derivative of <var>$\ell$</var> with respect to <var>$\mu$</var> is <var>$\sum_i (x_i-\mu)/\sigma^2$</var>, which is <var>$n(\bar x-\mu)/\sigma^2$</var> and vanishes exactly at the sample mean. The derivative with respect to <var>$\sigma$</var> vanishes at the root-mean-square deviation from that mean. So the MLE is the pair that every least-squares fit has been using all along.</p>
+    <div class="g-math g-katex">$$\hat\mu=\bar x=\frac1n\sum_{i=1}^n x_i,\qquad \hat\sigma^2=\frac1n\sum_{i=1}^n (x_i-\bar x)^2.$$</div>
+    <p>Least squares and maximum likelihood are not rivals; for Gaussian noise they are the same calculation, because <var>$\log p(x_i;\mu,\sigma)$</var> is a constant minus a squared residual over <var>$2\sigma^2$</var>. Maximising the log-likelihood is minimising the sum of squared residuals. Every time a fitting routine reports a residual sum of squares it is reporting a negative log-likelihood up to constants, and every time a language model reports a cross-entropy loss it is reporting a negative log-likelihood per token. The formula is not a textbook curiosity; it is the objective.</p>
+  </section>
+
+  <section class="g-step" id="not-probability">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Likelihood is not a probability over θ</h2></div>
+    <p class="g-eyebrow">The most common confusion in statistics, resolved once</p>
+    <p>Write down <var>$L(\theta;x)$</var> for a Gaussian with fixed <var>x</var> and sweep <var>$\theta$</var> over the line. It looks exactly like a bell curve. It is not one. A probability density over <var>$\theta$</var> must integrate to one; the likelihood has no such obligation, and in general <var>$\int L(\theta)\,d\theta$</var> is some finite number that depends on the data, the sample size, and the units in which you measured <var>$\theta$</var>. Change the units from metres to centimetres and the curve rescales; the peak stays put, the area does not. A quantity whose total can be anything is not a density.</p>
+    <div class="g-math g-katex">$$\int L(\theta;x)\,d\theta\ne 1 \quad\text{in general},\qquad L(\theta;x)\text{ is a function of }x.$$</div>
+    <p>There is a second, sharper distinction. <var>$L(\theta;x)$</var> answers "how well does this <var>$\theta$</var> explain the data?" It does not answer "how likely is this <var>$\theta$</var>?" To get the latter you need something extra: a prior <var>$p(\theta)$</var> describing what parameter values you considered plausible before seeing the data, and the evidence <var>p(x)</var>, which normalises. Bayes' rule then assembles the posterior, and only at that point does a density over <var>$\theta$</var> exist.</p>
+    <div class="g-math g-katex">$$p(\theta\mid x)=\frac{p(x\mid\theta)\,p(\theta)}{p(x)}=\frac{L(\theta;x)\,p(\theta)}{\int L(\theta;x)\,p(\theta)\,d\theta}.$$</div>
+    <p>Notice how the likelihood appears unchanged in the numerator. Maximum likelihood is what you get by refusing to supply a prior and reporting the peak alone; Bayesian inference is what you get when you supply one and report the whole reshaped curve. The two are not competing interpretations of the same curve so much as two different uses of it, and the next part of this volume is entirely about the second use.</p>
+    <p>The demo below isolates the point about the integral. It shows a one-parameter likelihood built from <var>n</var> observations, scaled so its peak is one, with the area under it shaded. As you raise <var>n</var>, the curve narrows like <var>$1/\sqrt n$</var> and the area shrinks with it. Nothing is wrong: a function that peaks at one and integrates to a tenth is a perfectly good likelihood. It simply cannot be a probability density over the parameter, because it does not carry the total probability that a density must.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="area-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">A likelihood over <var>$\mu$</var> from <var>n</var> observations, scaled to peak at one. The shaded region is the area the readout reports; watch it fall as <var>n</var> grows.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sample size n <span class="val">40</span></label><input type="range" id="area-n" min="5" max="300" step="5" value="40"></div>
+        <div class="g-readout" id="area-readout"></div>
+      </div>
+    </div>
+    <p>One more consequence is worth naming because it confuses people constantly: the likelihood is a function of the data. Two experiments that produce different samples give different likelihood curves, and you cannot compare the heights of curves from different datasets as if they were probabilities on a common scale. A likelihood ratio, however &mdash; the same curve divided by its own maximum, or two nested models compared on identical data &mdash; is invariant to constants and units, and that ratio is what tests, confidence intervals, and the hard part of Bayesian model comparison are built from.</p>
+  </section>
+
+  <section class="g-step" id="properties">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Properties and asymptotics</h2></div>
+    <p class="g-eyebrow">Why the peak is trustworthy when there is enough data</p>
+    <p>The maximum likelihood estimate has a short list of guarantees, and they explain why it is the default. Under mild regularity conditions &mdash; a smooth, identifiable model whose true parameter sits in the interior of the parameter space &mdash; the estimate is <strong>consistent</strong>: as the sample grows, it converges to the true parameter in probability. The reason is visible in the curve. Each observation contributes one term to <var>$\ell$</var>, and by the law of large numbers the average term converges to the expected log-likelihood, which is maximised at the truth. Adding data sharpens the peak around that point, so the estimate is dragged to the right answer.</p>
+    <p>It is also <strong>asymptotically normal and efficient</strong>. The error <var>$\hat\theta-\theta$</var> is approximately Gaussian with variance set by the curvature of the log-likelihood at the peak, and no unbiased estimator can do better in the large-sample limit. The curvature has a name: the <strong>Fisher information</strong>, the negative expected second derivative of the log-likelihood. A sharp peak means large information, a precise estimate, and small standard error; a flat peak means the data barely distinguish nearby parameters. This is the bridge from likelihood to the intervals, error bars, and information bounds of the next parts.</p>
+    <div class="g-math g-katex">$$\sqrt{n}\,(\hat\theta-\theta)\;\xrightarrow{\;d\;}\;\mathcal{N}\!\bigl(0,\;I(\theta)^{-1}\bigr),\qquad I(\theta)=-\mathbb{E}\!\left[\ell''(\theta)\right].$$</div>
+    <p>Two practical caveats sit inside that clean story. First, the estimator can be biased in finite samples even when it is consistent, and the Gaussian spread is the standard example: dividing by <var>n</var> systematically underestimates <var>$\sigma^2$</var>, and the familiar <var>n-1</var> correction is the unbiased repair. Second, the guarantees are asymptotic, and the approximation degrades when the sample is small, the parameter sits on a boundary, or the model is unidentifiable because two different parameters produce the same distribution. A mixture of two Gaussians is the canonical trap: swapping the two components gives an identical likelihood, so the peak is a ridge, not a point.</p>
+    <p>There is one more property that makes likelihood convenient in modelling rather than just estimation. The MLE is <strong>invariant under reparameterisation</strong>: if you find the peak in terms of a standard deviation, then the peak in terms of a variance is just the square of it. You never have to redo the optimisation because you changed how you write the parameter. This is not true of unbiasedness &mdash; a median-unbiased estimate of one quantity can be biased for a function of it &mdash; and it is one reason likelihood became the organising principle of modern statistics rather than just one method among many.</p>
+    <p>Finally, the likelihood is the natural language for comparing models of different complexity. Add parameters and the peak can only rise, because a bigger family contains the smaller one; that is why a raw likelihood cannot rank a simple model against a complicated one. Penalise the extra freedom and you get the information criteria, and hold part of the data aside and you get cross-validation. Both are attempts to ask not "which model fits?" but "which model would predict new data?" &mdash; a question this volume returns to whenever it fits something.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One objective, many names</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / LLM</div>
+        <h3 style="margin:6px 0;">Pretraining is maximum likelihood</h3>
+        <p style="margin-bottom:0;">A language model assigns a probability to the next token given the context, and <a href="{{ '/ai/llm-training/pretraining/' | relative_url }}">pretraining</a> maximises the log-likelihood of the corpus, which the training loop reports as cross-entropy loss per token. Everything in this part applies with the model's weights playing the role of <var>$\theta$</var>; the gradient of the loss is the negative score.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / LLM</div>
+        <h3 style="margin:6px 0;">Scaling laws are loss curves</h3>
+        <p style="margin-bottom:0;">Empirical <a href="{{ '/ai/llm-training/scaling/' | relative_url }}">scaling laws</a> fit smooth functions to how the negative log-likelihood falls with compute and data. They are likelihood curves read across model sizes, and the irreducible floor they extrapolate to is the entropy of the data itself.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Optimisers climb the log-likelihood</h3>
+        <p style="margin-bottom:0;">Gradient ascent on <var>$\ell$</var> is gradient descent on the negative log-likelihood, and <a href="{{ '/math/calculus-in-motion/optimizers/' | relative_url }}">optimizers</a> like momentum and Adam are the machinery that reaches the peak when the score equation has no closed form. The demo's <em>Snap to MLE</em> is what those methods do, slowly and in high dimensions.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Densities and change of variables</h3>
+        <p style="margin-bottom:0;">The likelihood is a density, and pushing a random variable through a map rescales it by a Jacobian. That is the calculus of probability covered in <a href="{{ '/math/calculus-in-motion/probability/' | relative_url }}">Calculus of probability</a>, and it is why a maximum likelihood problem in transformed coordinates is a different optimisation problem even though the answer transforms cleanly.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Intuition</th></tr></thead>
+      <tbody>
+        <tr><td>Likelihood</td><td><var>$L(\theta;x)=\prod_i p(x_i;\theta)$</var></td><td>Product of per-observation probabilities, read as a function of <var>$\theta$</var>.</td></tr>
+        <tr><td>Log-likelihood</td><td><var>$\ell(\theta)=\sum_i\log p(x_i;\theta)$</var></td><td>Same peak, additive terms, no underflow; the numerical workhorse.</td></tr>
+        <tr><td>MLE</td><td><var>$\hat\theta=\arg\max_\theta \ell(\theta;x)$</var></td><td>The parameter that makes the observed data least surprising.</td></tr>
+        <tr><td>Score</td><td><var>$\ell'(\theta)=\sum_i \partial_\theta\log p(x_i;\theta)=0$</var></td><td>Stationarity condition; the peak of a concave log-likelihood.</td></tr>
+        <tr><td>Gaussian MLE</td><td><var>$\hat\mu=\bar x,\quad \hat\sigma^2=\frac1n\sum_i (x_i-\bar x)^2$</var></td><td>Sample mean and mean squared deviation; least squares in disguise.</td></tr>
+        <tr><td>Relative likelihood</td><td><var>$L(\theta;x)/L(\hat\theta;x)\in[0,1]$</var></td><td>Invariant to constants and units; the basis of likelihood-ratio tests.</td></tr>
+        <tr><td>Not a density</td><td><var>$\int L(\theta;x)\,d\theta\ne1$</var></td><td>Only prior times likelihood over evidence makes a posterior density.</td></tr>
+        <tr><td>Fisher information</td><td><var>$I(\theta)=-\mathbb{E}[\ell''(\theta)]$</var></td><td>Curvature at the peak; inverse variance of the asymptotic estimate.</td></tr>
+        <tr><td>Posterior</td><td><var>$p(\theta\mid x)\propto L(\theta;x)\,p(\theta)$</var></td><td>The likelihood seen through the lens of a prior.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>R. A. Fisher, <em>On the mathematical foundations of theoretical statistics</em>, Philosophical Transactions of the Royal Society A, 1922 &mdash; the paper that introduced likelihood and maximum likelihood estimation.</li>
+      <li>A. W. F. Edwards, <em>Likelihood</em>, expanded edition, 1992 &mdash; the case for treating likelihood as the central concept of inference, with the geometry of the surface.</li>
+      <li>David MacKay, <em>Information Theory, Inference, and Learning Algorithms</em>, chapters 2 and 22 &mdash; likelihood, the Gaussian MLE, and the jump to Bayesian inference, written for this audience.</li>
+      <li>Lucien Le Cam, <em>Asymptotic Methods in Statistical Decision Theory</em>, 1986 &mdash; the rigorous version of the consistency and asymptotic-normality story in section five.</li>
+      <li>Bradley Efron and Trevor Hastie, <em>Computer Age Statistical Inference</em>, chapters 4&ndash;5 &mdash; maximum likelihood alongside the resampling ideas of the next parts of this volume.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The likelihood tells you which parameters explain the data; a prior tells you which parameters you expected, and multiplying them gives the posterior.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+  // ==================================================================
+  // The linked likelihood demo: histogram + log-likelihood + likelihood
+  // ==================================================================
+  var DATA_N = 64;
+  var dataSeed = 20260914;
+  var DATA = [];
+  var stat = { n: 0, xbar: 0, s: 1 };
+  var theta = { mu: 1.0, sigma: 1.0 };
+  var muMin = -2.2, muMax = 4.2;
+  var sigMin = 0.25, sigMax = 3.0;
+  var dataPlot = null, logPlot = null, likePlot = null, dataHandles = null;
+
+  function gpdf(x, mu, sig) {
+    var z = (x - mu) / sig;
+    return Math.exp(-0.5 * z * z) / (sig * Math.sqrt(2 * Math.PI));
+  }
+  function sumSq(mu) {
+    var s = 0, i, d;
+    for (i = 0; i < DATA.length; i++) { d = DATA[i] - mu; s += d * d; }
+    return s;
+  }
+  function logLik(mu, sig) {
+    var n = DATA.length;
+    return -n * Math.log(sig) - 0.5 * n * Math.log(2 * Math.PI) - sumSq(mu) / (2 * sig * sig);
+  }
+  function computeStat() {
+    var n = DATA.length, i, sum = 0, d;
+    for (i = 0; i < n; i++) sum += DATA[i];
+    var xbar = sum / n, ss = 0;
+    for (i = 0; i < n; i++) { d = DATA[i] - xbar; ss += d * d; }
+    stat = { n: n, xbar: xbar, s: Math.sqrt(ss / n) };
+  }
+  function genData() {
+    var r = Prob.rng(dataSeed), i;
+    DATA = [];
+    for (i = 0; i < DATA_N; i++) DATA.push(r.normal(1.0, 1.0));
+    computeStat();
+    muMin = stat.xbar - 3.2;
+    muMax = stat.xbar + 3.2;
+    theta.mu = clamp(theta.mu, muMin, muMax);
+    var ms = el('mu-slider');
+    if (ms) { ms.min = muMin.toFixed(3); ms.max = muMax.toFixed(3); }
+  }
+  function syncSliders() {
+    var ms = el('mu-slider'), ss = el('sigma-slider');
+    ms.value = theta.mu;
+    ss.value = theta.sigma;
+    var a = ms.parentElement ? ms.parentElement.querySelector('.val') : null;
+    var b = ss.parentElement ? ss.parentElement.querySelector('.val') : null;
+    if (a) a.textContent = theta.mu.toFixed(2);
+    if (b) b.textContent = theta.sigma.toFixed(2);
+  }
+
+  function drawData() {
+    if (!dataPlot) return;
+    var pl = dataPlot, i;
+    pl.xRange[0] = muMin; pl.xRange[1] = muMax;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var h = Prob.hist(DATA, { bins: 16, range: [muMin, muMax], density: true });
+    var histMax = 0;
+    for (i = 0; i < h.bins.length; i++) histMax = Math.max(histMax, h.bins[i].y);
+    var peak = gpdf(theta.mu, theta.mu, theta.sigma);
+    pl.yRange[0] = 0;
+    pl.yRange[1] = Math.max(histMax, peak, 0.05) * 1.18;
+    pl.bars(h.bins, { color: 'rgba(43,95,255,0.22)' });
+    pl.curve(function (x) { return gpdf(x, theta.mu, theta.sigma); },
+      { color: c.accent, width: 2.4, label: 'model N(μ, σ)' });
+    pl.vline(theta.mu, { color: c.accent2, dash: [5, 4], labelText: 'μ' });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'density' });
+    pl.legend();
+    if (dataHandles) dataHandles.draw();
+  }
+
+  function drawLog() {
+    if (!logPlot) return;
+    var pl = logPlot, i;
+    pl.xRange[0] = muMin; pl.xRange[1] = muMax;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var ref = logLik(stat.xbar, theta.sigma);
+    function rel(mu) { return logLik(mu, theta.sigma) - ref; }
+    var lo = pl.xRange[0], hi = pl.xRange[1], mn = 0, v;
+    for (i = 0; i <= 120; i++) { v = rel(lo + (hi - lo) * i / 120); if (v < mn) mn = v; }
+    var yMin = Math.max(mn, -50);
+    pl.yRange[0] = yMin * 1.08;
+    pl.yRange[1] = 0.6;
+    pl.curve(rel, { color: c.accent, width: 2.4, label: 'ℓ(μ) at current σ' });
+    pl.vline(theta.mu, { color: c.accent2, dash: [5, 4], labelText: 'θ' });
+    pl.points([{ x: stat.xbar, y: 0 }], { color: c.accent700, r: 5, label: 'MLE μ̂ = x̄' });
+    pl.axes({ step: 1, xLabel: 'μ', yLabel: 'log-lik − max' });
+    pl.legend();
+  }
+
+  function drawLike() {
+    if (!likePlot) return;
+    var pl = likePlot, i, x, yv;
+    pl.xRange[0] = muMin; pl.xRange[1] = muMax;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var ref = logLik(stat.xbar, theta.sigma);
+    function L(mu) { return Math.exp(logLik(mu, theta.sigma) - ref); }
+    var lo = muMin, hi = muMax;
+    pl.yRange[0] = 0;
+    pl.yRange[1] = 1.14;
+    pl.area(L, lo, hi, { color: 'rgba(214,0,108,0.14)', base: 0, label: 'area under L' });
+    pl.curve(L, { color: c.accent2, width: 2.4, label: 'likelihood (peak scaled to 1)' });
+    pl.vline(theta.mu, { color: c.accent2, dash: [5, 4], labelText: 'θ' });
+    pl.points([{ x: theta.mu, y: L(theta.mu) }, { x: stat.xbar, y: 1 }], { color: c.accent700, r: 5 });
+    pl.axes({ step: 1, xLabel: 'μ', yLabel: 'L(μ) / L(μ̂)' });
+    pl.legend();
+    var M = 400, area = 0, prev = L(lo);
+    for (i = 1; i <= M; i++) {
+      x = lo + (hi - lo) * i / M;
+      yv = L(x);
+      area += 0.5 * (prev + yv) * (hi - lo) / M;
+      prev = yv;
+    }
+    updateReadout(area);
+  }
+
+  function updateReadout(area) {
+    var ell = logLik(theta.mu, theta.sigma);
+    var ellHat = logLik(stat.xbar, stat.s);
+    var atMle = Math.abs(theta.mu - stat.xbar) < 0.006 && Math.abs(theta.sigma - stat.s) < 0.006;
+    el('mle-readout').innerHTML =
+      '<div><span class="k">θ = (μ, σ)</span> <span class="hi">(' + theta.mu.toFixed(2) + ', ' + theta.sigma.toFixed(2) + ')</span></div>' +
+      '<div><span class="k">μ̂ = x̄</span> ' + stat.xbar.toFixed(3) + '</div>' +
+      '<div><span class="k">σ̂</span> ' + stat.s.toFixed(3) + '</div>' +
+      '<div><span class="k">ℓ(θ)</span> ' + ell.toFixed(2) + '</div>' +
+      '<div><span class="k">ℓ(θ̂), the maximum</span> ' + ellHat.toFixed(2) + '</div>' +
+      '<div><span class="k">ℓ(θ) − ℓ(θ̂)</span> ' + (ell - ellHat).toFixed(2) + '</div>' +
+      (area != null ? '<div><span class="k">area under L(μ)</span> ' + area.toFixed(3) + ' &ne; 1</div>' : '') +
+      '<div style="margin-top:6px;">' + (atMle ? 'At the MLE: the score is zero and the curve is flat.' : 'Drag a handle or a slider; every view moves with θ.') + '</div>';
+  }
+
+  function drawAll() { drawData(); drawLog(); drawLike(); }
+
+  function setMu(v) { theta.mu = clamp(v, muMin, muMax); syncSliders(); drawAll(); }
+  function setSigma(v) { theta.sigma = clamp(v, sigMin, sigMax); syncSliders(); drawAll(); }
+
+  genData();
+  dataPlot = Prob.plot(el('mle-data-canvas'), { W: 640, H: 300, xRange: [muMin, muMax], yRange: [0, 1], onResize: drawAll });
+  logPlot = Prob.plot(el('mle-log-canvas'), { W: 640, H: 260, xRange: [muMin, muMax], yRange: [-10, 0.6], onResize: drawAll });
+  likePlot = Prob.plot(el('mle-like-canvas'), { W: 640, H: 260, xRange: [muMin, muMax], yRange: [0, 1.14], onResize: drawAll });
+
+  dataHandles = dataPlot.handles(function () {
+    return [
+      { id: 'mu', x: theta.mu, y: gpdf(theta.mu, theta.mu, theta.sigma), r: 8, color: c.accent2 },
+      { id: 'sigma', x: theta.mu + theta.sigma, y: gpdf(theta.mu + theta.sigma, theta.mu, theta.sigma), r: 8, color: c.accent }
+    ];
+  }, function (id, x) {
+    if (id === 'mu') setMu(x); else setSigma(x - theta.mu);
+  });
+
+  Guide.bindSliders([el('mu-slider')], function (s) {
+    theta.mu = clamp(parseFloat(s.value), muMin, muMax);
+    drawAll();
+  });
+  Guide.bindSliders([el('sigma-slider')], function (s) {
+    theta.sigma = clamp(parseFloat(s.value), sigMin, sigMax);
+    drawAll();
+  });
+  el('mle-snap').addEventListener('click', function () {
+    theta.mu = stat.xbar;
+    theta.sigma = stat.s;
+    syncSliders();
+    drawAll();
+  });
+  el('mle-reseed').addEventListener('click', function () {
+    dataSeed = (dataSeed * 1103515245 + 12345) % 2147483647;
+    genData();
+    syncSliders();
+    drawAll();
+  });
+  syncSliders();
+  drawAll();
+
+  // ==================================================================
+  // The coin likelihood: L(p) = p^k (1-p)^(n-k), peak at k/n
+  // ==================================================================
+  var coin = { n: 20, k: 8 };
+  var coinPlot = null;
+  function coinL(p) {
+    if (p <= 0) return coin.k === 0 ? 1 : 0;
+    if (p >= 1) return coin.k === coin.n ? 1 : 0;
+    return Math.pow(p, coin.k) * Math.pow(1 - p, coin.n - coin.k);
+  }
+  function drawCoin() {
+    if (!coinPlot) return;
+    var pl = coinPlot, i, mx = 0, p;
+    pl.xRange[0] = 0; pl.xRange[1] = 1;
+    pl.clear();
+    pl.grid({ step: 0.1 });
+    for (i = 0; i <= 200; i++) { p = 0.001 + 0.998 * i / 200; mx = Math.max(mx, coinL(p)); }
+    pl.yRange[0] = 0;
+    pl.yRange[1] = Math.max(mx, 1e-6) * 1.15;
+    pl.curve(coinL, { from: 0.001, to: 0.999, samples: 300, color: c.accent, width: 2.4, label: 'L(p) = p^k (1−p)^(n−k)' });
+    var phat = coin.k / coin.n;
+    pl.points([{ x: phat, y: coinL(phat) }], { color: c.accent700, r: 5, label: 'p̂ = k/n' });
+    pl.axes({ step: 0.2, xLabel: 'bias p', yLabel: 'likelihood' });
+    pl.legend();
+    var ell = Math.log(Math.max(coinL(phat), 1e-300));
+    el('coin-readout').innerHTML =
+      '<div><span class="k">heads k of n = 20</span> <span class="hi">' + coin.k + '</span></div>' +
+      '<div><span class="k">p̂ = k/n</span> <span class="hi">' + phat.toFixed(3) + '</span></div>' +
+      '<div><span class="k">L at p̂</span> ' + coinL(phat).toExponential(3) + '</div>' +
+      '<div><span class="k">ℓ at p̂</span> ' + ell.toFixed(2) + '</div>' +
+      '<div style="margin-top:6px;">The peak is the MLE; the curve is a function of p with the data held fixed.</div>';
+  }
+  coinPlot = Prob.plot(el('coin-canvas'), { W: 640, H: 300, xRange: [0, 1], yRange: [0, 1], onResize: drawCoin });
+  Guide.bindSliders([el('coin-k')], function (s) { coin.k = parseInt(s.value, 10); drawCoin(); });
+  drawCoin();
+
+  // ==================================================================
+  // The scaled likelihood: the area is not 1 and shrinks like 1/sqrt(n)
+  // ==================================================================
+  var areaDemo = { n: 40, sig: 1 };
+  var areaPlot = null;
+  function relLike(mu) {
+    var s = areaDemo.sig;
+    return Math.exp(-areaDemo.n * mu * mu / (2 * s * s));
+  }
+  function drawArea() {
+    if (!areaPlot) return;
+    var pl = areaPlot, lo = -3, hi = 3, M = 400, area = 0, prev = relLike(lo), i, x;
+    pl.xRange[0] = lo; pl.xRange[1] = hi;
+    pl.clear();
+    pl.grid({ step: 1 });
+    pl.yRange[0] = 0;
+    pl.yRange[1] = 1.14;
+    pl.area(relLike, lo, hi, { color: 'rgba(214,0,108,0.14)', base: 0, label: 'area under L(μ)' });
+    pl.curve(relLike, { color: c.accent2, width: 2.4, label: 'L(μ), peak scaled to 1' });
+    pl.axes({ step: 1, xLabel: 'μ', yLabel: 'L(μ) / L(μ̂)' });
+    pl.legend();
+    for (i = 1; i <= M; i++) { x = lo + (hi - lo) * i / M; area += 0.5 * (prev + relLike(x)) * (hi - lo) / M; prev = relLike(x); }
+    var exact = areaDemo.sig * Math.sqrt(2 * Math.PI / areaDemo.n);
+    el('area-readout').innerHTML =
+      '<div><span class="k">sample size n</span> <span class="hi">' + areaDemo.n + '</span></div>' +
+      '<div><span class="k">area under L(μ)</span> <span class="hi">' + area.toFixed(3) + '</span></div>' +
+      '<div><span class="k">∫L dμ over the line</span> ' + exact.toFixed(3) + '</div>' +
+      '<div><span class="k">is it 1?</span> <span class="bad">no</span></div>' +
+      '<div style="margin-top:6px;">A likelihood integrates to whatever it integrates to here, about 1/√n. Only prior times likelihood over evidence turns it into a density over μ.</div>';
+  }
+  areaPlot = Prob.plot(el('area-canvas'), { W: 640, H: 300, xRange: [-3, 3], yRange: [0, 1], onResize: drawArea });
+  Guide.bindSliders([el('area-n')], function (s) { areaDemo.n = parseInt(s.value, 10); drawArea(); });
+  drawArea();
+
+  // ==================================================================
+  // Check your understanding
+  // ==================================================================
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'likelihood-which-is-fixed',
+      kind: 'choice',
+      prompt: 'In the likelihood <var>L(θ;x)</var>, which quantity is held fixed and which varies?',
+      options: [
+        { label: 'The data <var>x</var> is fixed and the parameter <var>θ</var> varies.', correct: true },
+        { label: 'The parameter <var>θ</var> is fixed and the data <var>x</var> varies.', correct: false },
+        { label: 'Both vary; the likelihood is a joint density in <var>(θ,x)</var>.', correct: false }
+      ],
+      explanation: 'The likelihood reads the forward probability backwards: the observed sample is frozen and θ is swept across its range. Fixing θ and varying x gives the sampling distribution p(x;θ), a different object.'
+    },
+    {
+      id: 'likelihood-gaussian-mean',
+      kind: 'numeric',
+      prompt: 'Three observations are <var>2, 4, 6</var>. For a Gaussian model the MLE of the mean is <var>μ̂ = x̄</var>. What is <var>μ̂</var>?',
+      answer: 4,
+      tolerance: 0.001,
+      explanation: 'The sample mean is (2 + 4 + 6)/3 = 4. The Gaussian log-likelihood is maximised exactly where the sum of squared residuals is smallest, and that point is the sample mean.'
+    },
+    {
+      id: 'likelihood-why-log',
+      kind: 'choice',
+      prompt: 'Why is the log-likelihood used instead of the likelihood itself?',
+      options: [
+        { label: 'The logarithm is increasing, so it does not move the peak, and it turns the product of probabilities into a sum that is easy to differentiate and does not underflow.', correct: true },
+        { label: 'Because the likelihood of an independent sample is not a product.', correct: false },
+        { label: 'Because taking logs makes the likelihood integrate to one.', correct: false }
+      ],
+      explanation: 'Log is strictly increasing, so argmax is unchanged. It converts ∏ into Σ, which makes the score a sum of per-observation terms and keeps long products away from numerical zero. It does not normalise anything.'
+    },
+    {
+      id: 'likelihood-coin-mle',
+      kind: 'numeric',
+      prompt: 'A coin is flipped 10 times and lands heads 7 times. What is the maximum likelihood estimate <var>p̂</var> of the bias?',
+      answer: 0.7,
+      tolerance: 0.001,
+      explanation: 'For Bernoulli trials the score is k/p − (n−k)/(1−p), which vanishes at p = k/n = 7/10 = 0.7. The second derivative is negative there, so it is the maximum.'
+    },
+    {
+      id: 'likelihood-integral',
+      kind: 'choice',
+      prompt: 'What is <var>∫L(θ;x) dθ</var> for a typical model?',
+      options: [
+        { label: 'Some finite number that depends on the data and the units of θ — in general it is not 1.', correct: true },
+        { label: 'Always exactly 1, because θ must be somewhere.', correct: false },
+        { label: 'Zero, because the likelihood of any single θ is zero.', correct: false }
+      ],
+      explanation: 'A likelihood is not normalised over θ. Its integral depends on the sample size and on how θ is measured, and it typically shrinks as data accumulates. Only multiplying by a prior and dividing by the evidence yields a density over θ.'
+    },
+    {
+      id: 'likelihood-score-zero',
+      kind: 'choice',
+      prompt: 'At an interior maximum of a smooth log-likelihood, what is true of the score <var>ℓ′(θ)</var>?',
+      options: [
+        { label: 'It is zero, and the second derivative is negative, so the curve is concave there.', correct: true },
+        { label: 'It is zero, and the second derivative is positive, so the curve is convex there.', correct: false },
+        { label: 'It equals the Fisher information regardless of the data.', correct: false }
+      ],
+      explanation: 'A vanishing first derivative is the stationarity condition; a negative second derivative confirms a maximum. The curvature at that point, negated and averaged, is the Fisher information that sets the asymptotic variance of the estimate.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

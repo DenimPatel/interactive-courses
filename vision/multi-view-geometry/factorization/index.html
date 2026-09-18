@@ -1,0 +1,551 @@
+---
+title: "Affine Factorization: the Tomasi-Kanade Method"
+description: "Under weak perspective the tracked 2D features form a matrix of rank three: one SVD factors it into camera motion and 3D shape, with the affine gauge fixed by the orthonormality of each camera's rotation rows."
+permalink: "/vision/multi-view-geometry/factorization/"
+section: "vision"
+series: "multi_view_geometry"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .mvg { max-width: 1180px; }
+  .mvg .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .mvg-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .mvg-step:first-of-type { border-top: none; }
+  .mvg-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .mvg-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .mvg-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .mvg-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .mvg-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-goal b { color: var(--color-accent-800); }
+  .mvg-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-warn b { color: var(--color-accent-2-800); }
+  .mvg-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .mvg-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .mvg-canvas-wrap { flex: 1 1 380px; min-width: 280px; }
+  .mvg-canvas-wrap canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .mvg-plot3d { width: 100%; height: 380px; background: var(--color-neutral-100); border-radius: var(--radius-sm); cursor: grab; }
+  .mvg-plot3d:active { cursor: grabbing; }
+  .mvg-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .mvg-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .mvg-field { margin-bottom: 14px; }
+  .mvg-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .mvg-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .mvg-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .mvg-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .mvg-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .mvg-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .mvg-btnrow button.mvg-primary:hover { background: var(--color-accent-600); }
+  .mvg-btnrow button:disabled { opacity: 0.45; cursor: default; }
+  .mvg-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .mvg-readout .k { opacity: 0.6; }
+  .mvg-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .mvg-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .mvg-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .mvg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .mvg-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .mvg-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .mvg-cheat th, .mvg-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .mvg-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .mvg-cheat code { white-space: nowrap; }
+  .mvg-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  .mvg-imgplane { position: relative; }
+  .mvg-imgplane canvas { cursor: default; }
+  @media (max-width: 640px) {
+    .mvg-eyebrow { margin-left: 0; }
+    .mvg-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multi_view_geometry %}
+
+<main>
+<div class="wrap mvg">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 14 of {{ site.data.series.multi_view_geometry.parts | size }}</span>
+    <h1>Affine Factorization: the Tomasi-Kanade Method</h1>
+    <p>Everything so far has recovered geometry one error term at a time: triangulate a point, then estimate a pose, then reconcile the two with a nonlinear solver. This page does the opposite. When the camera is far from the scene, the entire set of tracked 2D features — every point in every frame — stacks into a single tall matrix that is provably <strong>rank three</strong>. One singular value decomposition splits that matrix into camera motion and 3D shape simultaneously, with no iteration, no initialization, and no alternation. It is the cleanest result in this whole series, and it comes with an honest price tag: the weak-perspective approximation.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="mvg-step" id="motivation">
+    <div class="mvg-step-head"><span class="mvg-step-num">0</span><h2>Shape from tracked features, in one shot</h2></div>
+    <p class="mvg-eyebrow">Motivation</p>
+    <p>The classical structure-from-motion problem is: someone hands you <var>P</var> feature points that have been tracked through <var>F</var> frames of video, and you must produce both the 3D shape of the object and the camera motion — from the 2D tracks alone. Position-based, incremental pipelines solve this by matching point pairs, estimating pairwise geometry, triangulating, then running bundle adjustment to clean up the accumulated drift. That works, but it is a long chain of nonlinear steps, each needing a good starting guess.</p>
+    <p>Tomasi and Kanade's 1992 result says something startling: if the camera is <em>far</em> from the object relative to the object's depth, you can skip the whole chain. Write every tracked pixel coordinate into one big matrix, subtract the per-frame mean, and read off the answer from a single <strong>singular value decomposition</strong>. The shape and the motion come out together, linearly, with no iteration at all.</p>
+    <div class="mvg-goal">💡 <span><b>The idea in one line:</b> under weak perspective the measurement matrix is the product of a small motion matrix and a small shape matrix, so it is rank three — and rank-three structure is exactly what a truncated SVD exposes.</span></div>
+    <p>The catch is the approximation itself. "Far from the object" is a claim about the camera's distance relative to the depth variation of the scene; when that fails, perspective projection bends the tracks and the rank-three story degrades one singular value at a time. The interactive demo below lets you drive that failure with a slider and watch it happen.</p>
+  </section>
+
+  <section class="mvg-step" id="weakperspective">
+    <div class="mvg-step-head"><span class="mvg-step-num">1</span><h2>Weak perspective: the imaging model and the measurement matrix</h2></div>
+    <p class="mvg-eyebrow">The model</p>
+    <p>Under full perspective, a 3D point <var>X</var> lands at <code>u = f·x/z</code>, which is a division and therefore not linear in <var>X</var>. <strong>Weak perspective</strong> (also called scaled orthographic) replaces that with an affine rule: for a camera whose center sits at <var>t</var> and whose orientation is the rotation <var>R</var>,</p>
+    <div class="mvg-math">
+      x  =  R (X &#8722; t)&nbsp;&nbsp;&nbsp;&nbsp;then&nbsp;&nbsp;&nbsp;&nbsp;u = x&#8321;,  v = x&#8322;  (drop the third coordinate)<br>
+      i.e. image coordinates are an <em>affine</em> function of the 3D point
+    </div>
+    <p>Concretely, the image of a point is its camera-frame position with the depth coordinate simply discarded. Why is this a good approximation? Because when the camera distance <var>D</var> greatly exceeds the object's depth extent &#916;z, full perspective projects to <code>u = f·x/(D + &#916;z)</code>, and expanding the division gives <code>u &#8776; (f/D)·x</code> plus a correction of order <code>&#916;z/D</code>. Weak perspective keeps the leading term and throws away the correction. It is <em>exact</em> for an orthographic camera and accurate whenever <code>&#916;z / D</code> is small — telephoto lenses, distant objects, aerial imagery.</p>
+    <div class="mvg-warn">⚠️ <span>This is where the method breaks. When the object is near the camera or has large depth relief, the discarded correction is no longer small — and the demo below shows precisely how it corrupts the reconstruction.</span></div>
+    <p><strong>The measurement matrix.</strong> Stack all the tracked data. For frame <var>i</var> and point <var>p</var>, let <code>(u&#7522;&#8346;, v&#7522;&#8346;)</code> be the tracked pixel. Define the <strong>measurement matrix</strong> <var>W</var> of size <code>2F &#215; P</code> by writing each frame's two coordinate rows one after another:</p>
+    <div class="mvg-math">
+      W&#8322;&#7522;&#8331;&#8321;,&#8346; = u&#7522;&#8346;, &nbsp;&nbsp; W&#8322;&#7522;,&#8346; = v&#7522;&#8346;&nbsp;&nbsp;&nbsp;&nbsp;(row 2i&#8722;1 = the u's of frame i, row 2i = the v's)
+    </div>
+    <p>Because the camera translation <var>t</var> is the same for every point in a frame, it contributes a constant offset to that frame's whole row. Subtracting each frame's centroid of tracked points therefore deletes the translation exactly:</p>
+    <div class="mvg-math">
+      u&#771;&#7522;&#8346; = u&#7522;&#8346; &#8722; (1/P) &#8721;&#8346; u&#7522;&#8346;&nbsp;&nbsp;&nbsp;&nbsp;v&#771;&#7522;&#8346; = v&#7522;&#8346; &#8722; (1/P) &#8721;&#8346; v&#7522;&#8346;
+    </div>
+    <p>From here on <var>W</var> means the <strong>centered</strong> matrix, with each frame's centroid subtracted. Optionally one also normalizes each frame by the RMS radius of its points, which removes any per-frame scale; it changes nothing conceptually and everything is cleaner without having to worry about the absolute scale, which is unrecoverable anyway.</p>
+    <div class="mvg-goal">🎯 <span><b>What centering buys you:</b> the unknown camera translation is gone, so the only unknowns left are the rotation of each frame and the 3D shape. That is the whole reason the problem collapses to a rank condition.</span></div>
+  </section>
+
+  <section class="mvg-step" id="rank3">
+    <div class="mvg-step-head"><span class="mvg-step-num">2</span><h2>The rank-3 theorem and the factorization</h2></div>
+    <p class="mvg-eyebrow">The core result</p>
+    <p>Write the shape of the object as a fixed <code>3 &#215; P</code> matrix <var>S</var> whose columns are the 3D points (after removing the mean point), and write the motion as a <code>2F &#215; 3</code> matrix <var>M</var> whose frame-<var>i</var> block is the <em>first two rows</em> of that frame's rotation — the third row is simply discarded by the projection. Then the centered measurement matrix factors exactly:</p>
+    <div class="mvg-math">
+      W  =  M S&nbsp;&nbsp;&nbsp;&nbsp;with&nbsp;&nbsp; M (2F &#215; 3),&nbsp; S (3 &#215; P)
+    </div>
+    <p>Two structural facts about <var>M</var> are the key to everything that follows. Within frame <var>i</var>, the two rows <code>m&#8322;&#7522;&#8331;&#8321;</code> and <code>m&#8322;&#7522;</code> are two rows of a rotation matrix, so they are <strong>orthonormal</strong>: each has unit norm and the two are perpendicular. And all frames share the same global scale.</p>
+    <div class="mvg-math">
+      m&#8322;&#7522;&#8331;&#8321; &#183; m&#8322;&#7522;&#8331;&#8321; = 1,&nbsp;&nbsp;&nbsp; m&#8322;&#7522; &#183; m&#8322;&#7522; = 1,&nbsp;&nbsp;&nbsp; m&#8322;&#7522;&#8331;&#8321; &#183; m&#8322;&#7522; = 0&nbsp;&nbsp;&nbsp;&nbsp;for every frame i
+    </div>
+    <p>Since <var>W</var> is the product of a <code>2F &#215; 3</code> and a <code>3 &#215; P</code> matrix, it has <strong>rank at most three</strong>. That is the theorem. Every entry of <var>W</var> is a linear combination of just three underlying shape directions.</p>
+    <p><strong>Factorization by truncated SVD.</strong> Compute the SVD <code>W = U &#931; V&#7488;</code>. If the data were exactly weak perspective, only the first three singular values would be nonzero. Keep the top three and split them symmetrically between motion and shape:</p>
+    <div class="mvg-math">
+      W &#8776; U&#8323; &#931;&#8323; V&#8323;&#7488;&nbsp;&nbsp;&#8658;&nbsp;&nbsp; M&#770; = U&#8323; &#931;&#8323;&#185;&#8260;&#178;&nbsp;&nbsp;&nbsp;S&#770; = &#931;&#8323;&#185;&#8260;&#178; V&#8323;&#7488;&nbsp;&nbsp;&nbsp;&nbsp;so that&nbsp; M&#770; S&#770; = W
+    </div>
+    <p>Here <code>&#931;&#8323;</code> is the <code>3 &#215; 3</code> diagonal matrix of the three largest singular values, and <code>U&#8323;, V&#8323;</code> their singular vectors. The split by the square root makes the two factors balanced, but it is not the answer yet.</p>
+    <p><strong>The affine gauge ambiguity.</strong> The factorization is not unique. Pick <em>any</em> invertible <code>3 &#215; 3</code> matrix <var>A</var> and you get another valid factorization, because</p>
+    <div class="mvg-math">
+      W  =  M&#770; S&#770;  =  (M&#770; A)(A&#8315;&#185; S&#770;)&nbsp;&nbsp;&nbsp;&nbsp;&#8658;&nbsp;&nbsp;&nbsp;&nbsp;M = M&#770; A,&nbsp;&nbsp; S = A&#8315;&#185; S&#770;
+    </div>
+    <p>SVD can hand you any member of this family; it has no way to know which one is the physically correct rotation. This is the <strong>affine gauge</strong> freedom — the residual metric ambiguity of the problem — and it is exactly 9 unknowns' worth of it. What pins it down is the orthonormality of the motion rows, which <var>M&#770;</var> does not in general satisfy but the true <var>M</var> must.</p>
+    <p><strong>Solving for the gauge with a linear system.</strong> Let <code>Q = A A&#7488;</code>, a symmetric <code>3 &#215; 3</code> matrix with six unknown entries. Look at a single frame's two rows of <var>M&#770;</var>, call them the row vectors <var>a&#7522;</var> and <var>b&#7522;</var>. The corresponding rows of the true motion are <code>m&#8322;&#7522;&#8331;&#8321; = a&#7522; A</code> and <code>m&#8322;&#7522; = b&#7522; A</code>, so each orthonormality condition becomes a condition on <var>Q</var> alone:</p>
+    <div class="mvg-math">
+      &#8214;m&#8322;&#7522;&#8331;&#8321;&#8214;&#178; = a&#7522; Q a&#7522;&#7488; = 1<br>
+      &#8214;m&#8322;&#7522;&#8214;&#178; = b&#7522; Q b&#7522;&#7488; = 1<br>
+      m&#8322;&#7522;&#8331;&#8321; &#183; m&#8322;&#7522; = a&#7522; Q b&#7522;&#7488; = 0
+    </div>
+    <p>Each of these is <em>linear</em> in the six entries of <var>Q</var>. Writing them explicitly for one frame, with <code>a&#7522; = (a&#8321;, a&#8322;, a&#8323;)</code>:</p>
+    <div class="mvg-math">
+      a&#8321;&#178; q&#8321;&#8321; + 2a&#8321;a&#8322; q&#8321;&#8322; + 2a&#8321;a&#8323; q&#8321;&#8323; + a&#8322;&#178; q&#8322;&#8322; + 2a&#8322;a&#8323; q&#8322;&#8323; + a&#8323;&#178; q&#8323;&#8323; = 1
+    </div>
+    <p>and the <var>b</var> and mixed rows are identical in form with <code>b</code> or the cross terms substituted. Stacking all three equations for all <var>F</var> frames gives <code>3F</code> linear equations in only <strong>six</strong> unknowns:</p>
+    <div class="mvg-math">
+      G q = 1&nbsp;&nbsp;where&nbsp; q = (q&#8321;&#8321;, q&#8321;&#8322;, q&#8321;&#8323;, q&#8322;&#8322;, q&#8322;&#8323;, q&#8323;&#8323;) and G is 3F &#215; 6
+    </div>
+    <p>Solve it in the least-squares sense, <code>q = (G&#7488;G)&#8315;&#185; G&#7488;1</code> — a single <code>6 &#215; 6</code> inverse, no iteration. Then factor <var>Q</var> itself. Since <code>Q = A A&#7488;</code>, it must be symmetric positive definite, so the Cholesky factorization gives <var>A</var> directly: <code>Q = L L&#7488;</code> with <var>L</var> lower triangular, take <code>A = L</code>. Finally</p>
+    <div class="mvg-math">
+      M = M&#770; A&nbsp;&nbsp;&nbsp;(&#8220;the motion&#8221;)&nbsp;&nbsp;&nbsp;&nbsp;S = A&#8315;&#185; S&#770;&nbsp;&nbsp;&nbsp;(&#8220;the shape&#8221;)
+    </div>
+    <p>and the columns of <var>S</var> are the recovered 3D points. Motion and shape are recovered together, in one SVD plus one 6&#215;6 solve. The only residual ambiguity is a single global rotation and reflection (which SVD cannot resolve, since a rotation of the whole world while rotating every camera oppositely is observationally identical) — precisely the ambiguity a Procrustes alignment removes when validating against ground truth.</p>
+    <div class="mvg-goal">🔑 <span><b>Summary of the algorithm:</b> center the tracks &#8594; SVD &#8594; truncate to three singular values &#8594; solve the 3F&#215;6 linear system for <var>Q</var> &#8594; Cholesky for <var>A</var> &#8594; split into <var>M</var> and <var>S</var>. Every step is closed-form.</span></div>
+  </section>
+
+  <section class="mvg-step" id="demo">
+    <div class="mvg-step-head"><span class="mvg-step-num">3</span><h2>Play: factor a tracked object in one SVD</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">🎯 <b>Learning goal:</b> watch the whole algorithm — SVD, rank-3 truncation, and the linear gauge solve — reconstruct an unknown 3D shape from nothing but its 2D tracks, and then watch a single slider (perspective distortion) break it in the honest, gradual way the theorem predicts.</div>
+    <p>A fixed synthetic point cloud is tracked through the chosen number of orthographic frames, each from a different viewpoint. The demo builds the centered measurement matrix <var>W</var>, computes a one-sided Jacobi SVD in your browser, solves the <code>3F &#215; 6</code> system for <var>Q</var>, factors it by Cholesky, and reconstructs the 3D shape. On the canvas, the <span style="color:var(--color-text)">gray</span> points are the ground-truth shape and the <span style="color:var(--color-accent-700)">accent</span> points are the reconstruction <em>after</em> an orthogonal Procrustes alignment (which removes the unavoidable global rotation/reflection/scale). Thin lines join each ground-truth point to its reconstruction. The readout reports the alignment RMS, the singular values of <var>W</var> (three large, the rest near zero), and the residual of the orthonormality constraints.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <canvas id="s3-canvas" width="560" height="380"></canvas>
+        <p class="mvg-canvas-hint">Ground truth (gray) vs. reconstructed shape (accent), aligned by Procrustes. Lines connect corresponding points.</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-text)"></i>ground truth</span>
+          <span><i style="background:var(--color-accent);border:2px solid #fff"></i>reconstruction (rank-3 + gauge solve)</span>
+        </div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Perspective distortion <span class="val" id="s3-perspval"></span></label><input type="range" id="s3-persp" min="0" max="1" step="0.01" value="0"></div>
+        <div class="mvg-field"><label>Frames F <span class="val" id="s3-framesval"></span></label><input type="range" id="s3-frames" min="4" max="24" step="1" value="12"></div>
+        <div class="mvg-field"><label>Object rotation (deg) <span class="val" id="s3-yawval"></span></label><input type="range" id="s3-yaw" min="0" max="360" step="1" value="0"></div>
+        <div class="mvg-btnrow">
+          <button id="s3-resample">Resample point cloud</button>
+          <button id="s3-reset" class="mvg-primary">Reset to orthographic</button>
+        </div>
+        <div class="mvg-readout" id="s3-readout"></div>
+      </div>
+    </div>
+    <p>With <b>perspective distortion</b> at 0 the model is exactly orthographic: the singular values collapse to three large ones and everything else at the level of floating-point noise, the orthonormality residual is ~10&#8315;&#185;&#8309;, and the reconstruction matches the ground truth to machine precision up to a global rotation and scale. As you raise the slider, the first three singular values stay put while the fourth, fifth, sixth… creep up out of the noise floor — that is perspective showing up as extra rank — and both the residual and the alignment error grow together. This is the honest limitation of the method: affine factorization is not "wrong" under perspective, it is simply operating in the wrong model, and the error is smooth and measurable rather than catastrophic.</p>
+  </section>
+
+  <section class="mvg-step" id="cheatsheet">
+    <div class="mvg-step-head"><span class="mvg-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="mvg-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="mvg-cheat">
+      <thead><tr><th>Object</th><th>Formula</th><th>Meaning / role</th></tr></thead>
+      <tbody>
+        <tr><td>Weak perspective</td><td><code>x = R(X &#8722; t)</code>, drop the third coordinate</td><td>Affine imaging model; exact for orthographic, good when distance &#8811; depth relief</td></tr>
+        <tr><td>Measurement matrix</td><td><code>W</code>, size <code>2F &#215; P</code></td><td>Stacked (u, v) tracks of every point in every frame, per-frame centroid subtracted</td></tr>
+        <tr><td>Centering</td><td><code>u&#771; = u &#8722; mean&#8346;(u)</code></td><td>Cancels the unknown camera translation exactly</td></tr>
+        <tr><td>Rank-3 theorem</td><td><code>W = M S</code>, <code>M</code> is <code>2F&#215;3</code>, <code>S</code> is <code>3&#215;P</code></td><td>The measurement matrix has rank at most three</td></tr>
+        <tr><td>Factorization</td><td><code>W &#8776; U&#8323;&#931;&#8323;V&#8323;&#7488;</code>, <code>M&#770;=U&#8323;&#931;&#8323;&#185;&#8260;&#178;</code>, <code>S&#770;=&#931;&#8323;&#185;&#8260;&#178;V&#8323;&#7488;</code></td><td>One SVD splits tracks into motion and shape</td></tr>
+        <tr><td>Affine gauge</td><td><code>M = M&#770;A</code>, <code>S = A&#8315;&#185;S&#770;</code></td><td>Any invertible <code>3&#215;3</code> <code>A</code> is a valid factorization; SVD picks an arbitrary one</td></tr>
+        <tr><td>Orthonormality constraints</td><td><code>a&#7522;Qa&#7522;&#7488;=1</code>, <code>b&#7522;Qb&#7522;&#7488;=1</code>, <code>a&#7522;Qb&#7522;&#7488;=0</code></td><td>Each frame's two motion rows are rows of a rotation; <code>Q = AA&#7488;</code></td></tr>
+        <tr><td>Linear solve</td><td><code>G q = 1</code>, <code>G</code> is <code>3F&#215;6</code></td><td>Least-squares for the six entries of <code>Q</code>; then Cholesky <code>Q = LL&#7488;</code>, <code>A = L</code></td></tr>
+        <tr><td>Metric upgrade</td><td><code>M = M&#770;A</code>, <code>S = A&#8315;&#185;S&#770;</code></td><td>Turns the arbitrary factorization into metric motion and shape</td></tr>
+        <tr><td>Remaining ambiguity</td><td>one global rotation / reflection / scale</td><td>Unobservable; removed by Procrustes alignment for validation</td></tr>
+        <tr><td>Failure modes</td><td>&#963;&#8324;&#8260;&#963;&#8321; no longer &#8776; 0</td><td>Perspective (near/large-depth scene), missing or mis-tracked data, outliers</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+{% endraw %}
+
+  <div class="mvg-next">
+    <span>Factorization is the elegant special case: closed-form, non-iterative, and exact under weak perspective. When perspective matters, or when data are noisy, occluded, or incomplete, the linear one-shot answer is only a starting point — and the general machinery that finishes the job is bundle adjustment.</span>
+    <a class="btn btn-secondary" href="{{ '/vision/multi-view-geometry/sfm/' | relative_url }}">Continue: bundle adjustment &amp; structure from motion →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.multi_view_geometry %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+
+  // ---------- deterministic RNG (fixed synthetic cloud) ----------
+  function makeRng(seed){
+    var s = seed >>> 0;
+    return function(){ s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  }
+
+  // ---------- 3x3 helpers ----------
+  function mat3mul(A,B){ var R=[[0,0,0],[0,0,0],[0,0,0]]; for (var i=0;i<3;i++) for (var j=0;j<3;j++){ var s=0; for (var k=0;k<3;k++) s+=A[i][k]*B[k][j]; R[i][j]=s; } return R; }
+  function mat3T(M){ return [[M[0][0],M[1][0],M[2][0]],[M[0][1],M[1][1],M[2][1]],[M[0][2],M[1][2],M[2][2]]]; }
+  function rotY(a){ var c=Math.cos(a),s=Math.sin(a); return [[c,0,s],[0,1,0],[-s,0,c]]; }
+  function rotX(a){ var c=Math.cos(a),s=Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
+  function mat3vec(M,v){ return [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]]; }
+
+  // ---------- one-sided Jacobi SVD (thin) ----------
+  function transpose(A){ var m=A.length,n=A[0].length,R=[]; for (var j=0;j<n;j++){ var row=[]; for (var i=0;i<m;i++) row.push(A[i][j]); R.push(row); } return R; }
+
+  function jacobiCols(Ain){
+    var m=Ain.length, n=Ain[0].length;
+    var A=Ain.map(function(r){ return r.slice(); });
+    var V=[]; for (var i=0;i<n;i++){ var r=[]; for (var j=0;j<n;j++) r.push(i===j?1:0); V.push(r); }
+    for (var sweep=0; sweep<60; sweep++){
+      var off=0;
+      for (var p=0;p<n-1;p++) for (var q=p+1;q<n;q++){
+        var alpha=0,beta=0,gamma=0;
+        for (var k=0;k<m;k++){ var ap=A[k][p], aq=A[k][q]; alpha+=ap*ap; beta+=aq*aq; gamma+=ap*aq; }
+        if (gamma===0 || Math.abs(gamma) < 1e-15*Math.sqrt(alpha*beta)) continue;
+        off += Math.abs(gamma);
+        var zeta=(beta-alpha)/(2*gamma);
+        var t=(zeta>=0?1:-1)/(Math.abs(zeta)+Math.sqrt(1+zeta*zeta));
+        var c=1/Math.sqrt(1+t*t), s=c*t;
+        for (k=0;k<m;k++){ var np=c*A[k][p]-s*A[k][q], nq=s*A[k][p]+c*A[k][q]; A[k][p]=np; A[k][q]=nq; }
+        for (k=0;k<n;k++){ var vp=c*V[k][p]-s*V[k][q], vq=s*V[k][p]+c*V[k][q]; V[k][p]=vp; V[k][q]=vq; }
+      }
+      if (off < 1e-14) break;
+    }
+    var S=[]; for (var j=0;j<n;j++){ var nrm=0; for (var i2=0;i2<m;i2++) nrm+=A[i2][j]*A[i2][j]; S.push(Math.sqrt(nrm)); }
+    var order=[]; for (j=0;j<n;j++) order.push(j);
+    order.sort(function(a,b){ return S[b]-S[a]; });
+    var Us=[], Ss=[], Vs=[];
+    order.forEach(function(j){
+      Ss.push(S[j]);
+      var col=[]; for (var i3=0;i3<m;i3++) col.push(S[j]>1e-12 ? A[i3][j]/S[j] : 0);
+      Us.push(col);
+      var vcol=[]; for (var k2=0;k2<n;k2++) vcol.push(V[k2][j]);
+      Vs.push(vcol);
+    });
+    var Umat=[]; for (i=0;i<m;i++){ var row2=[]; for (j=0;j<n;j++) row2.push(Us[j][i]); Umat.push(row2); }
+    var Vmat=[]; for (i=0;i<n;i++){ var row3=[]; for (j=0;j<n;j++) row3.push(Vs[j][i]); Vmat.push(row3); }
+    return { U:Umat, S:Ss, V:Vmat };
+  }
+  function svdThin(A){
+    var m=A.length, n=A[0].length;
+    if (m>=n) return jacobiCols(A);
+    var r=jacobiCols(transpose(A));
+    return { U: r.V, S: r.S, V: r.U };
+  }
+
+  // ---------- dense n x n solve ----------
+  function solveN(A,b){
+    var n=A.length, M=A.map(function(row,i){ return row.concat([b[i]]); });
+    for (var col=0;col<n;col++){
+      var piv=col; for (var r=col+1;r<n;r++) if (Math.abs(M[r][col])>Math.abs(M[piv][col])) piv=r;
+      var tmp=M[col]; M[col]=M[piv]; M[piv]=tmp;
+      var pv=M[col][col]; if (Math.abs(pv)<1e-14) continue;
+      for (var r2=0;r2<n;r2++){ if (r2===col) continue; var f=M[r2][col]/pv; for (var c2=col;c2<=n;c2++) M[r2][c2]-=f*M[col][c2]; }
+    }
+    return M.map(function(row,i){ return Math.abs(row[i])<1e-14 ? 0 : row[n]/row[i]; });
+  }
+  function chol(Q){
+    var L=[[0,0,0],[0,0,0],[0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<=i;j++){
+      var s=Q[i][j];
+      for (var k=0;k<j;k++) s-=L[i][k]*L[j][k];
+      if (i===j) L[i][j]=Math.sqrt(Math.max(s,0)); else L[i][j]=s/(L[j][j]||1e-12);
+    }
+    return L;
+  }
+
+  // ---------- synthetic object + orthographic/perspective tracking ----------
+  var shapeSeed = 12345;
+  function buildShape(P, seed){
+    var rng=makeRng(seed), X=[];
+    for (var i=0;i<P;i++){
+      var x,y,z,d;
+      do { x=2*rng()-1; y=2*rng()-1; z=2*rng()-1; d=x*x+y*y+z*z; } while (d>1);
+      X.push([x,y,z]);
+    }
+    return X;
+  }
+  function projectFrames(X, F, objYaw, dist){
+    var P=X.length, objR=rotY(objYaw);
+    var Y=X.map(function(p){ return mat3vec(objR,p); });
+    var W=[]; for (var i=0;i<2*F;i++){ var row=[]; for (var j=0;j<P;j++) row.push(0); W.push(row); }
+    for (var f=0;f<F;f++){
+      var R=mat3mul(rotY(2*Math.PI*f/F), rotX(0.35));
+      var us=[], vs=[];
+      for (var p=0;p<P;p++){
+        var xc=mat3vec(R, Y[p]), u, v;
+        if (dist<1e-6){ u=xc[0]; v=xc[1]; }
+        else { var D=3.0/dist, den=D+xc[2]; u=xc[0]*D/den; v=xc[1]*D/den; }
+        us.push(u); vs.push(v);
+      }
+      var mu=0,mv=0; for (p=0;p<P;p++){ mu+=us[p]; mv+=vs[p]; } mu/=P; mv/=P;
+      for (p=0;p<P;p++){ W[2*f][p]=us[p]-mu; W[2*f+1][p]=vs[p]-mv; }
+    }
+    return W;
+  }
+
+  // ---------- Tomasi-Kanade: SVD -> rank-3 -> linear gauge solve ----------
+  function factorize(W){
+    var F=W.length/2, P=W[0].length, i, j, p, c, k;
+    var svd=svdThin(W);
+    var s3=[svd.S[0],svd.S[1],svd.S[2]];
+    var sq=[Math.sqrt(s3[0]),Math.sqrt(s3[1]),Math.sqrt(s3[2])];
+    var Mhat=[]; for (i=0;i<2*F;i++) Mhat.push([svd.U[i][0]*sq[0], svd.U[i][1]*sq[1], svd.U[i][2]*sq[2]]);
+    var Shat=[[],[],[]]; for (p=0;p<P;p++) for (c=0;c<3;c++) Shat[c].push(sq[c]*svd.V[p][c]);
+
+    function coef(u,v){ return [u[0]*v[0], u[0]*v[1]+u[1]*v[0], u[0]*v[2]+u[2]*v[0], u[1]*v[1], u[1]*v[2]+u[2]*v[1], u[2]*v[2]]; }
+    var Arows=[], brhs=[];
+    for (var f=0;f<F;f++){
+      var a=Mhat[2*f], b=Mhat[2*f+1];
+      Arows.push(coef(a,a)); brhs.push(1);
+      Arows.push(coef(b,b)); brhs.push(1);
+      Arows.push(coef(a,b)); brhs.push(0);
+    }
+    var N=[]; for (i=0;i<6;i++) N.push([0,0,0,0,0,0]);
+    var rhs=[0,0,0,0,0,0];
+    for (var r=0;r<Arows.length;r++) for (i=0;i<6;i++){ for (j=0;j<6;j++) N[i][j]+=Arows[r][i]*Arows[r][j]; rhs[i]+=Arows[r][i]*brhs[r]; }
+    var q=solveN(N,rhs);
+    var Q=[[q[0],q[1],q[2]],[q[1],q[3],q[4]],[q[2],q[4],q[5]]];
+    var A=chol(Q);
+
+    var M=[]; for (i=0;i<2*F;i++){ var mr=[0,0,0]; for (c=0;c<3;c++){ var s=0; for (k=0;k<3;k++) s+=Mhat[i][k]*A[k][c]; mr[c]=s; } M.push(mr); }
+    var S=[[],[],[]];
+    for (p=0;p<P;p++){
+      var col=[Shat[0][p],Shat[1][p],Shat[2][p]];
+      var sc=solveN(A.map(function(r){return r.slice();}), col.slice());
+      S[0].push(sc[0]); S[1].push(sc[1]); S[2].push(sc[2]);
+    }
+
+    var resid=0;
+    for (f=0;f<F;f++){
+      var m1=M[2*f], m2=M[2*f+1];
+      var d1=Math.abs(m1[0]*m1[0]+m1[1]*m1[1]+m1[2]*m1[2]-1);
+      var d2=Math.abs(m2[0]*m2[0]+m2[1]*m2[1]+m2[2]*m2[2]-1);
+      var d3=Math.abs(m1[0]*m2[0]+m1[1]*m2[1]+m1[2]*m2[2]);
+      resid=Math.max(resid,d1,d2,d3);
+    }
+    return { S:S, Svals:svd.S, resid:resid };
+  }
+
+  // ---------- Procrustes alignment (rotation + reflection + uniform scale) ----------
+  function align(Xrec, Xtrue){
+    var P=Xrec.length, i, k;
+    var mc=[0,0,0], mt=[0,0,0];
+    for (i=0;i<P;i++) for (k=0;k<3;k++){ mc[k]+=Xrec[i][k]; mt[k]+=Xtrue[i][k]; }
+    for (k=0;k<3;k++){ mc[k]/=P; mt[k]/=P; }
+    var Rc=Xrec.map(function(q){ return [q[0]-mc[0],q[1]-mc[1],q[2]-mc[2]]; });
+    var Rt=Xtrue.map(function(q){ return [q[0]-mt[0],q[1]-mt[1],q[2]-mt[2]]; });
+    var H=[[0,0,0],[0,0,0],[0,0,0]];
+    for (i=0;i<P;i++) for (var a=0;a<3;a++) for (var b=0;b<3;b++) H[a][b]+=Rc[i][a]*Rt[i][b];
+    var svd=svdThin(H);
+    var R=mat3mul(svd.V, mat3T(svd.U));
+    var num=svd.S[0]+svd.S[1]+svd.S[2], den=0;
+    for (i=0;i<P;i++) den+=Rc[i][0]*Rc[i][0]+Rc[i][1]*Rc[i][1]+Rc[i][2]*Rc[i][2];
+    var sc=num/(den||1e-12);
+    var rms=0;
+    for (i=0;i<P;i++){
+      var ar=mat3vec(R,Rc[i]);
+      var e0=sc*ar[0]-Rt[i][0], e1=sc*ar[1]-Rt[i][1], e2=sc*ar[2]-Rt[i][2];
+      rms+=e0*e0+e1*e1+e2*e2;
+    }
+    return { rms:Math.sqrt(rms/P), R:R, scale:sc };
+  }
+
+  // ---------- canvas rendering ----------
+  var canvas=document.getElementById('s3-canvas'), ctx=canvas.getContext('2d');
+  var CW=canvas.width, CH=canvas.height;
+
+  function fillBg(){ ctx.clearRect(0,0,CW,CH); ctx.fillStyle='rgba(0,0,0,0.04)'; ctx.fillRect(0,0,CW,CH); }
+
+  function viewPoint(p){
+    var a=0.6, b=0.42;
+    var x1=p[0]*Math.cos(a)-p[2]*Math.sin(a);
+    var z1=p[0]*Math.sin(a)+p[2]*Math.cos(a);
+    var y2=p[1]*Math.cos(b)-z1*Math.sin(b);
+    var z2=p[1]*Math.sin(b)+z1*Math.cos(b);
+    return [x1,y2,z2];
+  }
+
+  function drawScene(truthC, recC, radius){
+    fillBg();
+    var cx=CW/2, cy=CH/2, sc=(Math.min(CW,CH)*0.42)/(radius||1);
+
+    var tProj=truthC.map(viewPoint), rProj=recC.map(viewPoint);
+    var order=[]; for (var i=0;i<tProj.length;i++) order.push(i);
+    order.sort(function(a,b){ return Math.min(tProj[a][2],rProj[a][2]) - Math.min(tProj[b][2],rProj[b][2]); });
+
+    // correspondence lines first (behind the dots)
+    ctx.strokeStyle=COLOR_DIVIDER; ctx.lineWidth=1;
+    for (i=0;i<tProj.length;i++){
+      ctx.beginPath();
+      ctx.moveTo(cx+tProj[i][0]*sc, cy-tProj[i][1]*sc);
+      ctx.lineTo(cx+rProj[i][0]*sc, cy-rProj[i][1]*sc);
+      ctx.stroke();
+    }
+
+    // ground truth (gray) then reconstruction (accent), back-to-front
+    order.forEach(function(i){
+      var t=tProj[i], depth=Math.min(t[2],rProj[i][2]);
+      var depthAlpha=0.35+0.65*(1/(1+Math.exp(-depth*2)));
+      ctx.globalAlpha=depthAlpha*0.8;
+      ctx.fillStyle=COLOR_TEXT;
+      ctx.beginPath(); ctx.arc(cx+t[0]*sc, cy-t[1]*sc, 5, 0, 7); ctx.fill();
+      ctx.globalAlpha=1;
+      var r=rProj[i];
+      ctx.fillStyle=COLOR_ACCENT;
+      ctx.beginPath(); ctx.arc(cx+r[0]*sc, cy-r[1]*sc, 3.6, 0, 7); ctx.fill();
+      ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.stroke();
+    });
+    ctx.globalAlpha=1;
+  }
+
+  // ---------- demo wiring ----------
+  var els={
+    persp: document.getElementById('s3-persp'),
+    frames: document.getElementById('s3-frames'),
+    yaw: document.getElementById('s3-yaw')
+  };
+  document.getElementById('s3-resample').addEventListener('click', function(){ shapeSeed=1+Math.floor(Math.random()*1e9); update(); });
+  document.getElementById('s3-reset').addEventListener('click', function(){ els.persp.value='0'; update(); });
+
+  var P=40;
+
+  function s2arr(S){ var PP=S[0].length, out=[]; for (var p=0;p<PP;p++) out.push([S[0][p],S[1][p],S[2][p]]); return out; }
+  function fmt(x){ return (Math.abs(x)<1e-3 && x!==0) ? x.toExponential(1) : x.toFixed(3); }
+
+  function update(){
+    var dist=parseFloat(els.persp.value);
+    var F=parseInt(els.frames.value,10);
+    var yawDeg=parseFloat(els.yaw.value);
+    var yaw=yawDeg*Math.PI/180;
+
+    var Xtrue=buildShape(P, shapeSeed);
+    var W=projectFrames(Xtrue, F, yaw, dist);
+    var res=factorize(W);
+    var al=align(s2arr(res.S), Xtrue);
+
+    // centered ground truth for display
+    var mt=[0,0,0]; for (var i=0;i<P;i++){ mt[0]+=Xtrue[i][0]; mt[1]+=Xtrue[i][1]; mt[2]+=Xtrue[i][2]; }
+    mt=[mt[0]/P,mt[1]/P,mt[2]/P];
+    var truthC=Xtrue.map(function(p){ return [p[0]-mt[0],p[1]-mt[1],p[2]-mt[2]]; });
+    var recC=s2arr(res.S);
+    var mrc=[0,0,0]; for (i=0;i<P;i++){ mrc[0]+=recC[i][0]; mrc[1]+=recC[i][1]; mrc[2]+=recC[i][2]; }
+    mrc=[mrc[0]/P,mrc[1]/P,mrc[2]/P];
+    recC=recC.map(function(p){ var q=[p[0]-mrc[0],p[1]-mrc[1],p[2]-mrc[2]]; var r=mat3vec(al.R,q); return [al.scale*r[0], al.scale*r[1], al.scale*r[2]]; });
+
+    var radius=0; truthC.forEach(function(p){ radius=Math.max(radius,Math.hypot(p[0],p[1],p[2])); });
+    drawScene(truthC, recC, radius);
+
+    document.getElementById('s3-perspval').textContent=dist.toFixed(2);
+    document.getElementById('s3-framesval').textContent=F;
+    document.getElementById('s3-yawval').textContent=yawDeg.toFixed(0);
+
+    var svals=res.Svals.slice(0,6).map(fmt).join(', ');
+    var ratio=res.Svals[3]/res.Svals[0];
+    document.getElementById('s3-readout').innerHTML=
+      '<div><span class="k">measurement matrix W</span> = ' + (2*F) + ' &#215; ' + P + '</div>' +
+      '<div><span class="k">singular values</span> = [' + svals + ']</div>' +
+      '<div><span class="k">&#963;&#8324; / &#963;&#8321; (extra rank)</span> = <span class="hi">' + ratio.toExponential(2) + '</span></div>' +
+      '<div><span class="k">orthonormality residual</span> = <span class="hi">' + res.resid.toExponential(2) + '</span></div>' +
+      '<div><span class="k">Procrustes alignment RMS</span> = <span class="hi">' + al.rms.toExponential(2) + '</span></div>' +
+      '<div><span class="k">frames F</span> = ' + F + ', <span class="k">points P</span> = ' + P + '</div>';
+  }
+
+  Object.keys(els).forEach(function(k){ els[k].addEventListener('input', update); });
+  update();
+
+})();
+</script>
+{% endraw %}
+</body>
+</html>

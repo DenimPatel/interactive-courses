@@ -1,0 +1,680 @@
+---
+title: "Probability in Action, Interactively — Part 19: Outliers, RANSAC and robust estimation"
+description: "One bad measurement can drag a least-squares fit anywhere; RANSAC searches for a consensus, and robust losses quietly turn large residuals down instead of chasing them."
+permalink: "/math/probability-in-action/robust/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-loss-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .g-btnrow button.active { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>Outliers, RANSAC and robust estimation</h1>
+    <p>You fit a straight line to a hundred careful measurements and one of them is wrong. Not slightly wrong &mdash; a sensor spike, a mislabelled pixel, a keypoint matched to the wrong building. Least squares will happily bend the whole line toward that single point, and the reason is not a bug: the method is the maximum-likelihood fit under Gaussian noise, and a Gaussian insists that huge errors are essentially impossible. When they happen anyway the model pays for them quadratically, so a lone point with a hundred-fold residual outvotes the ninety-nine honest ones. Robust estimation is the art of fitting when the noise is heavy-tailed and a few points are simply not to be trusted. This part shows the damage, then builds two repairs: the random-sample consensus search that finds a model ignoring the bad points entirely, and the robust loss functions that keep every point but let it pull only so hard.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">One bad point, and the line goes with it</p>
+    <p>Imagine forty points scattered around the line <var>y = 1 + 1.2x</var>, each nudged by small measurement noise, plus a handful of gross errors that land far below the line. The least-squares fit chooses the slope and intercept that minimise the sum of squared vertical gaps. Every honest point contributes a term of order a tenth; each gross error contributes a term of order a hundred. The optimiser does the rational thing: it moves the line down, sacrificing a little accuracy everywhere to claw back a lot of squared error in the few bad spots. The fit you wanted is gone, and the culprit is not the arithmetic but the loss.</p>
+    <p>Notice how asymmetric the trade is. Halving a large residual cuts its contribution to a quarter; halving many small residuals barely changes the total. So the optimiser always prefers to shave the biggest gap, no matter how many small gaps it spoils. This is the fingerprint of <em>unbounded influence</em>: push one data point to infinity and the least-squares line chases it there, at a speed that never drops to zero. Statisticians say the breakdown point of least squares is zero &mdash; it takes exactly one contaminated observation to destroy the estimate, whatever the sample size.</p>
+    <p>The Gaussian story explains why we ever put up with this. If the errors really were Gaussian, huge residuals really would be astronomically unlikely, and squaring them would be the correct likelihood. Least squares would then be not just reasonable but optimal, attaining the Cram&eacute;r&ndash;Rao bound. The trouble is that real sensors, real annotations and real correspondences do not have Gaussian tails. They have tails heavy enough that a large error is merely unusual rather than impossible, and the quadratic loss badly misprices those events.</p>
+    <p>So the question this part answers is concrete: given data you cannot fully trust, how do you recover the line the honest majority implies? Two strategies follow, and they are complementary. One throws suspicious points away before fitting, by searching for the largest set of points that agree on a single model. The other keeps every point but redesigns the loss so that a large residual is simply not worth chasing.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a single outlier can drag a least-squares line arbitrarily far, how RANSAC turns "which points do I trust?" into a counting problem with a closed-form iteration budget, and how the Huber, Cauchy and Tukey losses down-weight large residuals so the fit bends to the crowd instead of to the spike.</span></div>
+    <div class="g-toc">
+      <a href="#gaussian">2 · The Gaussian assumption and its cost</a>
+      <a href="#ransac">3 · RANSAC: consensus by sampling</a>
+      <a href="#losses">4 · Robust losses: Huber, Cauchy, Tukey</a>
+      <a href="#shows">5 · Where this shows up</a>
+      <a href="#cheat">6 · Cheat sheet</a>
+      <a href="#reading">7 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="gaussian">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The Gaussian assumption and its cost</h2></div>
+    <p class="g-eyebrow">Least squares is a likelihood in disguise</p>
+    <p>Write the model as <var>$y_i = x_i^\top\beta + \varepsilon_i$</var> with the errors assumed independent and Gaussian, <var>$\varepsilon_i\sim\mathcal N(0,\sigma^2)$</var>. The likelihood of the data is a product of bell curves, one per observation. Take its logarithm and the product becomes a sum, and the only term that depends on the parameters is the sum of squared residuals, divided by <var>$2\sigma^2$</var> and negated. Maximising the likelihood is therefore exactly minimising <var>$\sum_i r_i^2$</var>. The familiar normal equations, the closed-form slope and intercept, the whole apparatus falls out of a single modelling assumption.</p>
+    <p>That assumption is also the vulnerability. A Gaussian density decays like <var>$e^{-r^2/2\sigma^2}$</var>, so a residual of ten standard deviations is assigned a probability a bookmaker would treat as zero. The likelihood "believes" such a point cannot occur, so when it does occur the fit pays a price proportional to <var>r^2</var> to reduce it &mdash; a price that grows without bound. In the language of robust statistics, the <em>influence function</em> of the squared loss is <var>2r</var>, which is proportional to the residual and therefore unbounded: the further the point, the harder it pulls, forever.</p>
+    <div class="g-math g-katex">$$\hat\beta=\arg\min_\beta\sum_{i=1}^n\bigl(y_i-x_i^\top\beta\bigr)^2,\qquad \rho_{\text{sq}}(r)=\tfrac12 r^2,\qquad \psi_{\text{sq}}(r)=\rho_{\text{sq}}'(r)=r.$$</div>
+    <p>There is a second, subtler cost. Even with no gross errors, Gaussian noise is a strong claim about how often moderate residuals appear. Real error distributions are often better described by a Student-<var>t</var> or a mixture: mostly small errors, with a definite sprinkle of larger ones. Under such a distribution the quadratic loss is no longer the maximum-likelihood choice, and a robust loss with a bounded influence function is both more efficient and far less fragile.</p>
+    <p>The demo below makes the failure visceral. The cloud on the left is the honest data; the slider drops a growing clump of gross errors below it. Watch the solid least-squares line peel away from the dashed true line even though the majority of the points never move. The last readout is the total squared error: it grows, not linearly with the number of bad points, but with the square of how far they sit, which is the unbounded sensitivity made arithmetic.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ls-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Blue points are honest; magenta points are gross errors. The <b>dashed</b> line is the truth, the <b>solid</b> line is the least-squares fit. Move both sliders and watch the solid line leave the dashed one.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Outliers added <span class="val">0</span></label><input type="range" id="ls-count" min="0" max="12" step="1" value="0"></div>
+        <div class="g-field"><label>Outlier distance <span class="val">1.0</span></label><input type="range" id="ls-mag" min="1" max="4" step="0.1" value="1"></div>
+        <div class="g-btnrow"><button type="button" id="ls-reseed">New dataset</button></div>
+        <div class="g-readout" id="ls-readout"></div>
+      </div>
+    </div>
+    <p>One should not conclude that least squares is a bad method. Given clean Gaussian data it is the best linear unbiased estimator, and it is fast and differentiable, which matters enormously in the gradient-based pipelines that fit large models. The lesson is narrower and more useful: the squared loss is a bet on thin tails, and you should check that bet before you rely on it. When the tails are fat, a bounded-influence loss or an explicit consensus search keeps you honest.</p>
+  </section>
+
+  <section class="g-step" id="ransac">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>RANSAC: consensus by sampling</h2></div>
+    <p class="g-eyebrow">Trust the largest agreeing set, not the average</p>
+    <p>If a few points are wrong, the cleanest defence is to fit to a subset that excludes them &mdash; but you do not know which subset. RANSAC, for RANdom SAmple Consensus, sidesteps the question by guessing. It repeatedly draws the smallest number of points that determines a model, fits that model exactly, and then counts how many of the remaining points agree with it within a tolerance. The model with the most agreeing points is declared the consensus, and the inliers supporting it are used for a final fit. A line needs two points; a homography needs four; the principle is the same at every scale.</p>
+    <p>The remarkable part is that the number of guesses needed is a closed-form function of two things you can estimate: the fraction <var>w</var> of inliers and the size <var>s</var> of the minimal sample. A single draw contains only inliers with probability <var>w^s</var>. The chance that at least one of <var>N</var> independent draws is all-inlier is <var>1-(1-w^s)^N</var>, and setting that equal to a target confidence <var>p</var> and solving for <var>N</var> gives the iteration budget every vision textbook quotes.</p>
+    <div class="g-math g-katex">$$N=\frac{\log(1-p)}{\log\!\left(1-w^{s}\right)}.$$</div>
+    <p>The formula is brutally sensitive to <var>w</var> and <var>s</var>. With half the points inliers and <var>s=2</var>, a ninety-nine percent confidence costs about seventeen draws. Drop to a quarter inliers and the same confidence costs about seventy-three. Raise <var>s</var> to four, as a homography forces you to, and a quarter-inlier problem needs nearly six thousand ones. This is why RANSAC is paired with a cheap way to raise <var>w</var>: loose thresholds initially, local-feature pruning, or a coarse model that removes obvious mismatches first.</p>
+    <p>The threshold matters as much as the count. Too tight and honest points fall outside the consensus, so the count is noisy; too loose and outliers are welcomed in, so the best model is corrupted. In practice the threshold is set from the measurement noise &mdash; a few pixels of reprojection error, a couple of millimetres of range error &mdash; and a squared-distance test inside the loop avoids needless square roots. The animation below lets you set it by hand and watch the inlier highlight change shape as you do.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ransac-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Each iteration fits a line through two random points (dashed) and counts the points within the threshold (highlighted blue). The <b>solid</b> line is the best consensus found so far; grey points are currently rejected.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Inlier threshold <span class="val">0.8</span></label><input type="range" id="ransac-thresh" min="0.2" max="2.0" step="0.1" value="0.8"></div>
+        <div class="g-field"><label>Iteration budget <span class="val">100</span></label><input type="range" id="ransac-iters" min="10" max="400" step="10" value="100"></div>
+        <div class="g-btnrow">
+          <button type="button" id="ransac-play">Play</button>
+          <button type="button" id="ransac-step">Step</button>
+          <button type="button" id="ransac-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="ransac-readout"></div>
+      </div>
+    </div>
+    <p>Two refinements are worth knowing. First, when the inlier ratio is unknown you can update <var>w</var> from the best consensus found so far and recompute <var>N</var> on the fly, stopping early once the budget for the current estimate is exhausted &mdash; the animation shows this adaptive count in the readout. Second, the final model should be re-fit to all inliers rather than kept from the minimal sample, because a line through two points has no redundancy. RANSAC finds the consensus; a least-squares fit over that consensus, now with the outliers gone, supplies the accuracy.</p>
+  </section>
+
+  <section class="g-step" id="losses">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Robust losses: Huber, Cauchy, Tukey</h2></div>
+    <p class="g-eyebrow">Keep every point, but let it pull only so hard</p>
+    <p>RANSAC discards points. A gentler idea keeps them all and changes the price of a large residual. Replace the quadratic <var>$\rho(r)=\tfrac12 r^2$</var> with any function that grows more slowly, and minimise <var>$\sum_i\rho(r_i)$</var>. The derivative <var>$\psi=\rho'$</var> is the <em>influence function</em>: it sets how hard a point of residual <var>r</var> pulls the fit. For the squared loss <var>$\psi(r)=r$</var>, unbounded. Robust losses are designed so that <var>$\psi$</var> is bounded, or even falls back to zero, so that no single point can ever dominate.</p>
+    <p>The Huber loss is the mildest repair. It stays exactly quadratic for small residuals, so it keeps the smoothness and efficiency of least squares where it matters, and switches to a straight line of slope <var>$\delta$</var> beyond that point. Its influence function is <var>r</var> up to <var>$\delta$</var> and then flat at <var>$\delta$</var>: every outlier, however far, pulls with the same bounded force. The parameter <var>$\delta$</var> is the scale at which you stop believing the error is Gaussian; setting it near one or two standard deviations of the honest noise is a common choice.</p>
+    <div class="g-math g-katex">$$\rho_{\text{Huber}}(r)=\begin{cases}\tfrac12 r^2 & |r|\le\delta\\[2pt] \delta\bigl(|r|-\tfrac12\delta\bigr) & |r|&gt;\delta\end{cases}\qquad \rho_{\text{Cauchy}}(r)=\tfrac12 c^2\log\!\left(1+(r/c)^2\right).$$</div>
+    <p>The Cauchy loss is more aggressive: its influence function is <var>$\psi(r)=r/(1+(r/c)^2)$</var>, which rises, peaks at <var>r=c</var>, and then decays back to zero. In robust-statistics language it is <em>redescending</em> &mdash; at some point additional distance makes a point matter <em>less</em>, not more. The heavier-tailed Student-<var>t</var> likelihood produces a closely related loss, which is why <var>t</var>-distributed error models and Cauchy M-estimators feel like the same tool seen from two sides. Tukey's biweight goes all the way: it gives a residual beyond <var>c</var> literally zero weight, so flagrant outliers are ignored completely.</p>
+    <div class="g-math g-katex">$$\rho_{\text{Tukey}}(r)=\begin{cases}\tfrac{c^2}{6}\Bigl[1-\bigl(1-(r/c)^2\bigr)^3\Bigr] & |r|\le c\\[2pt] \tfrac{c^2}{6} & |r|&gt;c\end{cases}\qquad w(r)=\frac{\psi(r)}{r}.$$</div>
+    <p>How do you minimise a loss with a bounded influence function? With iteratively reweighted least squares, or IRLS. Start from any fit, compute each residual, convert it to a weight <var>$w_i=\psi(r_i)/r_i$</var> &mdash; one for small residuals, smaller for large ones, zero for the rejected ones &mdash; and solve a <em>weighted</em> least-squares problem. The weights change, so iterate until the fit stops moving. A few dozen iterations always suffice, and each step is as cheap as the closed-form least-squares solve. The price of a non-convex loss such as Tukey's is that the answer can depend on where you start; beginning from the least-squares fit, or from a RANSAC consensus, removes the ambiguity.</p>
+    <p>The three demos below share one set of controls. The first canvas shows the loss <var>$\rho(r)$</var>, the second the weight <var>w(r)</var> each method assigns to a residual of size <var>r</var>, and the third runs IRLS on contaminated regression data so you can compare the robust fit with the least-squares fit directly. Drag <var>$\delta$</var> and <var>c</var>, and switch the highlighted loss, to see how the weight you keep translates into a line you can trust.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="loss-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Each loss <var>&rho;(r)</var>. The squared loss leaves the top of the frame &mdash; that escape is the unbounded sensitivity. The highlighted curve is the one IRLS currently uses.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="weight-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">The weight <var>w(r)=&psi;(r)/r</var> each method gives a residual. Squared keeps weight one forever; Huber tapers like <var>&delta;/|r|</var>; Cauchy redescends; Tukey cuts off.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="irls-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">IRLS with the highlighted loss (solid) against the least-squares fit (dashed) on data with a few gross errors. The true line is the faint dashed line.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Huber <var>&delta;</var> <span class="val">1.0</span></label><input type="range" id="loss-delta" min="0.3" max="4" step="0.1" value="1"></div>
+        <div class="g-field"><label>Cauchy / Tukey <var>c</var> <span class="val">3.0</span></label><input type="range" id="loss-c" min="1" max="6" step="0.1" value="3"></div>
+        <div class="g-btnrow">
+          <button type="button" id="loss-sq">Squared</button>
+          <button type="button" id="loss-hu" class="active">Huber</button>
+          <button type="button" id="loss-ca">Cauchy</button>
+          <button type="button" id="loss-tu">Tukey</button>
+        </div>
+        <div class="g-readout" id="loss-readout"></div>
+      </div>
+    </div>
+    <p>Nothing here is a free lunch. Huber gains robustness to outliers while giving up some efficiency under perfect Gaussian noise, and choosing <var>$\delta$</var> is a bet about scale. Cauchy and Tukey are more resistant still but non-convex, so they reward a good starting point and can settle on different answers from different initialisations. The honest summary is that robustness is a modelling choice: you are replacing the claim "errors are Gaussian" with the claim "errors are heavy-tailed and a fraction of the data is wrong", and each loss expresses a slightly different version of that second claim.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Robustness wherever data is cheap and dirty</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Two-view geometry</h3>
+        <p style="margin-bottom:0;">Feature matches between two images are full of wrong correspondences, so the eight-point algorithm is run inside <a href="{{ '/vision/multi-view-geometry/ransac/' | relative_url }}">RANSAC</a> before any structure is triangulated. The minimal sample is four or more points and the inlier threshold is a few pixels of Sampson error.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Optimisation</div>
+        <h3 style="margin:6px 0;">Robust cost in the solver</h3>
+        <p style="margin-bottom:0;">Pose-graph and bundle-adjustment solvers bolt a robust kernel onto the residual, then optimise it with <a href="{{ '/vision/nonlinear-optimization/gradient-descent/' | relative_url }}">gradient-based</a> methods. The IRLS weights reappear as a diagonal matrix folded into the normal equations at every iteration.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Why heavy tails change the rules</h3>
+        <p style="margin-bottom:0;">The whole failure traces back to the shape of the tails: a Gaussian makes large deviations negligible, a <a href="{{ '/math/probability/tails/' | relative_url }}">heavy-tailed distribution</a> does not. Mean and variance can even fail to exist, which is exactly why squared-error summaries mislead.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sampling</div>
+        <h3 style="margin:6px 0;">Consensus by random draws</h3>
+        <p style="margin-bottom:0;">RANSAC is a stochastic search, and its guarantees are probabilistic. It is the same reasoning as rejection and importance <a href="{{ '/math/probability-in-action/sampling/' | relative_url }}">sampling</a>: draw repeatedly from a cheap proposal and keep the draw that scores best, trusting a counting argument for how many draws suffice.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Least squares</td><td><var>$\sum_i r_i^2$</var>, influence <var>$\psi=2r$</var></td><td>Gaussian MLE; unbounded pull, breakdown point zero.</td></tr>
+        <tr><td>Huber loss</td><td><var>$\tfrac12 r^2$</var> for <var>$|r|\le\delta$</var>, else <var>$\delta(|r|-\tfrac12\delta)$</var></td><td>Quadratic near zero, linear beyond; influence bounded by <var>$\delta$</var>.</td></tr>
+        <tr><td>Cauchy loss</td><td><var>$\tfrac12 c^2\log(1+(r/c)^2)$</var></td><td>Smooth redescending loss; weight <var>1/(1+(r/c)^2)</var>.</td></tr>
+        <tr><td>Tukey loss</td><td><var>$\tfrac{c^2}{6}[1-(1-(r/c)^2)^3]$</var> for <var>$|r|\le c$</var></td><td>Hard cutoff: residuals beyond <var>c</var> get zero weight.</td></tr>
+        <tr><td>Weight</td><td><var>$w(r)=\psi(r)/r$</var></td><td>One means trust fully; zero means ignore; between is a taper.</td></tr>
+        <tr><td>IRLS step</td><td>weighted least squares with <var>w_i=w(r_i)</var></td><td>Recompute residuals and weights, refit, repeat.</td></tr>
+        <tr><td>RANSAC</td><td><var>$N=\log(1-p)/\log(1-w^s)$</var></td><td>Draws for confidence <var>p</var> with inlier ratio <var>w</var> and sample size <var>s</var>.</td></tr>
+        <tr><td>Inlier test</td><td><var>$|r_i|\le t$</var></td><td>Tolerance from sensor noise; count the agreeing set.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>P. J. Huber, <em>Robust Statistics</em>, Wiley, 1981 &mdash; the Huber loss and the influence-function machinery that frames the whole subject.</li>
+      <li>P. J. Rousseeuw and A. M. Leroy, <em>Robust Regression and Outlier Detection</em>, Wiley, 1987 &mdash; least median of squares, breakdown points, and the Tukey biweight in practice.</li>
+      <li>M. A. Fischler and R. C. Bolles, <a href="https://doi.org/10.1145/358669.358692">"Random Sample Consensus"</a>, Communications of the ACM, 1981 &mdash; the original RANSAC paper, including the iteration formula.</li>
+      <li>R. Hartley and A. Zisserman, <em>Multiple View Geometry in Computer Vision</em>, chapter 4 &mdash; RANSAC for the eight-point algorithm and for homography estimation.</li>
+      <li>F. R. Hampel, E. M. Ronchetti, P. J. Rousseeuw and W. A. Stahel, <em>Robust Statistics: The Approach Based on Influence Functions</em>, Wiley, 1986 &mdash; redescending estimators and the theory of their multiple minima.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}With robust fits in hand, the final part turns probability into the engine of a machine-learning model, from softmax to cross-entropy to diffusion.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var P = Prob;
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; return x.toFixed(d); }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lsFit(pts) {
+    var n = pts.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (var i = 0; i < n; i++) {
+      sx += pts[i].x; sy += pts[i].y;
+      sxx += pts[i].x * pts[i].x; sxy += pts[i].x * pts[i].y;
+    }
+    var den = n * sxx - sx * sx;
+    if (Math.abs(den) < 1e-9) return { a: 0, b: 0 };
+    var b = (n * sxy - sx * sy) / den;
+    var a = (sy - b * sx) / n;
+    return { a: a, b: b };
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — heavy-tailed noise drags the least-squares fit
+  // ------------------------------------------------------------------
+  var TRUE_A = 1.0, TRUE_B = 1.2, A_N = 40, A_NOISE = 0.25;
+  var lsData = { inliers: [], pool: [], count: 0, mag: 1, seed: 20260914 };
+  var lsPlot = null;
+
+  function buildLsData() {
+    var r = P.rng(lsData.seed);
+    var inl = [], pool = [], i;
+    for (i = 0; i < A_N; i++) {
+      var x = -3 + 6 * r.uniform();
+      inl.push({ x: x, y: TRUE_A + TRUE_B * x + A_NOISE * r.normal() });
+    }
+    for (i = 0; i < 12; i++) {
+      var xo = -3 + 6 * r.uniform();
+      pool.push({ x: xo, y: TRUE_A + TRUE_B * xo - (6 + 2.5 * r.uniform()) });
+    }
+    lsData.inliers = inl; lsData.pool = pool;
+  }
+
+  function drawLs() {
+    if (!lsPlot) return;
+    var pl = lsPlot;
+    var mag = lsData.mag;
+    pl.yRange[0] = -3 - 9.5 * mag;
+    pl.yRange[1] = 6;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var used = lsData.inliers.slice();
+    for (var i = 0; i < lsData.count; i++) {
+      used.push(lsData.pool[i]);
+    }
+    var fit = lsFit(used);
+    var sse = 0, maxAbs = 0;
+    for (i = 0; i < used.length; i++) {
+      var r = used[i].y - (fit.a + fit.b * used[i].x);
+      sse += r * r;
+      if (Math.abs(r) > maxAbs) maxAbs = Math.abs(r);
+    }
+    pl.points(lsData.inliers, { color: c.accent, r: 3 });
+    var bad = [];
+    for (i = 0; i < lsData.count; i++) bad.push(lsData.pool[i]);
+    pl.points(bad, { color: c.accent2, r: 4 });
+    pl.curve(function (x) { return TRUE_A + TRUE_B * x; },
+      { from: -3.2, to: 3.2, color: c.accent400, width: 2, dash: [6, 4] });
+    pl.curve(function (x) { return fit.a + fit.b * x; },
+      { from: -3.2, to: 3.2, color: c.accent2, width: 2.6 });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'y' });
+    var slopeErr = fit.b - TRUE_B;
+    el('ls-readout').innerHTML =
+      '<div><span class="k">least-squares slope</span> <span class="hi">' + fmt(fit.b, 3) + '</span></div>' +
+      '<div><span class="k">true slope</span> ' + fmt(TRUE_B, 3) + '</div>' +
+      '<div><span class="k">slope error</span> ' + fmt(slopeErr, 3) + '</div>' +
+      '<div><span class="k">residual sum of squares</span> ' + fmt(sse, 1) + '</div>' +
+      '<div><span class="k">largest |residual|</span> ' + fmt(maxAbs, 2) + '</div>' +
+      '<div style="margin-top:6px;">Push the outliers further and the sum of squares climbs quadratically while the honest points never move.</div>';
+  }
+
+  lsPlot = P.plot(el('ls-canvas'), {
+    W: 640, H: 360, xRange: [-3.4, 3.4], yRange: [-12.5, 6], onResize: drawLs
+  });
+  buildLsData();
+  Guide.bindSliders([el('ls-count')], function (s) { lsData.count = parseInt(s.value, 10); drawLs(); });
+  Guide.bindSliders([el('ls-mag')], function (s) { lsData.mag = parseFloat(s.value); drawLs(); });
+  el('ls-reseed').addEventListener('click', function () {
+    lsData.seed = (lsData.seed * 1103515245 + 12345) % 2147483647;
+    buildLsData(); drawLs();
+  });
+  drawLs();
+
+  // ------------------------------------------------------------------
+  // Demo B — RANSAC consensus search, animated
+  // ------------------------------------------------------------------
+  var R_IN = 40, R_OUT = 20;
+  var ransacData = { pts: [], seed: 4211 };
+  var ransac = { thresh: 0.8, maxIter: 100, iter: 0, best: null, cand: null, rng: null };
+  var ransacPlot = null;
+
+  function buildRansacData() {
+    var r = P.rng(ransacData.seed);
+    var pts = [], i;
+    for (i = 0; i < R_IN; i++) {
+      var x = -3 + 6 * r.uniform();
+      pts.push({ x: x, y: TRUE_A + TRUE_B * x + 0.35 * r.normal(), inlier: true });
+    }
+    for (i = 0; i < R_OUT; i++) {
+      pts.push({ x: -3 + 6 * r.uniform(), y: -5 + 10 * r.uniform(), inlier: false });
+    }
+    ransacData.pts = pts;
+  }
+
+  function countInliers(a, b, t) {
+    var pts = ransacData.pts, n = pts.length, mask = [], cnt = 0;
+    for (var i = 0; i < n; i++) {
+      var r = Math.abs(pts[i].y - (a + b * pts[i].x));
+      var ok = r <= t;
+      mask.push(ok);
+      if (ok) cnt++;
+    }
+    return { mask: mask, count: cnt };
+  }
+
+  function ransacStep() {
+    if (ransac.iter >= ransac.maxIter) return false;
+    var pts = ransacData.pts, n = pts.length;
+    var i1 = Math.floor(ransac.rng.uniform() * n);
+    var i2 = Math.floor(ransac.rng.uniform() * n);
+    if (i1 === i2) i2 = (i2 + 1) % n;
+    var p1 = pts[i1], p2 = pts[i2];
+    if (Math.abs(p2.x - p1.x) < 1e-6) { ransac.iter++; return true; }
+    var b = (p2.y - p1.y) / (p2.x - p1.x);
+    var a = p1.y - b * p1.x;
+    var res = countInliers(a, b, ransac.thresh);
+    ransac.cand = { a: a, b: b, mask: res.mask, count: res.count };
+    if (!ransac.best || res.count > ransac.best.count) {
+      ransac.best = { a: a, b: b, mask: res.mask, count: res.count };
+    }
+    ransac.iter++;
+    return true;
+  }
+
+  function requiredIters(w, p) {
+    var s = 2;
+    var den = Math.log(1 - Math.pow(w, s));
+    if (!isFinite(den) || den >= 0) return Infinity;
+    return Math.log(1 - p) / den;
+  }
+
+  function drawRansac() {
+    if (!ransacPlot) return;
+    var pl = ransacPlot;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var pts = ransacData.pts;
+    var bestMask = ransac.best ? ransac.best.mask : [];
+    var inPts = [], outPts = [];
+    for (var i = 0; i < pts.length; i++) {
+      if (bestMask[i]) inPts.push(pts[i]); else outPts.push(pts[i]);
+    }
+    pl.points(outPts, { color: 'rgba(32,30,29,0.28)', r: 3 });
+    pl.points(inPts, { color: c.accent, r: 4 });
+    pl.curve(function (x) { return TRUE_A + TRUE_B * x; },
+      { from: -3.4, to: 3.4, color: c.accent400, width: 1.4, dash: [3, 4] });
+    if (ransac.cand) {
+      pl.curve(function (x) { return ransac.cand.a + ransac.cand.b * x; },
+        { from: -3.4, to: 3.4, color: c.accent2, width: 1.6, dash: [5, 4] });
+    }
+    if (ransac.best) {
+      pl.curve(function (x) { return ransac.best.a + ransac.best.b * x; },
+        { from: -3.4, to: 3.4, color: c.accent, width: 2.6 });
+    }
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'y', labels: false });
+    var n = pts.length;
+    var bestCount = ransac.best ? ransac.best.count : 0;
+    var w = bestCount / n;
+    var need = requiredIters(Math.max(w, 1e-3), 0.99);
+    var conf = 1 - Math.pow(1 - Math.pow(w, 2), ransac.iter);
+    el('ransac-readout').innerHTML =
+      '<div><span class="k">iterations run</span> <span class="hi">' + ransac.iter + ' / ' + ransac.maxIter + '</span></div>' +
+      '<div><span class="k">best consensus</span> ' + bestCount + ' inliers (' + fmt(100 * w, 0) + '%)</div>' +
+      '<div><span class="k">N for 99% (w, s=2)</span> ' + (isFinite(need) ? Math.ceil(need) : '&infin;') + '</div>' +
+      '<div><span class="k">confidence reached</span> ' + fmt(100 * clamp(conf, 0, 1), 1) + '%</div>' +
+      '<div style="margin-top:6px;">The dashed line is the last random sample; the solid line is the best consensus. Highlighted points lie within the threshold.</div>';
+  }
+
+  ransacPlot = P.plot(el('ransac-canvas'), {
+    W: 640, H: 360, xRange: [-3.4, 3.4], yRange: [-6, 6], onResize: drawRansac
+  });
+  buildRansacData();
+  ransac.rng = P.rng(ransacData.seed + 1);
+
+  var ransacLoop = Guide.loop({
+    button: el('ransac-play'), interval: 130,
+    onStep: function () {
+      if (!ransacStep()) { ransacLoop.stop(); }
+      drawRansac();
+    }
+  });
+
+  Guide.bindSliders([el('ransac-thresh')], function (s) {
+    ransac.thresh = parseFloat(s.value);
+    if (ransac.best) ransac.best.mask = countInliers(ransac.best.a, ransac.best.b, ransac.thresh).mask;
+    if (ransac.best) ransac.best.count = countInliers(ransac.best.a, ransac.best.b, ransac.thresh).count;
+    drawRansac();
+  });
+  Guide.bindSliders([el('ransac-iters')], function (s) { ransac.maxIter = parseInt(s.value, 10); drawRansac(); });
+  el('ransac-step').addEventListener('click', function () { ransacStep(); drawRansac(); });
+  el('ransac-reset').addEventListener('click', function () {
+    ransacLoop.stop();
+    ransac.iter = 0; ransac.best = null; ransac.cand = null;
+    ransac.rng = P.rng(ransacData.seed + 1);
+    drawRansac();
+  });
+  drawRansac();
+
+  // ------------------------------------------------------------------
+  // Demo C — robust loss curves, weights, and IRLS
+  // ------------------------------------------------------------------
+  var COL = {
+    sq: 'rgba(43,95,255,0.95)',
+    hu: 'rgba(214,0,108,0.95)',
+    ca: 'rgba(201,162,39,0.98)',
+    tu: 'rgba(95,138,58,0.98)'
+  };
+  var LOSS_LABEL = { sq: 'Squared', hu: 'Huber', ca: 'Cauchy', tu: 'Tukey' };
+  var robust = { delta: 1.0, c: 3.0, loss: 'hu', data: [], seed: 90210 };
+  var rhoPlot = null, weightPlot = null, irlsPlot = null;
+
+  function funRho(kind, r) {
+    var a = Math.abs(r);
+    if (kind === 'sq') return 0.5 * r * r;
+    if (kind === 'hu') {
+      var d = robust.delta;
+      return a <= d ? 0.5 * r * r : d * (a - 0.5 * d);
+    }
+    if (kind === 'ca') {
+      var cc = robust.c;
+      return 0.5 * cc * cc * Math.log(1 + (r / cc) * (r / cc));
+    }
+    var ct = robust.c;
+    if (a >= ct) return ct * ct / 6;
+    var u = (r / ct) * (r / ct);
+    return (ct * ct / 6) * (1 - Math.pow(1 - u, 3));
+  }
+
+  function funWeight(kind, r) {
+    var a = Math.abs(r);
+    if (kind === 'sq') return 1;
+    if (kind === 'hu') {
+      var d = robust.delta;
+      return a <= d ? 1 : d / a;
+    }
+    if (kind === 'ca') {
+      var cc = robust.c;
+      return 1 / (1 + (r / cc) * (r / cc));
+    }
+    var ct = robust.c;
+    if (a >= ct) return 0;
+    var u = (r / ct) * (r / ct);
+    return (1 - u) * (1 - u);
+  }
+
+  function drawCurves(pl, ylabel, valFn) {
+    pl.clear(); pl.grid({ step: 1 });
+    var order = ['sq', 'hu', 'ca', 'tu'], i, k;
+    for (i = 0; i < order.length; i++) {
+      k = order[i];
+      if (k === robust.loss) continue;
+      (function (kk) {
+        pl.curve(function (x) { return valFn(kk, x); },
+          { from: -6, to: 6, color: COL[kk], width: 1.5, samples: 300 });
+      })(k);
+    }
+    pl.curve(function (x) { return valFn(robust.loss, x); },
+      { from: -6, to: 6, color: COL[robust.loss], width: 3, samples: 300 });
+    pl.axes({ step: 1, xLabel: 'residual r', yLabel: ylabel });
+  }
+
+  function drawRho() {
+    if (!rhoPlot) return;
+    drawCurves(rhoPlot, 'rho(r)', function (k, r) { return Math.min(6, funRho(k, r)); });
+    rhoPlot.legend([
+      { label: 'Squared', color: COL.sq },
+      { label: 'Huber', color: COL.hu },
+      { label: 'Cauchy', color: COL.ca },
+      { label: 'Tukey', color: COL.tu }
+    ]);
+  }
+
+  function drawWeight() {
+    if (!weightPlot) return;
+    drawCurves(weightPlot, 'weight w(r)', function (k, r) { return clamp(funWeight(k, r), 0, 1.05); });
+  }
+
+  function buildIrlsData() {
+    var r = P.rng(robust.seed);
+    var pts = [], i;
+    for (i = 0; i < 40; i++) {
+      var x = -3 + 6 * r.uniform();
+      pts.push({ x: x, y: TRUE_A + TRUE_B * x + 0.2 * r.normal() });
+    }
+    for (i = 0; i < 8; i++) {
+      var xo = -3 + 6 * r.uniform();
+      pts.push({ x: xo, y: TRUE_A + TRUE_B * xo - (7 + 3 * r.uniform()) });
+    }
+    robust.data = pts;
+  }
+
+  function weightedFit(pts, wts) {
+    var sw = 0, swx = 0, swy = 0, swxx = 0, swxy = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var w = wts[i], x = pts[i].x, y = pts[i].y;
+      sw += w; swx += w * x; swy += w * y;
+      swxx += w * x * x; swxy += w * x * y;
+    }
+    var den = sw * swxx - swx * swx;
+    if (!isFinite(den) || Math.abs(den) < 1e-9) return { a: 0, b: 0 };
+    var b = (sw * swxy - swx * swy) / den;
+    var a = (swy - b * swx) / sw;
+    return { a: a, b: b };
+  }
+
+  function irlsFit(pts, kind) {
+    var wts = [], i;
+    for (i = 0; i < pts.length; i++) wts.push(1);
+    var fit = weightedFit(pts, wts);
+    for (var it = 0; it < 40; it++) {
+      for (i = 0; i < pts.length; i++) {
+        var r = pts[i].y - (fit.a + fit.b * pts[i].x);
+        var w = funWeight(kind, r);
+        wts[i] = isFinite(w) ? Math.max(w, 0) : 0;
+      }
+      var next = weightedFit(pts, wts);
+      if (Math.abs(next.a - fit.a) + Math.abs(next.b - fit.b) < 1e-8) { fit = next; break; }
+      fit = next;
+    }
+    return fit;
+  }
+
+  function drawIrls() {
+    if (!irlsPlot) return;
+    var pl = irlsPlot;
+    var pts = robust.data;
+    pl.yRange[0] = -12; pl.yRange[1] = 5.5;
+    pl.clear(); pl.grid({ step: 1 });
+    pl.points(pts, { color: 'rgba(32,30,29,0.35)', r: 3 });
+    var ls = lsFit(pts);
+    var fit = irlsFit(pts, robust.loss);
+    pl.curve(function (x) { return TRUE_A + TRUE_B * x; },
+      { from: -3.4, to: 3.4, color: c.accent400, width: 1.4, dash: [3, 4] });
+    pl.curve(function (x) { return ls.a + ls.b * x; },
+      { from: -3.4, to: 3.4, color: c.accent2, width: 2, dash: [6, 4] });
+    pl.curve(function (x) { return fit.a + fit.b * x; },
+      { from: -3.4, to: 3.4, color: c.accent, width: 2.8 });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'y', labels: false });
+    el('loss-readout').innerHTML =
+      '<div><span class="g-loss-dot" style="background:' + COL[robust.loss] + '"></span><span class="k">IRLS loss</span> <span class="hi">' + LOSS_LABEL[robust.loss] + '</span></div>' +
+      '<div><span class="k">true slope</span> ' + fmt(TRUE_B, 3) + '</div>' +
+      '<div><span class="k">least-squares slope</span> ' + fmt(ls.b, 3) + '</div>' +
+      '<div><span class="k">robust slope</span> ' + fmt(fit.b, 3) + '</div>' +
+      '<div><span class="k">robust intercept</span> ' + fmt(fit.a, 3) + '</div>' +
+      '<div style="margin-top:6px;">Squared leaves the outliers in charge; the highlighted loss lets the honest majority win.</div>';
+  }
+
+  rhoPlot = P.plot(el('loss-canvas'), {
+    W: 640, H: 300, xRange: [-6, 6], yRange: [-0.3, 6], onResize: drawRho
+  });
+  weightPlot = P.plot(el('weight-canvas'), {
+    W: 640, H: 300, xRange: [-6, 6], yRange: [-0.05, 1.05], onResize: drawWeight
+  });
+  irlsPlot = P.plot(el('irls-canvas'), {
+    W: 640, H: 300, xRange: [-3.4, 3.4], yRange: [-12, 5.5], onResize: drawIrls
+  });
+  buildIrlsData();
+
+  Guide.bindSliders([el('loss-delta')], function (s) { robust.delta = parseFloat(s.value); drawRho(); drawWeight(); drawIrls(); });
+  Guide.bindSliders([el('loss-c')], function (s) { robust.c = parseFloat(s.value); drawRho(); drawWeight(); drawIrls(); });
+
+  function selectLoss(kind) {
+    robust.loss = kind;
+    var ids = ['loss-sq', 'loss-hu', 'loss-ca', 'loss-tu'];
+    var kinds = ['sq', 'hu', 'ca', 'tu'];
+    for (var i = 0; i < ids.length; i++) {
+      var b = el(ids[i]);
+      if (kinds[i] === kind) b.classList.add('active'); else b.classList.remove('active');
+    }
+    drawRho(); drawWeight(); drawIrls();
+  }
+  el('loss-sq').addEventListener('click', function () { selectLoss('sq'); });
+  el('loss-hu').addEventListener('click', function () { selectLoss('hu'); });
+  el('loss-ca').addEventListener('click', function () { selectLoss('ca'); });
+  el('loss-tu').addEventListener('click', function () { selectLoss('tu'); });
+  drawRho(); drawWeight(); drawIrls();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'robust-breakdown',
+      kind: 'choice',
+      prompt: 'What is the breakdown point of the least-squares estimator?',
+      options: [
+        { label: 'Zero: a single arbitrarily bad observation can move the fit without bound.', correct: true },
+        { label: 'Fifty percent: it tolerates up to half the data being wrong.', correct: false },
+        { label: 'One hundred percent: it is robust by construction.', correct: false }
+      ],
+      explanation: 'The influence function of the squared loss is 2r, which grows without limit. Push one point far enough and the line follows it however many good points you add, so the smallest possible fraction of contamination — one point — already destroys the estimate.'
+    },
+    {
+      id: 'robust-ransac-iters',
+      kind: 'numeric',
+      prompt: 'With inlier ratio <var>w = 0.6</var>, minimal sample <var>s = 2</var> and target confidence <var>p = 0.99</var>, roughly how many RANSAC iterations are needed? Use <var>N = &minus;4.605 / log(1 &minus; w&sup2;)</var>.',
+      answer: 11,
+      tolerance: 1,
+      explanation: 'w² = 0.36, so 1 − w² = 0.64 and log 0.64 ≈ −0.446. Then N ≈ −4.605 / −0.446 ≈ 10.3, which rounds up to 11 iterations. The count is extremely sensitive to w and to the sample size s.'
+    },
+    {
+      id: 'robust-huber-shape',
+      kind: 'choice',
+      prompt: 'How does the Huber influence function behave as the residual grows?',
+      options: [
+        { label: 'It grows linearly, then flattens to a constant bound <var>&delta;</var>.', correct: true },
+        { label: 'It keeps growing linearly forever, like the squared loss.', correct: false },
+        { label: 'It decays back to zero past the threshold.', correct: false }
+      ],
+      explanation: 'Huber is quadratic near zero and linear beyond δ, so its influence is r up to δ and constant at δ afterwards. It bounds the pull of an outlier without discarding it; a redescending loss such as Cauchy or Tukey goes further and shrinks the pull back toward zero.'
+    },
+    {
+      id: 'robust-cauchy-weight',
+      kind: 'numeric',
+      prompt: 'For the Cauchy loss with <var>c = 2</var>, what weight <var>w(r) = 1/(1 + (r/c)&sup2;)</var> does a residual <var>r = 4</var> receive?',
+      answer: 0.2,
+      tolerance: 0.01,
+      explanation: '(r/c)² = 4, so w = 1/(1 + 4) = 0.2. The point still counts, but only one fifth as much as a small residual — the weight tapers smoothly instead of exploding like the squared loss.'
+    },
+    {
+      id: 'robust-irls',
+      kind: 'choice',
+      prompt: 'What does one iteration of IRLS actually do?',
+      options: [
+        { label: 'Turn each residual into a weight and solve a weighted least-squares problem, then repeat.', correct: true },
+        { label: 'Delete the points with the largest residuals and refit.', correct: false },
+        { label: 'Add a random sample of new points to stabilise the fit.', correct: false }
+      ],
+      explanation: 'IRLS converts the residual r_i into the weight w_i = ψ(r_i)/r_i — one for small residuals, smaller for large ones, zero for rejected ones — and solves weighted least squares. Iterating until the fit stops moving minimises the robust loss, and each step costs about as much as an ordinary least-squares solve.'
+    },
+    {
+      id: 'robust-nonconvex',
+      kind: 'choice',
+      prompt: 'Why should a redescending loss such as Tukey usually be started from a good initial fit?',
+      options: [
+        { label: 'Because it is non-convex and can have several local minima, so the starting point can decide the answer.', correct: true },
+        { label: 'Because it has no derivative anywhere and cannot be optimised.', correct: false },
+        { label: 'Because it ignores every point whose residual is small.', correct: false }
+      ],
+      explanation: 'Tukey gives a residual beyond c zero weight, so the loss is flat outside and can settle on different solutions depending on where the iteration begins. Starting from the least-squares fit, or from a RANSAC consensus, keeps the iteration in the basin that contains the honest majority of the points.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

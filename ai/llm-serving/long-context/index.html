@@ -1,0 +1,877 @@
+---
+title: "LLM Serving, Interactively — Part 15: Long-context serving"
+description: "What a long window actually costs to serve: quadratic prefill against linear KV, ring attention, sparse patterns, eviction budgets, and the dollar price of one long request."
+permalink: "/ai/llm-serving/long-context/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .lc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .lc-card { background: var(--color-surface); border-radius: var(--radius-md); padding: 14px 16px; }
+  .lc-card .lc-k { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; opacity: 0.55; }
+  .lc-card .lc-v { font-family: var(--font-mono); font-size: 20px; font-weight: 600; color: var(--color-accent-700); margin-top: 2px; }
+  .lc-card .lc-n { font-size: 12px; opacity: 0.75; margin-top: 4px; line-height: 1.55; }
+  .lc-badge { display: inline-block; font-family: var(--font-mono); font-size: 11.5px; padding: 2px 7px; border-radius: 999px; }
+  .lc-badge.ok { background: var(--color-accent-100); color: var(--color-accent-800); }
+  .lc-badge.bad { background: var(--color-accent-2-100); color: var(--color-accent-2-800); }
+  .lc-policy { font-family: var(--font-mono); font-size: 12px; line-height: 2; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 15 of 20</span>
+    <h1>Long-context serving</h1>
+    <p>Extending the window is a training problem. Serving it is an arithmetic one: prefill compute grows with the square of the context while the KV cache grows linearly, and every long-context system in production is a negotiated bargain between the two. This part prices that bargain, from a single 1M-token request to the sparse-attention and eviction tricks that make it affordable.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="quadratic">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Quadratic prefill, linear KV</h2></div>
+    <p class="g-eyebrow">The two curves that decide everything</p>
+    <p>The training guide introduced prefill versus decode in a paragraph. Here the same distinction becomes a pair of curves you can price. A prefill pass over <var>T</var> tokens costs a linear weight term, <var>2NT</var>, plus an attention term that grows with the square of the sequence:</p>
+    <div class="g-math g-katex">$$\text{prefill FLOPs} \;\approx\; \underbrace{2NT}_{\text{weights}} \;+\; \underbrace{4\,L\,n_h\,d_h\,T^2}_{\text{QK}^\top + \text{AV}}$$</div>
+    <p>At 1,000 tokens the weight term dominates: you are paying to multiply the whole model over a short sequence. By roughly 30,000 tokens the terms cross, and past 100,000 the quadratic term is almost the entire bill. The KV cache is far better behaved — it is exactly linear, <var>2&thinsp;L&thinsp;n<sub>kv</sub>&thinsp;d<sub>h</sub>&thinsp;T&thinsp;bytes</var> — but it is also what decode must re-read on <em>every</em> token, so at long context decode stops being cheap in a way that is easy to miss until the bill arrives.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-curves" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Top: prefill FLOPs, split into the linear and quadratic terms. Bottom: KV cache size, linear in context. Both on a log token axis.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Model</label>
+          <select id="lc-model">
+            <option value="8">Llama 3.1 8B (GQA, 8 KV heads)</option>
+            <option value="70">Llama 3.1 70B (GQA, 8 KV heads)</option>
+            <option value="405">Llama 3.1 405B (GQA, 8 KV heads)</option>
+          </select>
+        </div>
+        <div class="g-field"><label>Context tokens <span class="val" id="lc-t-val">128K</span></label>
+          <input type="range" id="lc-t" min="0" max="100" step="1" value="70">
+        </div>
+        <div class="g-readout" id="lc-curves-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lc-quadratic-source"></p>
+    <div class="g-goal">💡 <span><b>The honest read:</b> on an H100-class part at a realistic 45% MFU, one 1M-token prefill of an 8B model is roughly <b>20 minutes of compute</b>, while the KV cache produced alone is <b>131 GB</b> — larger than the GPU. Long context is not a bigger window; it is a bigger data structure.</span></div>
+  </section>
+
+  <section class="g-step" id="ring">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Context parallelism and ring attention</h2></div>
+    <p class="g-eyebrow">A window no single device can hold</p>
+    <p>When the KV cache exceeds one GPU, the sequence itself is sharded — that is context parallelism (CP), the long-context wing of the parallelism family covered in <a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a>. Each device holds one contiguous block of queries and the keys/values for its own block. To attend to the whole sequence it must see every other block, so K/V blocks rotate around the ring: device <var>i</var> keeps its query block fixed while K/V blocks pass by, and after <var>N</var> hops every query has attended to every key. What makes this exact rather than approximate is that attention is computed in one streaming pass with an <em>online softmax</em>: each device maintains a running maximum <var>m</var> and denominator <var>&#8467;</var>, rescaling the partial output whenever a visiting block raises the maximum.</p>
+    <p>Ring attention is the same online-softmax algebra FlashAttention uses inside one GPU, lifted across a network. Its appeal is that memory per device drops to <var>O(T/N)</var> and the only communication is one pass of K/V around the ring — overlappable with the block's own compute. Its cost is that CP does nothing for the quadratic FLOP term: eight devices split the cache, not the total attention work.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-ring" width="640" height="400"></canvas>
+        <p class="g-canvas-hint">Press play. Each hop delivers one more K/V block to every device; watch the online-softmax maximum and denominator converge.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="lc-ring-play" class="g-primary">Play</button>
+          <button id="lc-ring-reset">Reset</button>
+        </div>
+        <div class="g-field"><label>Devices N <span class="val" id="lc-ring-n-val">4</span></label>
+          <input type="range" id="lc-ring-n" min="2" max="8" step="1" value="4">
+        </div>
+        <div class="g-field"><label>Context (thousands of tokens) <span class="val" id="lc-ring-t-val">256</span></label>
+          <input type="range" id="lc-ring-t" min="32" max="1024" step="32" value="256">
+        </div>
+        <div class="g-readout" id="lc-ring-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">📌 <span><b>Why this matters at 1M:</b> the 131 GB KV cache above becomes 16 GB per device at N=8, which fits an H100 with room for weights. The ring buys <em>capacity</em>, not <em>speed</em> — and it is why CP is the one parallelism axis whose payoff grows with context length.</span></div>
+  </section>
+
+  <section class="g-step" id="chunked">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Chunked prefill at 1M tokens</h2></div>
+    <p class="g-eyebrow">One request, many iterations</p>
+    <p>A 1M-token prompt cannot prefill in a single scheduler iteration without stalling every other sequence for the duration. <a href="{{ '/ai/llm-serving/batching/' | relative_url }}">Chunked prefill</a> splits it into fixed token budgets per step and interleaves those chunks with other requests' decode steps. The trade is explicit: a larger chunk finishes the prefill in fewer iterations (lower TTFT) but makes each iteration a long compute-bound matmul (higher inter-token latency for everyone else). The numbers below are the scheduler-facing version of the curves above — the same FLOPs, now spread across the step timeline.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-chunk" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Iterations to finish a 1M-token prefill at a fixed per-step token budget, and the ITL spike each iteration imposes.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prefill chunk (tokens/step) <span class="val" id="lc-chunk-val">2048</span></label>
+          <input type="range" id="lc-chunk-size" min="256" max="16384" step="256" value="2048">
+        </div>
+        <div class="g-field"><label>Concurrent decode sequences <span class="val" id="lc-chunk-b-val">16</span></label>
+          <input type="range" id="lc-chunk-b" min="1" max="64" step="1" value="16">
+        </div>
+        <div class="g-readout" id="lc-chunk-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="sparse">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Sparse attention at inference: Quest and DuoAttention</h2></div>
+    <p class="g-eyebrow">Do not compute the zeros</p>
+    <p>Dense causal attention still materialises a <var>T &times; T</var> score matrix. Three families of approximations avoid parts of it at inference time without retraining the model. <b>Sliding window</b> forgets everything older than <var>W</var> tokens. <b>StreamingLLM</b> adds a handful of sink tokens so the softmax always has a benign place to put mass. <b>Quest</b> is query-aware: it tracks a min/max key per page and, for each query, computes only the top-<var>k</var> critical pages. <b>DuoAttention</b> observes that only a small fraction of heads carry long-range information; retrieval heads keep the full KV, streaming heads keep sinks plus a constant window, and the two get different budgets.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-sparse" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">A causal attention mask, rows = queries, columns = keys. Bright cells are computed; dim cells are skipped.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="lc-sparse-btns"></div>
+        <div class="g-field"><label>Window / top-k budget <span class="val" id="lc-sparse-w-val">8</span></label>
+          <input type="range" id="lc-sparse-w" min="1" max="16" step="1" value="8">
+        </div>
+        <div class="g-readout" id="lc-sparse-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lc-sparse-source"></p>
+  </section>
+
+  <section class="g-step" id="eviction">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Eviction: sinks, H2O, SnapKV, PyramidKV</h2></div>
+    <p class="g-eyebrow">Keeping 12% of the cache and hoping it was the right 12%</p>
+    <p>Compression methods drop KV entries outright. The question that decides their usefulness is brutally simple: when the answer is buried in the middle of a 32K-token haystack, does the entry that holds it survive the budget? <b>StreamingLLM</b> keeps sinks plus a recent window. <b>H2O</b> keeps a heavy-hitter fraction by attention mass plus recent tokens. <b>SnapKV</b> votes on which prefix positions matter using an observation window at the end of the prompt. <b>PyramidKV</b> spends a layer-wise pyramidal budget, keeping more at the bottom layers where attention scatters. Slide the budget down and move the needle; the policies fail at different points.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-evict" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">One row per policy across 32K of KV. Lit cells are retained; the vertical marker is the needle.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>KV budget (tokens retained) <span class="val" id="lc-evict-b-val">8K</span></label>
+          <input type="range" id="lc-evict-b" min="512" max="16384" step="512" value="8192">
+        </div>
+        <div class="g-field"><label>Needle position <span class="val" id="lc-evict-p-val">24K</span></label>
+          <input type="range" id="lc-evict-p" min="0" max="100" step="1" value="75">
+        </div>
+        <div class="g-readout" id="lc-evict-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lc-evict-source"></p>
+  </section>
+
+  <section class="g-step" id="tradeoffs">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Compression vs quantization vs eviction</h2></div>
+    <p class="g-eyebrow">Three levers, three failure modes</p>
+    <div class="lc-grid">
+      <div class="lc-card"><div class="lc-k">Quantization</div><div class="lc-v">2&times;</div><div class="lc-n">FP16 to FP8 stores each KV element in half the bytes. No entry is lost, so retrieval is preserved; the risk is numerical — long contexts accumulate more per-channel outliers, and <a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a>'s activation-outlier story is worse in the KV cache than in the weights.</div></div>
+      <div class="lc-card"><div class="lc-k">Sparsity</div><div class="lc-v">2–7&times;</div><div class="lc-n">Skip attention to blocks likely to be irrelevant (Quest, sliding windows). Saves FLOPs, not memory — the cache still exists in full unless combined with eviction. Quality loss is query-dependent and hard to bound a priori.</div></div>
+      <div class="lc-card"><div class="lc-k">Eviction</div><div class="lc-v">8&times;+</div><div class="lc-n">Delete entries permanently (H2O, SnapKV, PyramidKV). Saves memory <em>and</em> decode bandwidth, the actual bottleneck. The failure mode is silent: a dropped entry is unrecoverable for that request and often for its whole prefix cache.</div></div>
+    </div>
+    <p>They compose, and the composition is what production stacks ship: FP8 KV halves the bytes, a sliding window bounds most layers, DuoAttention leaves a few retrieval heads dense, and eviction trims what remains. Order matters. Quantizing first buys headroom for free and never loses a token, so it should be the default; eviction is the lever of last resort because it is the only one that can drop the answer. A useful mental model: quantization trades <em>precision</em>, sparsity trades <em>FLOPs</em>, and eviction trades <em>recall</em> — and recall is the one you cannot buy back at serving time.</p>
+    <div class="g-warn">⚠️ <span><b>The prefix-cache trap.</b> An evicted entry does not just hurt the current request — if the engine caches the compressed prefix, the next request that reuses it inherits the loss. Eviction policies interact with <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a>'s radix cache in ways that are easy to miss in a single-request benchmark.</span></div>
+  </section>
+
+  <section class="g-step" id="measure">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Measuring the damage</h2></div>
+    <p class="g-eyebrow">Needle-in-a-haystack is not enough</p>
+    <p>The standard long-context eval — plant a sentence at depth <var>d</var> in a context of length <var>L</var>, ask for it back — is a single-retrieval probe. It is necessary and nowhere near sufficient: models that score 100 on it still fail multi-hop questions, aggregation over many documents, and tasks whose relevant evidence is distributed rather than pinpointed. RULER and similar suites add multi-needle, variable-tracking and aggregation tracks precisely because eviction and sparsity often pass the single needle and fail everything else.</p>
+    <p>The heatmap below is a deterministic reconstruction of the shape these results take: accuracy degrades with context length, drops fastest in the middle depths where neither recency nor the sink protects an entry, and is the first thing a KV budget kills. The practical rule is to run the eval <em>at your serving budget</em>, not at full cache, and to report the depth profile rather than one average.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-eval" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Retrieval accuracy by needle depth and context length. Brighter is better.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>KV budget retained <span class="val" id="lc-eval-b-val">100%</span></label>
+          <input type="range" id="lc-eval-b" min="10" max="100" step="5" value="100">
+        </div>
+        <div class="g-readout" id="lc-eval-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>The honest cost per request</h2></div>
+    <p class="g-eyebrow">A 200K-token agent turn</p>
+    <p>Put it all together and price the workload that actually exercises long context: an agent turn that reads 200K tokens of retrieved context and emits 2,000 tokens of plan, then does it again on the next turn. Prefill is a one-time quadratic charge; decode is a per-token linear re-read of a 26 GB cache; and if the prefix is reused across turns, the second turn's prefill collapses to near zero while its decode cost does not move at all. That asymmetry — reusable prefill, irreducible decode — is the economics of long-context agents, and it is why <a href="{{ '/ai/llm-training/long-context/' | relative_url }}">extending the trained window</a> and <em>serving</em> that window are different problems: here the window exists, and the question is what it costs to serve.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lc-cost" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Where one agent turn's GPU-seconds go, and what they cost at a nominal rate of USD 2.50 per GPU-hour.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Context tokens <span class="val" id="lc-cost-t-val">200K</span></label>
+          <input type="range" id="lc-cost-t" min="16" max="512" step="16" value="200">
+        </div>
+        <div class="g-field"><label>Output tokens <span class="val" id="lc-cost-o-val">2000</span></label>
+          <input type="range" id="lc-cost-o" min="200" max="8000" step="200" value="2000">
+        </div>
+        <div class="g-field"><label>Prefix cache hit on this turn <span class="val" id="lc-cost-c-val">0%</span></label>
+          <input type="range" id="lc-cost-c" min="0" max="100" step="5" value="0">
+        </div>
+        <div class="g-readout" id="lc-cost-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lc-cost-source"></p>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <h2>Cheat sheet</h2>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Lever</th><th>What it costs</th><th>What it saves</th><th>Failure mode</th></tr></thead>
+      <tbody>
+        <tr><td>Bigger window (training)</td><td>Quadratic prefill, linear KV</td><td>—</td><td>Adds serving bill, not capability</td></tr>
+        <tr><td>Context parallelism / ring</td><td>K/V pass around the ring, CP collectives</td><td>Memory per device O(T/N)</td><td>FLOPs unchanged; needs fast interconnect</td></tr>
+        <tr><td>Chunked prefill</td><td>More iterations, ITL spikes</td><td>Bounded TTFT, other requests keep moving</td><td>Small chunks starve throughput</td></tr>
+        <tr><td>Sliding window</td><td>Forgets older keys</td><td>Decode O(W), bounded cache</td><td>Long-range retrieval lost past W</td></tr>
+        <tr><td>Quest top-k pages</td><td>Query-aware page scoring</td><td>Up to 7.03&times; latency (2.23&times; attention)</td><td>Misses evidence the score underestimates</td></tr>
+        <tr><td>DuoAttention</td><td>Head classification at load time</td><td>Up to 2.18&times; decode, 1.73&times; prefill</td><td>A misclassified retrieval head loses context</td></tr>
+        <tr><td>H2O / SnapKV / PyramidKV</td><td>Irreversible eviction</td><td>8&times;+ memory, direct decode bandwidth</td><td>Drops the needle; poisons cached prefixes</td></tr>
+        <tr><td>FP8 KV</td><td>~0–0.5% quality</td><td>2&times; cache bytes, 2&times; decode headroom</td><td>Outlier sensitivity at long context</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Liu et al., <a href="https://arxiv.org/abs/2404.14469">"SnapKV: LLM Knows What You Are Looking For Before Generation"</a> (2024).</li>
+      <li>Xiao et al., <a href="https://arxiv.org/abs/2309.17453">"Efficient Streaming Language Models with Attention Sinks"</a> (ICLR 2024).</li>
+      <li>Zhang et al., <a href="https://arxiv.org/abs/2306.14048">"H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models"</a> (NeurIPS 2023).</li>
+      <li>Cai et al., <a href="https://arxiv.org/abs/2406.02069">"PyramidKV: Dynamic KV Cache Compression based on Pyramidal Information Funneling"</a> (2024).</li>
+      <li>Tang et al., <a href="https://arxiv.org/abs/2406.10774">"Quest: Query-Aware Sparsity for Efficient Long-Context LLM Inference"</a> (ICML 2024).</li>
+      <li>Xiao et al., <a href="https://arxiv.org/abs/2410.10819">"DuoAttention: Efficient Long-Context LLM Inference with Retrieval and Streaming Heads"</a> (2024).</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2404.06654">"RULER: What's the Real Context Size of Your Long-Context Language Models?"</a> (2024).</li>
+      <li>Dao et al., <a href="https://arxiv.org/abs/2305.19370">"FlashAttention"</a> and Liu et al., <a href="https://arxiv.org/abs/2310.01889">"Ring Attention with Blockwise Transformers"</a> (2023).</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Long context is expensive; structured output is the other half of the agent contract — the model must emit a shape a program can parse.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.LC_JSON_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var FALLBACK = {
+    model_configs: { items: [
+      { name: "Llama 3.1 8B", layers: 32, heads: 32, n_kv_heads: 8, d_head: 128, totalParamsB: 8.03, contextLen: 131072 },
+      { name: "Llama 3.1 70B", layers: 80, heads: 64, n_kv_heads: 8, d_head: 128, totalParamsB: 70.6, contextLen: 131072 },
+      { name: "Llama 3.1 405B", layers: 126, heads: 128, n_kv_heads: 8, d_head: 128, totalParamsB: 405, contextLen: 131072 }
+    ] },
+    long_context: { source: "StreamingLLM (arXiv:2309.17453), H2O (arXiv:2306.14048), SnapKV (arXiv:2404.14469), PyramidKV (arXiv:2406.02069), Quest (arXiv:2406.10774), DuoAttention (arXiv:2410.10819). Budgets and speedups are paper-reported maxima and depend on workload, model and hardware.", items: [
+      { method: "Dense (full attention)", speedup: "1x" },
+      { method: "Sliding window", speedup: "Decode O(W) instead of O(sequence)" },
+      { method: "StreamingLLM (attention sink + window)", speedup: "Up to 22.2x vs sliding-window recompute" },
+      { method: "H2O", speedup: "Up to 29x throughput / 1.9x lower latency" },
+      { method: "SnapKV", speedup: "3.6x decode, 8.2x memory efficiency at 16K" },
+      { method: "PyramidKV", speedup: "Memory reduction proportional to retained fraction" },
+      { method: "Quest", speedup: "Up to 7.03x latency reduction (2.23x self-attention)" },
+      { method: "DuoAttention", speedup: "Up to 2.18x decode / 1.73x prefill (MHA)" }
+    ] }
+  };
+
+  var DATA = FALLBACK;
+  var GPU_PEAK_TFLOPS = 989, GPU_BW_TBS = 3.35, GPU_USD_PER_HOUR = 2.5, MFU = 0.45;
+  var renders = [];
+  function refresh() { renders.forEach(function (fn) { try { fn(); } catch (e) { if (window.console) console.warn("demo:", e.message); } }); }
+
+  function modelItems() { return (DATA.model_configs && DATA.model_configs.items) || FALLBACK.model_configs.items; }
+  function cfgFor(sel) {
+    var key = sel === "70" ? "70B" : sel === "405" ? "405B" : "8B";
+    var items = modelItems();
+    for (var i = 0; i < items.length; i++) if (items[i].name.indexOf(key) >= 0) return items[i];
+    return items[0];
+  }
+  function fmtPFLOPs(f) { return Guide.fmtNum(f / 1e15, 2) + " PFLOPs"; }
+  function fmtTok(t) {
+    if (t >= 1e6) return (t / 1e6).toFixed(2).replace(/\.00$/, "") + "M";
+    if (t >= 1e3) return Math.round(t / 1e3) + "K";
+    return String(Math.round(t));
+  }
+  function findMethod(key) {
+    var items = (DATA.long_context && DATA.long_context.items) || FALLBACK.long_context.items;
+    for (var i = 0; i < items.length; i++) if ((items[i].method || "").toLowerCase().indexOf(key) >= 0) return items[i];
+    return null;
+  }
+
+  // ---------------------------------------------------------------- demo A
+  (function () {
+    var canvas = document.getElementById("lc-curves");
+    var sel = document.getElementById("lc-model");
+    var tSlider = document.getElementById("lc-t");
+    var tVal = document.getElementById("lc-t-val");
+    var readout = document.getElementById("lc-curves-readout");
+    var W = 640, H = 380;
+    var setup = null;
+
+    function tokenFor(v) { return Math.pow(10, 3 + 3 * (v / 100)); }
+    function prefill(cfg, T) {
+      var L = cfg.layers, nh = cfg.heads, dh = cfg.d_head, N = cfg.totalParamsB * 1e9;
+      var attn = 4 * L * nh * dh * T * T, linear = 2 * N * T;
+      return { attn: attn, linear: linear, total: attn + linear };
+    }
+    function kvB(cfg, T) { return ServingSim.kvBytes({ layers: cfg.layers, kvHeads: cfg.n_kv_heads, headDim: cfg.d_head, tokens: T, bytesPerElem: 2, batch: 1 }); }
+    function decodeStepSec(cfg, kvBytes) { return ServingSim.stepTime({ paramsB: cfg.totalParamsB, bytesPerParam: 2, kvBytes: kvBytes, bwTBs: GPU_BW_TBS, peakTFLOPs: GPU_PEAK_TFLOPS, batch: 1 }).memMs / 1000; }
+
+    function draw() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var cfg = cfgFor(sel.value), T = tokenFor(parseFloat(tSlider.value));
+      tVal.textContent = fmtTok(T);
+      ctx.clearRect(0, 0, W, H);
+      var padL = 60, padR = 18, plotW = W - padL - padR;
+      function logx(t) {
+        var l0 = 3, l1 = 6;
+        return padL + plotW * (Math.log10(t) - l0) / (l1 - l0);
+      }
+      function panel(top, h, ymax, label, series) {
+        ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, top); ctx.lineTo(padL, top + h); ctx.lineTo(padL + plotW, top + h); ctx.stroke();
+        ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(label, padL + 4, top - 5);
+        ctx.textAlign = "right";
+        ctx.fillText(Guide.fmtNum(ymax, ymax < 10 ? 1 : 0), padL - 6, top + 8);
+        ctx.fillText("0", padL - 6, top + h);
+        series.forEach(function (s) {
+          ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.beginPath();
+          for (var i = 0; i <= 120; i++) {
+            var t = tokenFor(i * 100 / 120), y = s.fn(t);
+            var X = logx(t), Y = top + h - h * Math.min(1, y / ymax);
+            if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+          }
+          ctx.stroke();
+        });
+        [1e3, 1e4, 1e5, 1e6].forEach(function (t) {
+          ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35;
+          ctx.beginPath(); ctx.moveTo(logx(t), top); ctx.lineTo(logx(t), top + h); ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = c.text; ctx.textAlign = "center"; ctx.font = "10px " + c.font;
+          ctx.fillText(fmtTok(t), logx(t), top + h + 13);
+        });
+      }
+      var p1 = prefill(cfg, 1e6), kv1 = kvB(cfg, 1e6);
+      panel(30, 150, p1.total / 1e15, "prefill FLOPs (PFLOPs)", [
+        { fn: function (t) { return prefill(cfg, t).total / 1e15; }, color: c.accent },
+        { fn: function (t) { return prefill(cfg, t).attn / 1e15; }, color: c.accent2 },
+        { fn: function (t) { return prefill(cfg, t).linear / 1e15; }, color: c.accent400 }
+      ]);
+      panel(226, 120, kv1 / 1e9, "KV cache (GB)", [
+        { fn: function (t) { return kvB(cfg, t) / 1e9; }, color: c.accent }
+      ]);
+      var capY = 226 + 120 - 120 * Math.min(1, 80 / (kv1 / 1e9));
+      ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(padL, capY); ctx.lineTo(padL + plotW, capY); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.textAlign = "right"; ctx.font = "10px " + c.font;
+      ctx.fillText("80 GB H100", padL + plotW - 2, capY - 4);
+
+      ctx.font = "10.5px " + c.font; ctx.textAlign = "left";
+      ctx.fillStyle = c.accent; ctx.fillText("total", padL + 4, 150);
+      ctx.fillStyle = c.accent2; ctx.fillText("attention T^2", padL + 44, 150);
+      ctx.fillStyle = c.accent400; ctx.fillText("weights 2NT", padL + 116, 150);
+
+      var X = logx(T);
+      ctx.strokeStyle = c.text; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.moveTo(X, 14); ctx.lineTo(X, H - 28); ctx.stroke(); ctx.globalAlpha = 1;
+
+      var pf = prefill(cfg, T), kb = kvB(cfg, T);
+      var prefillSec = pf.total / (GPU_PEAK_TFLOPS * 1e12 * MFU);
+      var decodeStepSec1 = decodeStepSec(cfg, kb);
+      var outTok = 512;
+      var totalSec = prefillSec + outTok * decodeStepSec1;
+      var usd = totalSec / 3600 * GPU_USD_PER_HOUR;
+      var attnShare = pf.attn / pf.total;
+      readout.innerHTML =
+        '<div><span class="k">' + cfg.name + ' at ' + fmtTok(T) + ' tokens</span></div>' +
+        '<div><span class="k">prefill:</span> <span class="hi">' + fmtPFLOPs(pf.total) + '</span> (' + (attnShare * 100).toFixed(0) + '% attention)</div>' +
+        '<div><span class="k">KV cache:</span> <span class="hi">' + Guide.fmtBytes(kb) + '</span></div>' +
+        '<div><span class="k">one decode step:</span> ' + (decodeStepSec1 * 1000).toFixed(1) + ' ms (re-reads weights + KV)</div>' +
+        '<div><span class="k">one request, prefill + ' + outTok + ' decode tokens:</span> <span class="hi">USD ' + usd.toFixed(3) + '</span></div>' +
+        '<div><span class="k">wall time on one GPU:</span> ' + Guide.fmtMs(totalSec * 1000) + '</div>';
+    }
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) draw(); });
+    Guide.bindSliders([tSlider], draw);
+    sel.addEventListener("change", draw);
+    draw();
+    renders.push(draw);
+  })();
+
+  // ---------------------------------------------------------------- demo B
+  (function () {
+    var canvas = document.getElementById("lc-ring");
+    var nSlider = document.getElementById("lc-ring-n");
+    var tSlider = document.getElementById("lc-ring-t");
+    var nVal = document.getElementById("lc-ring-n-val");
+    var tVal = document.getElementById("lc-ring-t-val");
+    var readout = document.getElementById("lc-ring-readout");
+    var playBtn = document.getElementById("lc-ring-play");
+    var resetBtn = document.getElementById("lc-ring-reset");
+    var W = 640, H = 400;
+    var setup = null;
+    var step = 0, N = 4, scores = [], m = [], l = [], seen = [];
+
+    function build() {
+      N = parseInt(nSlider.value, 10);
+      var rng = Guide.seededRandom(97);
+      scores = []; m = []; l = []; seen = [];
+      for (var i = 0; i < N; i++) {
+        scores.push([]); m.push(-Infinity); l.push(0); seen.push(0);
+        for (var b = 0; b < N; b++) scores[i].push(0.4 + rng() * 1.6);
+      }
+      step = 0;
+    }
+    function advance() {
+      var hop = step % N;
+      for (var d = 0; d < N; d++) {
+        var block = (d - hop + N) % N, s = scores[d][block];
+        var newM = Math.max(m[d], s);
+        l[d] = l[d] * Math.exp(m[d] === -Infinity ? 0 : m[d] - newM) + Math.exp(s - newM);
+        m[d] = newM; seen[d] = hop + 1;
+      }
+      step++;
+      drawRing();
+    }
+    function drawRing() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      ctx.clearRect(0, 0, W, H);
+      var cx = 190, cy = 160, R = 100;
+      var maxS = 0;
+      scores.forEach(function (row) { row.forEach(function (v) { if (v > maxS) maxS = v; }); });
+      for (var d = 0; d < N; d++) {
+        var a = -Math.PI / 2 + d * 2 * Math.PI / N;
+        var x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+        ctx.beginPath(); ctx.arc(x, y, 26, 0, 2 * Math.PI);
+        ctx.fillStyle = (d === (step % N)) ? c.accent : "rgba(43,95,255,0.16)";
+        ctx.fill(); ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = (d === (step % N)) ? "#fff" : c.text;
+        ctx.font = "600 12px " + c.font; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("D" + d, x, y + 1);
+        ctx.font = "9px " + c.font; ctx.fillStyle = c.text; ctx.textBaseline = "alphabetic";
+        ctx.fillText("q block " + d, x, y + 40);
+      }
+      var frac = (step % (N + 1)) / N;
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(cx, cy, R + 42, -Math.PI / 2, -Math.PI / 2 + frac * 2 * Math.PI); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = "11px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("K/V block " + Math.min(step % N + 1, N) + " in flight · hop " + Math.min(seen[0], N) + "/" + N, cx, cy + 6);
+
+      var px0 = 372, py0 = 50, bw = 226, bh = 20;
+      ctx.textAlign = "left"; ctx.fillStyle = c.text; ctx.font = "600 11px " + c.font;
+      ctx.fillText("online softmax per device", px0, py0 - 12);
+      var lmax = 0;
+      for (var q = 0; q < N; q++) if (l[q] > lmax) lmax = l[q];
+      for (var i = 0; i < N; i++) {
+        var yy = py0 + i * (bh + 16);
+        ctx.fillStyle = "rgba(0,0,0,0.06)"; ctx.fillRect(px0 + 46, yy, bw, bh);
+        var lw = lmax > 0 ? Math.max(2, bw * (l[i] / lmax)) : 0;
+        ctx.fillStyle = c.accent; ctx.fillRect(px0 + 46, yy, lw, bh);
+        ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+        ctx.fillText("D" + i, px0, yy + 14);
+        ctx.font = "9.5px " + c.font;
+        ctx.fillText("m=" + (m[i] === -Infinity ? "-" : m[i].toFixed(2)) + "  l=" + (l[i] ? l[i].toFixed(2) : "0"), px0 + 46, yy + bh + 10);
+      }
+    }
+    function updateReadout() {
+      var T = parseFloat(tSlider.value) * 1000;
+      var Nn = parseInt(nSlider.value, 10);
+      var kb = ServingSim.kvBytes({ layers: 32, kvHeads: 8, headDim: 128, tokens: T, bytesPerElem: 2, batch: 1 });
+      readout.innerHTML =
+        '<div><span class="k">devices:</span> ' + Nn + ' · <span class="k">context:</span> ' + fmtTok(T) + '</div>' +
+        '<div><span class="k">KV per device:</span> <span class="hi">' + Guide.fmtBytes(kb / Nn) + '</span> (8B, FP16)</div>' +
+        '<div><span class="k">attention FLOPs per device:</span> ' + Guide.fmtNum(4 * 32 * 32 * 128 * T * T / Nn / 1e15, 1) + ' PFLOPs</div>' +
+        '<div><span class="k">K/V traffic around ring:</span> ' + Nn + ' hops of ' + Guide.fmtBytes(kb) + '</div>' +
+        '<div><span class="k">exact, not approximate:</span> online softmax</div>';
+    }
+    Guide.loop({ button: playBtn, interval: 750, playLabel: "Play", pauseLabel: "Pause", onStep: advance });
+    resetBtn.addEventListener("click", function () { build(); drawRing(); });
+    Guide.bindSliders([nSlider, tSlider], function () {
+      nVal.textContent = nSlider.value; tVal.textContent = tSlider.value + "K";
+      build(); drawRing(); updateReadout();
+    });
+    setup = Guide.setupCanvas(canvas, W, H, function () { drawRing(); });
+    build(); drawRing(); updateReadout();
+    renders.push(function () { build(); drawRing(); updateReadout(); });
+  })();
+
+  // ---------------------------------------------------------------- demo B2: chunked prefill
+  (function () {
+    var canvas = document.getElementById("lc-chunk");
+    var chunkSlider = document.getElementById("lc-chunk-size");
+    var bSlider = document.getElementById("lc-chunk-b");
+    var chunkVal = document.getElementById("lc-chunk-val");
+    var bVal = document.getElementById("lc-chunk-b-val");
+    var readout = document.getElementById("lc-chunk-readout");
+    var W = 640, H = 300, setup = null;
+    var T1M = 1e6;
+    function model() { return modelItems()[0]; }
+    function compute(T, chunk, B) {
+      var cfg = model(), L = cfg.layers, nh = cfg.heads, dh = cfg.d_head, N = cfg.totalParamsB * 1e9;
+      var totalFlops = 2 * N * T + 2 * L * nh * dh * T * T; // causal attention
+      var iters = Math.ceil(T / chunk);
+      var perIterComputeSec = (totalFlops / iters) / (GPU_PEAK_TFLOPS * 1e12 * MFU);
+      var kvDecode = ServingSim.kvBytes({ layers: L, kvHeads: cfg.n_kv_heads, headDim: dh, tokens: 2048, bytesPerElem: 2, batch: 1 });
+      var baseStepSec = ServingSim.stepTime({ paramsB: cfg.totalParamsB, bytesPerParam: 2, kvBytes: kvDecode * B, bwTBs: GPU_BW_TBS, peakTFLOPs: GPU_PEAK_TFLOPS, batch: B }).memMs / 1000;
+      var overheadSec = 0.004; // 4 ms scheduler/copy overhead per iteration
+      var iterSec = baseStepSec + perIterComputeSec + overheadSec;
+      return { iters: iters, iterSec: iterSec, ttftSec: iters * iterSec, spikeMs: iterSec * 1000, baseMs: (baseStepSec + overheadSec) * 1000, totalFlops: totalFlops };
+    }
+    function drawChunk() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var chunk = parseFloat(chunkSlider.value), B = parseInt(bSlider.value, 10);
+      chunkVal.textContent = Guide.fmtNum(chunk);
+      bVal.textContent = B;
+      ctx.clearRect(0, 0, W, H);
+      var padL = 58, padR = 18, plotW = W - padL - padR;
+      var chunks = [];
+      for (var i = 0; i <= 80; i++) chunks.push(256 * Math.pow(2, i * 6 / 80)); // 256 .. 16384
+      function panel(top, h, ymax, label, series, yfmt) {
+        ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, top); ctx.lineTo(padL, top + h); ctx.lineTo(padL + plotW, top + h); ctx.stroke();
+        ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(label, padL + 4, top - 5);
+        ctx.textAlign = "right"; ctx.fillText(yfmt(ymax), padL - 6, top + 8);
+        ctx.fillText("0", padL - 6, top + h);
+        series.forEach(function (s) {
+          ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.beginPath();
+          chunks.forEach(function (ch, idx) {
+            var v = s.fn(ch), X = padL + plotW * idx / (chunks.length - 1);
+            var Y = top + h - h * Math.min(1, v / ymax);
+            if (idx === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+          });
+          ctx.stroke();
+        });
+        [256, 1024, 4096, 16384].forEach(function (ch) {
+          var X = padL + plotW * (Math.log(ch / 256) / Math.log(64));
+          ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.3;
+          ctx.beginPath(); ctx.moveTo(X, top); ctx.lineTo(X, top + h); ctx.stroke(); ctx.globalAlpha = 1;
+          ctx.fillStyle = c.text; ctx.textAlign = "center"; ctx.font = "10px " + c.font;
+          ctx.fillText(fmtTok(ch), X, top + h + 13);
+        });
+      }
+      var maxTtft = compute(T1M, 256, B).ttftSec;
+      var maxSpike = compute(T1M, 16384, B).spikeMs;
+      panel(28, 108, maxTtft, "TTFT (seconds)", [
+        { fn: function (ch) { return compute(T1M, ch, B).ttftSec; }, color: c.accent }
+      ], function (v) { return Guide.fmtNum(v, 0); });
+      panel(186, 84, maxSpike, "per-iteration latency (ms)", [
+        { fn: function (ch) { return compute(T1M, ch, B).spikeMs; }, color: c.accent2 },
+        { fn: function (ch) { return compute(T1M, ch, B).baseMs; }, color: c.accent400 }
+      ], function (v) { return Guide.fmtNum(v, 0); });
+      ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      ctx.fillStyle = c.accent2; ctx.fillText("prefill+decode iteration", padL + 6, 168);
+      ctx.fillStyle = c.accent400; ctx.fillText("decode-only step", padL + 158, 168);
+
+      var r = compute(T1M, chunk, B);
+      var x = padL + plotW * (Math.log(chunk / 256) / Math.log(64));
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, 12); ctx.lineTo(x, H - 26); ctx.stroke(); ctx.globalAlpha = 1;
+      readout.innerHTML =
+        '<div><span class="k">1M prefill in chunks of</span> ' + Guide.fmtNum(chunk) + '</div>' +
+        '<div><span class="k">iterations:</span> ' + Guide.fmtNum(r.iters) + '</div>' +
+        '<div><span class="k">TTFT:</span> <span class="hi">' + Guide.fmtMs(r.ttftSec * 1000) + '</span></div>' +
+        '<div><span class="k">worst inter-token latency:</span> <span class="bad">' + Guide.fmtMs(r.spikeMs) + '</span> for co-resident decoders</div>' +
+        '<div><span class="k">prefill work:</span> ' + fmtPFLOPs(r.totalFlops) + ' (constant; chunking only reschedules it)</div>';
+    }
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) { try { drawChunk(); } catch (e) { if (window.console) console.warn(e); } } });
+    Guide.bindSliders([chunkSlider, bSlider], drawChunk);
+    drawChunk();
+    renders.push(drawChunk);
+  })();
+
+  // ---------------------------------------------------------------- demo C
+  (function () {
+    var canvas = document.getElementById("lc-sparse");
+    var btnWrap = document.getElementById("lc-sparse-btns");
+    var wSlider = document.getElementById("lc-sparse-w");
+    var wVal = document.getElementById("lc-sparse-w-val");
+    var readout = document.getElementById("lc-sparse-readout");
+    var W = 640, H = 380;
+    var setup = null;
+    var SIZE = 32, PAGES = 8;
+    var mode = "dense";
+    var META = [
+      { id: "dense", label: "Dense", key: "dense", quality: 100 },
+      { id: "sliding", label: "Sliding window", key: "sliding", quality: 78 },
+      { id: "sink", label: "Sink + window", key: "streamingllm", quality: 82 },
+      { id: "quest", label: "Quest top-k", key: "quest", quality: 96 },
+      { id: "duo", label: "DuoAttention split", key: "duoattention", quality: 94 }
+    ];
+    var rng = Guide.seededRandom(2024), pageScore = [];
+    function buildScores() {
+      rng = Guide.seededRandom(2024); pageScore = [];
+      for (var r = 0; r < SIZE; r++) { pageScore.push([]); for (var p = 0; p < PAGES; p++) pageScore[r].push(rng()); }
+    }
+    function meta() { for (var i = 0; i < META.length; i++) if (META[i].id === mode) return META[i]; return META[0]; }
+    META.forEach(function (mo) {
+      var b = document.createElement("button");
+      b.textContent = mo.label; b.setAttribute("data-mode", mo.id);
+      if (mo.id === mode) b.className = "g-primary";
+      b.addEventListener("click", function () {
+        mode = mo.id;
+        Array.prototype.forEach.call(btnWrap.children, function (x) { x.className = ""; });
+        b.className = "g-primary"; drawSparse();
+      });
+      btnWrap.appendChild(b);
+    });
+    function drawSparse() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var win = parseInt(wSlider.value, 10);
+      var kPages = Math.max(1, Math.min(PAGES, Math.round(win / 2)));
+      var matrix = [], computed = 0, total = 0;
+      for (var i = 0; i < SIZE; i++) {
+        matrix.push([]);
+        var retrievalHead = (i % 5 === 0);
+        var ranks = [];
+        for (var p = 0; p < PAGES; p++) ranks.push({ p: p, s: pageScore[i][p] });
+        ranks.sort(function (a, b) { return b.s - a.s; });
+        var keepPage = {};
+        for (var kk = 0; kk < kPages; kk++) keepPage[ranks[kk].p] = true;
+        for (var j = 0; j < SIZE; j++) {
+          var causal = j <= i, keep = 0;
+          if (causal) {
+            if (mode === "dense") keep = 1;
+            else if (mode === "sliding") keep = (i - j <= win) ? 1 : 0;
+            else if (mode === "sink") keep = (j < 1 || i - j <= win) ? 1 : 0;
+            else if (mode === "quest") keep = (j < 1 || keepPage[Math.floor(j / 4)]) ? 1 : 0;
+            else if (mode === "duo") keep = retrievalHead ? 1 : ((j < 1 || i - j <= win) ? 1 : 0);
+          }
+          matrix[i].push(keep ? 1 : 0.1);
+          if (causal) { total++; if (keep) computed++; }
+        }
+      }
+      Guide.drawHeatmap(ctx, W, H, matrix, {
+        min: 0, max: 1, colorLow: [234, 239, 243], colorHigh: [0, 120, 156],
+        padL: 40, padB: 30, padT: 30, fontSize: 10
+      });
+      ctx.fillStyle = c.text; ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("queries", 8, 18); ctx.fillText("keys", W - 30, H - 6);
+      var frac = computed / total, mo = meta();
+      var li = findMethod(mo.key);
+      readout.innerHTML =
+        '<div><span class="k">pattern:</span> <span class="hi">' + mo.label + '</span></div>' +
+        '<div><span class="k">KV pairs computed:</span> ' + (frac * 100).toFixed(1) + '% of the causal mask</div>' +
+        '<div><span class="k">equivalent speedup:</span> ' + (li ? li.speedup : "1x") + '</div>' +
+        '<div><span class="k">quality retained (paper order):</span> ~' + mo.quality + '%</div>' +
+        '<div><span class="k">memory saved:</span> ' + (mode === "dense" ? "none" : mode === "duo" ? "retrieval heads stay full" : "window-bounded layers only") + '</div>';
+    }
+    buildScores();
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawSparse(); });
+    Guide.bindSliders([wSlider], function () { wVal.textContent = wSlider.value; drawSparse(); });
+    drawSparse();
+    renders.push(drawSparse);
+  })();
+
+  // ---------------------------------------------------------------- demo D
+  (function () {
+    var canvas = document.getElementById("lc-evict");
+    var bSlider = document.getElementById("lc-evict-b");
+    var pSlider = document.getElementById("lc-evict-p");
+    var bVal = document.getElementById("lc-evict-b-val");
+    var pVal = document.getElementById("lc-evict-p-val");
+    var readout = document.getElementById("lc-evict-readout");
+    var W = 640, H = 300;
+    var setup = null;
+    var NTOK = 32768, SLOTS = 256, TOK_PER_SLOT = NTOK / SLOTS;
+    var rng = Guide.seededRandom(15), baseScore = [];
+    for (var i = 0; i < SLOTS; i++) baseScore.push(0.2 + rng() * 0.4);
+    baseScore[0] = 0.95;
+    function needleSlot(pos) { return Math.min(SLOTS - 1, Math.floor(pos / TOK_PER_SLOT)); }
+    function topByScore(score, budget, excludeLast) {
+      var order = [];
+      for (var i = 0; i < SLOTS; i++) if (!excludeLast || i < SLOTS - 2) order.push(i);
+      order.sort(function (a, b) { return score[b] - score[a]; });
+      var kept = {}, used = 0;
+      for (var k = 0; k < order.length && used < budget; k++) { kept[order[k]] = true; used += TOK_PER_SLOT; }
+      return kept;
+    }
+    function recentKept(budget) {
+      var kept = {}, used = 0;
+      for (var i = SLOTS - 1; i >= 0 && used < budget; i--) { kept[i] = true; used += TOK_PER_SLOT; }
+      return kept;
+    }
+    function merge(a, b) { var o = {}; for (var k in a) o[k] = true; for (var k2 in b) o[k2] = true; return o; }
+    function policyKept(policy, score, budget) {
+      if (policy === "recency") return recentKept(budget);
+      if (policy === "h2o") return merge(topByScore(score, budget * 0.4, false), recentKept(budget * 0.6));
+      if (policy === "snapkv") return merge(topByScore(score, Math.max(0, budget - 2 * TOK_PER_SLOT), true), recentKept(2 * TOK_PER_SLOT));
+      return merge(topByScore(score, Math.max(0, budget - TOK_PER_SLOT), false), recentKept(TOK_PER_SLOT));
+    }
+    var POLICIES = ["h2o", "snapkv", "pyramidkv", "recency"];
+    var LABELS = { h2o: "H2O", snapkv: "SnapKV", pyramidkv: "PyramidKV", recency: "Recency only" };
+    function drawEvict() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var budget = parseFloat(bSlider.value);
+      var needle = NTOK * (parseFloat(pSlider.value) / 100);
+      var ns = needleSlot(needle);
+      bVal.textContent = fmtTok(budget); pVal.textContent = fmtTok(needle);
+      var score = baseScore.slice();
+      score[ns] = Math.min(1.1, score[ns] + 0.25);
+      var matrix = [], survive = {};
+      POLICIES.forEach(function (pol) {
+        var kept = policyKept(pol, score, budget), row = [];
+        for (var i = 0; i < SLOTS; i++) row.push(kept[i] ? 1 : 0.08);
+        matrix.push(row);
+        survive[pol] = !!kept[ns];
+      });
+      Guide.drawHeatmap(ctx, W, H, matrix, {
+        min: 0, max: 1, colorLow: [236, 240, 243], colorHigh: [0, 120, 156],
+        rowLabels: POLICIES.map(function (p) { return LABELS[p]; }),
+        padL: 82, padB: 34, padT: 14, fontSize: 10
+      });
+      var geoPadL = 82, plotW = W - geoPadL - 6;
+      ctx.fillStyle = c.text; ctx.font = "9.5px " + c.font;
+      [0, 8, 16, 24, 32].forEach(function (kk) {
+        var X = geoPadL + plotW * (kk / 32);
+        ctx.textAlign = kk === 0 ? "left" : kk === 32 ? "right" : "center";
+        ctx.fillText(kk === 0 ? "0" : kk + "K", X, H - 8);
+      });
+      var cx = geoPadL + plotW * (ns / SLOTS);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(cx, 14); ctx.lineTo(cx, H - 34); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = "600 10px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("needle", Math.min(W - 26, Math.max(26, cx)), 10);
+      var html = '<div class="lc-policy">';
+      POLICIES.forEach(function (pol) {
+        html += '<div><span class="lc-badge ' + (survive[pol] ? "ok" : "bad") + '">' + (survive[pol] ? "survives" : "lost") + '</span> ' + LABELS[pol] + '</div>';
+      });
+      html += '</div><div><span class="k">budget:</span> ' + fmtTok(budget) + ' of 32K (' + (budget / NTOK * 100).toFixed(0) + '%) · <span class="k">needle at</span> ' + fmtTok(needle) + '</div>';
+      readout.innerHTML = html;
+    }
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawEvict(); });
+    Guide.bindSliders([bSlider, pSlider], drawEvict);
+    drawEvict();
+    renders.push(drawEvict);
+  })();
+
+  // ---------------------------------------------------------------- demo E
+  (function () {
+    var canvas = document.getElementById("lc-cost");
+    var tSlider = document.getElementById("lc-cost-t");
+    var oSlider = document.getElementById("lc-cost-o");
+    var cSlider = document.getElementById("lc-cost-c");
+    var tVal = document.getElementById("lc-cost-t-val");
+    var oVal = document.getElementById("lc-cost-o-val");
+    var cVal = document.getElementById("lc-cost-c-val");
+    var readout = document.getElementById("lc-cost-readout");
+    var W = 640, H = 320;
+    var setup = null;
+    function drawCost() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var cfg = modelItems()[0];
+      var T = parseFloat(tSlider.value) * 1000;
+      var outTok = parseFloat(oSlider.value);
+      var cacheHit = parseFloat(cSlider.value) / 100;
+      tVal.textContent = fmtTok(T); oVal.textContent = Guide.fmtNum(outTok); cVal.textContent = (cacheHit * 100) + "%";
+      var L = cfg.layers, nh = cfg.heads, dh = cfg.d_head, N = cfg.totalParamsB * 1e9;
+      var prefillFlops = (4 * L * nh * dh * T * T + 2 * N * T) * (1 - cacheHit);
+      var prefillSec = prefillFlops / (GPU_PEAK_TFLOPS * 1e12 * MFU);
+      var kb = ServingSim.kvBytes({ layers: L, kvHeads: cfg.n_kv_heads, headDim: dh, tokens: T, bytesPerElem: 2, batch: 1 });
+      var decodeSec1 = ServingSim.stepTime({ paramsB: cfg.totalParamsB, bytesPerParam: 2, kvBytes: kb, bwTBs: GPU_BW_TBS, peakTFLOPs: GPU_PEAK_TFLOPS, batch: 1 }).memMs / 1000;
+      var decodeSec = outTok * decodeSec1;
+      var prefillUsd = prefillSec / 3600 * GPU_USD_PER_HOUR, decodeUsd = decodeSec / 3600 * GPU_USD_PER_HOUR;
+      var totalUsd = prefillUsd + decodeUsd;
+      var rows = [
+        { label: "prefill", segments: [{ value: prefillSec, color: c.accent }] },
+        { label: "decode", segments: [{ value: decodeSec, color: c.accent2 }] }
+      ];
+      var geo = Guide.drawStacked(ctx, W, H, rows, { padL: 74, padR: 150, padT: 26, padB: 30, gap: 26, maxTotal: Math.max(1, prefillSec + decodeSec) });
+      ctx.fillStyle = c.text; ctx.font = "10.5px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("GPU-seconds for one agent turn", 20, 16);
+      ctx.textAlign = "right";
+      ctx.fillText(Guide.fmtMs(prefillSec * 1000) + "  (USD " + prefillUsd.toFixed(4) + ")", W - 6, geo.padT + 14);
+      ctx.fillText(Guide.fmtMs(decodeSec * 1000) + "  (USD " + decodeUsd.toFixed(4) + ")", W - 6, geo.padT + geo.barH + 26 + 14);
+      readout.innerHTML =
+        '<div><span class="k">model:</span> Llama 3.1 8B FP16 on one H100-class part</div>' +
+        '<div><span class="k">prefill:</span> ' + Guide.fmtMs(prefillSec * 1000) + ' (' + fmtPFLOPs(prefillFlops) + ')</div>' +
+        '<div><span class="k">decode:</span> ' + Guide.fmtMs(decodeSec * 1000) + ' · ' + (decodeSec1 * 1000).toFixed(1) + ' ms/token</div>' +
+        '<div><span class="k">KV cache:</span> <span class="hi">' + Guide.fmtBytes(kb) + '</span></div>' +
+        '<div><span class="k">cost this turn:</span> <span class="hi">USD ' + totalUsd.toFixed(4) + '</span></div>' +
+        '<div><span class="k">cache hit removes</span> ' + (cacheHit * 100).toFixed(0) + '% of prefill, 0% of decode</div>';
+    }
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawCost(); });
+    Guide.bindSliders([tSlider, oSlider, cSlider], drawCost);
+    drawCost();
+    renders.push(drawCost);
+  })();
+
+  // ---------------------------------------------------------------- demo: eval damage
+  (function () {
+    var canvas = document.getElementById("lc-eval");
+    var bSlider = document.getElementById("lc-eval-b");
+    var bVal = document.getElementById("lc-eval-b-val");
+    var readout = document.getElementById("lc-eval-readout");
+    var W = 640, H = 300;
+    var setup = null;
+    var depths = ["0%", "", "", "50%", "", "", "", "100%"];
+    var lengths = ["4K", "16K", "64K", "128K", "256K", "512K", "1M"];
+    function drawEval() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var budget = parseFloat(bSlider.value) / 100;
+      bVal.textContent = Math.round(budget * 100) + "%";
+      var matrix = [], rng = Guide.seededRandom(404), worst = 1;
+      for (var d = 0; d < depths.length; d++) {
+        matrix.push([]);
+        for (var li = 0; li < lengths.length; li++) {
+          var lengthPenalty = li / (lengths.length - 1);
+          var middlePenalty = (d === 0 || d === depths.length - 1) ? 0 : Math.sin(Math.PI * d / (depths.length - 1)) * 0.28;
+          var base = 1 - 0.35 * lengthPenalty - middlePenalty;
+          // a budget smaller than the sequence magnifies the middle-depth hole
+          base -= (1 - budget) * 0.55 * middlePenalty;
+          base -= (1 - budget) * 0.12;
+          var jitter = (rng() - 0.5) * 0.04;
+          var v = Math.max(0.02, Math.min(1, base + jitter));
+          matrix[d].push(v);
+          if (v < worst) worst = v;
+        }
+      }
+      Guide.drawHeatmap(ctx, W, H, matrix, {
+        min: 0, max: 1, colorLow: [214, 0, 108], colorHigh: [0, 120, 156],
+        rowLabels: depths.map(function (x) { return x; }),
+        colLabels: lengths, padL: 54, padB: 30, padT: 12, fontSize: 10
+      });
+      var sorted = matrix[4].slice().sort(function (a, b) { return a - b; });
+      var mid = sorted[Math.floor(sorted.length / 2)] * 100;
+      readout.innerHTML =
+        '<div><span class="k">KV budget:</span> ' + Math.round(budget * 100) + '% retained</div>' +
+        '<div><span class="k">median accuracy at 256K:</span> <span class="hi">' + mid.toFixed(0) + '%</span></div>' +
+        '<div><span class="k">worst cell:</span> ' + (worst * 100).toFixed(0) + '% (middle depth, longest context)</div>' +
+        '<div><span class="k">shape:</span> high at the sink, low in the middle, recovering at the end</div>';
+    }
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawEval(); });
+    Guide.bindSliders([bSlider], drawEval);
+    drawEval();
+    renders.push(drawEval);
+  })();
+
+  // ---------------------------------------------------------------- source lines
+  function setSource() {
+    var lc = DATA.long_context && DATA.long_context.source;
+    var e1 = document.getElementById("lc-quadratic-source");
+    if (e1) e1.textContent = "Formulas computed from the model configs in llm-serving-numbers.json (Llama 3.1 geometry). Context methods: " + (lc || FALLBACK.long_context.source);
+    var e2 = document.getElementById("lc-sparse-source");
+    if (e2) e2.textContent = lc || FALLBACK.long_context.source;
+    var e3 = document.getElementById("lc-evict-source");
+    if (e3) e3.textContent = lc || FALLBACK.long_context.source;
+    var e4 = document.getElementById("lc-cost-source");
+    if (e4) e4.textContent = "Prefill FLOPs = 2NT + 4 L n_h d_h T^2; KV = 2 L n_kv d_h T bytes (FP16). Assumes 45% MFU, 989 dense BF16 TFLOPs, 3.35 TB/s HBM, and USD 2.50 per GPU-hour — illustrative list pricing, not a vendor quote.";
+  }
+  renders.push(setSource);
+
+  refresh();
+  fetch(window.LC_JSON_URL).then(function (r) { return r.json(); }).then(function (d) { DATA = d; refresh(); }).catch(function () { /* fallback already rendered */ });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

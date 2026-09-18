@@ -1,0 +1,487 @@
+---
+title: "LLM Training, Interactively — Part 10: Evaluation"
+description: "How MMLU is actually scored, few-shot prompting as a protocol, LLM-as-judge position bias, Elo/Bradley-Terry arena ratings, and pass@k for code."
+permalink: "/ai/llm-training/evaluation/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-evaluation.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 10 of 15</span>
+    <h1>Evaluation</h1>
+    <p>"OLMo 2 scores 63.7 on MMLU" sounds like a simple fact. It hides several protocol choices — how each answer choice is scored, how many examples the model sees first, who or what is judging open-ended output — each of which can move the number by several points without changing the model at all. This part makes those choices visible.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="mmlu">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>How a multiple-choice benchmark is actually scored</h2></div>
+    <p class="llmt-eyebrow">MMLU-style scoring</p>
+    <p>A base model isn't given "A/B/C/D" as buttons to press — it's a next-token predictor. The standard trick: append each answer choice's <em>text</em> to the question and score the whole continuation's log-likelihood under the model; the highest-scoring choice wins. Two protocol details change results: whether you divide by the answer's token length (<strong>length normalization</strong> — without it, longer correct answers are unfairly penalized just for having more tokens to get exactly right), and whether you show the choices as text (<strong>cloze</strong>) or ask the model to output a letter (<strong>multiple-choice formulation</strong>) — models are often measurably better at one than the other.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <p><b>Q: The capital of Australia is:</b></p>
+      <div id="mmlu-choices"></div>
+      <div class="llmt-btnrow">
+        <button id="mmlu-lennorm" class="llmt-primary">Length normalization: ON</button>
+      </div>
+      <div class="llmt-readout" id="mmlu-readout"></div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Toggle length normalization above</b> and watch the ranked order change — "Canberra" (correct, 3 tokens) loses to "Sydney" (wrong, 1 token) under raw summed log-likelihood, simply because a shorter answer has fewer negative log-probabilities to add up; per-token averaging removes that length bias but isn't automatically "more correct" either — it's a different, also-defensible scoring convention, which is exactly why the same model gets different reported numbers from different eval harnesses.</span></div>
+  </section>
+
+  <section class="llmt-step" id="fewshot">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>Few-shot prompting as a protocol</h2></div>
+    <p class="llmt-eyebrow">In-context learning</p>
+    <p>Benchmarks are usually run "k-shot": k solved examples are prepended to the prompt before the real question, purely as context — no gradient update happens. More shots generally help (the model infers the expected answer format and task from the examples) but cost more prompt tokens per question and eventually plateau or even hurt if examples are unrepresentative.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="fs-canvas" width="480" height="220"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Shots k <span class="val" id="fs-k-val">3</span></label>
+          <input type="range" id="fs-k" min="0" max="10" step="1" value="3"></div>
+        <div class="llmt-readout" id="fs-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="judge">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>LLM-as-judge, and its position bias</h2></div>
+    <p class="llmt-eyebrow">Judging open-ended output</p>
+    <p>For tasks without a single correct string (chat quality, helpfulness), it's common to have a strong model judge a pair of responses and pick the better one. A well-documented failure mode: judges are measurably more likely to prefer whichever response is shown <strong>first</strong>, independent of content — <strong>position bias</strong>. Rigorous evals run every pairwise comparison in both orders and check whether the verdict flips.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow">
+        <button id="judge-swap" class="llmt-primary">Swap response A/B order</button>
+      </div>
+      <div class="llmt-readout" id="judge-readout"></div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="arena">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Arena ratings: Elo / Bradley-Terry</h2></div>
+    <p class="llmt-eyebrow">Reusing Part 8's math</p>
+    <p>Human-preference arenas (like Chatbot Arena) collect pairwise "which response was better" votes across many models and convert them into a single ranking with the same Bradley-Terry model from Part 8's reward modeling section: <code>P(A beats B) = σ(s<sub>A</sub> − s<sub>B</sub>)</code>. Feed in a batch of pairwise match results below and watch the fitted scores settle via simple gradient ascent on the same likelihood.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="arena-canvas" width="440" height="220"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow"><button id="arena-more" class="llmt-primary">Simulate 20 more matches</button>
+        <button id="arena-reset">Reset ratings</button></div>
+        <div class="llmt-readout" id="arena-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="passk">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>pass@k for code</h2></div>
+    <p class="llmt-eyebrow">Unbiased estimation</p>
+    <p>For code, "correct" is checkable by running unit tests, so accuracy is usually reported as pass@k: does at least one of k sampled completions pass? Naively generating exactly k samples and checking is a biased, high-variance estimator; the standard unbiased estimator instead samples <var>n</var> ≥ k completions, counts <var>c</var> correct ones, and computes:</p>
+    <div class="llmt-math llmt-katex">$$\text{pass@}k = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-grid3">
+          <div class="llmt-field"><label>Samples generated n <span class="val" id="pk-n-val">20</span></label><input type="range" id="pk-n" min="1" max="200" step="1" value="20"></div>
+          <div class="llmt-field"><label>Correct count c <span class="val" id="pk-c-val">4</span></label><input type="range" id="pk-c" min="0" max="200" step="1" value="4"></div>
+          <div class="llmt-field"><label>k <span class="val" id="pk-k-val">1</span></label><input type="range" id="pk-k" min="1" max="50" step="1" value="1"></div>
+        </div>
+        <div class="llmt-readout" id="pk-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="pitfalls">
+    <div class="llmt-step-head"><span class="llmt-step-num">6</span><h2>Other ways benchmark numbers mislead</h2></div>
+    <p class="llmt-eyebrow">Named, not demoed</p>
+    <div class="llmt-grid2">
+      <div class="llmt-card reveal"><b>Contamination</b> — if a benchmark's questions (or close paraphrases) leaked into pretraining data, the model may have memorized answers rather than reasoned to them. N-gram overlap checks (Part 4) against known benchmark text are a standard mitigation.</div>
+      <div class="llmt-card reveal"><b>Error bars and variance</b> — a benchmark score from a few hundred questions has real sampling noise; a 1-point difference between two models is often not statistically significant. Ai2 and others increasingly report confidence intervals, not just a point estimate.</div>
+      <div class="llmt-card reveal"><b>Benchmark saturation</b> — once most frontier models score 90%+, a benchmark stops discriminating between them, and remaining errors may just be label noise in the benchmark itself.</div>
+      <div class="llmt-card reveal"><b>OLMES</b> — Ai2's own standardized evaluation suite, built specifically to fix apples-to-oranges comparisons: fixed prompt formats, fixed few-shot counts, and documented scoring conventions per task, so numbers from different papers are actually comparable.</div>
+    </div>
+    {% endraw %}<p>See the site's <a href="{{ 'https://denimpatel.github.io/AI/ai/benchmarks/' | relative_url }}">benchmarks page</a> for how these numbers get tracked over time across the industry.</p>{% raw %}
+  </section>
+
+  <section class="llmt-step" id="suite">
+    <div class="llmt-step-head"><span class="llmt-step-num">7</span><h2>Inside OLMo 3's evaluation suite</h2></div>
+    <p class="llmt-eyebrow">Tasks, clusters, and signal</p>
+    <p>OLMo 3 grew Ai2's base evaluation suite from <strong>11 tasks in OLMo 2 to 43 tasks</strong>. That expansion is not just "more benchmarks" — it is a deliberate design with three ideas behind it.</p>
+    <p><b>Task clustering.</b> Thirty or forty benchmarks over-weight whatever they all share. To see the structure, the team took per-task correctness from 70 models across ~23,000 benchmark results and ran agglomerative (Ward) clustering. Tasks that models pass and fail together land in the same cluster, revealing the underlying capabilities.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="clust-canvas" width="560" height="300"></canvas>
+        <p class="llmt-canvas-hint">Schematic dendrogram of benchmark tasks (Ward-style). Slide the cut height to choose how coarse the capability clusters are.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Merge-distance cut <span class="val" id="clust-cut-val">0.80</span></label>
+          <input type="range" id="clust-cut" min="0.1" max="2" step="0.05" value="0.8"></div>
+        <div class="llmt-readout" id="clust-readout"></div>
+      </div>
+    </div>
+    <p><b>Signal-to-noise by averaging a cluster.</b> A single benchmark is a noisy estimate. Averaging the tasks inside a cluster cancels independent noise, so the cluster mean is a more reliable readout than any single task — provided the tasks aren't so correlated that they all move together.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="snr-canvas" width="520" height="250"></canvas>
+        <p class="llmt-canvas-hint">SNR of a cluster average versus the number of tasks, for different inter-task correlations ρ.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Tasks in cluster <span class="val" id="snr-n-val">6</span></label>
+          <input type="range" id="snr-n" min="1" max="20" step="1" value="6"></div>
+        <div class="llmt-field"><label>Inter-task correlation ρ <span class="val" id="snr-rho-val">0.30</span></label>
+          <input type="range" id="snr-rho" min="0" max="0.95" step="0.05" value="0.3"></div>
+        <div class="llmt-readout" id="snr-readout"></div>
+      </div>
+    </div>
+    <p><b>Base Easy validates the pipeline; Base Main measures the model.</b> The full 43-task suite is hard and noisy for a base model mid-run. So OLMo 3 also defines a small <em>Base Easy</em> suite (bits-per-byte on easier tasks) that runs quickly and correlates strongly with the harder Base Main average. Developers use it to confirm a training recipe is on track before paying for the full evaluation.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="easymain-canvas" width="520" height="250"></canvas>
+        <p class="llmt-canvas-hint">Base Easy (bits-per-byte) versus Base Main average across checkpoints. Lower BPB should mean higher Main accuracy.</p>
+      </div>
+      <div class="llmt-readout" id="easymain-readout"></div>
+    </div>
+    <div class="llmt-goal">💡 <span><b>Held-out tasks:</b> a handful of benchmarks — MMLU Pro, DeepMind Math, LBPP, and BigBench Hard — are deliberately excluded from model-development decisions and kept as a clean held-out check on the final model.</span></div>
+  </section>
+
+  <section class="llmt-step" id="variance">
+    <div class="llmt-step-head"><span class="llmt-step-num">8</span><h2>Noise, variance, and contamination</h2></div>
+    <p class="llmt-eyebrow">Reading a number honestly</p>
+    <p><b>Sampling temperature and top-p are protocol choices.</b> For pass@k on code, OLMo 3 swept temperature and nucleus sampling across five models and settled on <strong>temperature 0.6</strong>. The number you report is only comparable to another number reported under the same sampling settings.</p>
+    <p><b>Match k to how the model will be trained.</b> OLMo 3 reports code pass@k with <strong>k = 16</strong>, the same group size its GRPO uses. That makes pass@16 an empirical upper bound on what RL on that prompt set could achieve, and it is large enough to capture variance without exploding cost.</p>
+    <p><b>Know which benchmarks are noisy.</b> Repeating runs lets you bucket tasks by stability. The very stable tasks (MATH, MMLU, PopQA) are safe to compare within a point; the high-variance tasks (GPQA, IFEval) need wider error bars before you claim a win.</p>
+    <div style="overflow-x:auto; margin:10px 0 16px;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Stability</th><th>Benchmarks (std. dev. across runs)</th></tr></thead>
+      <tbody>
+        <tr><td>High variance</td><td>GPQA (1.48), AlpacaEval 3 (1.24), IFEval (0.88)</td></tr>
+        <tr><td>Moderate</td><td>ZebraLogic (0.56), Omega (0.56), AIME 24 Avg@32 (0.54), HumanEvalPlus (0.46), AgiEval (0.43), BigBenchHard (0.39)</td></tr>
+        <tr><td>Very stable</td><td>LiveCodeBench Avg@10 (0.29), MBPPPlus (0.27), MATH (0.25), MMLU (0.22), PopQA (0.16)</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p><b>Contamination and overestimation diverge.</b> As Part 4 covered, a highly contaminated benchmark is not automatically an inflated one. The table below is repeated here because it is the single best argument for <em>measuring</em> overestimation directly instead of assuming high overlap means a fake score.</p>
+    <div style="overflow-x:auto; margin:10px 0 16px;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Benchmark</th><th>% contaminated</th><th>Perf. overestimation</th></tr></thead>
+      <tbody>
+        <tr><td>DROP (generative)</td><td>66.87%</td><td><span class="k">+13.99</span></td></tr>
+        <tr><td>GSM-Symbolic</td><td>0.00%</td><td>+5.54</td></tr>
+        <tr><td>Codex HumanEval @16</td><td>7.07%</td><td>+3.54</td></tr>
+        <tr><td>SQuAD</td><td>83.24%</td><td>+1.70</td></tr>
+        <tr><td>GSM8K</td><td>84.99%</td><td>+1.61 (decontaminated perf. higher)</td></tr>
+        <tr><td>Minerva</td><td>45.17%</td><td>−1.95</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <div class="llmt-goal">📌 <span><b>Cross-links:</b> the decontamination method and the full table are in <a href="{% endraw %}{{ '/ai/llm-training/data/' | relative_url }}{% raw %}">Part 4</a>; the spurious-reward contamination test for RL is in <a href="{% endraw %}{{ '/ai/llm-training/posttraining-scale/' | relative_url }}{% raw %}">Part 15</a>; and the pass@k estimator on this page is the same one used to measure code RL.</span></div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Hendrycks et al., <a href="https://arxiv.org/abs/2009.03300">"Measuring Massive Multitask Language Understanding"</a> (2020) — MMLU.</li>
+      <li>Chen et al. (OpenAI), <a href="https://arxiv.org/abs/2107.03374">"Evaluating Large Language Models Trained on Code"</a> (2021) — pass@k's unbiased estimator, HumanEval.</li>
+      <li>Zheng et al., <a href="https://arxiv.org/abs/2306.05685">"Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"</a> (2023) — position bias.</li>
+      <li>Gu et al. (Ai2), <a href="https://arxiv.org/abs/2406.08446">"OLMES: A Standard for Language Model Evaluations"</a> (2024).</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>With training and evaluation both covered, the last piece is making sure the deployed model behaves — and fails — safely.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/guardrails/' | relative_url }}">Continue: guardrails, safety & deployment →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+
+  // ---- MMLU scoring ----
+  (function(){
+    var choices = [
+      {label:'A', text:'Canberra', correct:true, tokLogProbs:[-0.2,-0.15,-0.25]},
+      {label:'B', text:'Sydney', correct:false, tokLogProbs:[-0.5]},
+      {label:'C', text:'Melbourne, the former capital', correct:false, tokLogProbs:[-1.4,-1.6,-1.5,-1.5,-1.5]},
+      {label:'D', text:'Perth', correct:false, tokLogProbs:[-0.7]}
+    ];
+    var lenNorm = true;
+    var container = document.getElementById('mmlu-choices');
+    var readout = document.getElementById('mmlu-readout');
+    var toggle = document.getElementById('mmlu-lennorm');
+
+    function render(){
+      var scored = choices.map(function(ch){
+        var sum = ch.tokLogProbs.reduce(function(a,b){return a+b;},0);
+        var score = lenNorm ? sum/ch.tokLogProbs.length : sum;
+        return {label:ch.label, text:ch.text, correct:ch.correct, score:score};
+      }).sort(function(a,b){return b.score-a.score;});
+      container.innerHTML = '';
+      scored.forEach(function(s,i){
+        var div = document.createElement('div');
+        div.style.padding = '6px 10px'; div.style.marginBottom='4px'; div.style.borderRadius='2px';
+        div.style.background = i===0 ? (s.correct?'var(--color-accent-100)':'var(--color-accent-2-100)') : 'var(--color-bg)';
+        div.innerHTML = '<b>'+s.label+'.</b> '+s.text+' — log-score: '+s.score.toFixed(3) + (i===0?' <b>(top pick)</b>':'') + (s.correct?' ✓ correct answer':'');
+        container.appendChild(div);
+      });
+      readout.innerHTML = '<span class="k">model picks:</span> ' + scored[0].label + (scored[0].correct ? ' <span class="hi">— correct</span>' : ' <span class="bad">— WRONG, correct is A</span>');
+    }
+    toggle.addEventListener('click', function(){
+      lenNorm = !lenNorm;
+      toggle.textContent = 'Length normalization: ' + (lenNorm?'ON':'OFF');
+      render();
+    });
+    render();
+  })();
+
+  // ---- Few-shot ----
+  (function(){
+    var slider = document.getElementById('fs-k'), val = document.getElementById('fs-k-val');
+    var canvas = document.getElementById('fs-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('fs-readout');
+    var W = canvas.width, H = canvas.height;
+    function accAt(k){ return 0.35 + 0.5*(1-Math.exp(-k/2.5)) + (k>7? -0.01*(k-7): 0); }
+    function render(){
+      var k = parseInt(slider.value,10);
+      val.textContent = k;
+      var pts = []; for (var i=0;i<=10;i++) pts.push({x:i, y:accAt(i)});
+      var axes = G.drawLines(ctx, W, H, [{points:pts, color:c.accent}], [0,10], [0,1], {xLabel:'shots (k)', yLabel:'accuracy (illustrative curve)'});
+      var mx = axes.px(k), my = axes.py(accAt(k));
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(mx,my,5,0,2*Math.PI); ctx.fill();
+      var promptTokens = 40*k + 20;
+      readout.innerHTML = '<span class="k">shots:</span> '+k+'  <span class="k">≈accuracy:</span> '+(accAt(k)*100).toFixed(0)+'%  <span class="k">prompt overhead:</span> ~'+promptTokens+' tokens/question';
+    }
+    slider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Judge position bias ----
+  (function(){
+    var swapBtn = document.getElementById('judge-swap');
+    var readout = document.getElementById('judge-readout');
+    var swapped = false;
+    var responseA = "A thorough, well-organized answer covering the key trade-offs.";
+    var responseB = "A thorough, well-organized answer covering the key trade-offs."; // deliberately near-identical content
+    function render(){
+      var first = swapped ? 'B' : 'A';
+      readout.innerHTML = '<span class="k">shown first:</span> Response ' + first + ' (content of A and B is deliberately near-identical here)<br>' +
+        '<span class="k">judge verdict:</span> <span class="hi">Response ' + first + ' is better</span><br>' +
+        '<span style="opacity:0.6">the verdict tracks presentation order, not content — this is position bias, measured by running every comparison in both orders and checking for exactly this flip</span>';
+    }
+    swapBtn.addEventListener('click', function(){ swapped=!swapped; render(); });
+    render();
+  })();
+
+  // ---- Arena Bradley-Terry ----
+  (function(){
+    var models = ['Model α','Model β','Model γ','Model δ'];
+    var trueSkill = [1.5, 0.8, 0.2, -0.6];
+    var scores = [0,0,0,0];
+    var matchLog = [];
+    var canvas = document.getElementById('arena-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('arena-readout');
+    var W = canvas.width, H = canvas.height;
+
+    function sigmoid(x){ return 1/(1+Math.exp(-x)); }
+    function simulate(nMatches){
+      for (var m=0;m<nMatches;m++){
+        var i = Math.floor(Math.random()*4), j = Math.floor(Math.random()*4);
+        if (i===j) continue;
+        var pIwins = sigmoid(trueSkill[i]-trueSkill[j]);
+        var iWon = Math.random() < pIwins;
+        matchLog.push({i:i,j:j,iWon:iWon});
+      }
+    }
+    function fit(){
+      scores = [0,0,0,0];
+      var lr = 0.05;
+      for (var iter=0; iter<300; iter++){
+        var grad = [0,0,0,0];
+        matchLog.forEach(function(mm){
+          var p = sigmoid(scores[mm.i]-scores[mm.j]);
+          var err = (mm.iWon?1:0) - p;
+          grad[mm.i]+=err; grad[mm.j]-=err;
+        });
+        for (var k=0;k<4;k++) scores[k]+=lr*grad[k]/Math.max(1,matchLog.length);
+      }
+    }
+    function render(){
+      fit();
+      var data = models.map(function(name,i){ return {label:name, value: scores[i]+3, valueLabel: scores[i].toFixed(2)}; })
+        .sort(function(a,b){return b.value-a.value;});
+      G.drawBars(ctx, W, H, data, {maxV: Math.max.apply(null, data.map(function(d){return d.value;}))});
+      readout.innerHTML = '<span class="k">matches recorded:</span> '+matchLog.length+'<br><span style="opacity:0.6">fitted scores converge toward the true underlying skill gaps as more matches accumulate — the exact same Bradley-Terry likelihood as Part 8\'s reward model</span>';
+    }
+    document.getElementById('arena-more').addEventListener('click', function(){ simulate(20); render(); });
+    document.getElementById('arena-reset').addEventListener('click', function(){ matchLog=[]; render(); });
+    simulate(20); render();
+  })();
+
+  // ---- pass@k ----
+  (function(){
+    var nS=document.getElementById('pk-n'), cS=document.getElementById('pk-c'), kS=document.getElementById('pk-k');
+    var nV=document.getElementById('pk-n-val'), cV=document.getElementById('pk-c-val'), kV=document.getElementById('pk-k-val');
+    var readout = document.getElementById('pk-readout');
+    function logChoose(n,k){
+      if (k<0||k>n) return -Infinity;
+      var s=0; for (var i=0;i<k;i++) s += Math.log(n-i) - Math.log(i+1);
+      return s;
+    }
+    function render(){
+      var n=+nS.value, c=Math.min(+cS.value,n), k=Math.min(+kS.value,n);
+      cS.max = n;
+      nV.textContent=n; cV.textContent=c; kV.textContent=k;
+      var passK;
+      if (n-c < k) passK = 1;
+      else passK = 1 - Math.exp(logChoose(n-c,k) - logChoose(n,k));
+      readout.innerHTML = '<span class="k">n='+n+', c='+c+', k='+k+'</span><br><span class="k">pass@k:</span> <span class="hi">'+(passK*100).toFixed(1)+'%</span>';
+    }
+    [nS,cS,kS].forEach(function(el){el.addEventListener('input',render);});
+    render();
+  })();
+
+  // ---- Task-cluster dendrogram (schematic) ----
+  (function(){
+    var canvas = document.getElementById('clust-canvas'), ctx = canvas.getContext('2d');
+    var slider = document.getElementById('clust-cut'), val = document.getElementById('clust-cut-val');
+    var readout = document.getElementById('clust-readout');
+    var W = canvas.width, H = canvas.height;
+    var leaves = ['MMLU','GPQA','ARC','HellaSwag','GSM8K','MATH','HumanEval','MBPP'];
+    var merges = [
+      { l:0, r:1, h:0.4 }, { l:8, r:2, h:0.7 }, { l:9, r:3, h:1.0 },
+      { l:4, r:5, h:0.5 }, { l:6, r:7, h:0.6 }, { l:11, r:12, h:1.2 }, { l:10, r:13, h:1.8 }
+    ];
+    var nodes = leaves.map(function(name,i){ return { x:i, y:0, name:name }; });
+    merges.forEach(function(m){
+      nodes.push({ x:(nodes[m.l].x+nodes[m.r].x)/2, y:m.h });
+    });
+    var palette = [c.accent, c.accent2, '#3aa66a', '#c98a00'];
+    function clustersAt(cut){
+      var parent = {}; for (var i=0;i<8;i++) parent[i]=i;
+      function find(a){ while (parent[a]!==a){ parent[a]=parent[parent[a]]; a=parent[a]; } return a; }
+      merges.forEach(function(m){ if (m.h<=cut){ var a=find(m.l), b=find(m.r); if (a!==b) parent[a]=b; } });
+      var out = {};
+      for (i=0;i<8;i++){ var r=find(i); (out[r]=out[r]||[]).push(i); }
+      return Object.keys(out).map(function(k){ return out[k]; });
+    }
+    function render(){
+      var cut = parseFloat(slider.value); val.textContent = cut.toFixed(2);
+      var cls = clustersAt(cut); var colorOf = {};
+      cls.forEach(function(g,gi){ g.forEach(function(i){ colorOf[i]=palette[gi%palette.length]; }); });
+      ctx.clearRect(0,0,W,H);
+      var padL=80, padR=20, padT=20, padB=70;
+      var plotW=W-padL-padR, plotH=H-padT-padB, maxH=2.0;
+      function X(x){ return padL + (x+0.5)/8*plotW; }
+      function Y(y){ return padT + plotH - (y/maxH)*plotH; }
+      merges.forEach(function(m){
+        var left=nodes[m.l], right=nodes[m.r];
+        ctx.strokeStyle=c.divider; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.moveTo(X(left.x),Y(left.y)); ctx.lineTo(X(left.x),Y(m.h)); ctx.lineTo(X(right.x),Y(m.h)); ctx.lineTo(X(right.x),Y(right.y)); ctx.stroke();
+      });
+      nodes.slice(0,8).forEach(function(n,i){
+        ctx.fillStyle=colorOf[i]; ctx.beginPath(); ctx.arc(X(n.x),Y(0),4,0,2*Math.PI); ctx.fill();
+        ctx.save(); ctx.translate(X(n.x),Y(0)+8); ctx.rotate(-Math.PI/3); ctx.textAlign='right'; ctx.font='10px '+c.font; ctx.fillStyle=c.text;
+        ctx.fillText(leaves[i],0,0); ctx.restore();
+      });
+      ctx.strokeStyle=c.accent2; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(padL,Y(cut)); ctx.lineTo(W-padR,Y(cut)); ctx.stroke(); ctx.setLineDash([]);
+      ctx.font='10px '+c.font; ctx.fillStyle=c.text; ctx.textAlign='left';
+      ctx.fillText('merge distance (Ward) →', padL, H-8);
+      readout.innerHTML = '<span class="k">clusters at this cut:</span> '+cls.length+'<br>' +
+        cls.map(function(g,gi){ return '<span style="color:'+palette[gi%palette.length]+'">●</span> '+g.map(function(i){return leaves[i];}).join(', '); }).join('<br>');
+    }
+    slider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Cluster SNR ----
+  (function(){
+    var canvas = document.getElementById('snr-canvas'), ctx = canvas.getContext('2d');
+    var slider = document.getElementById('snr-rho'), val = document.getElementById('snr-rho-val');
+    var nS = document.getElementById('snr-n'), nV = document.getElementById('snr-n-val');
+    var readout = document.getElementById('snr-readout');
+    var W = canvas.width, H = canvas.height;
+    var rhos = [
+      { r:0, color:c.accent, label:'ρ=0 (independent)' },
+      { r:0.3, color:'#3aa66a', label:'ρ=0.3' },
+      { r:0.6, color:'#c98a00', label:'ρ=0.6' },
+      { r:0.9, color:c.accent2, label:'ρ=0.9' }
+    ];
+    function snr(n,rho){ return Math.sqrt(n/(1+(n-1)*rho)); }
+    function render(){
+      var rho=parseFloat(slider.value), n=parseInt(nS.value,10);
+      val.textContent=rho.toFixed(2); nV.textContent=n;
+      var series=rhos.map(function(x){ var pts=[]; for (var i=1;i<=20;i++) pts.push({x:i,y:snr(i,x.r)}); return {points:pts,color:x.color}; });
+      var ax = G.drawLines(ctx, W, H, series, [1,20], [1,4.5], { xLabel:'tasks averaged in the cluster', yLabel:'SNR multiplier' });
+      var mx=ax.px(n), my=ax.py(snr(n,rho));
+      ctx.fillStyle=c.text; ctx.beginPath(); ctx.arc(mx,my,5,0,2*Math.PI); ctx.fill();
+      ctx.font='10.5px '+c.font; ctx.textAlign='left';
+      rhos.forEach(function(x,i){ ctx.fillStyle=x.color; ctx.fillText('▬ '+x.label, ax.padL+8, ax.padT+14+i*13); });
+      readout.innerHTML = '<span class="k">SNR multiplier at n='+n+':</span> <span class="hi">'+snr(n,rho).toFixed(2)+'×</span> (ρ='+rho.toFixed(2)+')<br>' +
+        '<span style="opacity:0.65">independent tasks average noise away fastest; correlated tasks still help, with diminishing returns.</span>';
+    }
+    slider.addEventListener('input', render); nS.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Base Easy vs Base Main ----
+  (function(){
+    var canvas = document.getElementById('easymain-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('easymain-readout');
+    var W = canvas.width, H = canvas.height;
+    var rng = G.seededRandom(3);
+    var pts = [];
+    for (var i=0;i<28;i++){
+      var bpb = 0.74 + 0.32*rng();
+      var acc = 12 + 62/(1+Math.exp((bpb-0.9)*22)) + 4*(rng()-0.5);
+      pts.push({ x:bpb, y:Math.max(5,Math.min(80,acc)) });
+    }
+    var n=pts.length, sx=0,sy=0,sxx=0,sxy=0,syy=0;
+    pts.forEach(function(p){ sx+=p.x; sy+=p.y; sxx+=p.x*p.x; sxy+=p.x*p.y; syy+=p.y*p.y; });
+    var slope=(n*sxy-sx*sy)/(n*sxx-sx*sx), intercept=(sy-slope*sx)/n;
+    var r=(n*sxy-sx*sy)/Math.sqrt((n*sxx-sx*sx)*(n*syy-sy*sy));
+    var ax = G.drawLines(ctx, W, H, [{ points:[{x:0.72,y:slope*0.72+intercept},{x:1.07,y:slope*1.07+intercept}], color:c.accent }], [0.72,1.07], [0,85], { xLabel:'Base Easy (BPB, lower is better)', yLabel:'Base Main average' });
+    pts.forEach(function(p){ ctx.fillStyle=c.accent2; ctx.beginPath(); ctx.arc(ax.px(p.x),ax.py(p.y),3.5,0,2*Math.PI); ctx.fill(); });
+    readout.innerHTML = '<span class="k">Pearson r:</span> <span class="hi">'+r.toFixed(3)+'</span> over '+n+' checkpoints<br>' +
+      '<span style="opacity:0.65">Base Easy is cheap and tracks Base Main rank, so it validates a recipe before the full suite is worth running.</span>';
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,266 @@
+---
+title: "LLM Training, Interactively — Part 9: Reasoning & RL with Verifiable Rewards"
+description: "Chain-of-thought as computation, RLVR (Tulu 3's third post-training stage), GRPO vs PPO without a value model, and how test-time compute scaling turns more samples into higher accuracy."
+permalink: "/ai/llm-training/reasoning/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-reasoning.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .grp-sample { display:flex; align-items:center; gap:8px; font-family: var(--font-mono); font-size:12px; margin-bottom:4px; }
+  .grp-bar { height:14px; border-radius:2px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 9 of 15</span>
+    <h1>Reasoning &amp; RL with Verifiable Rewards</h1>
+    <p>Part 8 covered alignment with human preferences. A parallel, more recent development trains models to be better at tasks with an <em>automatically checkable</em> answer — math, code, precise instruction-following — using reinforcement learning where the reward comes from a verifier function, not a learned reward model. This is the biggest change to post-training since RLHF itself, and it's what powers "thinking" models that write out long chains of reasoning before answering.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="cot">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Chain-of-thought as computation-in-tokens</h2></div>
+    <p class="llmt-eyebrow">Setup</p>
+    <p>A transformer does a fixed amount of computation per generated token (one forward pass through <var>L</var> layers). If a problem needs more computation than that, the model has no way to "think longer" on a single token — but it <em>can</em> spend more tokens: writing out intermediate reasoning steps effectively lets the model use its next-token machinery as a scratchpad, trading generation length for solved-problem difficulty. Models explicitly trained to do this at length (o1-style, DeepSeek-R1, OLMo 3 Think) can spend thousands of tokens "thinking" before answering.</p>
+  </section>
+
+  <section class="llmt-step" id="rlvr">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>RLVR: reward from a verifier, not a model</h2></div>
+    <p class="llmt-eyebrow">Tulu 3's third stage</p>
+    <p>RLHF's reward comes from a learned reward model trained on human preference judgments — useful for open-ended quality, but noisy and gameable (Part 8's reward-hacking demo). For tasks with a checkable correct answer, Tulu 3 introduced <strong>RLVR (Reinforcement Learning with Verifiable Rewards)</strong>: skip the reward model, and instead score each completion with a small deterministic verifier function — does the final numeric answer match, does the code pass its unit tests, was the requested format followed exactly.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-field"><label>Problem: "What is 17 × 24?"</label></div>
+      <div class="llmt-field"><label>Candidate completion (try changing the number, or the format)</label>
+        <textarea id="rlvr-input" rows="2">Let's compute step by step: 17 × 24 = 17 × 20 + 17 × 4 = 340 + 68 = 408. The answer is 408.</textarea></div>
+      <div class="llmt-readout" id="rlvr-readout"></div>
+    </div>
+    <p class="llmt-canvas-hint">The verifier here just extracts the last number in the response and checks it against 408 — crude, but this is genuinely close to how math RLVR verifiers work in practice (answer extraction + exact or numeric match), which is also exactly why format matters so much: an otherwise-correct answer the verifier can't parse gets zero reward.</p>
+  </section>
+
+  <section class="llmt-step" id="grpo">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>GRPO: dropping the value model</h2></div>
+    <p class="llmt-eyebrow">Group-relative advantages</p>
+    <p>PPO (Part 8) needs a learned <strong>value model</strong> to estimate how good a state is, so it can compute an advantage (reward minus baseline) — that's a second model roughly the size of the policy, trained alongside it, doubling memory and compute. <strong>GRPO</strong> (Group Relative Policy Optimization) removes it: sample a <em>group</em> of <var>G</var> completions for the same prompt, score each with the verifier, and use the group's own mean and standard deviation as the baseline.</p>
+    <div class="llmt-math llmt-katex">$$\hat{A}_i = \frac{r_i - \text{mean}(r_1,\dots,r_G)}{\text{std}(r_1,\dots,r_G)}$$</div>
+    <p>Tulu 3.1 switched its RLVR stage from PPO to GRPO for exactly this reason — comparable results, less compute per step, no separate value model to train and keep synchronized.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-field"><label>Group size G <span class="val" id="grp-g-val">6</span></label><input type="range" id="grp-g" min="2" max="12" step="1" value="6"></div>
+      <div class="llmt-btnrow"><button id="grp-resample" class="llmt-primary">Sample a new group of completions</button></div>
+      <div id="grp-samples"></div>
+      <div class="llmt-readout" id="grp-readout"></div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Notice:</b> a completion with reward 1 gets a <em>negative</em> advantage if every other sample in its group also scored 1 (mean≈1, nothing to distinguish it) — advantage is entirely relative to what else was sampled for the same prompt, which is both GRPO's efficiency trick and its main quirk (very easy or very hard prompts, where every sample gets the same reward, contribute almost no learning signal).</span></div>
+  </section>
+
+  <section class="llmt-step" id="testtime">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Test-time compute: more samples, higher accuracy</h2></div>
+    <p class="llmt-eyebrow">A second axis besides training compute</p>
+    <p>If a model solves a given problem with probability <var>p</var> per independent attempt, sampling <var>k</var> attempts and checking if <em>any</em> is correct (pass@k, reused from Part 10) succeeds with probability $1-(1-p)^k$. Majority voting — sample k times, take the most common final answer — does worse than pass@k (it needs the correct answer to be the <em>plurality</em>, not just present) but doesn't require an external verifier at inference time, which is what makes it usable in production.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="tt-canvas" width="520" height="260"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Per-attempt success probability p <span class="val" id="tt-p-val">0.3</span></label>
+          <input type="range" id="tt-p" min="0.05" max="0.9" step="0.01" value="0.3"></div>
+        <div class="llmt-readout" id="tt-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="olmorl">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>From GRPO to OLMoRL — and RL from base</h2></div>
+    <p class="llmt-eyebrow">The 2025 upgrades</p>
+    <p>GRPO as introduced above is now the starting point, not the final word. OLMoRL builds on it with ideas from <strong>DAPO</strong> and <strong>Dr.GRPO</strong>, and each change fixes a concrete failure of vanilla GRPO. In one line: filter the zero-signal groups, refill the batch, normalize the loss by tokens, drop the KL term, clip asymmetrically, correct for engine mismatch, and stop dividing by the group's standard deviation. Part 15 opens each one up with demos.</p>
+    <ul class="llmt-refs">
+      <li><b>Zero-gradient filtering</b> — drop groups whose rewards are all identical (no advantage, no gradient).</li>
+      <li><b>Active sampling</b> — keep pulling prompt–completion pairs from the result queue so filtering doesn't shrink the batch over training.</li>
+      <li><b>Token-level loss</b> — normalize by total batch tokens, not per sample, removing a length bias.</li>
+      <li><b>No KL loss</b> — less-restricted updates without observed over-optimization.</li>
+      <li><b>Clip-higher</b> — asymmetric clipping lets probability rise more than it falls.</li>
+      <li><b>Truncated importance sampling</b> — correct the log-prob gap between the vLLM inference engine and the trainer.</li>
+      <li><b>No std normalization</b> — advantage becomes <span class="lc-note">r − mean(r)</span>, removing the difficulty bias that inflates near-saturated prompts.</li>
+    </ul>
+    <p><b>Verifiers go multi-domain.</b> Tulu 3 and early RLVR mostly rewarded math. OLMo 3 expands to four domains, each with its own checker: <b>math</b> (SymPy answer equivalence), <b>code</b> (test-case execution on AWS Lambda, so verification never blocks the trainer), <b>instruction following</b> (constraint checkers, all-or-nothing), and <b>chat</b> (an LM judge, with or without a reference answer). This is what turns RLVR from a math trick into a general post-training stage.</p>
+    <p><b>Difficulty filtering is where the sample efficiency comes from.</b> For each prompt, sample eight rollouts from the starting checkpoint and discard prompts the model already solves more than <strong>62.5%</strong> of the time. Those prompts produce near-zero advantage and waste compute; keeping only the hard-but-solvable middle makes each RL step count. (The 32B run then relies on active sampling instead of offline filtering.)</p>
+    <p><b>RL-Zero</b> applies all of this directly to the midtrained base model, with no SFT or DPO warm start. Two findings generalize: <em>simple</em> prompt templates beat standard chat templates when the base model never saw special tokens, and the choice of midtraining data determines whether RL learns to reason longer — a base with too little reasoning data plateaus instead of growing its response length. Because RL-Zero starts from a fully open pipeline, it also enables a clean contamination test: train with <strong>spurious random rewards</strong>. If benchmark performance rises, the eval leaked into pretraining; OLMo 3's flat curve is evidence it didn't. Part 15 walks through both the difficulty filter and the spurious-reward control.</p>
+    <div class="llmt-warn">⚠️ <span><b>Multi-objective RL is harder than single-domain RL.</b> A model trained on math alone reaches a higher math reward than one trained on math + code + instruction + chat. But the single-domain model overfits and generalizes worse. The mixed run is the better benchmark for real assistants — and the reason OLMo 3's final RL mix is roughly balanced across domains.</span></div>
+    <div class="llmt-goal">📌 <span><b>Cross-links:</b> Part 15 has the OLMoRL objective, the domain-verifier zoo, the difficulty-filter histogram, and the async RL systems that make long-chain-of-thought training practical.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td>Chain-of-thought</td><td>Spending generated tokens as computation, not just output</td></tr>
+        <tr><td>RLVR</td><td>RL reward from a deterministic verifier instead of a learned reward model</td></tr>
+        <tr><td>GRPO</td><td>Advantage from a sampled group's own mean/std — no value model</td></tr>
+        <tr><td>pass@k</td><td>P(at least one of k samples correct) = 1−(1−p)ᵏ</td></tr>
+        <tr><td>Majority voting</td><td>Sample k, answer with the most common output — usable without a verifier at inference</td></tr>
+        <tr><td>Zero-gradient filtering</td><td>Drop groups with identical rewards — no advantage means no gradient</td></tr>
+        <tr><td>Active sampling</td><td>Resample prompts until the batch is full of non-zero-gradient completions</td></tr>
+        <tr><td>Clip-higher / token-level loss</td><td>Asymmetric clipping and total-token normalization (DAPO-style GRPO upgrades)</td></tr>
+        <tr><td>No std normalization</td><td>Advantage = reward − group mean; avoids difficulty bias (Dr.GRPO)</td></tr>
+        <tr><td>Multi-domain verifiers</td><td>SymPy math, test-case code, IF constraint checks, LM-judge chat</td></tr>
+        <tr><td>Difficulty filtering</td><td>Remove prompts solved &gt;62.5% of 8 rollouts to keep only learnable signal</td></tr>
+        <tr><td>RL-Zero</td><td>RLVR directly from the base model, no SFT/DPO warm start</td></tr>
+        <tr><td>Spurious-reward control</td><td>Random rewards should not improve benchmarks; if they do, data is contaminated</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Lambert et al. (Ai2), <a href="https://arxiv.org/abs/2411.15124">"Tulu 3: Pushing Frontiers in Open Language Model Post-Training"</a> (2024) — RLVR.</li>
+      <li>Shao et al. (DeepSeek), <a href="https://arxiv.org/abs/2402.03300">"DeepSeekMath: Pushing the Limits of Mathematical Reasoning"</a> (2024) — GRPO.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2501.12948">"DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"</a> (2025).</li>
+      <li>Wang et al., <a href="https://arxiv.org/abs/2203.11171">"Self-Consistency Improves Chain of Thought Reasoning"</a> (2022) — majority voting.</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>All of these techniques need a way to measure whether they worked — which is a surprisingly deep question in its own right.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/evaluation/' | relative_url }}">Continue: evaluation →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+
+  // ---- RLVR verifier ----
+  (function(){
+    var input = document.getElementById('rlvr-input');
+    var readout = document.getElementById('rlvr-readout');
+    function verify(){
+      var text = input.value;
+      var nums = text.match(/-?\d+(\.\d+)?/g);
+      var last = nums && nums.length ? parseFloat(nums[nums.length-1]) : null;
+      var correct = last === 408;
+      readout.innerHTML = '<span class="k">extracted final number:</span> ' + (last===null?'(none found)':last) + '<br>' +
+        '<span class="k">verifier reward:</span> <span class="' + (correct?'hi':'bad') + '">' + (correct?'1 (correct)':'0 (incorrect or unparseable)') + '</span>';
+    }
+    input.addEventListener('input', verify);
+    verify();
+  })();
+
+  // ---- GRPO group sampling ----
+  (function(){
+    var gSlider = document.getElementById('grp-g'), gVal = document.getElementById('grp-g-val');
+    var resampleBtn = document.getElementById('grp-resample');
+    var samplesEl = document.getElementById('grp-samples');
+    var readout = document.getElementById('grp-readout');
+
+    function sample(){
+      var G_n = parseInt(gSlider.value,10);
+      gVal.textContent = G_n;
+      var rewards = [];
+      for (var i=0;i<G_n;i++) rewards.push(Math.random() < 0.5 ? 1 : 0); // binary verifiable reward, ~coin flip difficulty
+      var mean = rewards.reduce(function(a,b){return a+b;},0)/G_n;
+      var variance = rewards.reduce(function(a,b){return a+(b-mean)*(b-mean);},0)/G_n;
+      var std = Math.sqrt(variance) || 1;
+      samplesEl.innerHTML = '';
+      rewards.forEach(function(r,i){
+        var adv = (r-mean)/std;
+        var row = document.createElement('div'); row.className='grp-sample';
+        var bar = document.createElement('div'); bar.className='grp-bar';
+        bar.style.width = (60+Math.abs(adv)*40)+'px';
+        bar.style.background = adv>=0 ? c.accent : c.accent2;
+        row.appendChild(document.createTextNode('sample '+i+'  reward='+r+'  '));
+        row.appendChild(bar);
+        row.appendChild(document.createTextNode('  advantage='+adv.toFixed(2)));
+        samplesEl.appendChild(row);
+      });
+      readout.innerHTML = '<span class="k">group mean reward:</span> '+mean.toFixed(2)+'  <span class="k">std:</span> '+std.toFixed(2)+'<br>' +
+        (std < 0.05 ? '<span style="opacity:0.6">all samples scored the same — near-zero learning signal from this prompt this step</span>' : '<span style="opacity:0.6">samples above the mean push the policy toward them; below, away</span>');
+    }
+    gSlider.addEventListener('input', sample);
+    resampleBtn.addEventListener('click', sample);
+    sample();
+  })();
+
+  // ---- Test-time compute scaling ----
+  (function(){
+    var slider = document.getElementById('tt-p'), pVal = document.getElementById('tt-p-val');
+    var canvas = document.getElementById('tt-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('tt-readout');
+    var W = canvas.width, H = canvas.height;
+
+    function majorityAccuracy(p, k){
+      // probability that correct answer is the strict plurality among k iid Bernoulli(p) draws
+      // approximate via simulation for small k
+      var trials = 3000, wins = 0;
+      for (var t=0;t<trials;t++){
+        var correctCount = 0;
+        for (var i=0;i<k;i++) if (Math.random()<p) correctCount++;
+        // correct is majority if more than half are correct (binary outcome model: correct vs "some other wrong answer", each wrong draw assumed distinct)
+        if (correctCount > k/2) wins++;
+        else if (correctCount === Math.ceil(k/2) && correctCount > (k-correctCount)) wins++;
+      }
+      return wins/trials;
+    }
+
+    function render(){
+      var p = parseFloat(slider.value);
+      pVal.textContent = p.toFixed(2);
+      var passK = [], majK = [];
+      for (var k=1;k<=20;k++){
+        passK.push({x:k, y: 1-Math.pow(1-p,k)});
+        majK.push({x:k, y: majorityAccuracy(p,k)});
+      }
+      var lines = [{points:passK, color:c.accent}, {points:majK, color:c.accent2}];
+      var axes = G.drawLines(ctx, W, H, lines, [1,20], [0,1], {xLabel:'k (samples)', yLabel:'accuracy'});
+      ctx.font='11px '+c.font;
+      ctx.fillStyle=c.accent; ctx.fillText('pass@k', axes.padL+8, axes.padT+14);
+      ctx.fillStyle=c.accent2; ctx.fillText('majority vote', axes.padL+8, axes.padT+28);
+      readout.innerHTML = '<span class="k">pass@10:</span> '+(1-Math.pow(1-p,10)).toFixed(2)+'<br><span class="k">majority@10 (approx.):</span> '+majorityAccuracy(p,10).toFixed(2);
+    }
+    slider.addEventListener('input', render);
+    render();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

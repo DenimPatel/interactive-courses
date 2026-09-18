@@ -1,0 +1,599 @@
+---
+title: "Building with LLMs, Interactively — Part 13: Embeddings and vector similarity"
+description: "An embedding maps meaning to a vector: cosine measures direction rather than distance, similarity is not relevance, queries and documents are embedded asymmetrically, Matryoshka truncation trades recall for storage, and MTEB is a shortlist rather than an answer."
+permalink: "/ai/building-with-llms/embeddings/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Embeddings and vector similarity</h1>
+    <p>BM25 matches the words you typed. An embedding is supposed to match the <em>meaning</em>: two texts with no word in common land near each other in a high-dimensional space. That promise is real but narrower than the marketing. Cosine similarity measures direction, not relevance; queries and documents are embedded differently by design; and the leaderboard that tells you which model to use is a shortlist, not an answer. This part takes the same 60-document corpus and looks at it as a space.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="vector">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Meaning as a position</h2></div>
+    <p class="g-eyebrow">A point, a direction, and what similarity can and cannot mean</p>
+    <p>A text embedding is a fixed-length vector such that texts with similar meaning map to nearby points. "Near" is usually measured with <strong>cosine similarity</strong> — the cosine of the angle between the vectors, which ignores their lengths. Two documents about the same topic point in the same direction even if one is long and one is short. That is why cosine is the default, and why the magnitude of an embedding is usually normalised away.</p>
+    <p>The whole series has been using one embedding under the hood: the shared 60-document corpus has hand-fixed 2-D coordinates, coloured by guide, and those coordinates <em>are</em> the running example. A point's position is its meaning; closeness is the model's claim of similarity. Everything below happens in that same two-dimensional space, so the geometry stays visible.</p>
+    <div class="g-goal">💡 <span><b>Carry two sentences forward.</b> First: <b>cosine measures direction, not distance</b> — a short vector can outrank a long one on angle while losing on euclidean distance. Second: <b>most similar is not most relevant</b> — similarity ranks candidates, and relevance is decided by the task and the reranker.</span></div>
+    <p class="g-source" id="emb-src-model"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> treating a similarity score as a relevance score. In a well-separated space the top similarity is usually on-topic, but among near-ties the ordering is noise. That is why production systems retrieve wide with a cheap similarity and then rerank narrow with a model that reads the query and the document together.</span></div>
+  </section>
+
+  <section class="g-step" id="space">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The semantic space</h2></div>
+    <p class="g-eyebrow">Nearby points are topically similar</p>
+    <p>Plot all sixty documents by their coordinates and the topical structure is immediate: five clusters — LLM training, serving, applications, math, and vision &amp; robotics. Type a query and the same 2-D space gets a point of its own, placed at the BM25-weighted centroid of the documents it lexically matches. Because the query lands in the space the documents live in, the nearest points by cosine are the model's nearest neighbours.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="emb-space-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">All 60 documents, coloured by guide. The star is the query's position; rings and lines mark the nearest neighbours by cosine.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query <span class="val">kv cache</span></label><input type="text" id="emb-query" value="kv cache" autocomplete="off"></div>
+        <div class="g-btnrow">
+          <button id="emb-q-kv">kv cache</button>
+          <button id="emb-q-att">attention blocks</button>
+          <button id="emb-q-rr">reranking</button>
+          <button id="emb-q-none">remember our conversation</button>
+        </div>
+        <div class="g-readout" id="emb-a-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Read the geometry, not just the list:</b> the query point lands inside a cluster, and the neighbours it returns are mostly from that cluster. When a query has no lexical overlap at all it lands at the origin — this 2-D embedding is defined by lexical matching, which is the honest limitation of the running example.</span></div>
+  </section>
+
+  <section class="g-step" id="cosine">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Cosine is direction, not distance</h2></div>
+    <p class="g-eyebrow">Two vectors that rank in opposite orders</p>
+    <p>Cosine similarity is <code>a·b / (|a| |b|)</code> — the contribution of length cancels. Euclidean distance is <code>|a − b|</code>, which does not. So a vector that points almost exactly at the query can lose to a shorter vector that points slightly off, or win, depending on which measure you use. The two retrievers rank the same candidates differently, and neither is wrong; they are answering different questions.</p>
+    <p>Vector <var>q</var> points right. Drag <var>A</var>'s length and <var>B</var>'s length and angle. The readout re-ranks A and B under cosine and under euclidean distance — watch the two orders disagree.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="emb-cosine-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Arrows are vectors from the origin. The dashed circle is the unit length: cosine compares angles, euclidean compares arrow tips.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>|A| (aligned but long) <span class="val">3</span></label><input type="range" id="emb-a-mag" min="0.5" max="3.5" step="0.1" value="3"></div>
+        <div class="g-field"><label>|B| (near but off-axis) <span class="val">0.9</span></label><input type="range" id="emb-b-mag" min="0.4" max="3" step="0.1" value="0.9"></div>
+        <div class="g-field"><label>B angle <span class="val">0.5</span></label><input type="range" id="emb-b-ang" min="0" max="1.2" step="0.05" value="0.5"></div>
+        <div class="g-readout" id="emb-b-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Practical consequence:</b> if you switch a store from L2 to cosine, or normalise vectors after indexing but not before, you change the ranking. Pick one metric, record it in the index configuration, and never mix a normalised query with un-normalised documents.</span></div>
+  </section>
+
+  <section class="g-step" id="asymmetry">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Queries and documents are not the same text</h2></div>
+    <p class="g-eyebrow">Why asymmetric models exist</p>
+    <p>A query is a question; a document is an answer. They are different distributions of text, and a single encoder trained on both will place them in slightly different regions. Asymmetric embedding models handle this explicitly: E5 expects <code>query:</code> and <code>passage:</code> prefixes, and BGE takes an instruction on the query side only. Get the convention wrong — embed queries as passages, or forget the prefix — and the neighbour ordering shifts. The magnitude is small; the effect on the top few results is not.</p>
+    <p>Below, the same query is embedded two ways. On the left, the query is embedded as if it were a document (no prefix). On the right, it carries a query-side instruction, modelled as a fixed, seeded shift in the space. Lines follow each document from its rank on the left to its rank on the right.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="emb-asym-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Two rankings of the same five documents by the same model. Left: document-style query embedding. Right: instruction-prefixed query embedding.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query-prefix shift <span class="val">0.30</span></label><input type="range" id="emb-shift" min="0" max="0.6" step="0.05" value="0.3"></div>
+        <div class="g-btnrow">
+          <button id="emb-asym-kv">kv cache</button>
+          <button id="emb-asym-rr">reranking</button>
+          <button id="emb-asym-tok">tokens</button>
+        </div>
+        <div class="g-readout" id="emb-c-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="emb-src-fusion"></p>
+  </section>
+
+  <section class="g-step" id="matryoshka">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Matryoshka truncation, and the MTEB trap</h2></div>
+    <p class="g-eyebrow">Smaller vectors, and a leaderboard that is a shortlist</p>
+    <p>Storage and search cost scale with dimension, so the interesting question is how much accuracy you give up by cutting the vector short. <strong>Matryoshka representation learning</strong> trains the embedding so that its most important information sits in the leading dimensions: a 1,536-dimension vector can be truncated to 768, 384 or 192 and still work, because each prefix is itself a usable embedding. The recall loss is small and, crucially, measurable — you plot it on your corpus rather than trusting a blog post.</p>
+    <p>The plot below is a seeded simulation of that tradeoff: exact nearest-neighbour search over the corpus scaled up to a few hundred points, compared against the same search after truncation. Drag the point count to change the density of the space.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="emb-matryoshka-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Recall@1 against exact search as the dimension is truncated. The pale line is storage relative to the full 1,536 dimensions.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Points in the scaled corpus <span class="val">240</span></label><input type="range" id="emb-points" min="120" max="600" step="60" value="240"></div>
+        <div class="g-readout" id="emb-d-readout"></div>
+      </div>
+    </div>
+    <p>The other half of the trap is model selection. <strong>MTEB</strong> ranks hundreds of embedding models across dozens of tasks, and it is useful for exactly one thing: narrowing the field to a shortlist worth testing. The scores are dominated by a handful of benchmarks, the leaderboard is public enough to be overfitted, and a model that wins on a general web-retrieval task can lose on your corpus of support tickets or camera drivers. Choose from the shortlist, then measure on your own labelled set — the same rule the eval harness in Part 5 imposes on everything else.</p>
+    <p class="g-source" id="emb-src-ann"></p>
+    <div class="g-goal">💡 <span><b>Two decisions, two measurements.</b> Truncate dimensions and MTEB-rank models only on paper; then plot recall against your own queries and pick the smallest vector and the cheapest model that clears the bar. The leaderboard shortlists; your corpus decides.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>What is an embedding?</td><td>A fixed-length vector where meaning is position; similar texts land nearby.</td></tr>
+        <tr><td>Why cosine and not L2?</td><td>Cosine measures direction and ignores magnitude, which is what "same topic, different length" needs.</td></tr>
+        <tr><td>Does higher similarity mean more relevant?</td><td>No. Similarity ranks; relevance needs the task and usually a reranker over a wide candidate set.</td></tr>
+        <tr><td>Why prefix the query?</td><td>Asymmetric models (E5, BGE) were trained with query and passage conventions; using them wrong shifts the ordering.</td></tr>
+        <tr><td>What is Matryoshka?</td><td>An embedding trained so prefixes are usable — truncate 1,536 → 768 → 384 for less storage at a small, plottable recall cost.</td></tr>
+        <tr><td>How do I pick a model?</td><td>Shortlist from MTEB, then measure recall on your own labelled queries. The leaderboard is not the answer.</td></tr>
+        <tr><td>What comes next?</td><td>Chunking: an embedding is per passage, so how you cut documents decides what can be retrieved at all.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Reimers &amp; Gurevych, <a href="https://arxiv.org/abs/1908.10084">"Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks"</a>, EMNLP 2019 — the architecture that made sentence embeddings practical.</li>
+      <li>Wang et al., <a href="https://arxiv.org/abs/2212.03533">"Text Embeddings by Weakly-Supervised Contrastive Pre-training"</a> (E5), 2022 — the <code>query:</code> / <code>passage:</code> prefixes behind the asymmetry in step 4.</li>
+      <li>Xiao et al., <a href="https://arxiv.org/abs/2309.07597">"C-Pack: Packed Resources for General Chinese Embeddings"</a> (BGE), 2023 — the instruction-prefixed query convention and a widely used open model family.</li>
+      <li>Kusupati et al., <a href="https://arxiv.org/abs/2205.13147">"Matryoshka Representation Learning"</a>, NeurIPS 2022 — nested, truncatable embeddings and the recall-versus-dimension tradeoff plotted in step 5.</li>
+      <li>Muennighoff et al., <a href="https://arxiv.org/abs/2210.07316">"MTEB: Massive Text Embedding Benchmark"</a>, 2022 — the leaderboard, its task coverage, and why it shortlists rather than decides.</li>
+      <li>Jégou, Douze &amp; Schmid, <a href="https://arxiv.org/abs/1102.3828">"Product Quantization for Nearest Neighbor Search"</a>, IEEE TPAMI 2011 — the compression half of the storage question this part's truncation plot starts.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}An embedding is per passage, so the passage is the unit that can be retrieved. Next: chunking — how splitting documents trades retrieval precision against context cost, and the four strategies worth knowing.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    embeddings: {
+      source: "Sentence-BERT (Reimers & Gurevych, arXiv:1908.10084, EMNLP 2019); E5 (Wang et al., arXiv:2212.03533, 2022); BGE / C-Pack (Xiao et al., arXiv:2309.07597, 2023); Matryoshka Representation Learning (Kusupati et al., arXiv:2205.13147, NeurIPS 2022); MTEB (Muennighoff et al., arXiv:2210.07316, 2022). Offline fallback constants.",
+      typicalDims: [384, 512, 768, 1024, 1536, 3072],
+      matryoshkaTruncation: "A Matryoshka-trained embedding can be truncated at 1/2, 1/4 or 1/8 of its width with a small, measurable recall loss."
+    },
+    ann: {
+      source: "HNSW (Malkov & Yashunin, arXiv:1603.09320); IVF + product quantization (Jégou et al., arXiv:1102.3828, IEEE TPAMI 2011); ScaNN (Guo et al., arXiv:1908.10396, ICML 2020); DiskANN (Subramanya et al., NeurIPS 2019). Offline fallback constants.",
+      methods: [
+        { method: "Flat (exact)", recall: "1.00", latency: "highest", memory: "highest" },
+        { method: "HNSW", recall: "0.95-0.99", latency: "very low", memory: "high (graph)" }
+      ]
+    },
+    fusion: {
+      source: "Reciprocal Rank Fusion (Cormack, Clarke & Buettcher, SIGIR 2009), k=60 as the paper's default. Cross-encoders rerank far more accurately than they retrieve. Offline fallback constants.",
+      rrfK: 60,
+      patterns: ["lexical + dense fused with RRF", "cross-encoder rerank of the top 50-100"]
+    }
+  };
+  var NUM = FALLBACK;
+
+  var GUIDE_ORDER = Object.keys(AppSim.GUIDE_LABELS);
+  var PALETTE = ['#2b5fff', '#d6006c', '#c9a227', '#5f8a3a', '#7a5c9e'];
+  function guideColor(g) {
+    var i = GUIDE_ORDER.indexOf(g);
+    return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
+  }
+  function shortTitle(t) { t = String(t || ''); return t.length > 25 ? t.slice(0, 24) + '…' : t; }
+  function byScoreDesc(a, b) { return b.s - a.s; }
+  function maxBm25(query) {
+    return AppSim.bm25(AppSim.CORPUS, query, {}).reduce(function (m, s) { return Math.max(m, s.score); }, 0);
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the semantic space
+  // ------------------------------------------------------------------
+  var A = { query: 'kv cache' };
+  var setupA = Guide.setupCanvas(el('emb-space-canvas'), 640, 360, drawA);
+  var AP = { padL: 42, padR: 42, padT: 26, padB: 42 };
+  function Amx(x) { return AP.padL + (x + 1) / 2 * (640 - AP.padL - AP.padR); }
+  function Amy(y) { return (360 - AP.padB) - (y + 1) / 2 * ((360 - AP.padB) - AP.padT); }
+  function queryRanked(qv) {
+    return AppSim.CORPUS.map(function (d) {
+      return { d: d, s: AppSim.cosine([qv.x, qv.y], [d.x, d.y]) };
+    }).sort(byScoreDesc);
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(Amx(-1), Amy(0)); ctx.lineTo(Amx(1), Amy(0)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(Amx(0), Amy(-1)); ctx.lineTo(Amx(0), Amy(1)); ctx.stroke();
+    AppSim.CORPUS.forEach(function (d) {
+      ctx.beginPath();
+      ctx.arc(Amx(d.x), Amy(d.y), 4, 0, 2 * Math.PI);
+      ctx.fillStyle = guideColor(d.guide); ctx.globalAlpha = 0.75; ctx.fill(); ctx.globalAlpha = 1;
+    });
+    GUIDE_ORDER.forEach(function (g) {
+      var docs = AppSim.CORPUS.filter(function (d) { return d.guide === g; });
+      if (!docs.length) return;
+      var cx = docs.reduce(function (a, d) { return a + d.x; }, 0) / docs.length;
+      var cy = docs.reduce(function (a, d) { return a + d.y; }, 0) / docs.length;
+      ctx.fillStyle = guideColor(g); ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(AppSim.GUIDE_LABELS[g], Amx(cx), Amy(cy) - 12);
+    });
+    var noMatch = maxBm25(A.query) <= 0;
+    var qv = AppSim.queryVector(A.query);
+    var ranked = queryRanked(qv);
+    if (!noMatch) {
+      var top5 = ranked.slice(0, 5);
+      var radii = [top5[0], top5[2], top5[4]].filter(Boolean).map(function (r) {
+        return Math.hypot(Amx(r.d.x) - Amx(qv.x), Amy(r.d.y) - Amy(qv.y));
+      });
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+      radii.forEach(function (rr) { ctx.beginPath(); ctx.arc(Amx(qv.x), Amy(qv.y), rr, 0, 2 * Math.PI); ctx.stroke(); });
+      ctx.globalAlpha = 1;
+      top5.forEach(function (r) {
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 1; ctx.globalAlpha = 0.45;
+        ctx.beginPath(); ctx.moveTo(Amx(qv.x), Amy(qv.y)); ctx.lineTo(Amx(r.d.x), Amy(r.d.y)); ctx.stroke();
+        ctx.globalAlpha = 1;
+      });
+    }
+    ctx.beginPath();
+    ctx.arc(Amx(qv.x), Amy(qv.y), 7, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = c.accent2; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('query', Amx(qv.x) + 10, Amy(qv.y) + 4);
+    // legend
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    var lx = 46;
+    GUIDE_ORDER.forEach(function (g) {
+      ctx.fillStyle = guideColor(g);
+      ctx.fillRect(lx, H - 16, 9, 9);
+      ctx.fillStyle = c.text;
+      ctx.fillText(AppSim.GUIDE_LABELS[g], lx + 13, H - 8);
+      lx += ctx.measureText(AppSim.GUIDE_LABELS[g]).width + 34;
+    });
+    if (noMatch) {
+      el('emb-a-readout').innerHTML =
+        '<div><span class="k">query</span> ' + A.query + '</div>' +
+        '<div class="bad">no lexical overlap, so the BM25-weighted centroid has nothing to weight and the query sits at the origin. This 2-D embedding is tied to lexical matching — the honest limitation of the running example.</div>';
+    } else {
+      el('emb-a-readout').innerHTML =
+        '<div><span class="k">query point</span> (' + qv.x.toFixed(2) + ', ' + qv.y.toFixed(2) + ')</div>' +
+        ranked.slice(0, 5).map(function (r) {
+          return '<div><span class="k">cos ' + r.s.toFixed(3) + '</span> ' + r.d.title + ' <span class="k">· ' + AppSim.GUIDE_LABELS[r.d.guide] + '</span></div>';
+        }).join('');
+    }
+  }
+  el('emb-query').addEventListener('input', function () {
+    A.query = this.value; drawA();
+    var v = this.parentElement && this.parentElement.querySelector('.val');
+    if (v) v.textContent = this.value || '—';
+  });
+  function setAQuery(q) {
+    A.query = q; el('emb-query').value = q; drawA();
+    var inp = el('emb-query');
+    var v = inp.parentElement && inp.parentElement.querySelector('.val');
+    if (v) v.textContent = q;
+  }
+  el('emb-q-kv').addEventListener('click', function () { setAQuery('kv cache'); });
+  el('emb-q-att').addEventListener('click', function () { setAQuery('attention blocks'); });
+  el('emb-q-rr').addEventListener('click', function () { setAQuery('reranking'); });
+  el('emb-q-none').addEventListener('click', function () { setAQuery('remember our conversation'); });
+
+  // ------------------------------------------------------------------
+  // Demo B — cosine vs euclidean
+  // ------------------------------------------------------------------
+  var B = { aMag: el('emb-a-mag'), bMag: el('emb-b-mag'), bAng: el('emb-b-ang') };
+  var setupB = Guide.setupCanvas(el('emb-cosine-canvas'), 640, 320, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var ox = 180, oy = 240, sc = 52;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(20, oy); ctx.lineTo(W - 20, oy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ox, 24); ctx.lineTo(ox, oy); ctx.stroke();
+    var aMag = +B.aMag.value, bMag = +B.bMag.value, bAng = +B.bAng.value;
+    var aAng = 0.08;
+    var q = [1, 0];
+    var av = [aMag * Math.cos(aAng), aMag * Math.sin(aAng)];
+    var bv = [bMag * Math.cos(bAng), bMag * Math.sin(bAng)];
+    function cosTo(v) { return AppSim.cosine(v, q); }
+    function l2To(v) { return Math.sqrt((v[0] - q[0]) * (v[0] - q[0]) + (v[1] - q[1]) * (v[1] - q[1])); }
+    // unit circle
+    ctx.strokeStyle = c.divider; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.arc(ox, oy, sc, 0, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('unit length', ox + sc + 4, oy - 4);
+    Guide.drawArrow(ctx, ox, oy, ox + q[0] * sc, oy - q[1] * sc, { color: c.accent700, width: 2.4, label: 'q', labelColor: c.accent700 });
+    Guide.drawArrow(ctx, ox, oy, ox + av[0] * sc, oy - av[1] * sc, { color: c.accent, width: 2.4, label: 'A', labelColor: c.accent });
+    Guide.drawArrow(ctx, ox, oy, ox + bv[0] * sc, oy - bv[1] * sc, { color: c.accent2, width: 2.4, label: 'B', labelColor: c.accent2 });
+    var cosA = cosTo(av), cosB = cosTo(bv), l2A = l2To(av), l2B = l2To(bv);
+    var cosWinner = cosA >= cosB ? 'A' : 'B';
+    var l2Winner = l2A <= l2B ? 'A' : 'B';
+    el('emb-b-readout').innerHTML =
+      '<div><span class="k">cosine(q,·)</span> A <span class="hi">' + cosA.toFixed(3) + '</span> · B ' + cosB.toFixed(3) + ' → prefers <span class="hi">' + cosWinner + '</span></div>' +
+      '<div><span class="k">|q − ·|</span> A ' + l2A.toFixed(3) + ' · B <span class="hi">' + l2B.toFixed(3) + '</span> → prefers <span class="hi">' + l2Winner + '</span></div>' +
+      (cosWinner === l2Winner
+        ? '<div class="k">the two metrics agree at these values — move the sliders until they do not</div>'
+        : '<div class="bad">the two metrics disagree: cosine ranks ' + cosWinner + ' first, euclidean ranks ' + l2Winner + ' first. Same vectors, different question.</div>');
+  }
+  Guide.bindSliders([B.aMag, B.bMag, B.bAng], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — query/document asymmetry
+  // ------------------------------------------------------------------
+  var C = { query: 'kv cache', shift: el('emb-shift') };
+  var setupC = Guide.setupCanvas(el('emb-asym-canvas'), 640, 300, drawC);
+  function hashAngle(str) {
+    var h = 2166136261;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return (h % 360) * Math.PI / 180;
+  }
+  function rankByEmbedding(e) {
+    return AppSim.CORPUS.map(function (d) {
+      return { d: d, s: AppSim.cosine([e.x, e.y], [d.x, d.y]) };
+    }).sort(byScoreDesc).slice(0, 5);
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var qv = AppSim.queryVector(C.query);
+    var shift = +C.shift.value;
+    var ang = hashAngle(C.query);
+    var qStyle = { x: qv.x + shift * Math.cos(ang), y: qv.y + shift * Math.sin(ang) };
+    var docRank = rankByEmbedding(qv);
+    var qRank = rankByEmbedding(qStyle);
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('query "' + C.query + '"  ·  shift ' + shift.toFixed(2), 14, 16);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('embedded as a document', 80, 40);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('embedded as a query', 430, 40);
+    var y0 = 62, rowH = 44;
+    function posLeft(i) { return { x: 80, y: y0 + i * rowH }; }
+    function posRight(i) { return { x: 430, y: y0 + i * rowH }; }
+    var posInQ = {};
+    qRank.forEach(function (r, i) { posInQ[r.d.id] = i; });
+    var dropped = 0;
+    docRank.forEach(function (r, i) {
+      var lp = posLeft(i);
+      ctx.fillStyle = guideColor(r.d.guide); ctx.globalAlpha = 0.9;
+      ctx.fillRect(lp.x - 66, lp.y - 13, 9, 9); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText((i + 1) + '. ' + shortTitle(r.d.title), lp.x - 52, lp.y - 4);
+      var rIdx = posInQ[r.d.id];
+      if (rIdx == null) { dropped++; return; }
+      var rp = posRight(rIdx);
+      var changed = rIdx !== i;
+      ctx.strokeStyle = changed ? c.accent2 : c.divider; ctx.lineWidth = changed ? 1.6 : 1;
+      ctx.beginPath(); ctx.moveTo(lp.x + 4, lp.y); ctx.lineTo(rp.x - 76, rp.y); ctx.stroke();
+    });
+    qRank.forEach(function (r, i) {
+      var rp = posRight(i);
+      ctx.fillStyle = guideColor(r.d.guide); ctx.globalAlpha = 0.9;
+      ctx.fillRect(rp.x - 76, rp.y - 13, 9, 9); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText((i + 1) + '. ' + shortTitle(r.d.title), rp.x - 62, rp.y - 4);
+    });
+    var overlap = docRank.filter(function (r) { return posInQ[r.d.id] != null; }).length;
+    var top1same = docRank[0] && qRank[0] && docRank[0].d.id === qRank[0].d.id;
+    el('emb-c-readout').innerHTML =
+      '<div><span class="k">overlap@5</span> <span class="hi">' + overlap + '/5</span> · top-1 ' + (top1same ? '<span class="hi">unchanged</span>' : '<span class="bad">changed</span>') + ' · dropped from top-5 ' + dropped + '</div>' +
+      '<div><span class="k">document-style top</span> ' + (docRank[0] ? docRank[0].d.title : '—') + '</div>' +
+      '<div><span class="k">query-style top</span> ' + (qRank[0] ? qRank[0].d.title : '—') + '</div>' +
+      '<div class="k">asymmetric models (E5, BGE) were trained with this convention; skip the prefix and the top few results move.</div>';
+  }
+  Guide.bindSliders([C.shift], drawC);
+  function setCQuery(q) { C.query = q; drawC(); }
+  el('emb-asym-kv').addEventListener('click', function () { setCQuery('kv cache'); });
+  el('emb-asym-rr').addEventListener('click', function () { setCQuery('reranking'); });
+  el('emb-asym-tok').addEventListener('click', function () { setCQuery('tokens'); });
+
+  // ------------------------------------------------------------------
+  // Demo D — Matryoshka truncation
+  // ------------------------------------------------------------------
+  var D = { points: el('emb-points') };
+  var setupD = Guide.setupCanvas(el('emb-matryoshka-canvas'), 640, 300, drawD);
+  var DIMS = [1536, 768, 384, 192];
+  var FULL_D = 1536;
+  var NZ = {};
+  function nz(i, j) {
+    var key = i < j ? (i + ':' + j) : (j + ':' + i);
+    if (NZ[key] == null) NZ[key] = AppSim.gaussian(AppSim.rng(i * 10007 + j * 97 + 7));
+    return NZ[key];
+  }
+  function buildPoints(n) {
+    var r = AppSim.rng(5), pts = [];
+    AppSim.CORPUS.forEach(function (d) { pts.push({ x: d.x, y: d.y }); });
+    var extra = Math.max(0, n - AppSim.CORPUS.length);
+    for (var k = 0; k < extra; k++) {
+      var d = AppSim.CORPUS[k % AppSim.CORPUS.length];
+      pts.push({
+        x: Math.max(-1, Math.min(1, d.x + AppSim.gaussian(r) * 0.03)),
+        y: Math.max(-1, Math.min(1, d.y + AppSim.gaussian(r) * 0.03))
+      });
+    }
+    return pts;
+  }
+  function exactNN(pts, i) {
+    var b = -1, bd = Infinity;
+    for (var j = 0; j < pts.length; j++) {
+      if (j === i) continue;
+      var dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; b = j; }
+    }
+    return b;
+  }
+  function recallAt(pts, k) {
+    var eps = 0.18 * Math.pow((FULL_D - k) / FULL_D, 2.5);
+    var hits = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var trueB = exactNN(pts, i);
+      var b = -1, bd = Infinity;
+      for (var j = 0; j < pts.length; j++) {
+        if (j === i) continue;
+        var dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y;
+        var base = Math.sqrt(dx * dx + dy * dy);
+        var d = base * (1 + eps * nz(i, j));
+        if (d < bd) { bd = d; b = j; }
+      }
+      if (b === trueB) hits++;
+    }
+    return pts.length ? hits / pts.length : 0;
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 300;
+    var n = parseInt(D.points.value, 10);
+    var pts = buildPoints(n);
+    var recalls = DIMS.map(function (k) { return recallAt(pts, k); });
+    var data = DIMS.map(function (k, i) {
+      return { x: i, y: recalls[i] * 100, color: i === 0 ? c.accent700 : c.accent };
+    });
+    var geo = Guide.drawColumns(ctx, W, H, data, {
+      xRange: [-0.5, DIMS.length - 0.5], yRange: [0, 104], padL: 54, padR: 30, padT: 26, padB: 44
+    });
+    // recall line + value labels
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.8; ctx.beginPath();
+    DIMS.forEach(function (k, i) {
+      var X = geo.px(i), Y = geo.py(recalls[i] * 100);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke();
+    ctx.font = '10.5px ' + c.font; ctx.textAlign = 'center';
+    DIMS.forEach(function (k, i) {
+      var X = geo.px(i), Y = geo.py(recalls[i] * 100);
+      ctx.fillStyle = c.text;
+      ctx.fillText((recalls[i] * 100).toFixed(1) + '%', X, Y - 7);
+      ctx.fillStyle = c.accent2;
+      ctx.beginPath(); ctx.arc(X, Y, 3, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+      ctx.fillText(k + 'd', X, geo.padT + geo.plotH + 16);
+      ctx.font = '9.5px ' + c.font;
+      ctx.fillStyle = c.accent400;
+      ctx.fillText((k / FULL_D * 100).toFixed(0) + '% storage', X, geo.padT + geo.plotH + 30);
+      ctx.font = '10.5px ' + c.font;
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('recall@1 vs exact, ' + n + ' points', 54, 16);
+    el('emb-d-readout').innerHTML =
+      DIMS.map(function (k, i) {
+        return '<div><span class="k">' + k + ' dims (' + (k / FULL_D * 100).toFixed(0) + '%)</span> recall <span class="hi">' + (recalls[i] * 100).toFixed(1) + '%</span></div>';
+      }).join('') +
+      '<div class="k">seeded simulation against exact search: truncation trades storage for a small, plottable recall loss.</div>';
+  }
+  Guide.bindSliders([D.points], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var m = el('emb-src-model'), f = el('emb-src-fusion'), a = el('emb-src-ann');
+    if (m) m.textContent = (NUM.embeddings && NUM.embeddings.source) || FALLBACK.embeddings.source;
+    if (f) f.textContent = (NUM.fusion && NUM.fusion.source) || FALLBACK.fusion.source;
+    if (a) a.textContent = (NUM.ann && NUM.ann.source) || FALLBACK.ann.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'embeddings-vector',
+      kind: 'choice',
+      prompt: 'What does an embedding vector represent?',
+      options: [
+        { label: 'A position in a space where meaning is location: similar texts land nearby.', correct: true },
+        { label: 'A compressed copy of the text that can be decoded back exactly.' },
+        { label: 'The word count of the passage, per topic.' },
+        { label: 'A hash of the text used only for exact deduplication.' }
+      ],
+      explanation: 'An embedding is a learned fixed-length representation. Distance in that space is the model\'s claim about similarity; it is not a reversible compression of the text.'
+    },
+    {
+      id: 'embeddings-cosine',
+      kind: 'numeric',
+      prompt: 'What is the cosine similarity of a = (3, 0) and b = (3, 4)? Give three decimal places or fewer.',
+      answer: 0.6,
+      tolerance: 0.005,
+      explanation: 'a·b = 9; |a| = 3, |b| = 5; cos = 9 / 15 = 0.6. Cosine ignores magnitude, so only the directions matter.'
+    },
+    {
+      id: 'embeddings-relevance',
+      kind: 'choice',
+      prompt: 'A vector store returns the ten highest-cosine documents. Does that give you the ten most relevant?',
+      options: [
+        { label: 'No — similarity ranks candidates; relevance depends on the task and is usually decided by a reranker.', correct: true },
+        { label: 'Yes — cosine similarity is a direct measure of relevance.' },
+        { label: 'Yes, provided the vectors are normalised.' },
+        { label: 'No, because cosine cannot compare a query to a document.' }
+      ],
+      explanation: 'Similarity and relevance are different quantities. The standard pipeline retrieves wide with cheap similarity and reranks narrow with a cross-encoder that reads query and document together.'
+    },
+    {
+      id: 'embeddings-matryoshka',
+      kind: 'choice',
+      prompt: 'What does Matryoshka representation learning make possible?',
+      options: [
+        { label: 'Truncating a trained embedding to a prefix of its dimensions with a small, measurable recall loss.', correct: true },
+        { label: 'Compressing vectors losslessly so the full accuracy is kept at a quarter of the storage.' },
+        { label: 'Embedding a document at every possible chunk size at once.' },
+        { label: 'Removing the need for an approximate-nearest-neighbour index.' }
+      ],
+      explanation: 'Matryoshka training front-loads information so a 1,536-dim vector truncated to 768, 384 or 192 is still usable. The recall loss is small but real, and it must be plotted on your own corpus.'
+    },
+    {
+      id: 'embeddings-mteb',
+      kind: 'choice',
+      prompt: 'How should you use the MTEB leaderboard?',
+      options: [
+        { label: 'As a shortlist of models to test, then measure recall on your own labelled queries.', correct: true },
+        { label: 'As the answer: take the top-ranked model and ship it.' },
+        { label: 'As a way to pick the embedding dimension without measuring.' },
+        { label: 'As a guarantee of retrieval quality on domain-specific corpora.' }
+      ],
+      explanation: 'MTEB aggregates many tasks and is public enough to be overfitted; a top score can fail to transfer to your corpus. Shortlist with it, decide with your own labelled set.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

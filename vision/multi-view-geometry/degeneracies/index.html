@@ -1,0 +1,725 @@
+---
+title: "Degenerate Configurations: When Multi-View Algorithms Break"
+description: "Planar scenes, pure rotation, critical surfaces and near-degenerate baselines: the geometric coincidences that make fundamental-matrix estimation, triangulation and pose recovery fail, and how pipelines detect them."
+permalink: "/vision/multi-view-geometry/degeneracies/"
+section: "vision"
+series: "multi_view_geometry"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .mvg { max-width: 1180px; }
+  .mvg .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .mvg-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .mvg-step:first-of-type { border-top: none; }
+  .mvg-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .mvg-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .mvg-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .mvg-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .mvg-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-goal b { color: var(--color-accent-800); }
+  .mvg-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-warn b { color: var(--color-accent-2-800); }
+  .mvg-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .mvg-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .mvg-canvas-wrap { flex: 1 1 380px; min-width: 280px; }
+  .mvg-canvas-wrap canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .mvg-plot3d { width: 100%; height: 380px; background: var(--color-neutral-100); border-radius: var(--radius-sm); cursor: grab; }
+  .mvg-plot3d:active { cursor: grabbing; }
+  .mvg-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .mvg-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .mvg-field { margin-bottom: 14px; }
+  .mvg-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .mvg-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .mvg-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .mvg-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .mvg-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .mvg-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .mvg-btnrow button.mvg-primary:hover { background: var(--color-accent-600); }
+  .mvg-btnrow button:disabled { opacity: 0.45; cursor: default; }
+  .mvg-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .mvg-readout .k { opacity: 0.6; }
+  .mvg-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .mvg-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .mvg-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .mvg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .mvg-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .mvg-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .mvg-cheat th, .mvg-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .mvg-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .mvg-cheat code { white-space: nowrap; }
+  .mvg-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  .mvg-imgplane { position: relative; }
+  .mvg-imgplane canvas { cursor: default; }
+  @media (max-width: 640px) {
+    .mvg-eyebrow { margin-left: 0; }
+    .mvg-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multi_view_geometry %}
+
+<main>
+<div class="wrap mvg">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 18 of {{ site.data.series.multi_view_geometry.parts | size }}</span>
+    <h1>Degenerate Configurations</h1>
+    <p>Every estimator in this series &mdash; the eight-point algorithm, homography DLT, triangulation, PnP &mdash; is a constraint solver. It stacks observations into a matrix and trusts that matrix to have a unique, well-conditioned answer. That trust is not a theorem about cameras; it is an assumption about the <em>scene</em>. Flat walls, pure panning, drone footage with a hair-thin baseline, and symmetric buildings all break it. When they do, the solver does not throw an error &mdash; it returns a confident-looking wrong answer. This part collects the failure modes in one place, and shows the checks real pipelines use to catch them.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="mvg-step" id="stakes">
+    <div class="mvg-step-head"><span class="mvg-step-num">0</span><h2>An estimator is only as good as the geometry feeding it</h2></div>
+    <p class="mvg-eyebrow">Motivation</p>
+    <p>Look back at the shape of every estimation step so far. The eight-point algorithm builds a matrix <var>A</var> from correspondences and takes its smallest singular vector. Homography DLT does the same with a different <var>A</var>. Triangulation solves a small linear system; PnP-RANSAC repeatedly solves a minimal one. In each case the answer is <em>the null space of a matrix</em> &mdash; and a null space is only a single, stable direction when the geometric configuration that built the matrix is generic.</p>
+    <p>A <strong>degenerate configuration</strong> is a specific, nameable coincidence in the scene and camera placement where that stops being true. There are exactly two ways it can go wrong. Either the constraint matrix <strong>loses rank</strong> &mdash; a second direction also nearly satisfies every row, so the solver's choice of "the" answer becomes arbitrary and noise-dominated. Or <strong>two genuinely different 3D explanations fit the same images equally well</strong> &mdash; a two-fold or continuous ambiguity that no amount of residual minimization can resolve, because both explanations have the same residual.</p>
+    <p>The important practical fact is that these cases do not announce themselves. A degenerate fit still returns an <var>F</var>, still gives a reprojection error near zero on the (degenerate) input, and still looks like a successful reconstruction. What distinguishes a robust pipeline from a naive one is that it <em>checks</em> for the coincidences this page describes, and falls back to a different model when it finds one.</p>
+  </section>
+
+  <section class="mvg-step" id="gallery">
+    <div class="mvg-step-head"><span class="mvg-step-num">1</span><h2>A gallery of degeneracies</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Each entry below is a configuration that has been studied on its own in this series. Here they are side by side, each stated as a <strong>geometric coincidence</strong> and the <strong>symptom</strong> it produces.</p>
+
+    <h3>Planar scene</h3>
+    <p><strong>Coincidence.</strong> Every matched point lies on a single 3D plane. Two views of a plane are related by a homography <var>x&#8322; &#8773; H x&#8321;</var>, so the correspondences are <em>already</em> fully explained by a 3&times;3 matrix with 8 degrees of freedom &mdash; strictly less structure than the fundamental matrix <var>F</var> claims to capture.</p>
+    <p><strong>Symptom.</strong> The eight-point system becomes ill-posed: the constraint matrix has a near-degenerate null space, so the fitted <var>F</var> is not uniquely determined and is extremely sensitive to pixel noise. The epipolar lines it produces are still roughly consistent with the training points, but they drift under even a tiny resampling. This is the classical road to a two-fold ambiguity: a plane admits two distinct decompositions, and both can satisfy the same image data.</p>
+
+    <h3>Pure rotation (no translation)</h3>
+    <p><strong>Coincidence.</strong> The camera rotates about its own optical center, so the two camera centers coincide: <var>t = 0</var>.</p>
+    <p><strong>Symptom.</strong> The essential matrix is built as <var>E = [t]&#215;R</var>, and with <var>t = 0</var> that product is identically zero &mdash; there is no epipolar geometry to recover at all. Equivalently, the two views are related by a pure rotation homography, and because the baseline is zero, <strong>triangulation is impossible</strong>: there is no parallax, so every depth is unobservable. A pipeline that blindly reports a depth map here is reporting prior, not measurement.</p>
+
+    <h3>Small baseline (near-degenerate)</h3>
+    <p><strong>Coincidence.</strong> The two camera centers are separated by a distance that is tiny compared to the scene depth, so the rays that meet at a scene point are nearly parallel.</p>
+    <p><strong>Symptom.</strong> The two rays still intersect, so triangulation is not impossible &mdash; it is merely catastrophically ill-conditioned. With baseline <var>B</var>, focal length <var>f</var> and depth <var>Z</var>, a pixel-sized error <var>&#963;</var> becomes a depth error <var>&#916;Z &#8776; &#963;&#183;Z&#178;/(fB)</var>: quadratic in distance, and only linearly (inversely) helped by baseline. The triangulated points come out with enormous, elongated covariance along the viewing direction, even though the reprojection residual still looks small.</p>
+
+    <h3>Critical surfaces</h3>
+    <p><strong>Coincidence.</strong> Every 3D point lies on a <strong>ruled quadric that passes through both camera centers</strong> &mdash; a one-sheeted hyperboloid, a circular cylinder through the baseline, or (as the degenerate case) a plane. The camera centers are on the surface, not merely near it.</p>
+    <p><strong>Symptom.</strong> This is the configuration with a genuine, exact <strong>two-fold ambiguity</strong>: there are <em>two distinct</em> reconstructions &mdash; two different camera placements and two different point clouds &mdash; that reproject to bit-for-bit the same pixels. Unlike noise or a small baseline, no residual-minimizing method can separate them, because their residuals are equal. The twin is the "twisted pair" reconstruction, and cheirality does not necessarily rule it out, because both twins can place points in front of both cameras.</p>
+
+    <h3>Repeated / symmetric structure and forward motion</h3>
+    <p><strong>Coincidence.</strong> The scene contains repeated texture &mdash; windows, tiles, a colonnade &mdash; whose local appearance is nearly identical; or the camera moves mostly <em>along</em> its optical axis, so peripheral points show almost no parallax.</p>
+    <p><strong>Symptom.</strong> Two mechanisms compound each other. Repeated structure makes feature matching <em>aliased</em>: a descriptor can match the wrong instance, producing geometrically inconsistent correspondences that look like ordinary outliers. Forward motion then shrinks the epipolar geometry toward degeneracy, exactly as in the small-baseline case, so the geometric check that would normally reject the aliased match has little leverage. The failure mode is a confidently wrong model built from a majority that happens to agree with itself.</p>
+
+    <div class="mvg-warn"><b>&#9888; Common thread.</b> Four of these five are the <em>same</em> rank deficiency seen from different directions; the fifth (critical surfaces) is an exact non-uniqueness. Rank deficiency is diagnosable &mdash; the numbers get scary. Exact ambiguity is not &mdash; the numbers look perfect. That distinction drives every detection method in the next section.</div>
+  </section>
+
+  <section class="mvg-step" id="detection">
+    <div class="mvg-step-head"><span class="mvg-step-num">2</span><h2>Detection and model selection</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Because a degenerate fit reports a small residual, residual alone is useless as a detector. Robust pipelines instead ask three separate questions: <em>which model is simpler that fits just as well</em>, <em>how well-determined is the constraint matrix</em>, and <em>does the geometry itself have enough parallax to support the answer</em>.</p>
+
+    <h3>Model selection: comparing H against F</h3>
+    <p>The cleanest test for a planar scene is to fit <em>both</em> a homography (8 DOF) and a fundamental matrix (7 DOF) to the same correspondences and compare. A penalized score does the judging. The classic one is <strong>GRIC</strong>, the Geometric Robust Information Criterion: a sum of robust squared residuals plus a per-degree-of-freedom penalty <var>&#955;&#183;d&#183;n</var> (with <var>n</var> the number of points). Its whole point is that a more complex model must earn its extra parameters by explaining the data clearly better. If <var>H</var> is nearly as good as <var>F</var>, GRIC prefers <var>H</var> &mdash; which is exactly the correct call on a plane, and it also catches pure rotation, where the motion <em>is</em> a homography. A related, cheaper heuristic is simply to compare <strong>RANSAC inlier counts</strong>: when the homography model reaches almost the same inlier count as <var>F</var>, suspect planarity.</p>
+
+    <h3>Conditioning of the constraint matrix</h3>
+    <p>For a well-posed fit, the smallest singular value of <var>A</var> is clearly separated from the next one: the null space is a single, unambiguous direction. For a rank-deficient configuration the two smallest values crowd together, so the "smallest singular vector" is a poorly determined mixture of two candidates. The ratio <strong>&#963;&#8322;/&#963;&#8321;</strong> (second-smallest over smallest) therefore reads <em>large and healthy</em> on a general scene and <em>near one</em> as the configuration degenerates. This is the single most useful scalar to watch, and it is reported live in the demo below.</p>
+
+    <h3>A cheap geometric gate: baseline and triangulation angle</h3>
+    <p>Before trusting any per-point depth, measure the <strong>angle between the two back-projected rays</strong> that meet at the point (equivalently, the parallax). Healthy two-view geometry has a healthy spread of these angles; pure rotation collapses them to zero, and a small baseline collapses them to a fraction of a degree. A median-angle threshold is a fast, model-free way to discard a bad pair or mark a region as depth-unreliable &mdash; and it is exactly the quantity the depth-uncertainty formula <var>&#916;Z &#8776; &#963;&#183;Z&#178;/(fB)</var> is punishing.</p>
+
+    <h3>Degeneracy checks on the essential matrix</h3>
+    <p>Once the cameras are calibrated, <var>F</var> is promoted to <var>E = K&#7488; F K</var>, and a valid essential matrix has a very specific spectrum: <strong>two equal nonzero singular values and a third that is zero</strong>, <var>&#963;&#8321; = &#963;&#8322; &gt; &#963;&#8323; = 0</var>. The shape of that spectrum is itself a diagnostic. If the two nonzero values come out nearly equal, the matrix is genuinely an essential matrix; if one of them collapses toward zero (so the matrix is closer to rank 1), the estimated geometry is sitting in or near a degenerate configuration and should not be trusted as calibrated motion.</p>
+
+    <div class="mvg-goal"><b>&#127919; Why modern SfM fits multiple models per pair.</b> Incremental structure-from-motion (the COLMAP-style pipeline) does not assume the general case and hope. For every image pair it initializes both a homography and a fundamental matrix, runs RANSAC for each, and picks the winner by inlier count and GRIC-style scoring. Pairs that choose the homography are flagged so the pipeline does not try to triangulate them; frames whose motion is dominated by rotation are handled without pretending to recover depth. Model selection is not a refinement &mdash; it is the difference between a pipeline that quietly fails on a rotating phone video and one that does not.</div>
+  </section>
+
+  <section class="mvg-step" id="demo">
+    <div class="mvg-step-head"><span class="mvg-step-num">3</span><h2>Play: switch on a degeneracy and watch the estimator break</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> the same eight-point estimator runs in every mode &mdash; nothing about the algorithm changes. Only the geometry does. Watch the readout turn from healthy to pathological, and watch the second reconstruction switch from "impossible" to "just as good as the first".</div>
+    <p>Each mode below builds a synthetic two-camera scene with a well-defined coincidence, projects the points, adds a little pixel noise, and then <strong>re-runs the full estimator live</strong>: a normalized eight-point fit for <var>F</var>, a calibrated promotion to <var>E</var>, and a second fit from the next-smallest null direction of the constraint matrix. The diagnostics are computed from scratch on every mode change.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <canvas id="deg-scene" width="480" height="300"></canvas>
+        <p class="mvg-canvas-hint">The rig in its own world frame: both camera centers, the scene points, and the two back-projected rays to a sample correspondence. Pure rotation puts both centers at the same place; a small baseline makes the two rays nearly parallel.</p>
+        <canvas id="deg-epi" width="520" height="300"></canvas>
+        <p class="mvg-canvas-hint">Image 2. Dots are the matched pixels; solid lines are epipolar lines from the fitted <var>F</var>, dashed lines from the second model. Where the dashed lines stop passing through the dots, no second reconstruction exists.</p>
+        <canvas id="deg-recon" width="480" height="260"></canvas>
+        <p class="mvg-canvas-hint">Two reconstructions in the same camera-1 frame, each centered and scaled to fit. Grey = model 1, accent = the second model. When a coincidence lets both fit, the clouds are clearly different yet reproject to the same pixels.</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-accent)"></i>camera 1</span>
+          <span><i style="background:var(--color-accent-2)"></i>camera 2</span>
+          <span><i style="background:#9b9797"></i>model 1 (F)</span>
+          <span><i style="background:var(--color-accent)"></i>model 2 (F&#8322;)</span>
+        </div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-btnrow" id="deg-modes">
+          <button id="deg-btn-general" class="mvg-primary">general</button>
+          <button id="deg-btn-planar">planar</button>
+          <button id="deg-btn-rotation">pure rotation</button>
+          <button id="deg-btn-near">small baseline</button>
+          <button id="deg-btn-critical">critical surface</button>
+        </div>
+        <div class="mvg-btnrow"><button id="deg-btn-reset">Reset / general</button></div>
+        <div class="mvg-readout" id="deg-readout"></div>
+      </div>
+    </div>
+    <div class="mvg-warn"><b>&#9888; What "second reconstruction" means here.</b> The estimator's first answer is the smallest-null direction of the constraint matrix. The second model is the next-smallest direction &mdash; a fully independent fit to the same pixels. On a general scene that direction does not satisfy the data, and its reprojection residual is enormous. On a planar or critical configuration it <em>does</em> satisfy the data, so a second, different 3D story fits just as well: the empirical signature of the ambiguity.</div>
+  </section>
+
+  <section class="mvg-step" id="cheatsheet">
+    <div class="mvg-step-head"><span class="mvg-step-num">&#10003;</span><h2>Cheat sheet</h2></div>
+    <p class="mvg-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="mvg-cheat">
+      <thead><tr><th>Configuration</th><th>Geometric coincidence</th><th>Symptom</th><th>Detection method</th></tr></thead>
+      <tbody>
+        <tr><td>Planar scene</td><td>All points on one plane; correspondences explained by a homography <var>H</var></td><td><var>F</var> not uniquely determined; epipolar lines ill-determined and noise-sensitive; road to a two-fold ambiguity</td><td>Fit <var>H</var> <em>and</em> <var>F</var>; compare GRIC or RANSAC inlier counts; if <var>H</var> is nearly as good, treat the pair as planar</td></tr>
+        <tr><td>Pure rotation</td><td>Camera centers coincide (<var>t = 0</var>); motion is a homography</td><td><var>E = [t]&#215;R</var> collapses; no baseline, so triangulation is impossible; every depth is unobservable</td><td>Check the recovered translation norm / baseline; triangulation angle &#8776; 0; <var>E</var>'s singular spectrum</td></tr>
+        <tr><td>Small baseline (near-degenerate)</td><td>Ray-intersection angle shrinks toward zero; rays nearly parallel</td><td>Enormous, elongated depth uncertainty <var>&#916;Z &#8776; &#963;&#183;Z&#178;/(fB)</var> even with tiny reprojection error</td><td>Median triangulation angle vs a threshold; baseline-to-depth ratio; per-point covariance / uncertainty ellipsoid</td></tr>
+        <tr><td>Critical surface</td><td>All points on a ruled quadric through <em>both</em> camera centers (hyperboloid, cylinder through the baseline, or plane)</td><td>Exact two-fold ambiguity: two distinct reconstructions (cameras and points) reproject identically; residuals equal</td><td>Second model fits equally well; two candidate reconstructions with near-identical residual; degeneracy of the essential matrix</td></tr>
+        <tr><td>Repeated / symmetric structure</td><td>Locally identical texture at many scene locations</td><td>Aliased feature matches that look like ordinary outliers; a geometrically consistent but wrong model can win</td><td>Descriptor ratio test; geometric-consistency checks; RANSAC inlier distribution; cycle/loop consistency</td></tr>
+        <tr><td>Forward motion</td><td>Translation mostly along the optical axis; peripheral parallax vanishes</td><td>Near-degenerate <var>F</var>; small triangulation angle far from the focus of expansion; weak leverage against aliased matches</td><td>Median parallax angle; baseline direction vs optical axis; cheirality and depth-sign checks</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+{% endraw %}
+
+  <div class="mvg-next">
+    <span>Degenerate geometry is where two-view estimation stops being a well-posed algebra problem and becomes a modeling decision. The final part steps back from the classical pipeline entirely &mdash; to SLAM, dense stereo, and the learned successors that replace the constraints with predictions.</span>
+    <a class="btn btn-secondary" href="{{ '/vision/multi-view-geometry/beyond/' | relative_url }}">Continue: beyond multi-view geometry →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.multi_view_geometry %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+  var COLOR_GREY = '#9b9797';
+
+  var IMG = { w: 640, h: 480, K: { fx: 600, fy: 600, cx: 320, cy: 240 } };
+  var NOISE = 0.5;
+
+  // ---------- vectors ----------
+  function dot(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+  function cross(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+  function vnorm(a){ return Math.hypot(a[0],a[1],a[2]); }
+  function normalize(a){ var n=vnorm(a)||1; return [a[0]/n,a[1]/n,a[2]/n]; }
+  function sub(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; }
+  function add(a,b){ return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]; }
+  function vscale(a,s){ return [a[0]*s,a[1]*s,a[2]*s]; }
+  function matVec(R,v){ return [dot(R[0],v),dot(R[1],v),dot(R[2],v)]; }
+  function matMul(A,B){
+    var C=[[0,0,0],[0,0,0],[0,0,0]];
+    for(var i=0;i<3;i++)for(var j=0;j<3;j++){var s=0;for(var k=0;k<3;k++)s+=A[i][k]*B[k][j];C[i][j]=s;}
+    return C;
+  }
+  function transpose(A){ return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]]; }
+  function rotX(a){ var c=Math.cos(a),s=Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
+  function rotY(a){ var c=Math.cos(a),s=Math.sin(a); return [[c,0,s],[0,1,0],[-s,0,c]]; }
+
+  function project(K,cam,X){
+    var Xc = matVec(cam.R, sub(X, cam.C));
+    if (Xc[2] <= 1e-6) return null;
+    return { u: K.fx*Xc[0]/Xc[2] + K.cx, v: K.fy*Xc[1]/Xc[2] + K.cy, depth: Xc[2] };
+  }
+
+  // ---------- generic linear algebra ----------
+  function matMulG(A,B){
+    var n=A.length, k=A[0].length, m=B[0].length, C=[];
+    for(var i=0;i<n;i++){ C.push([]); for(var j=0;j<m;j++){ var s=0; for(var p=0;p<k;p++) s+=A[i][p]*B[p][j]; C[i].push(s); } }
+    return C;
+  }
+  function transposeG(A){ var n=A.length,m=A[0].length,T=[]; for(var j=0;j<m;j++){ T.push([]); for(var i=0;i<n;i++) T[j].push(A[i][j]); } return T; }
+  function jacobi(Ain,n){
+    var A=Ain.map(function(r){return r.slice();});
+    var V=[]; for(var i=0;i<n;i++){ V.push([]); for(var j=0;j<n;j++) V[i].push(i===j?1:0); }
+    for(var sweep=0; sweep<100; sweep++){
+      for(var p=0;p<n-1;p++) for(var q=p+1;q<n;q++){
+        if(Math.abs(A[p][q])<1e-14) continue;
+        var theta=(A[q][q]-A[p][p])/(2*A[p][q]);
+        var sgn=theta>=0?1:-1;
+        var t=sgn/(Math.abs(theta)+Math.sqrt(theta*theta+1));
+        var c=1/Math.sqrt(t*t+1), s=t*c;
+        var app=A[p][p], aqq=A[q][q], apq=A[p][q];
+        A[p][p]=c*c*app-2*s*c*apq+s*s*aqq;
+        A[q][q]=s*s*app+2*s*c*apq+c*c*aqq;
+        A[p][q]=0; A[q][p]=0;
+        for(var k=0;k<n;k++){
+          if(k===p||k===q) continue;
+          var akp=A[k][p], akq=A[k][q];
+          A[k][p]=c*akp-s*akq; A[p][k]=A[k][p];
+          A[k][q]=s*akp+c*akq; A[q][k]=A[k][q];
+        }
+        for(var k2=0;k2<n;k2++){
+          var vkp=V[k2][p], vkq=V[k2][q];
+          V[k2][p]=c*vkp-s*vkq; V[k2][q]=s*vkp+c*vkq;
+        }
+      }
+    }
+    var vals=[]; for(var d=0;d<n;d++) vals.push(A[d][d]);
+    return { values: vals, vectors: V };
+  }
+  function svd3(M){
+    var MtM=matMul(transpose(M),M);
+    var eig=jacobi(MtM,3);
+    var order=[0,1,2].sort(function(a,b){return eig.values[b]-eig.values[a];});
+    var S=order.map(function(i){ return Math.sqrt(Math.max(eig.values[i],0)); });
+    var V=order.map(function(i){ return [eig.vectors[0][i],eig.vectors[1][i],eig.vectors[2][i]]; });
+    var U=order.map(function(i,k){
+      if(S[k]>1e-9) return vscale(matVec(M,V[k]),1/S[k]);
+      return null;
+    });
+    if(!U[2]) U[2]=normalize(cross(U[0],U[1]));
+    if(!U[1]) U[1]=normalize(cross(U[2],U[0]));
+    if(!U[0]) U[0]=normalize(cross(U[1],U[2]));
+    return { S:S, U:U, V:V };
+  }
+  function rank2(M){
+    var s=svd3(M), R=[[0,0,0],[0,0,0],[0,0,0]];
+    for(var k=0;k<2;k++) for(var i=0;i<3;i++) for(var j=0;j<3;j++) R[i][j]+=s.S[k]*s.U[k][i]*s.V[k][j];
+    return R;
+  }
+  function frob(M){ var s=0; M.forEach(function(r){ r.forEach(function(v){ s+=v*v; }); }); return Math.sqrt(s); }
+  function reshape9(f){ return [[f[0],f[1],f[2]],[f[3],f[4],f[5]],[f[6],f[7],f[8]]]; }
+  function solve4(A){
+    var AtA=matMulG(transposeG(A),A);
+    var e=jacobi(AtA,4);
+    var idx=0; for(var i=1;i<4;i++) if(e.values[i]<e.values[idx]) idx=i;
+    var x=[e.vectors[0][idx],e.vectors[1][idx],e.vectors[2][idx]], w=e.vectors[3][idx];
+    if(Math.abs(w)<1e-12) return [NaN,NaN,NaN];
+    return [x[0]/w, x[1]/w, x[2]/w];
+  }
+
+  // ---------- eight-point fit ----------
+  function hartley(pts){
+    var n=pts.length, cx=0, cy=0;
+    pts.forEach(function(p){ cx+=p[0]; cy+=p[1]; });
+    cx/=n; cy/=n;
+    var md=0; pts.forEach(function(p){ md+=Math.hypot(p[0]-cx,p[1]-cy); }); md/=n;
+    var s = md>1e-9 ? Math.SQRT2/md : 1;
+    var T=[[s,0,-s*cx],[0,s,-s*cy],[0,0,1]];
+    return { T:T, pts: pts.map(function(p){ return [s*(p[0]-cx), s*(p[1]-cy)]; }) };
+  }
+  function epiRow(c){ var x1=c[0],y1=c[1],x2=c[2],y2=c[3]; return [x1*x2,y1*x2,x2,x1*y2,y1*y2,y2,x1,y1,1]; }
+  function fitF(corrs){
+    var p1=corrs.map(function(c){return [c[0],c[1]];}), p2=corrs.map(function(c){return [c[2],c[3]];});
+    var n1=hartley(p1), n2=hartley(p2);
+    var normed=corrs.map(function(c,i){ return [n1.pts[i][0],n1.pts[i][1],n2.pts[i][0],n2.pts[i][1]]; });
+    var A=normed.map(epiRow);
+    var AtA=matMulG(transposeG(A),A);
+    var eig=jacobi(AtA,9);
+    var order=[0,1,2,3,4,5,6,7,8].sort(function(a,b){return eig.values[a]-eig.values[b];});
+    function vec(k){ var f=[]; for(var i=0;i<9;i++) f.push(eig.vectors[i][order[k]]); return f; }
+    var sig=order.map(function(i){ return Math.sqrt(Math.max(eig.values[i],0)); });
+    var F  = matMul(matMul(transpose(n2.T), reshape9(vec(0))), n1.T);
+    var F2 = matMul(matMul(transpose(n2.T), reshape9(vec(1))), n1.T);
+    return { F:F, F2:F2, sig:sig };
+  }
+  function sampson(F,c){
+    var x1=[c[0],c[1],1], x2=[c[2],c[3],1];
+    var Fx1=[F[0][0]*x1[0]+F[0][1]*x1[1]+F[0][2], F[1][0]*x1[0]+F[1][1]*x1[1]+F[1][2], F[2][0]*x1[0]+F[2][1]*x1[1]+F[2][2]];
+    var FTx2=[F[0][0]*x2[0]+F[1][0]*x2[1]+F[2][0], F[0][1]*x2[0]+F[1][1]*x2[1]+F[2][1], F[0][2]*x2[0]+F[1][2]*x2[1]+F[2][2]];
+    var num=Math.abs(x2[0]*Fx1[0]+x2[1]*Fx1[1]+x2[2]*Fx1[2]);
+    var den=Math.sqrt(Fx1[0]*Fx1[0]+Fx1[1]*Fx1[1]+FTx2[0]*FTx2[0]+FTx2[1]*FTx2[1])||1e-9;
+    return num/den;
+  }
+  function projectP(P,X){
+    var h=[P[0][0]*X[0]+P[0][1]*X[1]+P[0][2]*X[2]+P[0][3],
+           P[1][0]*X[0]+P[1][1]*X[1]+P[1][2]*X[2]+P[1][3],
+           P[2][0]*X[0]+P[2][1]*X[1]+P[2][2]*X[2]+P[2][3]];
+    if(Math.abs(h[2])<1e-12) return null;
+    return [h[0]/h[2], h[1]/h[2]];
+  }
+  function triangulate(P1,x1,P2,x2){
+    var A=[
+      [x1[0]*P1[2][0]-P1[0][0], x1[0]*P1[2][1]-P1[0][1], x1[0]*P1[2][2]-P1[0][2], x1[0]*P1[2][3]-P1[0][3]],
+      [x1[1]*P1[2][0]-P1[1][0], x1[1]*P1[2][1]-P1[1][1], x1[1]*P1[2][2]-P1[1][2], x1[1]*P1[2][3]-P1[1][3]],
+      [x2[0]*P2[2][0]-P2[0][0], x2[0]*P2[2][1]-P2[0][1], x2[0]*P2[2][2]-P2[0][2], x2[0]*P2[2][3]-P2[0][3]],
+      [x2[1]*P2[2][0]-P2[1][0], x2[1]*P2[2][1]-P2[1][1], x2[1]*P2[2][2]-P2[1][2], x2[1]*P2[2][3]-P2[1][3]]
+    ];
+    A=A.map(function(r){ var nn=Math.sqrt(r.reduce(function(s,v){return s+v*v;},0))||1; return r.map(function(v){return v/nn;}); });
+    return solve4(A);
+  }
+  function cameraFromF(F){
+    var B=matMul(F,transpose(F));
+    var e=jacobi(B,3);
+    var idx=0; for(var i=1;i<3;i++) if(e.values[i]<e.values[idx]) idx=i;
+    var e2=[e.vectors[0][idx],e.vectors[1][idx],e.vectors[2][idx]];
+    e2=normalize(e2);
+    var ex=[[0,-e2[2],e2[1]],[e2[2],0,-e2[0]],[-e2[1],e2[0],0]];
+    var M=matMul(ex,F);
+    return {
+      P1:[[1,0,0,0],[0,1,0,0],[0,0,1,0]],
+      P2:[[M[0][0],M[0][1],M[0][2],e2[0]],[M[1][0],M[1][1],M[1][2],e2[1]],[M[2][0],M[2][1],M[2][2],e2[2]]]
+    };
+  }
+
+  // ---------- scenes ----------
+  function rand(seed){ var s=(seed>>>0) || 1; return function(){ s=(1103515245*s+12345)>>>0; return s/4294967296; }; }
+  function gauss(rnd,std){
+    var u=Math.max(rnd(),1e-9), v=rnd();
+    return std*Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+  }
+  function buildScene(mode){
+    var rnd=rand(20260916 + mode.length*7919 + (mode==='near'?11:0) + (mode==='critical'?29:0) + (mode==='rotation'?3:0) + (mode==='planar'?5:0));
+    var cam1={ C:[0,0,0], R:[[1,0,0],[0,1,0],[0,0,1]] };
+    var cam2, pts=[];
+    function cloud(n,zmin,zmax,spread){
+      var P=[]; for(var i=0;i<n;i++) P.push([(rnd()*2-1)*spread, (rnd()*2-1)*spread*0.7, zmin+rnd()*(zmax-zmin)]);
+      return P;
+    }
+    if(mode==='general'){
+      cam2={ C:[1.6,0.15,0.25], R:matMul(rotY(-0.20),rotX(0.06)) };
+      pts=cloud(24,3.2,6.5,1.6);
+    } else if(mode==='planar'){
+      cam2={ C:[1.6,0.15,0.25], R:matMul(rotY(-0.20),rotX(0.06)) };
+      [-1.6,-0.8,0,0.8,1.6].forEach(function(x){ [-1.1,0,1.1].forEach(function(y){ pts.push([x,y,4.0]); }); });
+    } else if(mode==='rotation'){
+      cam2={ C:[0,0,0], R:rotY(-0.40) };
+      pts=cloud(24,3.2,6.5,1.6);
+    } else if(mode==='near'){
+      cam2={ C:[0.05,0.008,0.0], R:matMul(rotY(-0.02),rotX(0.005)) };
+      pts=cloud(24,6.0,9.0,1.6);
+    } else { // critical
+      var b=2.4, y0=0.6, x0=b/2, Rc=Math.sqrt(x0*x0+y0*y0);
+      cam1={ C:[0,0,0], R:rotY(-0.12) };
+      cam2={ C:[b,0,0], R:rotY(-0.12) };
+      var n=0, guard=0;
+      while(n<24 && guard<400){
+        guard++;
+        var phi=n*2*Math.PI/24 + (rnd()-0.5)*0.06;
+        var z=1.7+rnd()*2.5;
+        var q=[x0+Rc*Math.cos(phi), y0+Rc*Math.sin(phi), z];
+        var p1=project(IMG.K,cam1,q), p2=project(IMG.K,cam2,q);
+        if(p1 && p2 && p1.depth>0.5 && p2.depth>0.5){ pts.push(q); n++; }
+      }
+    }
+    // correspondences with noise
+    var rndN=rand(424242);
+    var corrs=[], trueCorrs=[];
+    pts.forEach(function(X){
+      var p1=project(IMG.K,cam1,X), p2=project(IMG.K,cam2,X);
+      if(!p1||!p2||p1.depth<=0||p2.depth<=0) return;
+      trueCorrs.push([p1.u,p1.v,p2.u,p2.v]);
+      corrs.push([p1.u+gauss(rndN,NOISE), p1.v+gauss(rndN,NOISE), p2.u+gauss(rndN,NOISE), p2.v+gauss(rndN,NOISE)]);
+    });
+    return { K:IMG.K, cam1:cam1, cam2:cam2, pts:pts, corrs:corrs, trueCorrs:trueCorrs };
+  }
+
+  function triangulationAngle(sc){
+    var tot=0,n=0;
+    sc.pts.forEach(function(X){
+      var d1=normalize(sub(X,sc.cam1.C)), d2=normalize(sub(X,sc.cam2.C));
+      tot+=Math.acos(Math.max(-1,Math.min(1,dot(d1,d2))))*180/Math.PI; n++;
+    });
+    return n?tot/n:0;
+  }
+
+  // ---------- evaluate one mode ----------
+  function evaluate(mode){
+    var sc=buildScene(mode);
+    var corrs=sc.corrs;
+    if(corrs.length<8) return null;
+    var fit=fitF(corrs);
+    var Fr=rank2(fit.F), Fr2=rank2(fit.F2);
+
+    var Km=[[IMG.K.fx,0,IMG.K.cx],[0,IMG.K.fy,IMG.K.cy],[0,0,1]];
+    function toNorm(F){ return matMul(matMul(transpose(Km),F),Km); }
+    var cA=cameraFromF(toNorm(Fr)), cB=cameraFromF(toNorm(Fr2));
+
+    var cloudA=[], cloudB=[], repA=[], repB=[];
+    corrs.forEach(function(c){
+      var cn=[(c[0]-IMG.K.cx)/IMG.K.fx,(c[1]-IMG.K.cy)/IMG.K.fy,(c[2]-IMG.K.cx)/IMG.K.fx,(c[3]-IMG.K.cy)/IMG.K.fy];
+      var Xa=triangulate(cA.P1,[cn[0],cn[1]],cA.P2,[cn[2],cn[3]]);
+      var Xb=triangulate(cB.P1,[cn[0],cn[1]],cB.P2,[cn[2],cn[3]]);
+      cloudA.push(Xa); cloudB.push(Xb);
+      var ra1=projectP(cA.P1,Xa), ra2=projectP(cA.P2,Xa);
+      if(ra1&&ra2) repA.push(Math.hypot(IMG.K.fx*ra1[0]+IMG.K.cx-c[0], IMG.K.fy*ra1[1]+IMG.K.cy-c[1]) + Math.hypot(IMG.K.fx*ra2[0]+IMG.K.cx-c[2], IMG.K.fy*ra2[1]+IMG.K.cy-c[3]));
+      var rb1=projectP(cB.P1,Xb), rb2=projectP(cB.P2,Xb);
+      if(rb1&&rb2) repB.push(Math.hypot(IMG.K.fx*rb1[0]+IMG.K.cx-c[0], IMG.K.fy*rb1[1]+IMG.K.cy-c[1]) + Math.hypot(IMG.K.fx*rb2[0]+IMG.K.cx-c[2], IMG.K.fy*rb2[1]+IMG.K.cy-c[3]));
+    });
+
+    function median(a){ if(!a.length) return NaN; var s=a.slice().sort(function(x,y){return x-y;}); return s[Math.floor(s.length/2)]; }
+
+    var epi=0, epi2=0;
+    corrs.forEach(function(c){ epi+=sampson(fit.F,c); epi2+=sampson(fit.F2,c); });
+    epi/=corrs.length; epi2/=corrs.length;
+
+    var gap = fit.sig[1]/(fit.sig[0]||1e-12);
+    var cond = fit.sig[8]/(fit.sig[0]||1e-12);
+    var rankRes = frob([[fit.F[0][0]-Fr[0][0],fit.F[0][1]-Fr[0][1],fit.F[0][2]-Fr[0][2]],
+                        [fit.F[1][0]-Fr[1][0],fit.F[1][1]-Fr[1][1],fit.F[1][2]-Fr[1][2]],
+                        [fit.F[2][0]-Fr[2][0],fit.F[2][1]-Fr[2][1],fit.F[2][2]-Fr[2][2]]])/(frob(fit.F)||1e-12);
+
+    // disagreement between the two reconstructions (normalized so scale is not the story)
+    function centered(C){
+      var ok=C.filter(function(p){ return p && isFinite(p[0])&&isFinite(p[1])&&isFinite(p[2]); });
+      if(!ok.length) return [];
+      var cx=0,cy=0,cz=0; ok.forEach(function(p){ cx+=p[0]; cy+=p[1]; cz+=p[2]; });
+      cx/=ok.length; cy/=ok.length; cz/=ok.length;
+      var rms=0; ok.forEach(function(p){ rms+=(p[0]-cx)*(p[0]-cx)+(p[1]-cy)*(p[1]-cy)+(p[2]-cz)*(p[2]-cz); });
+      rms=Math.sqrt(rms/ok.length)||1;
+      return ok.map(function(p){ return [(p[0]-cx)/rms,(p[1]-cy)/rms,(p[2]-cz)/rms]; });
+    }
+    var nA=centered(cloudA), nB=centered(cloudB);
+    var diff=0, cnt=0;
+    for(var i=0;i<Math.min(nA.length,nB.length);i++){ diff+=Math.hypot(nA[i][0]-nB[i][0],nA[i][1]-nB[i][1],nA[i][2]-nB[i][2]); cnt++; }
+    diff = cnt ? diff/cnt : NaN;
+
+    return {
+      mode: mode, scene: sc, corrs: corrs, fit: fit, Fr: Fr, Fr2: Fr2,
+      cA: cA, cB: cB, cloudA: nA, cloudB: nB,
+      epi: epi, epi2: epi2, gap: gap, cond: cond, rankRes: rankRes,
+      angle: triangulationAngle(sc),
+      repA: median(repA), repB: median(repB),
+      cloudDiff: diff,
+      f1: fit.F, f2: fit.F2
+    };
+  }
+
+  // ---------- drawing ----------
+  function projector(pts, W, H, pad, az, el){
+    var ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
+    function raw(p){
+      var x1=p[0]*ca - p[2]*sa;
+      var z1=p[0]*sa + p[2]*ca;
+      var y2=p[1]*ce - z1*se;
+      return [x1, -y2];
+    }
+    var minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+    pts.forEach(function(p){ var q=raw(p); if(q[0]<minX)minX=q[0]; if(q[0]>maxX)maxX=q[0]; if(q[1]<minY)minY=q[1]; if(q[1]>maxY)maxY=q[1]; });
+    if(!isFinite(minX)){ minX=0;maxX=1;minY=0;maxY=1; }
+    var sx=(W-2*pad)/((maxX-minX)||1), sy=(H-2*pad)/((maxY-minY)||1), s=Math.min(sx,sy);
+    var ox=pad + ((W-2*pad)-s*(maxX-minX))/2, oy=pad + ((H-2*pad)-s*(maxY-minY))/2;
+    return function(p){ var q=raw(p); return [ox + s*(q[0]-minX), H - (oy + s*(q[1]-minY))]; };
+  }
+  function frame(ctx,W,H){
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='rgba(0,0,0,0.04)'; ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle=COLOR_DIVIDER; ctx.lineWidth=1;
+    ctx.strokeRect(0.5,0.5,W-1,H-1);
+  }
+  function frustumLines(cam, s){
+    var right=cam.R[0], down=cam.R[1], fwd=cam.R[2], d=0.45;
+    var corners=[[-1,-1],[1,-1],[1,1],[-1,1]].map(function(c){
+      return add(add(cam.C, vscale(fwd,d)), add(vscale(right, c[0]*s), vscale(down, c[1]*s)));
+    });
+    var segs=[];
+    corners.forEach(function(c){ segs.push([cam.C,c]); });
+    for(var i=0;i<4;i++) segs.push([corners[i],corners[(i+1)%4]]);
+    return segs;
+  }
+  function drawScene(ev){
+    var cv=document.getElementById('deg-scene'); if(!cv) return;
+    var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+    frame(ctx,W,H);
+    var sc=ev.scene;
+    var all=sc.pts.concat([sc.cam1.C, sc.cam2.C]);
+    frustumLines(sc.cam1,0.22).forEach(function(sg){ all.push(sg[1]); });
+    frustumLines(sc.cam2,0.22).forEach(function(sg){ all.push(sg[1]); });
+    var P=projector(all,W,H,26,-0.6,0.5);
+
+    // rays to a sample correspondence
+    var sample=null;
+    for(var i=0;i<sc.pts.length;i++){ var p1=project(IMG.K,sc.cam1,sc.pts[i]), p2=project(IMG.K,sc.cam2,sc.pts[i]); if(p1&&p2){ sample=sc.pts[i]; break; } }
+    if(sample){
+      ctx.strokeStyle=COLOR_ACCENT2; ctx.lineWidth=1; ctx.setLineDash([4,3]);
+      var far1=add(sc.cam1.C, vscale(normalize(sub(sample,sc.cam1.C)), 40));
+      var far2=add(sc.cam2.C, vscale(normalize(sub(sample,sc.cam2.C)), 40));
+      var a1=P(sc.cam1.C), a2=P(far1), b1=P(sc.cam2.C), b2=P(far2);
+      ctx.beginPath(); ctx.moveTo(a1[0],a1[1]); ctx.lineTo(a2[0],a2[1]); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(b1[0],b1[1]); ctx.lineTo(b2[0],b2[1]); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // baseline
+    var c1p=P(sc.cam1.C), c2p=P(sc.cam2.C);
+    ctx.strokeStyle=COLOR_DIVIDER; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(c1p[0],c1p[1]); ctx.lineTo(c2p[0],c2p[1]); ctx.stroke();
+    // points
+    ctx.fillStyle=COLOR_TEXT;
+    sc.pts.forEach(function(X){ var q=P(X); ctx.beginPath(); ctx.arc(q[0],q[1],3.2,0,7); ctx.fill(); });
+    // cameras
+    function cam(camObj,color){
+      ctx.strokeStyle=color; ctx.lineWidth=1.6;
+      frustumLines(camObj,0.22).forEach(function(sg){ var a=P(sg[0]), b=P(sg[1]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); });
+      var q=P(camObj.C); ctx.fillStyle=color; ctx.beginPath(); ctx.arc(q[0],q[1],4.5,0,7); ctx.fill();
+    }
+    cam(sc.cam1,COLOR_ACCENT); cam(sc.cam2,COLOR_ACCENT2);
+    ctx.fillStyle=COLOR_TEXT; ctx.font='11px monospace';
+    ctx.globalAlpha=0.75;
+    ctx.fillText('camera 1 (origin)', c1p[0]+7, c1p[1]-6);
+    ctx.fillText('camera 2', c2p[0]+7, c2p[1]-6);
+    ctx.globalAlpha=1;
+  }
+  function drawEpipolar(ev){
+    var cv=document.getElementById('deg-epi'); if(!cv) return;
+    var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+    frame(ctx,W,H);
+    var sx=W/(IMG.w+40), sy=H/(IMG.h+40);
+    var ox=20*sx, oy=20*sy;
+    function map(u,v){ return [ox+u*sx, oy+v*sy]; }
+    // image border
+    ctx.strokeStyle=COLOR_DIVIDER; ctx.lineWidth=1.2;
+    ctx.strokeRect(ox,oy,IMG.w*sx,IMG.h*sy);
+    // epipolar lines
+    function lines(F,color,dash,width){
+      ctx.strokeStyle=color; ctx.lineWidth=width; ctx.setLineDash(dash);
+      ev.corrs.forEach(function(c){
+        var l=[F[0][0]*c[0]+F[0][1]*c[1]+F[0][2], F[1][0]*c[0]+F[1][1]*c[1]+F[1][2], F[2][0]*c[0]+F[2][1]*c[1]+F[2][2]];
+        var p1=map(-40,0), p2=map(IMG.w+40,0);
+        function vAt(u){ return Math.abs(l[1])<1e-9 ? null : -(l[0]*u+l[2])/l[1]; }
+        var y1=vAt(-40), y2=vAt(IMG.w+40);
+        if(y1===null||y2===null) return;
+        var a=map(-40,y1), b=map(IMG.w+40,y2);
+        ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+      });
+      ctx.setLineDash([]);
+    }
+    lines(ev.f2,COLOR_ACCENT2,[5,4],1.1);
+    lines(ev.f1,COLOR_GREY,[],1.4);
+    // dots
+    ev.corrs.forEach(function(c){
+      var q=map(c[2],c[3]);
+      ctx.fillStyle=COLOR_TEXT; ctx.beginPath(); ctx.arc(q[0],q[1],3.4,0,7); ctx.fill();
+    });
+    ctx.fillStyle=COLOR_TEXT; ctx.font='11px monospace'; ctx.globalAlpha=0.7;
+    ctx.fillText('image 2: solid = model 1 (F), dashed = model 2 (F\u2082)', 8, 14);
+    ctx.globalAlpha=1;
+  }
+  function drawRecon(ev){
+    var cv=document.getElementById('deg-recon'); if(!cv) return;
+    var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+    frame(ctx,W,H);
+    var A=ev.cloudA, B=ev.cloudB;
+    if(!A.length){ return; }
+    var all=A.concat(B);
+    var P=projector(all,W,H,22,0.5,0.35);
+    for(var i=0;i<Math.min(A.length,B.length);i++){
+      var a=P(A[i]), b=P(B[i]);
+      ctx.strokeStyle=COLOR_DIVIDER; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+    }
+    ctx.fillStyle=COLOR_GREY;
+    A.forEach(function(p){ var q=P(p); ctx.beginPath(); ctx.arc(q[0],q[1],3,0,7); ctx.fill(); });
+    ctx.fillStyle=COLOR_ACCENT;
+    B.forEach(function(p){ var q=P(p); ctx.beginPath(); ctx.arc(q[0],q[1],3,0,7); ctx.fill(); });
+    ctx.font='11px monospace'; ctx.globalAlpha=0.75;
+    ctx.fillStyle=COLOR_GREY; ctx.fillText('\u25cf model 1 (F)', 10, 16);
+    ctx.fillStyle=COLOR_ACCENT; ctx.fillText('\u25cf model 2 (F\u2082)', 10, 30);
+    ctx.globalAlpha=1;
+  }
+
+  // ---------- readout ----------
+  var VERDICT = {
+    general: 'well-posed: a single F fits, and no second model does',
+    planar: 'rank-deficient: the plane explains the data as well as F',
+    rotation: 'no baseline: t = 0, so depth is unobservable',
+    near: 'ill-conditioned: rays nearly parallel, depth error explodes',
+    critical: 'exact two-fold ambiguity: two distinct reconstructions fit'
+  };
+  function fmt(x, d){ if(!isFinite(x)) return '\u2014'; return x.toFixed(d===undefined?2:d); }
+  function drawReadout(ev){
+    var el=document.getElementById('deg-readout'); if(!el) return;
+    var healthy = ev.gap > 20;
+    var second = ev.epi2 < 2 ? '<span class="hi">fits (residual \u2248 0)</span>' : '<span class="hi">no second model</span>';
+    el.innerHTML =
+      '<div><span class="k">mode</span> ' + ev.mode + '</div>' +
+      '<div><span class="k">&#963;&#8322;/&#963;&#8321; of A</span> <b>' + (ev.gap>1e5?ev.gap.toExponential(2):fmt(ev.gap,2)) + '</b> ' +
+        '<span class="k">(' + (healthy?'well-separated':'collapsed') + ')</span></div>' +
+      '<div><span class="k">cond(A) = &#963;max/&#963;min</span> ' + (ev.cond>1e6?ev.cond.toExponential(2):fmt(ev.cond,1)) + '</div>' +
+      '<div><span class="k">rank-2 projection residual</span> ' + ev.rankRes.toExponential(2) + '</div>' +
+      '<div><span class="k">triangulation angle</span> ' + fmt(ev.angle,2) + '&deg;</div>' +
+      '<div><span class="k">epipolar residual (F)</span> ' + fmt(ev.epi,2) + ' px</div>' +
+      '<div><span class="k">epipolar residual (F&#8322;)</span> ' + fmt(ev.epi2,2) + ' px &mdash; ' + second + '</div>' +
+      '<div><span class="k">two-cloud disagreement</span> ' + fmt(ev.cloudDiff,2) + '</div>' +
+      '<div style="margin-top:6px;"><span class="k">verdict:</span> ' + VERDICT[ev.mode] + '</div>';
+  }
+
+  // ---------- wiring ----------
+  var current='general';
+  var lastEval=null;
+  var BTN = {
+    general:'deg-btn-general', planar:'deg-btn-planar', rotation:'deg-btn-rotation',
+    near:'deg-btn-near', critical:'deg-btn-critical'
+  };
+  function setMode(m){
+    current=m;
+    Object.keys(BTN).forEach(function(k){
+      var b=document.getElementById(BTN[k]);
+      if(b){ if(k===m) b.classList.add('mvg-primary'); else b.classList.remove('mvg-primary'); }
+    });
+    lastEval=evaluate(m);
+    if(!lastEval) return;
+    drawScene(lastEval);
+    drawEpipolar(lastEval);
+    drawRecon(lastEval);
+    drawReadout(lastEval);
+  }
+  Object.keys(BTN).forEach(function(m){
+    var b=document.getElementById(BTN[m]);
+    if(b) b.addEventListener('click', function(){ setMode(m); });
+  });
+  var resetBtn=document.getElementById('deg-btn-reset');
+  if(resetBtn) resetBtn.addEventListener('click', function(){ setMode('general'); });
+
+  setMode('general');
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

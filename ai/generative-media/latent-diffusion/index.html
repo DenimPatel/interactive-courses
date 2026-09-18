@@ -1,0 +1,341 @@
+---
+title: "Latent diffusion"
+description: "The VAE compressor that shrinks an image before it is diffused, the reconstruction cost of an eight-times downsample, and the pixel versus latent budget."
+permalink: "/ai/generative-media/latent-diffusion/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-panel-stack { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Latent diffusion</h1>
+    <p>A 512&times;512 photograph is three quarters of a million numbers, and running a denoiser over all of them at every step is ruinous. Latent diffusion refuses the premise: train an autoencoder that squeezes the image into a small grid of feature values, run the entire diffusion process there, and decode once at the end. The compressor is lossy, so every generation carries a reconstruction cost &mdash; and understanding where that cost lands is most of what separates a good latent model from a blurry one.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="why">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Why compress</h2></div>
+    <p class="g-eyebrow">The diffusion cost is quadratic in resolution</p>
+    <p>The reverse process is a sequence of network evaluations, and the network is mostly convolution and attention over a spatial grid. Convolutions cost roughly linearly in the number of pixels; attention costs quadratically in the number of tokens. Doubling the side length of an image quadruples the pixel count and quadruples attention's bill four times over. At 1024&times;1024 there are more than three million values per image, and a hundred sampling steps means the network sees all of them a hundred times.</p>
+    <p>The fix is to stop diffusing pixels. An autoencoder is trained once to map an image to a <em>latent</em> of much smaller spatial extent and back again, and the diffusion model is trained and sampled entirely in that latent space. The decoder is run exactly once, on the final latent, to produce the picture. Most of the compute disappears with the resolution, and the expensive generative model works on a grid of tens of thousands of values rather than hundreds of thousands.</p>
+    <p>This is not free compression. The autoencoder throws information away, and whatever it throws away can never be recovered by the decoder &mdash; no amount of diffusion quality puts back detail the latent never stored. The rest of this part is about how much is thrown away and where it shows.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say what an 8&times; downsample does to the token count, explain why the latent has its own channel dimension, predict which image content suffers most from aggressive compression, and quote the compute ratio between pixel and latent diffusion.</span></div>
+    <div class="g-toc">
+      <a href="#encoder">2 · The encoder and the latent</a>
+      <a href="#cost">3 · The reconstruction cost</a>
+      <a href="#budget">4 · Pixel versus latent budget</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="encoder">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The encoder and the latent</h2></div>
+    <p class="g-eyebrow">Downsample, then diffuse the small thing</p>
+    <p>A latent diffusion encoder is a stack of strided convolutions that reduces the spatial side length by a fixed factor &mdash; commonly eight &mdash; while <em>increasing</em> the channel count. A 512&times;512 RGB image becomes a 64&times;64 grid with four channels, so roughly 16,000 values carry the image instead of 786,000. Those four channels are not colours and do not look like an image; they are learned features, and a good latent has the property that its values are roughly centred and roughly unit variance so that the diffusion process's noise assumptions hold.</p>
+    <p>The demo below replaces the learned encoder with plain average pooling, which is the crudest possible compressor and makes the cost visible without a training run. The source image is the 64&times;64 test picture; the middle panel is the latent at the current factor; the third panel is the reconstruction after nearest-neighbour upsampling. The MSE under the panels is the squared error between source and reconstruction, averaged over every channel.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-panel-stack">
+        <div class="g-imgrow">
+          <figure class="g-imgcell"><canvas id="ld-image-canvas" width="200" height="200"></canvas><figcaption>source 64&times;64&times;3</figcaption></figure>
+          <figure class="g-imgcell"><canvas id="ld-latent-canvas" width="160" height="160"></canvas><figcaption id="ld-latent-cap">latent</figcaption></figure>
+          <figure class="g-imgcell"><canvas id="ld-recon-canvas" width="200" height="200"></canvas><figcaption>reconstruction</figcaption></figure>
+        </div>
+        <p class="g-canvas-hint">Average pooling then nearest-neighbour upsampling. The latent panel really is the tiny grid the diffusion model would operate on &mdash; here shown at pixel scale so you can see how few values remain.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>downsample factor <span class="val">4</span></label>
+          <input type="range" id="ld-factor" min="0" max="2" step="1" value="1">
+        </div>
+        <div class="g-readout" id="ld-readout"></div>
+        <p class="g-mini">Pooling averages each $f\times f$ block; upsampling repeats it. A trained decoder is far better than this, but the shape of the error is the same.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The latent is not an image.</b> Four channels is a compromise: fewer and the decoder cannot recover texture, more and the diffusion model's attention gets expensive again. Real latents are unbounded floats, so the pipeline scales them by a measured factor before adding noise, and getting that factor wrong is a classic cause of washed-out samples.</span></div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The reconstruction cost</h2></div>
+    <p class="g-eyebrow">What pooling throws away, and where a real decoder differs</p>
+    <p>Averaging a block destroys every variation inside it. Flat regions &mdash; skies, walls, skin &mdash; lose almost nothing, because the average is what they already look like. High-frequency content loses everything: text becomes illegible, a face's eyes blur, fine texture turns to mush. The chart below measures exactly that, raising the factor and watching the MSE climb.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ld-mse-canvas" width="560" height="280"></canvas>
+        <p class="g-canvas-hint">Reconstruction MSE against the downsample factor, for factors 2, 4, 8, 16 and 32. The current factor is highlighted.</p>
+      </div>
+      <div class="g-controls">
+        <p>Real VAEs are trained with a mixture of reconstruction loss and a perceptual term, usually features from a pretrained network or an adversarial loss, so the decoder learns to hallucinate plausible texture rather than average it. That is what makes an 8&times; latent workable: the decoder does not have to recover the exact lost pixels, only a distributionally similar image.</p>
+        <p class="g-mini">A pure MSE objective pushes the decoder toward blur, because the mean of several plausible textures minimises squared error and looks like nothing.</p>
+      </div>
+    </div>
+    <p>The failure modes are worth naming because they show up in generated images. Compression is worst for content with high-frequency structure and a strong prior about what it should look like: small text, distant faces, repeated fine patterns such as fabric or foliage. When the latent cannot represent it, the decoder invents it, and it invents the same plausible wrong texture every time. That is the origin of the characteristic latent-diffusion artifacts.</p>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Pixel versus latent budget</h2></div>
+    <p class="g-eyebrow">Tokens scale with the square of the factor</p>
+    <p>The quantity that matters downstream is the number of tokens the generative network sees. Downsampling by a factor $f$ on each side reduces the token count by $f^2$: an 8&times; latent has $1/64$ as many spatial positions as the image. Since attention cost is quadratic in token count and convolutional cost linear, the saving compounds. At $f=8$ attention inside the latent operates on a sequence 64 times shorter, which is 4096 times less work per attention layer than the pixel equivalent.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ld-budget-canvas" width="560" height="280"></canvas>
+        <p class="g-canvas-hint">Spatial token count for a 64&times;64 image against the downsample factor. Dashed: pixel tokens (constant at 4096). Solid: latent tokens, $(64/f)^2$. The marker is the current factor.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="ld-budget-readout"></div>
+        <p class="g-mini">The latent also carries four channels instead of three, so the raw value count is $4/3$ times the spatial token count &mdash; a rounding error next to the $f^2$ saving.</p>
+      </div>
+    </div>
+    <p>The model does not get all of that back as speed, because it is usually trained at the higher capacity the latent budget affords. The trade is deliberate: latent diffusion spends the saved compute on a larger network and more attention, which is why modern latent models are far bigger than the early pixel-space ones. The relevant comparison is not pixels against latents at equal parameters but pixels against latents at equal wall-clock time, and the latent side wins by a wide margin at high resolution.</p>
+    <div class="g-warn">⚠ <span><b>Downsampling also changes the learning problem.</b> The latent distribution is smoother and more Gaussian than pixels, which is easier for the diffusion model, but the decoder must then map a coarse, noisy latent back to sharp detail. Where the encoder is too aggressive, the decoder's reconstruction error dominates the sampler's error and no sampler improvement is visible.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every production image and video model</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">Stable Diffusion and SDXL</h3>
+        <p style="margin-bottom:0;">The original latent diffusion paper established the 8&times;, four-channel VAE, and SDXL kept it while moving the text conditioning to two encoders. The <a href="{{ '/ai/generative-media/unet/' | relative_url }}">U-Net backbone</a> of those models operates entirely on the 64&times;64 latent, never on the 512&times;512 image; the decoder is called once at the very end.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Video</div>
+        <h3 style="margin:6px 0;">Temporal compression</h3>
+        <p style="margin-bottom:0;">Video models extend the same idea along the time axis with a causal 3-D VAE, compressing both space and time before the transformer sees anything. The token count then scales as frames, height and width each divided by their own factor &mdash; which is the only reason a minute of footage fits in a context window at all.</p>
+      </div>
+    </div>
+    <p>The same pattern appears in audio and in scientific data: compress to a small learned code, model the code, decode once. Whenever a generative model looks at thousands rather than millions of tokens, an autoencoder is doing the work quietly underneath.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The latent-diffusion paper is the reference for the 8&times; four-channel VAE and for the argument that perceptual compression and semantic generation should be separated. The papers after it are the refinements: better reconstruction objectives, adversarial fine-tuning of the decoder, and the video extension.</p>
+    <p>Rombach and coauthors introduce the two-stage pipeline; Van den Oord and coauthors give the VQ-VAE origin of learned discrete latents; Esser and coauthors add the first-stage GAN loss that sharpens the decoder; and Blattmann and coauthors carry the compressor into time.</p>
+    <ul class="g-refs">
+      <li>Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser and Björn Ommer, <a href="https://arxiv.org/abs/2112.10752">"High-Resolution Image Synthesis with Latent Diffusion Models"</a>, 2022 &mdash; the 8&times; VAE and the two-stage pipeline.</li>
+      <li>Aaron van den Oord, Oriol Vinyals and Koray Kavukcuoglu, <a href="https://arxiv.org/abs/1711.00937">"Neural Discrete Representation Learning"</a>, 2017 &mdash; the learned-latent idea in its discrete form.</li>
+      <li>Patrick Esser, Robin Rombach and Björn Ommer, <a href="https://arxiv.org/abs/2112.10752#:~:text=taming">"Taming Transformers for High-Resolution Image Synthesis"</a>, 2021 &mdash; the adversarial reconstruction loss that removes decoder blur.</li>
+      <li>Andreas Blattmann and coauthors, <a href="https://arxiv.org/abs/2307.04725">"Align your Latents: High-Resolution Video Synthesis with Latent Diffusion Models"</a>, 2023 &mdash; the spatial then temporal compressor.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Encoder</td><td>Strided convolutions mapping an image to a small latent grid</td></tr>
+        <tr><td>Latent</td><td>Commonly $H/8 \times W/8$ with 4 channels; what the diffusion model sees</td></tr>
+        <tr><td>Decoder</td><td>Maps the final latent back to pixels; run exactly once</td></tr>
+        <tr><td>Downsample factor $f$</td><td>Side-length reduction; token count falls by $f^2$</td></tr>
+        <tr><td>Reconstruction loss</td><td>Pixel or perceptual error of the autoencoder; sets the fidelity ceiling</td></tr>
+        <tr><td>Latent scaling</td><td>A measured factor applied to latents so the noise model's assumptions hold</td></tr>
+        <tr><td>Artifact source</td><td>Information the encoder discarded, hallucinated back by the decoder</td></tr>
+        <tr><td>Compute ratio</td><td>Attention work changes by roughly $f^4$ per layer at fixed latent width</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The latent made generation affordable, but something still has to denoise it. For a decade the answer was a U-Net: a resolution pyramid with skip connections and attention bolted in at the coarse levels. The next part draws that architecture and lets you change its width.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var image = GM.img.circles(64, 5);
+  var factor = 4;
+  var FACTOR_CHOICES = [2, 4, 8];
+  var CHART_FACTORS = [2, 4, 8, 16, 32];
+  var mses = CHART_FACTORS.map(function (f) { return D.vaeRoundTrip(image, f).mse; });
+  var mseMax = Math.max.apply(null, mses) || 1;
+
+  var srcR = GM.raster(document.getElementById('ld-image-canvas'), {
+    cols: 64, rows: 64, channels: 3, W: 200, H: 200,
+    onResize: function () { drawSource(); }
+  });
+  var reconR = GM.raster(document.getElementById('ld-recon-canvas'), {
+    cols: 64, rows: 64, channels: 3, W: 200, H: 200,
+    onResize: function () { redraw(); }
+  });
+  var latentR = null;
+
+  function buildLatent(f) {
+    var lw = Math.floor(64 / f);
+    latentR = GM.raster(document.getElementById('ld-latent-canvas'), {
+      cols: lw, rows: lw, channels: 3, W: 160, H: 160,
+      onResize: function () { redraw(); }
+    });
+  }
+
+  var msePlot = GM.plot(document.getElementById('ld-mse-canvas'), {
+    W: 560, H: 280, xRange: [0, CHART_FACTORS.length], yRange: [0, mseMax * 1.25],
+    xLabel: 'downsample factor', yLabel: 'reconstruction MSE', onResize: redrawMse
+  });
+  var budgetPlot = GM.plot(document.getElementById('ld-budget-canvas'), {
+    W: 560, H: 280, xRange: [1, 16], yRange: [0, 4400],
+    xLabel: 'downsample factor f', yLabel: 'spatial tokens', onResize: redrawBudget
+  });
+
+  function drawSource() {
+    if (!srcR) return;
+    srcR.fromArray(image.data);
+    srcR.draw();
+  }
+
+  function redrawMse() {
+    if (!msePlot) return;
+    msePlot.clear();
+    msePlot.yRange[0] = 0;
+    msePlot.yRange[1] = mseMax * 1.25;
+    msePlot.axes({
+      xLabel: 'downsample factor', yLabel: 'reconstruction MSE',
+      xTicks: [0.5, 1.5, 2.5, 3.5, 4.5],
+      xFormat: function (t) {
+        var i = Math.round(t - 0.5);
+        return (i >= 0 && i < CHART_FACTORS.length) ? String(CHART_FACTORS[i]) : '';
+      }
+    });
+    msePlot.columns(CHART_FACTORS.map(function (f, i) {
+      return {
+        x0: i + 0.08, x1: i + 0.92, h: mses[i],
+        color: (f === factor) ? c.accent2 : c.accent400
+      };
+    }), { alpha: 0.85 });
+    msePlot.legend([
+      { label: 'MSE: pool then nearest upsample', color: c.accent400, fill: true },
+      { label: 'current factor', color: c.accent2, fill: true }
+    ], { dy: 6 });
+  }
+
+  function redrawBudget() {
+    if (!budgetPlot) return;
+    budgetPlot.clear();
+    budgetPlot.axes({ xLabel: 'downsample factor f', yLabel: 'spatial tokens' });
+    budgetPlot.curve(function () { return 64 * 64; }, { color: c.text, width: 1.6, dashed: true });
+    budgetPlot.curve(function (f) { return Math.pow(64 / f, 2); }, { color: c.accent, width: 2.6 });
+    budgetPlot.vline(factor, { color: c.accent2, dashed: true, width: 1.2, label: 'f = ' + factor });
+    budgetPlot.legend([
+      { label: 'pixel tokens (64² = 4096)', color: c.text, dashed: true },
+      { label: 'latent tokens (64/f)²', color: c.accent }
+    ], { dy: 6 });
+  }
+
+  function redrawReadout(rt) {
+    var el = document.getElementById('ld-readout');
+    if (el) {
+      var lw = rt.latent.w;
+      el.innerHTML =
+        '<div><span class="k">factor</span> <span class="hi">' + factor + '×</span></div>' +
+        '<div><span class="k">latent grid</span> ' + lw + '×' + lw + ' × 3ch</div>' +
+        '<div><span class="k">values vs image</span> 1 / ' + (factor * factor) + '</div>' +
+        '<div><span class="k">reconstruction MSE</span> <span class="hi">' + rt.mse.toExponential(3) + '</span></div>' +
+        '<div class="g-mini">A production VAE uses four latent channels and a learned decoder, so its error is far smaller than this toy.</div>';
+    }
+    var cap = document.getElementById('ld-latent-cap');
+    if (cap) cap.textContent = 'latent ' + (64 / factor) + '×' + (64 / factor);
+    var bel = document.getElementById('ld-budget-readout');
+    if (bel) {
+      bel.innerHTML =
+        '<div><span class="k">factor f</span> <span class="hi">' + factor + '</span></div>' +
+        '<div><span class="k">latent tokens</span> ' + Guide.fmtNum(Math.pow(64 / factor, 2)) + '</div>' +
+        '<div><span class="k">pixel tokens</span> ' + Guide.fmtNum(64 * 64) + '</div>' +
+        '<div><span class="k">token ratio</span> 1 / ' + (factor * factor) + '</div>' +
+        '<div class="g-mini">Per attention layer at fixed latent width, work falls by about f⁴.</div>';
+    }
+  }
+
+  function redraw() {
+    var rt = D.vaeRoundTrip(image, factor);
+    drawSource();
+    if (reconR) { reconR.fromArray(rt.recon.data); reconR.draw(); }
+    if (latentR) { latentR.fromArray(rt.latent.data); latentR.draw(); }
+    redrawMse();
+    redrawBudget();
+    redrawReadout(rt);
+  }
+
+  buildLatent(factor);
+  redraw();
+
+  Guide.bindSliders(document.querySelectorAll('#ld-factor'), function (el) {
+    factor = FACTOR_CHOICES[parseInt(el.value, 10)];
+    buildLatent(factor);
+    redraw();
+  });
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'latent-diffusion-values',
+      kind: 'numeric',
+      prompt: 'A 512&times;512 RGB image is compressed by an 8&times; VAE whose latent has 4 channels. How many latent values does the diffusion model operate on?',
+      answer: 16384,
+      tolerance: 1,
+      explanation: '512/8 = 64 on each side, so the latent is 64&times;64 spatial positions. With 4 channels that is 64&times;64&times;4 = 16,384 values, against 512&times;512&times;3 = 786,432 for the image.'
+    },
+    {
+      id: 'latent-diffusion-token-factor',
+      kind: 'numeric',
+      prompt: 'Downsampling by a factor of 8 on each side reduces the number of spatial tokens by what factor?',
+      answer: 64,
+      tolerance: 0.5,
+      explanation: 'Both side lengths shrink by 8, so the token count shrinks by 8&times;8 = 64. That is the f&sup2; scaling the budget plot shows.'
+    },
+    {
+      id: 'latent-diffusion-trade',
+      kind: 'choice',
+      prompt: 'What does the autoencoder give up in exchange for the smaller grid?',
+      options: [
+        { label: 'Information: whatever the encoder discards can never be recovered by the decoder.', correct: true },
+        { label: 'Determinism: latent diffusion must use a stochastic sampler.', correct: false },
+        { label: 'Conditioning: a latent model cannot be guided by text.', correct: false }
+      ],
+      explanation: 'The latent is a lossy summary. Detail the encoder drops is gone, and the decoder either blurs it or hallucinates a plausible replacement. That reconstruction ceiling is independent of how good the diffusion model is.'
+    },
+    {
+      id: 'latent-diffusion-artifacts',
+      kind: 'choice',
+      prompt: 'Which content suffers most from aggressive latent compression, and why?',
+      options: [
+        { label: 'High-frequency structure such as small text or fine texture, because averaging destroys variation within a block.', correct: true },
+        { label: 'Large flat regions, because they have nothing for the encoder to store.', correct: false },
+        { label: 'The overall colour balance, because four latent channels cannot represent colour.', correct: false }
+      ],
+      explanation: 'A block average preserves flat areas and destroys variation. Text, distant faces and repeated fine patterns sit exactly in the frequency band the latent cannot hold, so the decoder invents the same plausible wrong texture each time.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,721 @@
+---
+title: "Agents in Action, Interactively — Part 18: Shipping probabilistic products"
+description: "Prompts as versioned artifacts, canaries and automated rollback, risk-tiered autonomy, user interfaces for uncertainty, and capturing user edits as signal — the flywheel that compounds."
+permalink: "/ai/agents-in-action/shipping/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Shipping probabilistic products</h1>
+    <p>The last gap between a working agent and a product is not model quality. It is that everything downstream of the model assumed a deterministic dependency: deploys you can reason about, behaviour you can specify, interfaces that promise a right answer. A probabilistic system breaks each of those assumptions, and the teams that ship well replace them rather than pretend. A prompt becomes a versioned artifact with a canary and a rollback; autonomy becomes a decision matched to risk and measured confidence; uncertainty becomes something the interface shows rather than hides; and every user correction becomes a label that makes the next release better.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="deploys">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A prompt change is a deploy</h2></div>
+    <p class="g-eyebrow">Version it, review it, canary it, and be able to take it back</p>
+    <p>The single most common production incident in an LLM product is an unreviewed prompt edit shipped straight to everyone. It is not a config tweak, because the prompt <em>is</em> the program: a reworded instruction, a reordered example, or a swapped model changes behaviour across every request at once, and there is no compiler to catch it. Treat it exactly like a code deploy.</p>
+    <ul>
+      <li><strong>Version it.</strong> A prompt is an artifact with a hash and a history. "Which prompt produced this answer?" must be answerable from a trace, months later.</li>
+      <li><strong>Review and gate it.</strong> Run the candidate against the eval suite from Parts 8 to 11 — the labelled set, the judge, the failure taxonomy — and block the merge on a quality regression, not on a feeling.</li>
+      <li><strong>Canary it.</strong> Send a small slice of live traffic to the new version and watch quality and cost per request on real traffic, which is always stranger than the eval set.</li>
+      <li><strong>Automate the rollback.</strong> Define the threshold in advance so the decision is not made under pressure. A canary without an automatic revert is a slow-motion full rollout.</li>
+    </ul>
+    <p>The rollout below puts a candidate that looks faster and cheaper on a slice of traffic. It is both — and it is worse on one slice. Move the canary share and the rollback threshold and watch the release decide itself.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ship-canary-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Top: quality per batch on the canary slice. Bottom: cost per request. The candidate wins on cost and loses on quality.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Canary share of traffic (%) <span class="val">12</span></label><input type="range" id="ship-share" min="5" max="50" step="1" value="12"></div>
+        <div class="g-field"><label>Rollback threshold (quality) <span class="val">90</span></label><input type="range" id="ship-threshold" min="80" max="95" step="1" value="90"></div>
+        <div class="g-btnrow">
+          <button id="ship-auto" class="g-primary">Automatic rollback: on</button>
+        </div>
+        <div class="g-readout" id="ship-canary-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="shipping-cost-source"></p>
+    <div class="g-warn">⚠️ <span><b>A canary that only watches cost will ship a regression.</b> Here the candidate is genuinely cheaper, so a cost dashboard would call it a win while a slice of users quietly get worse answers. Gate on the metric that encodes the promise, and treat cost as a constraint rather than the objective.</span></div>
+  </section>
+
+  <section class="g-step" id="autonomy">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Risk-tiered autonomy</h2></div>
+    <p class="g-eyebrow">Match the level of autonomy to the risk and the measured confidence</p>
+    <p>"Should the agent do it, or ask?" is not one question. It has two inputs and four sensible answers. The inputs are the <strong>risk of the action</strong> — how expensive, how irreversible, how visible outside your boundary — and the system's <strong>measured confidence</strong> on this task, which should come from evidence (a labelled slice, a check that passed, agreement across attempts) rather than from the model's own assertion. The answers form a ladder.</p>
+    <ul>
+      <li><strong>Suggest.</strong> High risk, low confidence. The agent proposes; a human decides and acts.</li>
+      <li><strong>Confirm.</strong> Low risk, low confidence. The agent can act, but it stops for a yes first.</li>
+      <li><strong>Act and report.</strong> High risk, high confidence. The agent acts and tells a human what it did, with a correction path.</li>
+      <li><strong>Fully autonomous.</strong> Low risk, high confidence. The agent acts silently; this is the only tier that earns back the human attention the others spend.</li>
+    </ul>
+    <p>Place the sample tasks, then move the two thresholds. The point of the exercise is how few tasks belong in the bottom-right corner — the tier that actually saves time is the tier you can only justify with evidence.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ship-matrix-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Task risk on the horizontal axis, measured confidence on the vertical. The thresholds move the four autonomy levels.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Risk threshold <span class="val">50</span></label><input type="range" id="ship-risk" min="20" max="85" step="5" value="50"></div>
+        <div class="g-field"><label>Confidence threshold <span class="val">60</span></label><input type="range" id="ship-conf" min="30" max="90" step="5" value="60"></div>
+        <div class="g-readout" id="ship-matrix-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="shipping-agents-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> autonomy is not a property of the agent, it is a property of a <b>task, a risk and a measured confidence</b>. Change any of the three and the right answer changes — which is why a single global setting ("the agent may act") is always wrong somewhere in the product.</span></div>
+  </section>
+
+  <section class="g-step" id="ux">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>An interface for uncertainty</h2></div>
+    <p class="g-eyebrow">Show provenance, make correction cheap, never fake confidence</p>
+    <p>A probabilistic system will be wrong sometimes. The interface decides what happens next. An answer presented with the same formatting regardless of how well-grounded it is teaches users to trust everything equally, which is precisely the wrong lesson — and it is expensive, because unearned trust is only discovered when it costs someone. Three moves change the failure mode without changing the model.</p>
+    <ul>
+      <li><strong>Show provenance.</strong> Cite the source for each claim, link to it, and let the user check. A citation turns a blind trust decision into a cheap verification.</li>
+      <li><strong>Make the correction path cheap.</strong> An edit box, a thumbs-down with a reason, a one-click "this is wrong" — each is a label and a repair in the same gesture. If correcting costs more than ignoring, users ignore.</li>
+      <li><strong>Never fabricate a confident answer.</strong> If the retrieved evidence is thin or the checks disagree, say so and lower the claim. A hedged "I could not find that in the sources" is a better product than a confident guess.</li>
+    </ul>
+    <p>The three answer cards below are the same model's output presented three ways. Move the accuracy slider: the bare card's trust score does not move with it, which is exactly the problem.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ship-ux-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Trust, correction rate and misled users per 1,000 answers for each presentation. Trust that does not track accuracy is the hazard.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Model accuracy on this task (%) <span class="val">85</span></label><input type="range" id="ship-accuracy" min="55" max="99" step="1" value="85"></div>
+        <div class="g-readout" id="ship-ux-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> the interface is where a probabilistic system earns or loses trust. Provenance makes verification cheap, a correction affordance turns a complaint into a label, and honest hedging keeps the label honest — because the user can tell the difference between "I know" and "I think".</span></div>
+  </section>
+
+  <section class="g-step" id="flywheel">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The edit-to-dataset flywheel</h2></div>
+    <p class="g-eyebrow">Every correction is a free label, and the flywheel is the moat</p>
+    <p>The reason a shipped LLM product can get better faster than a competitor's is not the prompt or the model — both are available to everyone. It is the labelled data the product generates as a by-product of use, and how quickly that data returns to the eval suite and the prompt. A user edit is the most valuable event in the system: it is a human telling you the right answer, for free, on real traffic, on a case your eval set probably did not contain.</p>
+    <p>Closing the loop is the discipline. Capture the edit with enough context to reproduce the request; turn it into a labelled example; add it to the eval set that gates releases; use the recurring failures to change the prompt, the retrieval or a fine-tune; then measure the improvement on the same set. This is the loop Parts 9 and 14 described from the other ends — error analysis upstream, tuning downstream — and it is the one asset a competitor cannot copy, because it is produced by your users on your product.</p>
+    <p>Step the loop below and watch the counts move. The capture rate is the lever that decides how much of the signal survives; the rest is destroyed at the moment the user corrects and nobody records it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ship-flywheel-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Edits → labels → eval → prompt change → better answers → more usage → more edits. The packet is one week of signal.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>User edits per week <span class="val">220</span></label><input type="range" id="ship-edits" min="20" max="600" step="10" value="220"></div>
+        <div class="g-field"><label>Edit capture rate (%) <span class="val">70</span></label><input type="range" id="ship-capture" min="10" max="100" step="5" value="70"></div>
+        <div class="g-field"><label>Loop position <span class="val">5</span></label><input type="range" id="ship-stage" min="0" max="5" step="1" value="5"></div>
+        <div class="g-btnrow">
+          <button id="ship-play">Play the loop</button>
+        </div>
+        <div class="g-readout" id="ship-flywheel-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="shipping-evals-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> the flywheel is the durable moat. Models and prompts are commoditised and substitutable; a labelled dataset produced by your own users, and a loop fast enough to act on it, is the thing that compounds — and pass^k on that set is how you prove it did.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the release</th></tr></thead>
+      <tbody>
+        <tr><td>Is a prompt edit a config change?</td><td>No. It is a deploy: version it, review it, gate it on the eval suite, and be able to roll it back.</td></tr>
+        <tr><td>What must a canary have?</td><td>A pre-defined threshold and an automatic revert. Otherwise it is just a slow rollout.</td></tr>
+        <tr><td>What should a canary watch?</td><td>The metric that encodes the promise. A cost-only canary ships quality regressions.</td></tr>
+        <tr><td>What are the two inputs to autonomy?</td><td>Risk of the action and measured confidence — evidence, not the model's own assertion.</td></tr>
+        <tr><td>What are the four autonomy levels?</td><td>Suggest, confirm, act-and-report, fully autonomous.</td></tr>
+        <tr><td>Which tier saves the most time?</td><td>Fully autonomous — and it is the one that needs the most evidence, so it stays the smallest quadrant.</td></tr>
+        <tr><td>How should uncertainty be shown?</td><td>Provenance, a cheap correction path, and honest hedging. Never a confident answer the system cannot support.</td></tr>
+        <tr><td>What is a user edit worth?</td><td>A free label on real traffic: the right answer, on a case your eval set likely missed.</td></tr>
+        <tr><td>How do you close the loop?</td><td>Capture with context → label → add to the eval set → change the prompt/model → measure on the same set.</td></tr>
+        <tr><td>What is the durable moat?</td><td>The labelled dataset your users generate, and a loop fast enough to use it.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Sculley et al., <a href="https://papers.nips.cc/paper/5656-hidden-technical-debt-in-machine-learning-systems">"Hidden Technical Debt in Machine Learning Systems"</a>, NeurIPS 2015 — why an ML product is a software system, and why the code around the model is the system.</li>
+      <li>Breck et al., <a href="https://research.google/pubs/pub46555/">"The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction"</a>, 2017 — the production-readiness checklist behind canaries, rollback and monitoring.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — pass^k as the reliability metric that a canary on the eval set is trying to protect.</li>
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024 — a benchmark whose score depends on the harness, and therefore on the deploy.</li>
+      <li>Amershi et al., <a href="https://www.microsoft.com/en-us/research/publication/guidelines-for-human-ai-interaction/">"Guidelines for Human-AI Interaction"</a>, CHI 2019 — provenance, correction and honest confidence as design guidance rather than taste.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">"Building effective agents"</a>, December 2024 — when to automate and when to keep a human in the loop, which is the autonomy ladder restated.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Shipping is the discipline that turns a demo into a product. The last part looks at what is arriving rather than what has arrived: computer use, long-running autonomous work, and the evaluation problems that come with systems that act for days.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08, a 500-instance human-validated subset); τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench (2025) for tool-agent-user interaction, which introduced pass^k. Public scores are contaminated by training-data leakage, scaffolding differences and harness version drift, which is why a public number is a weak predictor of your task. Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    agents: {
+      source: "Anthropic, 'Effective context engineering for AI agents' (2025-09-29) and 'Building effective agents' (2024-12) for the workflow-versus-agent split. Reliability compounding is arithmetic: 0.95^20 ≈ 0.36. Offline fallback constants.",
+      workflowPatterns: ["prompt chaining", "routing", "parallelisation", "orchestrator-worker", "evaluator-optimiser"],
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Shared two-panel chart helper (no kit primitive draws two panels)
+  // ------------------------------------------------------------------
+  function panel(ctx, x0, y0, w, h, xr, yr, opts) {
+    opts = opts || {};
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    function X(x) { return x0 + w * (x - xr[0]) / (xr[1] - xr[0]); }
+    function Y(y) { var v = Math.max(yr[0], Math.min(yr[1], y)); return y0 + h * (1 - (v - yr[0]) / (yr[1] - yr[0])); }
+    if (opts.title) { ctx.fillStyle = c.text; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'left'; ctx.fillText(opts.title, x0, y0 - 8); }
+    if (opts.xLabel) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.fillText(opts.xLabel, x0 + w / 2, y0 + h + 24); }
+    if (opts.yLabel) {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.save();
+      ctx.translate(x0 - 30, y0 + h / 2); ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center'; ctx.fillText(opts.yLabel, 0, 0); ctx.restore();
+    }
+    return { X: X, Y: Y, x0: x0, y0: y0, w: w, h: h };
+  }
+  function line(p, pts, color, dashed, width) {
+    ctxLine(p.ctx, p, pts, color, dashed, width);
+  }
+  function ctxLine(ctx, p, pts, color, dashed, width) {
+    ctx.strokeStyle = color; ctx.lineWidth = width || 2.2;
+    if (dashed) ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    pts.forEach(function (pt, i) { var X = p.X(pt.x), Y = p.Y(pt.y); if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y); });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — a canary rollout with automatic rollback
+  // ------------------------------------------------------------------
+  var A = { share: el('ship-share'), threshold: el('ship-threshold'), auto: true };
+  var setupA = Guide.setupCanvas(el('ship-canary-canvas'), 640, 380, drawA);
+  var BATCHES = 36, REG_START = 18, CONSEC = 3;
+  function canaryRun() {
+    var thr = parseInt(A.threshold.value, 10) / 100;
+    if (!isFinite(thr)) thr = 0.90;
+    var r = AppSim.rng(23);
+    var v1 = [], v2 = [], k1 = [], k2 = [];
+    var q1base = 0.905, q2base = 0.932;
+    var below = 0, rollback = null, measured = [];
+    for (var i = 0; i < BATCHES; i++) {
+      var q1 = q1base + (r() - 0.5) * 0.012;
+      var drop = i >= REG_START ? 0.088 : 0;
+      var q2 = q2base - drop + (r() - 0.5) * 0.016;
+      var cost1 = 9.60 + (r() - 0.5) * 0.22;
+      var cost2 = 8.70 + (r() - 0.5) * 0.22;
+      v1.push(q1); v2.push(q2); k1.push(cost1); k2.push(cost2);
+      measured.push(q2);
+      if (A.auto && rollback == null) {
+        if (q2 < thr) { below++; if (below >= CONSEC) rollback = i; } else { below = 0; }
+      }
+    }
+    return { v1: v1, v2: v2, k1: k1, k2: k2, rollback: rollback, thr: thr };
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var s = canaryRun();
+    var share = parseInt(A.share.value, 10); if (!isFinite(share)) share = 12;
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('canary rollout · prompt v2 on ' + share + '% of traffic · threshold ' + (s.thr * 100).toFixed(0) + '% quality', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('v2 is 10% cheaper and worse on one slice', 14, 34);
+
+    var pQ = panel(ctx, 56, 66, 552, 148, [1, BATCHES], [0.78, 1.0], {
+      title: 'quality per batch (canary slice)', xLabel: 'batch', yLabel: 'quality'
+    });
+    pQ.ctx = ctx;
+    var pC = panel(ctx, 56, 252, 552, 92, [1, BATCHES], [8.2, 10.2], {
+      title: 'cost per request', xLabel: 'batch', yLabel: '$ / req'
+    });
+    pC.ctx = ctx;
+
+    line(pQ, s.v1.map(function (v, i) { return { x: i + 1, y: v }; }), c.accent700, true);
+    line(pQ, s.v2.map(function (v, i) { return { x: i + 1, y: v }; }), c.accent2, false);
+    var ty = pQ.Y(s.thr);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(pQ.x0, ty); ctx.lineTo(pQ.x0 + pQ.w, ty); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('rollback threshold', pQ.x0 + 4, ty - 4);
+
+    line(pC, s.k1.map(function (v, i) { return { x: i + 1, y: v }; }), c.accent700, true);
+    line(pC, s.k2.map(function (v, i) { return { x: i + 1, y: v }; }), c.accent2, false);
+
+    if (s.rollback != null) {
+      var rx = pQ.X(s.rollback + 1);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(rx, pQ.y0); ctx.lineTo(rx, pQ.y0 + pQ.h); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(rx, pC.y0); ctx.lineTo(rx, pC.y0 + pC.h); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+      ctx.fillText('rolled back at batch ' + (s.rollback + 1), Math.min(rx + 4, 430), pQ.y0 + 12);
+      // after rollback traffic is v1 again: draw the recovered series
+      var rec = [];
+      for (var i = s.rollback + 1; i < BATCHES; i++) rec.push({ x: i + 1, y: s.v1[i] });
+      line(pQ, rec, c.accent, false, 2.6);
+      ctx.fillStyle = c.accent; ctx.font = '9.5px ' + c.font;
+      ctx.fillText('traffic back on v1', Math.min(rx + 4, 470), pQ.y0 + 28);
+    } else if (A.auto) {
+      ctx.fillStyle = c.accent700; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('no batch crossed the threshold three times — v2 keeps the traffic', pQ.x0 + 4, pQ.y0 + 12);
+    } else {
+      ctx.fillStyle = c.accent2; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('automatic rollback is off: v2 stays live for every batch', pQ.x0 + 4, pQ.y0 + 12);
+    }
+
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('prompt v2 (canary)', pQ.x0 + 6, pQ.y0 + pQ.h - 24);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('prompt v1 (control)', pQ.x0 + 6, pQ.y0 + pQ.h - 10);
+
+    var before = s.v2[REG_START - 1], after = s.v2[REG_START + 1];
+    var costDelta = (s.k1[BATCHES - 1] - s.k2[BATCHES - 1]) / s.k1[BATCHES - 1];
+    el('ship-canary-readout').innerHTML =
+      '<div><span class="k">canary share</span> ' + share + '% of traffic &nbsp; <span class="k">rollback</span> ' +
+      (s.rollback != null ? '<span class="hi">batch ' + (s.rollback + 1) + '</span>, after ' + CONSEC + ' batches below threshold'
+        : (A.auto ? '<span class="hi">none triggered</span>' : '<span class="bad">disabled</span>')) + '</div>' +
+      '<div><span class="k">quality</span> ' + (before * 100).toFixed(1) + '% → ' +
+      '<span class="bad">' + (after * 100).toFixed(1) + '%</span> on the affected slice</div>' +
+      '<div><span class="k">cost</span> v2 is <span class="hi">' + (costDelta * 100).toFixed(0) + '% cheaper</span> per request' +
+      ' <span class="k">— a cost dashboard alone would have shipped it</span></div>' +
+      '<div class="k">' + (s.rollback != null
+        ? 'the revert is automatic because the threshold was set in advance; the decision was not made in an incident channel'
+        : 'raise the canary share or move the threshold to see the gate fire') + '</div>';
+  }
+  Guide.bindSliders([A.share, A.threshold], drawA);
+  el('ship-auto').addEventListener('click', function () {
+    A.auto = !A.auto;
+    this.className = A.auto ? 'g-primary' : '';
+    this.textContent = A.auto ? 'Automatic rollback: on' : 'Automatic rollback: off';
+    drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — risk-tiered autonomy matrix
+  // ------------------------------------------------------------------
+  var B = { risk: el('ship-risk'), conf: el('ship-conf') };
+  var setupB = Guide.setupCanvas(el('ship-matrix-canvas'), 640, 380, drawB);
+  var TASKS = [
+    { name: 'answer a docs question', risk: 0.14, conf: 0.93 },
+    { name: 'summarise a thread', risk: 0.22, conf: 0.86 },
+    { name: 'draft a reply', risk: 0.28, conf: 0.58 },
+    { name: 'update a CRM record', risk: 0.44, conf: 0.72 },
+    { name: 'rotate an API key', risk: 0.80, conf: 0.90 },
+    { name: 'issue a refund', risk: 0.72, conf: 0.66 },
+    { name: 'send a payment', risk: 0.90, conf: 0.52 },
+    { name: 'delete a repository', risk: 0.95, conf: 0.30 }
+  ];
+  var LEVELS = [
+    { key: 'suggest', label: 'suggest', color: '#7a5c9e' },
+    { key: 'confirm', label: 'confirm', color: '#c9a227' },
+    { key: 'report', label: 'act and report', color: c.accent400 },
+    { key: 'auto', label: 'fully autonomous', color: c.accent }
+  ];
+  function levelFor(risk, conf, riskT, confT) {
+    if (conf >= confT) return risk > riskT ? LEVELS[2] : LEVELS[3];
+    return risk > riskT ? LEVELS[0] : LEVELS[1];
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var riskT = parseInt(B.risk.value, 10) / 100; if (!isFinite(riskT)) riskT = 0.5;
+    var confT = parseInt(B.conf.value, 10) / 100; if (!isFinite(confT)) confT = 0.6;
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('risk-tiered autonomy · task risk × measured confidence', 14, 18);
+
+    var x0 = 74, y0 = 48, pw = 520, ph = 260;
+    function X(v) { return x0 + pw * v; }
+    function Y(v) { return y0 + ph * (1 - v); }
+
+    // quadrant tints
+    var quads = [
+      { rx: 0, ry: 1, level: LEVELS[3] },
+      { rx: 1, ry: 1, level: LEVELS[2] },
+      { rx: 0, ry: 0, level: LEVELS[1] },
+      { rx: 1, ry: 0, level: LEVELS[0] }
+    ];
+    quads.forEach(function (q) {
+      var qx = q.rx ? X(riskT) : x0, qy = q.ry ? y0 : Y(confT);
+      var qw = q.rx ? x0 + pw - X(riskT) : X(riskT) - x0;
+      var qh = q.ry ? Y(confT) - y0 : y0 + ph - Y(confT);
+      ctx.globalAlpha = 0.10; ctx.fillStyle = q.level.color;
+      ctx.fillRect(qx, qy, qw, qh); ctx.globalAlpha = 1;
+      ctx.fillStyle = q.level.color; ctx.font = '600 10.5px ' + c.font;
+      ctx.textAlign = 'center';
+      ctx.fillText(q.level.label, qx + qw / 2, qy + qh / 2);
+    });
+
+    // thresholds
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.45; ctx.lineWidth = 1.4; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(X(riskT), y0); ctx.lineTo(X(riskT), y0 + ph); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x0, Y(confT)); ctx.lineTo(x0 + pw, Y(confT)); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+
+    // axes
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + ph); ctx.lineTo(x0 + pw, y0 + ph); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('task risk →', x0 + pw / 2, y0 + ph + 30);
+    ctx.save(); ctx.translate(x0 - 34, y0 + ph / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('measured confidence →', 0, 0); ctx.restore();
+
+    TASKS.forEach(function (t) {
+      var lv = levelFor(t.risk, t.conf, riskT, confT);
+      var x = X(t.risk), y = Y(t.conf);
+      ctx.fillStyle = lv.color;
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2; ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '9.5px ' + c.font;
+      var right = t.risk > 0.6;
+      ctx.textAlign = right ? 'right' : 'left';
+      ctx.fillText(t.name, right ? x - 8 : x + 8, y + 3);
+    });
+
+    var counts = {};
+    var list = { suggest: [], confirm: [], report: [], auto: [] };
+    TASKS.forEach(function (t) {
+      var lv = levelFor(t.risk, t.conf, riskT, confT);
+      counts[lv.key] = (counts[lv.key] || 0) + 1;
+      list[lv.key].push(t.name);
+    });
+
+    el('ship-matrix-readout').innerHTML =
+      '<div><span class="k">thresholds</span> risk ≤ ' + (riskT * 100).toFixed(0) + '% and confidence ≥ ' + (confT * 100).toFixed(0) + '%</div>' +
+      LEVELS.map(function (lv) {
+        return '<div><span class="k">' + lv.label + '</span> <span class="hi">' + (counts[lv.key] || 0) + '</span>' +
+          (list[lv.key].length ? ' — ' + list[lv.key].join(', ') : '') + '</div>';
+      }).join('') +
+      '<div class="k">' + ((counts.auto || 0) === 0
+        ? 'no task currently earns silent autonomy; the tier that saves the most time is the one that needs the most evidence'
+        : 'only the low-risk, high-confidence tasks sit in the silent tier — everything else spends a human\'s attention deliberately') + '</div>';
+  }
+  Guide.bindSliders([B.risk, B.conf], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — interfaces for uncertainty
+  // ------------------------------------------------------------------
+  var C = { accuracy: el('ship-accuracy') };
+  var setupC = Guide.setupCanvas(el('ship-ux-canvas'), 640, 340, drawC);
+  var VARIANTS = [
+    { name: 'bare answer', trust: 0.90, correction: 0.11, confidentWhenWrong: 0.96, calibrated: false },
+    { name: 'answer + citations', trust: 0.79, correction: 0.34, confidentWhenWrong: 0.70, calibrated: false },
+    { name: 'answer + confidence + correction', trust: 0.70, correction: 0.63, confidentWhenWrong: 0.28, calibrated: true }
+  ];
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var acc = parseInt(C.accuracy.value, 10) / 100; if (!isFinite(acc)) acc = 0.85;
+    var r = AppSim.rng(71);
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the same output, three presentations · model accuracy ' + (acc * 100).toFixed(0) + '%', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('trust that does not track accuracy is the hazard', 14, 34);
+
+    var cardW = 192, cardGap = 12, cardX0 = 18, cardY = 56, cardH = 214;
+    VARIANTS.forEach(function (v, i) {
+      var jitter = (r() - 0.5) * 0.03;
+      var trust = Math.max(0.2, Math.min(0.99, v.calibrated ? acc * 0.92 + jitter : v.trust + jitter));
+      var correction = Math.max(0.02, Math.min(0.95, v.correction + jitter * 0.5));
+      var misled = (1 - acc) * 1000 * v.confidentWhenWrong;
+      var x = cardX0 + i * (cardW + cardGap);
+
+      ctx.fillStyle = 'rgba(120,120,120,0.05)'; ctx.fillRect(x, cardY, cardW, cardH);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, cardY + 0.5, cardW - 1, cardH - 1);
+      ctx.fillStyle = c.text; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'left';
+      var words = v.name.split(' ');
+      var lines = [], cur = '';
+      words.forEach(function (w) {
+        if ((cur + ' ' + w).trim().length > 20) { lines.push(cur.trim()); cur = w; } else { cur += ' ' + w; }
+      });
+      if (cur.trim()) lines.push(cur.trim());
+      lines.forEach(function (ln, li) { ctx.fillText(ln, x + 10, cardY + 20 + li * 13); });
+
+      var bars = [
+        { label: 'trust', v: trust, color: c.accent },
+        { label: 'correction rate', v: correction, color: c.accent700 },
+        { label: 'misled / 1k', v: Math.min(1, misled / 1000), color: c.accent2 }
+      ];
+      bars.forEach(function (bar, bi) {
+        var by = cardY + 68 + bi * 42;
+        ctx.fillStyle = c.text; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(bar.label, x + 10, by);
+        ctx.fillStyle = 'rgba(120,120,120,0.16)'; ctx.fillRect(x + 10, by + 6, cardW - 20, 12);
+        ctx.fillStyle = bar.color; ctx.fillRect(x + 10, by + 6, (cardW - 20) * bar.v, 12);
+        ctx.fillStyle = c.text; ctx.font = '600 9.5px ' + c.font;
+        ctx.fillText(bar.label === 'misled / 1k' ? Math.round(misled) + '' : (bar.v * 100).toFixed(0) + '%', x + 12, by + 30);
+      });
+      if (!v.calibrated) {
+        ctx.fillStyle = c.accent2; ctx.font = '9.5px ' + c.font;
+        ctx.fillText('trust ≠ accuracy', x + 10, cardY + cardH - 12);
+      } else {
+        ctx.fillStyle = c.accent700; ctx.font = '9.5px ' + c.font;
+        ctx.fillText('trust tracks accuracy', x + 10, cardY + cardH - 12);
+      }
+    });
+
+    var out = VARIANTS.map(function (v, i) {
+      var trust = v.calibrated ? acc * 0.92 : v.trust;
+      var misled = (1 - acc) * 1000 * v.confidentWhenWrong;
+      return { name: v.name, trust: trust, misled: misled, over: trust - acc };
+    });
+    el('ship-ux-readout').innerHTML =
+      '<div><span class="k">accuracy</span> ' + (acc * 100).toFixed(0) + '% &nbsp; <span class="k">wrong answers per 1,000</span> ' + Math.round((1 - acc) * 1000) + '</div>' +
+      out.map(function (o) {
+        return '<div><span class="k">' + o.name + '</span> trust ' + (o.trust * 100).toFixed(0) + '%' +
+          ' · over-trust ' + (o.over >= 0 ? '+' : '') + (o.over * 100).toFixed(0) + ' pts' +
+          ' · misled <span class="' + (o.misled > 60 ? 'bad' : 'hi') + '">' + Math.round(o.misled) + '</span></div>';
+      }).join('') +
+      '<div class="k">the bare card\'s trust barely moves with accuracy; provenance and an honest confidence signal are what make the numbers track reality</div>';
+  }
+  Guide.bindSliders([C.accuracy], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — the edit-to-dataset flywheel
+  // ------------------------------------------------------------------
+  var D = { edits: el('ship-edits'), capture: el('ship-capture'), stage: el('ship-stage'), t: 5 };
+  var setupD = Guide.setupCanvas(el('ship-flywheel-canvas'), 640, 340, drawD);
+  var NODES = [
+    { name: 'user edits', sub: 'signal' },
+    { name: 'capture + label', sub: 'dataset' },
+    { name: 'eval suite', sub: 'the gate' },
+    { name: 'prompt / tune', sub: 'the change' },
+    { name: 'better answers', sub: 'the result' },
+    { name: 'more usage', sub: 'the volume' }
+  ];
+  function nodePos(i) {
+    var ang = -Math.PI / 2 + i * (2 * Math.PI / NODES.length);
+    return { x: 320 + 196 * Math.cos(ang), y: 168 + 112 * Math.sin(ang) };
+  }
+  function flywheelCounts() {
+    var E = parseInt(D.edits.value, 10); if (!isFinite(E)) E = 220;
+    var cap = parseInt(D.capture.value, 10) / 100; if (!isFinite(cap)) cap = 0.7;
+    var captured = E * cap;
+    var labelled = captured * 0.85;
+    var evalAdds = labelled * 0.30;
+    var changes = Math.round(labelled / 40);
+    return { E: E, cap: cap, captured: captured, lost: E - captured, labelled: labelled, evalAdds: evalAdds, changes: changes,
+      evalSize: 220 + evalAdds };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var f = flywheelCounts();
+    var t = D.t;
+    var from = Math.floor(t) % 6, frac = t - Math.floor(t);
+    var to = (from + 1) % 6;
+    var filled = Math.ceil(t);
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the edit-to-dataset flywheel · one week of signal', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('signal destroyed: ' + Math.round(f.lost) + ' edits/week that nobody captured', 14, 34);
+
+    var counts = [
+      Math.round(f.E), Math.round(f.captured), Math.round(f.evalSize), f.changes, Math.round(f.labelled), Math.round(f.E * 1.15)
+    ];
+    for (var i = 0; i < NODES.length; i++) {
+      var a = nodePos(i), b = nodePos((i + 1) % NODES.length);
+      var active = i < filled;
+      Guide.drawArrow(ctx, a.x, a.y, b.x, b.y, {
+        color: active ? c.accent400 : c.divider, width: active ? 2.2 : 1.4, head: 8
+      });
+    }
+    NODES.forEach(function (n, i) {
+      var p = nodePos(i);
+      var active = i < filled;
+      ctx.fillStyle = active ? 'rgba(43,95,255,0.10)' : 'rgba(120,120,120,0.07)';
+      ctx.fillRect(p.x - 62, p.y - 26, 124, 52);
+      ctx.strokeStyle = active ? c.accent700 : c.divider; ctx.lineWidth = active ? 1.6 : 1;
+      ctx.strokeRect(p.x - 61.5, p.y - 25.5, 123, 51);
+      ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(n.name, p.x, p.y - 6);
+      ctx.fillStyle = active ? c.accent700 : c.text; ctx.font = '9.5px ' + c.font;
+      ctx.fillText(n.sub + ' · ' + counts[i], p.x, p.y + 10);
+    });
+
+    var pa = nodePos(from), pb = nodePos(to);
+    var px = pa.x + (pb.x - pa.x) * frac, py = pa.y + (pb.y - pa.y) * frac;
+    ctx.fillStyle = c.accent2;
+    ctx.beginPath(); ctx.arc(px, py, 7, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '600 8.5px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('L', px, py + 3);
+
+    el('ship-flywheel-readout').innerHTML =
+      '<div><span class="k">edits/week</span> ' + Math.round(f.E) +
+      ' &nbsp; <span class="k">captured</span> <span class="hi">' + Math.round(f.captured) + '</span> (' + Math.round(f.cap * 100) + '%)' +
+      ' &nbsp; <span class="k">lost</span> <span class="bad">' + Math.round(f.lost) + '</span></div>' +
+      '<div><span class="k">labelled rows added</span> ' + Math.round(f.labelled) +
+      ' &nbsp; <span class="k">eval set</span> ' + Math.round(f.evalSize) + ' cases' +
+      ' &nbsp; <span class="k">prompt/model changes shipped</span> ' + f.changes + '/week</div>' +
+      '<div class="k">pass^k on the growing eval set is how you prove the loop is working, not merely running</div>' +
+      '<div class="k">' + (f.cap < 0.5
+        ? 'more than half the human corrections are discarded at the moment they are made — the cheapest possible label, thrown away'
+        : 'most corrections survive into the dataset; the loop\'s speed is now the binding constraint, not its supply of signal') + '</div>';
+  }
+  Guide.bindSliders([D.edits, D.capture], drawD);
+  el('ship-stage').addEventListener('input', function () {
+    D.t = parseInt(this.value, 10);
+    if (!isFinite(D.t)) D.t = 5;
+    if (this.parentElement) { var v = this.parentElement.querySelector('.val'); if (v) v.textContent = this.value; }
+    drawD();
+  });
+  Guide.loop({
+    onStep: function () {
+      D.t += 0.06;
+      if (D.t > 6) D.t = 0;
+      el('ship-stage').value = String(Math.floor(D.t));
+      drawD();
+    },
+    button: el('ship-play'), interval: 40, playLabel: 'Play the loop', pauseLabel: 'Pause'
+  });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var ev = (data && data.evals) || FALLBACK.evals;
+    var cl = (data && data.cost_latency) || FALLBACK.cost_latency;
+    var ag = (data && data.agents) || FALLBACK.agents;
+    el('shipping-evals-source').textContent = ev.source +
+      (ev.passKFormula ? ' ' + ev.passKFormula : '');
+    el('shipping-cost-source').textContent = cl.source +
+      (cl.cacheLayers && cl.cacheLayers.length ? ' Cache layers: ' + cl.cacheLayers.join(', ') + '.' : '');
+    el('shipping-agents-source').textContent = ag.source +
+      (ag.reliabilityExample ? ' Per-step reliability compounds: ' + ag.reliabilityExample.perStep + '^' +
+        ag.reliabilityExample.steps + ' = ' + ag.reliabilityExample.endToEnd + '.' : '');
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'shipping-prompt-deploy',
+      kind: 'choice',
+      prompt: 'Why is a prompt change a deploy rather than a configuration tweak?',
+      options: [
+        { label: 'The prompt is the program: one edit changes behaviour across every request at once, with no compiler to catch it.', correct: true },
+        { label: 'Because prompts are stored in files like code.', correct: false },
+        { label: 'Because the provider charges for prompt edits.', correct: false },
+        { label: 'Because a prompt has to pass lint before it runs.', correct: false }
+      ],
+      explanation: 'Rewording an instruction or reordering examples changes behaviour globally. So a prompt is versioned, reviewed, gated on the eval suite, canaried and revertible — the same discipline as any other artifact that ships.'
+    },
+    {
+      id: 'shipping-canary-numeric',
+      kind: 'numeric',
+      prompt: 'A candidate prompt is canaried on 12% of 50,000 daily requests. How many requests per day receive the new version?',
+      answer: 6000,
+      unit: "requests",
+      tolerance: 1,
+      explanation: '12% of 50,000 is 0.12 × 50,000 = 6,000 requests per day — enough to measure a quality difference, small enough that a regression reaches a bounded share of users.'
+    },
+    {
+      id: 'shipping-autonomy',
+      kind: 'choice',
+      prompt: 'What are the two inputs that decide how much autonomy an agent should have on a task?',
+      options: [
+        { label: 'The risk of the action and the system\'s measured confidence — evidence, not the model\'s own assertion.', correct: true },
+        { label: 'The model size and the temperature setting.', correct: false },
+        { label: 'The user\'s seniority and the time of day.', correct: false },
+        { label: 'The token budget and the provider.', correct: false }
+      ],
+      explanation: 'Risk (how expensive, irreversible or outward-facing the action is) crossed with measured confidence gives four tiers: suggest, confirm, act-and-report, fully autonomous. A single global "the agent may act" setting is wrong somewhere in the product.'
+    },
+    {
+      id: 'shipping-ux',
+      kind: 'choice',
+      prompt: 'Which interface choice best handles a probabilistic system\'s uncertainty?',
+      options: [
+        { label: 'Show provenance, make correction cheap, and hedge honestly rather than presenting every answer with equal confidence.', correct: true },
+        { label: 'Render every answer identically so the interface never undermines trust.', correct: false },
+        { label: 'Hide the sources so users cannot misread them.', correct: false },
+        { label: 'Ask the model to state its confidence as a percentage and display it verbatim.', correct: false }
+      ],
+      explanation: 'Identical formatting teaches users to trust everything equally, including the wrong answers. Citations make verification cheap, a correction affordance turns a complaint into a label, and honest hedging keeps trust tracking accuracy.'
+    },
+    {
+      id: 'shipping-edits',
+      kind: 'choice',
+      prompt: 'Why is capturing user edits the durable moat of an LLM product?',
+      options: [
+        { label: 'A correction is a free label from a real user on real traffic, and feeding it back into the eval set and the prompt is an asset competitors cannot copy.', correct: true },
+        { label: 'Because edits reduce the number of tokens the model must generate.', correct: false },
+        { label: 'Because storing edits is required for GDPR compliance.', correct: false },
+        { label: 'Because edits let you avoid running an evaluation suite.', correct: false }
+      ],
+      explanation: 'Prompts and models are available to everyone; a labelled dataset produced by your own users on your own product is not. Closing the loop — capture, label, add to the eval, change the prompt or tune, measure — is the flywheel, and pass^k on that set is the proof it turns.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

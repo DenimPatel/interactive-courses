@@ -1,0 +1,639 @@
+---
+title: "Agents in Action, Interactively — Part 6: Multi-agent: the argument"
+description: "Orchestrator-worker versus single-thread; Anthropic's research system against Cognition's objection; the read-heavy-and-independent versus shared-mutable-state reconciliation."
+permalink: "/ai/agents-in-action/multi-agent/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Multi-agent: the argument</h1>
+    <p>Two engineering teams published opposite conclusions within weeks of each other in 2025, and both were right. One built a research system out of an orchestrator and parallel subagents and reported it beating a single agent on breadth-first work, at a large token cost. The other argued that splitting an agent into subagents quietly breaks the thing that makes it good. This part puts the two claims side by side, gives you a slider for the property that decides between them, and marks the point where the fan-out stops paying.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="camps">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Two camps, two conditions</h2></div>
+    <p class="g-eyebrow">Both published in June 2025, both correct</p>
+    <p><strong>Anthropic's case.</strong> In "How we built our multi-agent research system" (13 June 2025), the team describes a lead agent that plans, spawns parallel subagents, and synthesises their results. On breadth-first research — cast a wide net over many sources, then pull the findings together — that orchestrator-worker design beat a single agent. The cost was reported plainly: multi-agent systems used roughly an order of magnitude more tokens than a plain chat interaction, because every subagent carries its own context and every finding is summarised on the way back.</p>
+    <p><strong>Cognition's case.</strong> In "Don't Build Multi-Agents" (June 2025), the counter-argument is not that parallelism is slow — it is that it is <em>incoherent</em>. The claim is that actions carry implicit decisions. A subagent handed only a task description makes its own assumptions about conventions, formats and prior context, and two subagents working in parallel can make <em>different</em> assumptions that only collide at merge time. Their principle: share full context, not just the task — and their recommended default is a single-threaded linear agent, or a deliberately serial hand-off.</p>
+    <div class="g-goal">💡 <span><b>The reconciliation, in one line:</b> multi-agent wins when the subtasks are <b>read-heavy and independent</b> — parallel search, fan-out over sources, results merged at the end. It loses when subtasks need <b>shared mutable state or a single coherent voice</b>, because then the "implicit decisions" are the work.</span></div>
+    <p>The rest of this part makes that line measurable. A single property — how tightly the subtasks are coupled through shared state — runs underneath every demo, and the reader is the one who finds the crossover.</p>
+  </section>
+
+  <section class="g-step" id="crossover">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The crossover</h2></div>
+    <p class="g-eyebrow">One slider decides the architecture</p>
+    <p>Think of coupling as the fraction of the work that is <em>not</em> independent: 0 is a set of read-only subtasks whose results are combined once at the end, 1 is a set of subtasks that all read and write the same evolving state. At low coupling the fan-out is a pure win — the subagents never need to agree, so their independence costs nothing. As coupling rises, two things happen at once: the single thread gets <em>better</em>, because one context sees every change and never has to reconcile two sets of assumptions, while the orchestrator-worker gets <em>worse</em>, because its subagents increasingly make decisions the others cannot see.</p>
+    <p>Both curves are modelled, not measured — the seeded dots are the "observations" the model is drawn through. Move the coupling slider and find the point where the orchestrator stops winning on quality. It is marked, but the interesting exercise is knowing <em>why</em> it sits where it does.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ma-crossover-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: task quality against coupling. Right: wall-clock latency. The quality crossover and the latency crossover are not in the same place.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Shared-state coupling <span class="val">45</span></label><input type="range" id="ma-coupling" min="0" max="100" step="1" value="45"></div>
+        <div class="g-readout" id="ma-crossover-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="ma-agents-source"></p>
+  </section>
+
+  <section class="g-step" id="multiplier">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The token multiplier</h2></div>
+    <p class="g-eyebrow">Why the fan-out is expensive even when it wins</p>
+    <p>Multi-agent's cost is not a rounding error: it is the price of breadth, and it scales with the number of agents, not with the difficulty of the question. Each subagent carries its own system prompt, its own growing transcript of explorations, and its own output; the orchestrator then pays again to dispatch work and to read back summaries. Meanwhile the single thread answering the same question with the same number of explorations has one context, so it pays for the system prompt once.</p>
+    <p>This is the honest half of the Anthropic result: the design won on breadth-first research <em>and</em> used far more tokens doing it. Below, each column is one subagent's token bill; the dashed line is what a single thread would send for the same subtasks. Multiply the agents and watch the multiplier move roughly one-for-one.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ma-multiplier-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">One column per agent, stacked by system prompt, explorations and output. The dashed line is the single-thread baseline.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Agents <span class="val">4</span></label><input type="range" id="ma-agents" min="1" max="8" step="1" value="4"></div>
+        <div class="g-field"><label>Explorations per agent <span class="val">4</span></label><input type="range" id="ma-subtasks" min="1" max="10" step="1" value="4"></div>
+        <div class="g-field"><label>Tokens per exploration <span class="val">2000</span></label><input type="range" id="ma-task" min="500" max="6000" step="100" value="2000"></div>
+        <div class="g-readout" id="ma-multiplier-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="ma-cost-source"></p>
+    <div class="g-warn">⚠️ <span><b>The multiplier is not the only cost:</b> reliability compounds too. A twenty-step run at 95% per-step reliability succeeds about 36% of the time end to end (0.95<sup>20</sup> ≈ 0.36). Ten parallel agents each at 95% do not average that away; they multiply the number of places a wrong assumption can enter.</span></div>
+  </section>
+
+  <section class="g-step" id="overhead">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Coordination overhead, drawn</h2></div>
+    <p class="g-eyebrow">The same steps, run two ways</p>
+    <p>Here is the Cognition objection as a trace. Both tracks run the same twelve steps. The top track is a single thread: every step sees every earlier step, so its assumptions stay consistent no matter how coupled the work is. The bottom track is an orchestrator with parallel workers: as coupling and headcount rise, steps start appearing twice (two workers solved the same sub-problem) and start <em>conflicting</em> (two workers solved it under different assumptions).</p>
+    <p>Redundancy is the cheap failure — it burns tokens. Conflict is the expensive one: it produces a merge that is internally inconsistent, and it is invisible in an aggregate metric. Move the coupling slider from the previous section and add workers; the conflict rate climbs faster than the redundancy rate, which is exactly why the quality curve bends before the latency curve does.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ma-overhead-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Top: one thread, one set of assumptions. Bottom: doubled steps are redundancy, crossed steps are a conflict.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Workers <span class="val">3</span></label><input type="range" id="ma-workers" min="1" max="6" step="1" value="3"></div>
+        <div class="g-readout" id="ma-overhead-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="verdict">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The evidence board</h2></div>
+    <p class="g-eyebrow">Each claim, and the condition it holds under</p>
+    <p>Both claims are conditional, and the conditions are stated in the posts themselves. Anthropic's design is a research system: subtasks are searches and reads, and the merge is a synthesis step. Cognition's objection is about agents that edit shared files, drive a single conversation, or write code in one repository — where the implicit decisions <em>are</em> the work and must not diverge. Put the two boards side by side, then let the coupling slider and the read-heavy toggle cast the verdict.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ma-verdict-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The verdict is deliberately mechanical: independence and coupling decide it, not taste.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="ma-readheavy" class="g-primary">Read-heavy &amp; independent</button>
+        </div>
+        <div class="g-readout" id="ma-verdict-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="ma-evals-source"></p>
+    <div class="g-warn">⚠️ <span><b>The eval problem:</b> you cannot evaluate a system you cannot trace. An orchestrator-worker run that produced a wrong answer is a tree of contexts, each contributing a fragment; if you only kept the final message, you have no way to tell a bad retrieval from a bad synthesis from a bad assumption in subagent three. Budget for tracing before you budget for agents.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What did Anthropic report?</td><td>An orchestrator-worker research system beating a single agent on breadth-first tasks, at roughly an order of magnitude more tokens (2025-06-13).</td></tr>
+        <tr><td>What did Cognition argue?</td><td>Actions carry implicit decisions; subagents given only a task description make conflicting assumptions. Share full context, or stay single-threaded (2025-06).</td></tr>
+        <tr><td>When does multi-agent win?</td><td>When subtasks are read-heavy and independent: parallel search, fan-out over sources, merged once at the end.</td></tr>
+        <tr><td>When does it lose?</td><td>When subtasks share mutable state or must produce one coherent voice — the coupling is the work.</td></tr>
+        <tr><td>What is the crossover?</td><td>The coupling value at which coordination cost exceeds the parallelism win on quality. On this model it sits near 0.40.</td></tr>
+        <tr><td>Why is quality before latency?</td><td>Conflicting assumptions damage results long before the merge becomes the slow part; latency stays ahead across the whole range.</td></tr>
+        <tr><td>What scales the bill?</td><td>The number of agents: each carries its own system prompt, transcript and output, plus orchestrator dispatch and summarisation.</td></tr>
+        <tr><td>What must you build first?</td><td>Tracing. An untraceable multi-agent run cannot be evaluated, debugged or attributed.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/multi-agent-research-system">"How we built our multi-agent research system"</a>, 13 June 2025 — the orchestrator-worker research system, its breadth-first win, and its reported token multiplier.</li>
+      <li>Cognition, <a href="https://cognition.ai/blog/dont-build-multi-agents">"Don't Build Multi-Agents"</a>, June 2025 — the implicit-decision argument, "share full context, not just the task", and the case for a single thread.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">"Building effective agents"</a>, December 2024 — the workflow patterns, including orchestrator-worker, and when not to reach for any of them.</li>
+      <li>Cemri et al., <a href="https://arxiv.org/abs/2503.13657">"Why Do Multi-Agent LLM Systems Fail?"</a>, 2025 — a taxonomy of multi-agent failure modes, most of them coordination rather than capability.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — pass^k and the reliability gap that parallel agents widen.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — context isolation as an explicit operation, which is what a subagent boundary really is.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}One agent or many, the run still has to survive forty steps without drifting, looping or losing the thread. Next: what long-horizon work costs the harness.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    agents: {
+      source: "Anthropic, 'How we built our multi-agent research system' (2025-06-13) for the orchestrator-worker research result and its token multiplier; Cognition, 'Don't Build Multi-Agents' (2025-06) for the implicit-decision objection. Reliability compounding is arithmetic: 0.95^20 ≈ 0.36. Offline fallback constants.",
+      workflowPatterns: ["prompt chaining", "routing", "parallelisation", "orchestrator-worker", "evaluator-optimiser"],
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    evals: {
+      source: "SWE-bench Verified (OpenAI, 2024-08); τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench for tool-agent-user interaction; GAIA (Mialon et al., arXiv:2311.12983, 2023); OSWorld (Xie et al., arXiv:2404.07972, 2024). Public scores are contaminated by training-data leakage, scaffolding differences and harness version drift. Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    }
+  };
+
+  var A = { coupling: el('ma-coupling') };
+  var setupA = Guide.setupCanvas(el('ma-crossover-canvas'), 640, 340, drawA);
+  var B = { agents: el('ma-agents'), subtasks: el('ma-subtasks'), task: el('ma-task') };
+  var setupB = Guide.setupCanvas(el('ma-multiplier-canvas'), 640, 340, drawB);
+  var C = { workers: el('ma-workers') };
+  var setupC = Guide.setupCanvas(el('ma-overhead-canvas'), 640, 320, drawC);
+  var D = { readHeavy: true };
+  var setupD = Guide.setupCanvas(el('ma-verdict-canvas'), 640, 340, drawD);
+
+  // The modelled curves. The crossover is a property of these two lines, not of
+  // taste: single(c) = 0.62 + 0.28c and orch(c) = 0.90 - 0.42c cross at c = 0.40.
+  var CROSSOVER = 0.40;
+  function singleQ(x) { return 0.62 + 0.28 * x; }
+  function orchQ(x) { return 0.90 - 0.42 * x; }
+  function singleL(x) { return 30 + 18 * x; }
+  function orchL(x) { return 12 + 34 * x; }
+
+  function panel(ctx, x0, y0, w, h, series, xRange, yRange, opts) {
+    opts = opts || {};
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    function X(x) { return x0 + w * (x - xRange[0]) / (xRange[1] - xRange[0]); }
+    function Y(y) {
+      var v = Math.max(yRange[0], Math.min(yRange[1], y));
+      return y0 + h * (1 - (v - yRange[0]) / (yRange[1] - yRange[0]));
+    }
+    if (opts.grid) {
+      ctx.strokeStyle = 'rgba(120,120,120,0.18)'; ctx.setLineDash([3, 4]);
+      opts.grid.forEach(function (g) {
+        ctx.beginPath(); ctx.moveTo(x0, Y(g)); ctx.lineTo(x0 + w, Y(g)); ctx.stroke();
+      });
+      ctx.setLineDash([]);
+    }
+    series.forEach(function (s) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2.2;
+      if (s.dashed) ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      s.points.forEach(function (p, i) { if (i === 0) ctx.moveTo(X(p.x), Y(p.y)); else ctx.lineTo(X(p.x), Y(p.y)); });
+      ctx.stroke(); ctx.setLineDash([]);
+      if (s.dots) {
+        ctx.fillStyle = s.color; ctx.globalAlpha = 0.5;
+        s.dots.forEach(function (p) {
+          ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 1.6, 0, 2 * Math.PI); ctx.fill();
+        });
+        ctx.globalAlpha = 1;
+      }
+    });
+    if (opts.title) { ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left'; ctx.fillText(opts.title, x0, y0 - 10); }
+    if (opts.xLabel) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.fillText(opts.xLabel, x0 + w / 2, y0 + h + 24); }
+    if (opts.yLabel) {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.save();
+      ctx.translate(x0 - 32, y0 + h / 2); ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center'; ctx.fillText(opts.yLabel, 0, 0); ctx.restore();
+    }
+    return { X: X, Y: Y, x0: x0, y0: y0, w: w, h: h };
+  }
+
+  function wrapText(ctx, text, x, y, maxW, lineH, color) {
+    ctx.fillStyle = color || c.text;
+    var words = String(text).split(' '), line = '', ln = 0;
+    words.forEach(function (w) {
+      var t = line ? line + ' ' + w : w;
+      if (ctx.measureText(t).width > maxW && line) { ctx.fillText(line, x, y + ln * lineH); line = w; ln++; }
+      else { line = t; }
+    });
+    if (line) { ctx.fillText(line, x, y + ln * lineH); }
+    return ln + 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the crossover
+  // ------------------------------------------------------------------
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var x = parseInt(A.coupling.value, 10) / 100;
+    if (!isFinite(x)) x = 0;
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('quality and latency against shared-state coupling', 16, 20);
+
+    function curve(fn, jitterSeed) {
+      var pts = [], dots = [];
+      for (var i = 0; i <= 50; i++) {
+        var u = i / 50;
+        pts.push({ x: u, y: fn(u) });
+        var j = fn(u) + (AppSim.gaussian(AppSim.rng(jitterSeed + i * 13)) * 0.011);
+        dots.push({ x: u, y: Math.max(0, Math.min(1, j)) });
+      }
+      return { points: pts, dots: dots };
+    }
+    var qS = curve(singleQ, 210), qO = curve(orchQ, 977);
+
+    var left = panel(ctx, 56, 54, 258, 210,
+      [{ points: qS.points, dots: qS.dots, color: c.accent },
+       { points: qO.points, dots: qO.dots, color: c.accent2 }],
+      [0, 1], [0.3, 1.0],
+      { title: 'task quality', xLabel: 'coupling', yLabel: 'quality', grid: [0.4, 0.6, 0.8] });
+
+    var cxL = left.X(CROSSOVER);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([4, 3]); ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(cxL, left.y0); ctx.lineTo(cxL, left.y0 + left.h); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('crossover ' + CROSSOVER.toFixed(2), Math.min(cxL + 4, left.x0 + left.w - 74), left.y0 + 10);
+    ctx.fillStyle = c.accent; ctx.fillText('single thread', left.x0 + 6, left.y0 + left.h - 8);
+    ctx.fillStyle = c.accent2; ctx.fillText('orchestrator-worker', left.x0 + 6, left.y0 + 16);
+
+    var lS = curve(singleL, 331), lO = curve(orchL, 555);
+    var right = panel(ctx, 356, 54, 268, 210,
+      [{ points: lS.points, color: c.accent }, { points: lO.points, color: c.accent2 }],
+      [0, 1], [0, 56],
+      { title: 'wall-clock latency (s)', xLabel: 'coupling', yLabel: 'seconds', grid: [20, 40] });
+    ctx.fillStyle = c.accent; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('single thread', right.x0 + 6, right.y0 + right.h - 8);
+    ctx.fillStyle = c.accent2; ctx.fillText('orchestrator-worker', right.x0 + 6, right.y0 + 16);
+
+    [left, right].forEach(function (pnl) {
+      var mx = pnl.X(x);
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(mx, pnl.y0); ctx.lineTo(mx, pnl.y0 + pnl.h); ctx.stroke(); ctx.globalAlpha = 1;
+    });
+    var qSv = singleQ(x), qOv = orchQ(x), lSv = singleL(x), lOv = orchL(x);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('coupling ' + (x * 100).toFixed(0) + '%', 16, H - 8);
+
+    el('ma-crossover-readout').innerHTML =
+      '<div><span class="k">quality</span> single <span class="' + (qSv >= qOv ? 'hi' : '') + '">' + (qSv * 100).toFixed(0) + '%</span>' +
+      ' · fan-out <span class="' + (qOv > qSv ? 'hi' : 'bad') + '">' + (qOv * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">winner</span> ' + (qOv > qSv ? 'orchestrator-worker' : 'single thread') + '</div>' +
+      '<div><span class="k">latency</span> single ' + lSv.toFixed(1) + 's · fan-out ' + lOv.toFixed(1) + 's' +
+      ' &nbsp; <span class="k">winner</span> ' + (lOv < lSv ? 'orchestrator-worker' : 'single thread') + '</div>' +
+      '<div><span class="k">quality crossover</span> coupling ≈ ' + CROSSOVER.toFixed(2) +
+      ' — below it the fan-out wins, above it the single thread does</div>' +
+      '<div class="k">the latency curves do not cross in range: coupling damages coherence before it damages throughput, so "it is faster" is not evidence that it is right</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo B — the token multiplier
+  // ------------------------------------------------------------------
+  var SYS = 1200, OVERHEAD_PER_AGENT = 1400, SYNTHESIS = 2000;
+  var PRICES = { inputPerM: 3, outputPerM: 15, cachedPerM: 0.3 };
+  function explorationSum(subtasks, taskTokens) {
+    var outTok = Math.round(taskTokens * 0.25), sum = 0;
+    for (var i = 1; i <= subtasks; i++) sum += SYS + i * taskTokens + outTok;
+    return sum;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var agents = +B.agents.value, subtasks = +B.subtasks.value, taskTokens = +B.task.value;
+    if (!isFinite(agents)) agents = 1;
+    if (!isFinite(subtasks)) subtasks = 1;
+    if (!isFinite(taskTokens)) taskTokens = 500;
+    var outTok = Math.round(taskTokens * 0.25);
+    var single = explorationSum(subtasks, taskTokens);
+    var perAgent = [];
+    for (var a = 0; a < agents; a++) perAgent.push(explorationSum(subtasks, taskTokens));
+    var multi = perAgent.reduce(function (x, y) { return x + y; }, 0) + agents * OVERHEAD_PER_AGENT + SYNTHESIS;
+    var multiplier = multi / Math.max(1, single);
+    var outputTokens = agents * subtasks * outTok;
+
+    var palette = [c.accent400, c.accent, c.accent2];
+    var columns = perAgent.map(function (v, i) {
+      return {
+        label: 'a' + (i + 1),
+        segments: [
+          { value: SYS, color: palette[0] },
+          { value: v - SYS - subtasks * outTok, color: palette[1] },
+          { value: subtasks * outTok, color: palette[2] }
+        ]
+      };
+    });
+    var maxTotal = Math.max(Math.max.apply(null, perAgent), single) * 1.06;
+    var geo = Guide.drawStackedColumns(setupB.ctx, 640, 340, columns, {
+      maxTotal: maxTotal, padL: 56, padR: 14, padT: 54, padB: 40, gap: 8
+    });
+    var ctx = setupB.ctx;
+    var baseY = geo.py(single);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(geo.padL, baseY); ctx.lineTo(628, baseY); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('single thread, same ' + subtasks + ' explorations: ' + Guide.fmtNum(single) + ' tok', geo.padL + 2, baseY - 4);
+
+    var labels = ['system prompt', 'explorations', 'agent output'];
+    labels.forEach(function (t, i) {
+      var lx = 16 + i * 132;
+      ctx.fillStyle = palette[i]; ctx.fillRect(lx, 12, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(t, lx + 12, 21);
+    });
+    ctx.fillStyle = c.text;
+    ctx.fillText('orchestrator: ' + agents + ' agents × ' + subtasks + ' explorations, plus ' +
+      Guide.fmtNum(agents * OVERHEAD_PER_AGENT + SYNTHESIS) + ' tok of dispatch and synthesis', 16, 42);
+
+    var cost = AppSim.costModel({ inputTokens: multi - outputTokens, outputTokens: outputTokens, calls: 1, prices: PRICES });
+    var singleCost = AppSim.costModel({ inputTokens: single - subtasks * outTok, outputTokens: subtasks * outTok, calls: 1, prices: PRICES });
+    el('ma-multiplier-readout').innerHTML =
+      '<div><span class="k">fan-out total</span> <span class="hi">' + Guide.fmtNum(multi) + '</span> tok' +
+      ' &nbsp; <span class="k">single thread</span> ' + Guide.fmtNum(single) + ' tok</div>' +
+      '<div><span class="k">multiplier</span> <span class="hi">' + multiplier.toFixed(2) + '×</span>' +
+      ' &nbsp; <span class="k">per exploration</span> ' + Guide.fmtNum(taskTokens) + ' tok in, ' + Guide.fmtNum(outTok) + ' out</div>' +
+      '<div><span class="k">cost</span> fan-out $' + cost.total.toFixed(3) + ' · single $' + singleCost.total.toFixed(3) +
+      ' <span class="k">(illustrative $3/$15 per 1M)</span></div>' +
+      '<div class="k">the multiplier scales with the number of agents; the breadth the fan-out buys is what scales with the task</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo C — coordination overhead
+  // ------------------------------------------------------------------
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var coupling = parseInt(A.coupling.value, 10) / 100;
+    if (!isFinite(coupling)) coupling = 0;
+    var workers = +C.workers.value;
+    if (!isFinite(workers)) workers = 1;
+    var intensity = Math.min(1, coupling * (0.5 + 0.5 * workers / 6));
+    var redP = 0.10 + 0.45 * intensity, conP = 0.05 + 0.40 * intensity;
+    var N = 12;
+
+    var singleSteps = [];
+    for (var i = 0; i < N; i++) {
+      singleSteps.push({ id: 's' + i, label: 's' + i, state: i === N - 1 ? 'active' : 'done' });
+    }
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the same ' + N + ' steps, two architectures · coupling ' + (coupling * 100).toFixed(0) + '% · ' + workers + ' workers', 16, 20);
+    var geo = Guide.drawTraceTrack(ctx, W, H, singleSteps, { padT: 52, padB: 190, nodeR: 8, labelEvery: 1 });
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('single thread — one context, consistent assumptions throughout', 16, geo.y - 30);
+
+    var y2 = geo.y + 116;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(geo.x(0), y2); ctx.lineTo(geo.x(N - 1), y2); ctx.stroke();
+    var redundant = 0, conflict = 0;
+    var states = [];
+    for (var k = 0; k < N; k++) {
+      var roll = AppSim.rng(6100 + k * 71 + workers * 13 + Math.round(coupling * 100) * 3)();
+      var st = 'ok';
+      if (roll < redP) { st = 'redundant'; redundant++; }
+      else if (roll < redP + conP) { st = 'conflict'; conflict++; }
+      states.push(st);
+    }
+    states.forEach(function (st, i) {
+      var x = geo.x(i);
+      var col = st === 'conflict' ? c.accent2 : (st === 'redundant' ? '#c9a227' : c.accent700);
+      if (st === 'conflict') {
+        ctx.strokeStyle = col; ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.moveTo(x - 6, y2 - 6); ctx.lineTo(x + 6, y2 + 6);
+        ctx.moveTo(x + 6, y2 - 6); ctx.lineTo(x - 6, y2 + 6);
+        ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y2, 8, 0, 2 * Math.PI); ctx.stroke();
+      } else if (st === 'redundant') {
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(x - 4, y2, 7, 0, 2 * Math.PI); ctx.fill();
+        ctx.beginPath(); ctx.arc(x + 4, y2, 7, 0, 2 * Math.PI); ctx.fill();
+      } else {
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(x, y2, 8, 0, 2 * Math.PI); ctx.fill();
+      }
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(st === 'conflict' ? '✕' : (st === 'redundant' ? '2' : ''), x, y2 + 24);
+    });
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('orchestrator + ' + workers + ' workers — each solves its own version of the step', 16, y2 - 30);
+
+    var legendY = H - 26;
+    ctx.fillStyle = c.accent700; ctx.beginPath(); ctx.arc(20, legendY, 6, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.text; ctx.fillText('clean', 32, legendY + 4);
+    ctx.fillStyle = '#c9a227'; ctx.beginPath(); ctx.arc(96, legendY - 3, 6, 0, 2 * Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(104, legendY + 3, 6, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.text; ctx.fillText('redundant', 116, legendY + 4);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.2;
+    ctx.beginPath(); ctx.moveTo(198, legendY - 5); ctx.lineTo(210, legendY + 5); ctx.moveTo(210, legendY - 5); ctx.lineTo(198, legendY + 5); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.fillText('conflicting', 218, legendY + 4);
+
+    el('ma-overhead-readout').innerHTML =
+      '<div><span class="k">intensity</span> ' + (intensity * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">redundant steps</span> <span class="' + (redundant ? 'bad' : 'hi') + '">' + redundant + '</span>' +
+      ' &nbsp; <span class="k">conflicting steps</span> <span class="' + (conflict ? 'bad' : 'hi') + '">' + conflict + '</span></div>' +
+      '<div><span class="k">per-step redundancy risk</span> ' + (redP * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">conflict risk</span> ' + (conP * 100).toFixed(0) + '%</div>' +
+      '<div class="k">' + (conflict
+        ? 'conflicts are merge-time incoherence: two workers each did the step correctly under different assumptions'
+        : 'at this coupling the fan-out is still behaving — every worker can be right without agreeing') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo D — the evidence board
+  // ------------------------------------------------------------------
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var coupling = parseInt(A.coupling.value, 10) / 100;
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the evidence board — each claim and the condition it holds under', 16, 20);
+
+    ctx.fillStyle = 'rgba(120,120,120,0.05)';
+    ctx.fillRect(16, 32, 296, 176);
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 1.4; ctx.strokeRect(16, 32, 296, 176);
+    ctx.fillStyle = c.accent700; ctx.font = '600 11px ' + c.font;
+    ctx.fillText('Anthropic — orchestrator-worker', 28, 52);
+    ctx.font = '10px ' + c.font;
+    wrapText(ctx, 'A lead agent plans, spawns parallel subagents and synthesises their results. On breadth-first research it beat a single agent, at roughly an order of magnitude more tokens (2025-06-13).', 28, 70, 272, 13, c.text);
+    ctx.fillStyle = c.accent700; ctx.font = '600 10px ' + c.font;
+    ctx.fillText('holds when:', 28, 142);
+    ctx.font = '10px ' + c.font;
+    wrapText(ctx, 'subtasks are read-only and independent; the merge is a synthesis; breadth is the bottleneck.', 28, 156, 272, 13, c.text);
+
+    ctx.fillStyle = 'rgba(120,120,120,0.05)';
+    ctx.fillRect(328, 32, 296, 176);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.4; ctx.strokeRect(328, 32, 296, 176);
+    ctx.fillStyle = c.accent2; ctx.font = '600 11px ' + c.font;
+    ctx.fillText('Cognition — don\'t build multi-agents', 340, 52);
+    ctx.font = '10px ' + c.font;
+    wrapText(ctx, 'Actions carry implicit decisions. Subagents given only a task description assume different conventions, and the conflicts surface at merge time (June 2025).', 340, 70, 272, 13, c.text);
+    ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+    ctx.fillText('holds when:', 340, 142);
+    ctx.font = '10px ' + c.font;
+    wrapText(ctx, 'subtasks share mutable state or must produce one coherent voice; continuity is the bottleneck.', 340, 156, 272, 13, c.text);
+
+    var verdict, why, vcol;
+    if (!D.readHeavy) {
+      verdict = 'single thread (or a deliberate serial hand-off)';
+      why = 'the subtasks share mutable state, so the implicit decisions are the work and cannot diverge.';
+      vcol = c.accent;
+    } else if (coupling < CROSSOVER) {
+      verdict = 'orchestrator-worker';
+      why = 'read-heavy, independent subtasks with coupling ' + coupling.toFixed(2) + ' below the ' + CROSSOVER.toFixed(2) + ' crossover — parallelism is nearly free.';
+      vcol = c.accent2;
+    } else {
+      verdict = 'single thread';
+      why = 'even with independent reads, coupling ' + coupling.toFixed(2) + ' is at or above the ' + CROSSOVER.toFixed(2) + ' crossover: coordination now costs more than the fan-out buys.';
+      vcol = c.accent;
+    }
+    ctx.fillStyle = 'rgba(120,120,120,0.05)';
+    ctx.fillRect(16, 220, 608, 96);
+    ctx.strokeStyle = vcol; ctx.lineWidth = 2; ctx.strokeRect(16, 220, 608, 96);
+    ctx.fillStyle = vcol; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('verdict: ' + verdict, 28, 244);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    wrapText(ctx, why, 28, 262, 584, 13, c.text);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('inputs — shared-state coupling ' + (coupling * 100).toFixed(0) + '%  ·  read-heavy: ' + (D.readHeavy ? 'yes' : 'no') + '  ·  crossover ' + CROSSOVER.toFixed(2), 28, 304);
+
+    el('ma-verdict-readout').innerHTML =
+      '<div><span class="k">verdict</span> <span class="hi">' + verdict + '</span></div>' +
+      '<div class="k">' + why + '</div>' +
+      '<div class="k">' + (D.readHeavy
+        ? (coupling < CROSSOVER
+          ? 'note the direction: raising coupling flips this verdict without changing the task type'
+          : 'note the direction: lowering coupling below ' + CROSSOVER.toFixed(2) + ' flips this verdict back')
+        : 'toggle read-heavy back on and the coupling slider becomes the only input that matters') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // wiring
+  // ------------------------------------------------------------------
+  Guide.bindSliders([A.coupling], function () { drawA(); drawC(); drawD(); });
+  Guide.bindSliders([B.agents, B.subtasks, B.task], drawB);
+  Guide.bindSliders([C.workers], drawC);
+  el('ma-readheavy').addEventListener('click', function () {
+    D.readHeavy = !D.readHeavy;
+    this.className = D.readHeavy ? 'g-primary' : '';
+    this.innerHTML = D.readHeavy ? 'Read-heavy &amp; independent' : 'Shared mutable state';
+    drawD();
+  });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    el('ma-agents-source').textContent = (data && data.agents && data.agents.source) || FALLBACK.agents.source;
+    el('ma-cost-source').textContent = (data && data.cost_latency && data.cost_latency.source) || FALLBACK.cost_latency.source;
+    el('ma-evals-source').textContent = (data && data.evals && data.evals.source) || FALLBACK.evals.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'multi-agent-anthropic',
+      kind: 'choice',
+      prompt: 'What did Anthropic report about its orchestrator-worker research system?',
+      options: [
+        { label: 'It beat a single agent on breadth-first research tasks, at roughly an order of magnitude more tokens.', correct: true },
+        { label: 'It beat a single agent on coding tasks and was cheaper per task.', correct: false },
+        { label: 'It matched a single agent at the same token cost.', correct: false },
+        { label: 'It lost on research but won on latency because subagents run in parallel.', correct: false }
+      ],
+      explanation: 'The 2025-06-13 post reports a win on breadth-first research and states the cost plainly: multi-agent systems used far more tokens than a chat interaction. The win and the bill are both part of the result.'
+    },
+    {
+      id: 'multi-agent-cognition',
+      kind: 'choice',
+      prompt: 'What is the core of Cognition\'s objection to multi-agent systems?',
+      options: [
+        { label: 'Actions carry implicit decisions, so subagents given only a task description make assumptions that conflict at merge time.', correct: true },
+        { label: 'Subagents cannot call tools reliably.', correct: false },
+        { label: 'Parallelism is always slower than a single thread.', correct: false },
+        { label: 'Subagents cannot share a model or a provider.', correct: false }
+      ],
+      explanation: 'The argument is about coherence, not speed. Their principle — share full context, not just the task — follows directly: if the assumptions are the work, they must not be made twice in parallel.'
+    },
+    {
+      id: 'multi-agent-crossover',
+      kind: 'numeric',
+      prompt: 'In the crossover panel, single-thread quality is 0.62 + 0.28c and orchestrator-worker quality is 0.90 − 0.42c. At what coupling value c do the two curves cross?',
+      answer: 0.40,
+      unit: "coupling (0–1)",
+      tolerance: 0.02,
+      explanation: 'Setting them equal: 0.62 + 0.28c = 0.90 − 0.42c gives 0.70c = 0.28, so c = 0.40. Below it the fan-out wins on quality; above it the single thread does. The latency curves do not cross in range at all.'
+    },
+    {
+      id: 'multi-agent-multiplier',
+      kind: 'numeric',
+      prompt: 'In the token-multiplier panel at its default settings (4 agents, 4 explorations each, 2,000 tokens per exploration), what is the multiplier — fan-out tokens divided by the single thread\'s tokens for the same explorations?',
+      answer: 4.28,
+      relativeTolerance: 0.05,
+      explanation: 'Each agent repeats the system prompt and grows its own transcript, so the multiplier tracks the agent count: with four agents and the orchestrator overhead, the fan-out sends about 4.3× the single thread\'s tokens. Multiply the agents and the multiplier moves one-for-one.'
+    },
+    {
+      id: 'multi-agent-reconciliation',
+      kind: 'choice',
+      prompt: 'Which condition favours orchestrator-worker over a single thread?',
+      options: [
+        { label: 'Read-heavy, independent subtasks that are merged once at the end.', correct: true },
+        { label: 'Subtasks that edit the same file or evolve a shared object.', correct: false },
+        { label: 'Subtasks that must produce one coherent voice.', correct: false },
+        { label: 'Subtasks whose later steps depend on the implicit choices of earlier steps.', correct: false }
+      ],
+      explanation: 'Independence is the resource. When subtasks only read and their results are combined once, parallel workers cannot disagree; when they share mutable state or a single voice, the disagreements are the failure mode.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

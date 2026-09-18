@@ -1,0 +1,555 @@
+---
+title: "Agents in Action, Interactively — Part 13: When not to fine-tune"
+description: "The decision tree from prompt to RAG to eval to tune to RL; knowledge versus behaviour; the upgrade treadmill; your asset is the dataset, not the weights."
+permalink: "/ai/agents-in-action/when-not-to-tune/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>When not to fine-tune</h1>
+    <p>Fine-tuning has become the most over-prescribed move in applied LLM work: it is reachable in an afternoon, it feels like real engineering, and it is usually the wrong first response to a failure. The disciplined order is prompt, then retrieval, then an eval you can trust, then — only if the failure is a behaviour the model cannot be instructed into — tuning, and finally reinforcement learning when the outcome is programmatically verifiable. This part is the decision tree that keeps you off the treadmill, and the reason the durable asset you are building is a labelled dataset, not a set of weights.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="decision-tree">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The decision tree</h2></div>
+    <p class="g-eyebrow">Prompt → RAG → eval → tune → RL, in that order</p>
+    <p>Every fine-tuning project should survive four questions before it starts. <strong>Can you measure the failure?</strong> If not, you have nothing to tune toward and nothing to prove you improved — build the eval first. <strong>Is it a knowledge gap?</strong> A model that does not know your private facts, your current prices, or your internal vocabulary is not misbehaving; it is uninformed, and the cheap fix is retrieval, not weights. <strong>Is it a behaviour, format or style problem?</strong> A model that knows the right answer but returns the wrong JSON shape, ignores a house style, or reasons in the wrong register is a genuine tuning candidate, because prompting is a soft lever and behaviour is what tuning hardens. <strong>Do you have labelled data?</strong> Without examples of the target output there is nothing to train on, and the work that produces them is the work that matters.</p>
+    <p>Toggle the gates below. The recommendation and its reasoning change with each state; the point is that fine-tuning only appears at the end of a chain, never at the start.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wnt-tree-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Four gates on the left, one recommendation on the right. An unmet gate routes you away from tuning.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="wnt-t-measure" class="g-primary">Can measure it</button>
+          <button id="wnt-t-knowledge">Knowledge gap</button>
+          <button id="wnt-t-behaviour" class="g-primary">Behaviour problem</button>
+          <button id="wnt-t-data" class="g-primary">Have labelled data</button>
+        </div>
+        <div class="g-readout" id="wnt-tree-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> fine-tuning changes <b>how</b> the model responds, not <b>what</b> it knows. If your failure is a missing fact, no amount of training fixes it; if it is a missing format, only training makes it stick.</span></div>
+  </section>
+
+  <section class="g-step" id="knowledge-vs-behaviour">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Knowledge versus behaviour</h2></div>
+    <p class="g-eyebrow">Two axes: what it knows, and how it acts</p>
+    <p>The single most useful cut in this decision is between a <strong>knowledge</strong> deficiency and a <strong>behaviour</strong> deficiency. Knowledge is anything the model must be told: facts, documents, policy, current state. It changes constantly, it lives in your systems, and retrieval brings it in at request time with a citation. Behaviour is anything the model must <em>be</em>: a response schema, a tone, a refusal pattern, a tool-call policy, a decomposition habit. It is stable, it is expensive to express in a prompt, and it is exactly what examples teach.</p>
+    <p>The second axis is whether you can measure the failure at all. A knowledge gap you cannot evaluate is indistinguishable from a behaviour gap you cannot evaluate, and tuning against an unmeasured target is how teams ship regressions they cannot see. The quadrant below places six common failures; pick one to see the recommended fix and why.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wnt-quad-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Horizontal: knowledge deficit (left) to behaviour deficit (right). Vertical: measurable (top) to unmeasurable (bottom).</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Example failure <span class="val">1</span></label><input type="range" id="wnt-quad-pick" min="0" max="5" step="1" value="0"></div>
+        <div class="g-readout" id="wnt-quad-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> "the model got it wrong" is not a diagnosis. Until you can say whether the missing ingredient was a fact or an action, you are choosing a fix by mood.</span></div>
+  </section>
+
+  <section class="g-step" id="treadmill">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The upgrade treadmill</h2></div>
+    <p class="g-eyebrow">Every new base model invalidates the last fine-tune</p>
+    <p>A fine-tune is bound to the base checkpoint it was trained against. When the provider ships a better base model, your adapter does not come along: it must be retrained on the new base, and any quality you had is provisional until it is. That is the treadmill. Teams that treat the weights as the asset relabel, retrain and re-verify on every upgrade, and each cycle's work is discarded by the next. Teams that treat the <strong>labelled dataset and the eval</strong> as the asset keep the same examples and the same measurement, point them at the new base, and inherit the improvement instead of paying for it again.</p>
+    <p>The chart runs three base-model generations for the two strategies. The dataset strategy's quality compounds because its data and its eval improve with use; the weights-only strategy re-earns the same gain each time.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wnt-tread-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded quality curves across three generations. Solid = refit each time; dashed = keep the dataset and re-evaluate.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Base-model gain per upgrade <span class="val">8</span></label><input type="range" id="wnt-gain" min="2" max="15" step="1" value="8"></div>
+        <div class="g-field"><label>GPU-hours per refit <span class="val">18</span></label><input type="range" id="wnt-retrain" min="4" max="40" step="1" value="18"></div>
+        <div class="g-readout" id="wnt-tread-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="wnt-tuning-source"></p>
+  </section>
+
+  <section class="g-step" id="what-you-own">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What you actually own</h2></div>
+    <p class="g-eyebrow">The dataset appreciates; the weights depreciate</p>
+    <p>Run the accounting honestly and the two assets move in opposite directions. The fine-tuned weights are a snapshot of one base model at one moment: their value decays to nothing the day the base is retired, and it decays faster the faster the frontier moves. The labelled dataset and the eval harness do not decay. They become more valuable with every failure they encode, they transfer to whichever base model wins next, and they are the one artifact in the whole pipeline that a competitor cannot copy from your API. This is why "we fine-tuned a model" is a weaker claim than "we have ten thousand labelled cases and a harness that runs them in minutes."</p>
+    <p>Move the churn slider to see how fast the weights decay relative to the dataset's compounding value across three upgrades.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wnt-own-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Relative value after each base-model generation. Weights start high and fall; dataset + eval start lower and climb.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Model churn (value lost per upgrade) <span class="val">45</span></label><input type="range" id="wnt-decay" min="10" max="80" step="5" value="45"></div>
+        <div class="g-readout" id="wnt-own-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="wnt-evals-source"></p>
+    <p class="g-source" id="wnt-rag-source"></p>
+  </section>
+
+  <section class="g-step" id="when-rl">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>When reinforcement learning genuinely applies</h2></div>
+    <p class="g-eyebrow">Verifiable rewards, reasoning policies, and a real bill</p>
+    <p>Above supervised tuning sits <strong>reinforcement learning from verifiable rewards</strong> (RLVR). It is not a general-purpose upgrade over fine-tuning; it applies when the outcome is <em>programmatically checkable</em> — a unit test passes, a tool call is valid, a proof checks, a game is won — and the task rewards a long <em>policy</em> of intermediate steps rather than a single output. That is why it dominates reasoning and tool-use work: a verifier can grade a thousand sampled trajectories without a human, and the policy learns a strategy rather than a style. Group-relative methods such as GRPO make this practical by comparing samples within a group instead of training a separate value model.</p>
+    <p>The bill is real: high sample counts, expensive rollouts, reward-model or verifier infrastructure, and the characteristic failure mode of <strong>reward hacking</strong> — the policy learns to satisfy the checker rather than the task. It is also the method most likely to be applied too early, to a problem whose real defect is a missing fact that RAG would have supplied for free.</p>
+    <div class="g-goal">💡 <span><b>Order of operations:</b> prompt → retrieval → eval → supervised tune → RL. Skip a rung only when you can name, in writing, why it cannot help — and remember that the rung you skip is usually the one that would have told you whether the next one worked.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>Where does fine-tuning sit in the order?</td><td>Last, after prompt, retrieval and an eval you trust — and before RL, which is more expensive still.</td></tr>
+        <tr><td>The model lacks a fact I need. Tune it?</td><td>No. Retrieve the fact at request time; facts change and weights cannot.</td></tr>
+        <tr><td>The model ignores my output format. Tune it?</td><td>Yes — behaviour, format and style are exactly what examples harden.</td></tr>
+        <tr><td>I cannot measure the failure. What first?</td><td>Build the eval. Tuning without measurement ships regressions you cannot see.</td></tr>
+        <tr><td>What happens on the next base-model upgrade?</td><td>The fine-tune is invalidated and must be redone; the dataset and eval carry forward unchanged.</td></tr>
+        <tr><td>Which asset compounds over time?</td><td>The labelled dataset and the eval harness. The weights depreciate to zero when the base is retired.</td></tr>
+        <tr><td>When is RLVR the right tool?</td><td>When rewards are verifiable and the target is a reasoning or tool-use policy — never as a first response to a knowledge gap.</td></tr>
+        <tr><td>What is RLVR's signature failure?</td><td>Reward hacking: the policy exploits the verifier instead of solving the task. Hold out verifiers and read the traces.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685">"LoRA: Low-Rank Adaptation of Large Language Models"</a>, ICLR 2022 — why adapters are cheap and how a frozen base plus a low-rank update changes behaviour.</li>
+      <li>Dettmers et al., <a href="https://arxiv.org/abs/2305.14314">"QLoRA: Efficient Finetuning of Quantized LLMs"</a>, NeurIPS 2023 — the single-GPU path this part's dataset argument still applies to.</li>
+      <li>Shao et al., <a href="https://arxiv.org/abs/2402.03300">"DeepSeekMath"</a>, 2024 — introduced GRPO, the group-relative method behind much of the RLVR wave.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2501.12948">"DeepSeek-R1"</a>, 2025 — verification-driven reinforcement learning of reasoning at scale, and its cost.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench"</a>, 2024 — tool-agent-user tasks with a verifiable end state, the kind of target RLVR can grade.</li>
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench"</a>, ICLR 2024 — repository issue resolution graded by a test suite: a verifiable reward, and a contaminated public signal.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Once the tree says tune, the work becomes data. Next: curation, synthetic data and its diversity collapse, rejection sampling, LoRA arithmetic, preference methods and the reward-hacking curve.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    tuning: {
+      source: "LoRA (Hu et al., arXiv:2106.09685, ICLR 2022); QLoRA (Dettmers et al., arXiv:2305.14314, NeurIPS 2023); DPO (Rafailov et al., arXiv:2305.18290, NeurIPS 2023); KTO (Ethayarajh et al., arXiv:2402.01306, 2024); ORPO (Hong, Lee & Thorne, arXiv:2403.07691, 2024); GRPO introduced in DeepSeekMath (Shao et al., arXiv:2402.03300, 2024) and used at scale for DeepSeek-R1 (arXiv:2501.12948, 2025). RLVR trains on programmatically checkable outcomes. The value of fine-tuning is the labelled dataset you curated, which survives every base-model upgrade; the weights do not.",
+      rewardHacking: "A verifier that checks the final answer but not the reasoning invites shortcut policies: exploit the checker, not solve the task. Hold out verifiers and inspect traces."
+    },
+    evals: {
+      source: "SWE-bench (arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); tau-bench (arXiv:2406.12045, 2024); GAIA (arXiv:2311.12983, 2023); OSWorld (arXiv:2404.07972, 2024). Public scores are contaminated by leakage, scaffolding and harness drift; a public number is a weak predictor of your task.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts."
+    },
+    rag: {
+      source: "RAGAS metrics (Es et al., arXiv:2309.15217, EACL 2024): faithfulness, answer relevance, context precision, context recall. Self-RAG (arXiv:2310.11511, ICLR 2024) and CRAG (arXiv:2401.15884, 2024) add self-critique; HyDE (arXiv:2212.10496, 2022) generates a hypothetical answer to embed as the query.",
+      metrics: ["faithfulness", "answer relevance", "context precision", "context recall"]
+    }
+  };
+
+  // small text wrapper for canvas prose
+  function wrapText(ctx, text, x, y, maxW, lh) {
+    var words = String(text).split(' ');
+    var line = '', yy = y;
+    for (var i = 0; i < words.length; i++) {
+      var test = line ? line + ' ' + words[i] : words[i];
+      if (ctx.measureText(test).width > maxW && line) {
+        ctx.fillText(line, x, yy); line = words[i]; yy += lh;
+      } else { line = test; }
+    }
+    if (line) ctx.fillText(line, x, yy);
+    return yy;
+  }
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the decision-tree walker
+  // ------------------------------------------------------------------
+  var A = { measure: true, knowledge: false, behaviour: true, data: true };
+  var A_GATES = [
+    { key: 'measure', label: 'Can you measure it?', hint: 'a labelled set + a deterministic check' },
+    { key: 'knowledge', label: 'Is it a knowledge gap?', hint: 'facts, documents, current state' },
+    { key: 'behaviour', label: 'Is it a behaviour/format problem?', hint: 'schema, tone, policy, decomposition' },
+    { key: 'data', label: 'Do you have labelled data?', hint: 'examples of the target output' }
+  ];
+  var setupA = Guide.setupCanvas(el('wnt-tree-canvas'), 640, 340, drawA);
+
+  function decide(A) {
+    var reasons = [];
+    if (!A.measure) {
+      reasons.push('You cannot yet tell pass from fail, so any change is unverifiable.');
+      reasons.push('Build the eval harness on a labelled set first; it is also the dataset you will tune on later.');
+      return { rec: 'Eval first', tone: 'warn', reasons: reasons };
+    }
+    reasons.push('The failure is measurable, so an improvement can be proven.');
+    if (A.knowledge && A.behaviour) {
+      reasons.push('The model lacks facts AND the wrong behaviour: split the failure.');
+      reasons.push('Retrieve the facts (RAG) for the knowledge half, then tune the behaviour half once the facts are present.');
+      return { rec: 'RAG for knowledge, then tune behaviour', tone: 'ok', reasons: reasons };
+    }
+    if (A.knowledge) {
+      reasons.push('The model is uninformed, not misbehaving. Facts change and weights cannot.');
+      reasons.push('Retrieve at request time and cite. Tuning would freeze a snapshot that rots.');
+      return { rec: 'Retrieval (RAG), not tuning', tone: 'ok', reasons: reasons };
+    }
+    if (A.behaviour) {
+      reasons.push('The model knows enough but acts wrong: schema, style or policy.');
+      if (!A.data) {
+        reasons.push('You have no examples of the target output, so there is nothing to train on.');
+        reasons.push('Collect and label the cases first — that dataset is the durable asset, not the weights.');
+        return { rec: 'Collect labelled data, then tune', tone: 'warn', reasons: reasons };
+      }
+      reasons.push('You have examples, so a supervised adapter (LoRA/QLoRA) is the direct fix.');
+      reasons.push('If the outcome is programmatically verifiable and the target is a reasoning/tool policy, escalate to RLVR — otherwise preference tuning is enough.');
+      return { rec: 'Fine-tune (LoRA) + preference tuning', tone: 'ok', reasons: reasons };
+    }
+    reasons.push('No knowledge gap and no behaviour gap: the model can already do this.');
+    reasons.push('Reach for prompt and context engineering before anything that produces weights.');
+    return { rec: 'Prompt engineering', tone: 'ok', reasons: reasons };
+  }
+
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('gate 1 → gate 4: every unmet gate routes you left of fine-tuning', 16, 20);
+
+    var x0 = 16, gw = 300, y0 = 40, rowH = 60;
+    A_GATES.forEach(function (g, i) {
+      var y = y0 + i * rowH;
+      var on = !!A[g.key];
+      ctx.fillStyle = on ? 'rgba(43,95,255,0.10)' : 'rgba(120,120,120,0.08)';
+      roundRect(ctx, x0, y, gw, rowH - 12, 6); ctx.fill();
+      ctx.strokeStyle = on ? c.accent : c.divider; ctx.lineWidth = on ? 1.6 : 1;
+      roundRect(ctx, x0, y, gw, rowH - 12, 6); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '600 11.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(g.label, x0 + 12, y + 20);
+      ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+      ctx.fillText(g.hint, x0 + 12, y + 36);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = on ? c.accent : c.divider; ctx.font = '700 11px ' + c.font;
+      ctx.fillText(on ? 'YES' : 'NO', x0 + gw - 12, y + 26);
+      if (i < A_GATES.length - 1) {
+        Guide.drawArrow(ctx, x0 + gw / 2, y + rowH - 12, x0 + gw / 2, y + rowH, { color: c.divider, width: 1.2, head: 5 });
+      }
+    });
+
+    var d = decide(A);
+    var px = 336, py = 40, pw = 288, ph = H - 64;
+    ctx.fillStyle = d.tone === 'warn' ? 'rgba(214,0,108,0.08)' : 'rgba(43,95,255,0.08)';
+    roundRect(ctx, px, py, pw, ph, 8); ctx.fill();
+    ctx.strokeStyle = d.tone === 'warn' ? c.accent2 : c.accent; ctx.lineWidth = 1.6;
+    roundRect(ctx, px, py, pw, ph, 8); ctx.stroke();
+    ctx.fillStyle = d.tone === 'warn' ? c.accent2 : c.accent700; ctx.font = '600 10px ' + c.font;
+    ctx.textAlign = 'left'; ctx.fillText('RECOMMENDATION', px + 14, py + 22);
+    ctx.fillStyle = c.text; ctx.font = '700 15px ' + c.font;
+    var endY = wrapText(ctx, d.rec, px + 14, py + 48, pw - 28, 19);
+    ctx.font = '10.5px ' + c.font;
+    var ty = endY + 22;
+    d.reasons.forEach(function (r) {
+      ctx.fillStyle = c.divider; ctx.beginPath(); ctx.arc(px + 18, ty - 3, 2.2, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = c.text;
+      ty = wrapText(ctx, r, px + 26, ty, pw - 42, 13) + 13;
+    });
+
+    var picked = [];
+    A_GATES.forEach(function (g) { if (A[g.key]) picked.push(g.label.replace(/\?.*/, '')); });
+    el('wnt-tree-readout').innerHTML =
+      '<div><span class="k">gates on</span> <span class="hi">' + picked.length + '/4</span> ' +
+      (picked.length ? '· ' + picked.join(' · ') : '· none') + '</div>' +
+      '<div><span class="k">recommendation</span> <span class="hi">' + d.rec + '</span></div>' +
+      '<div class="k">' + d.reasons[0] + '</div>';
+  }
+  ['measure', 'knowledge', 'behaviour', 'data'].forEach(function (k) {
+    el('wnt-t-' + k).addEventListener('click', function () {
+      A[k] = !A[k];
+      this.className = A[k] ? 'g-primary' : '';
+      drawA();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — knowledge vs behaviour quadrant
+  // ------------------------------------------------------------------
+  var EXAMPLES = [
+    { name: 'answers with facts not in the model', x: -0.62, y: 0.66, kind: 'knowledge',
+      fix: 'Retrieval (RAG). The model is uninformed, not misbehaving; retrieve and cite at request time.' },
+    { name: 'quotes a stale price from last quarter', x: -0.48, y: 0.80, kind: 'knowledge',
+      fix: 'Retrieval (RAG). Facts change; weights cannot. Put current state in the context.' },
+    { name: 'returns JSON with the wrong keys', x: 0.60, y: 0.74, kind: 'behaviour',
+      fix: 'Fine-tune, or constrain decoding. A schema is behaviour and examples teach it.' },
+    { name: 'too verbose; ignores house style', x: 0.55, y: 0.52, kind: 'behaviour',
+      fix: 'Fine-tune on style. Prompting is a soft lever; examples make a style stick.' },
+    { name: 'you cannot tell if the fix improved it', x: -0.30, y: -0.62, kind: 'unknown',
+      fix: 'Eval first. An unmeasurable failure is not a diagnosis; the harness is the prerequisite.' },
+    { name: 'agent loops and picks the wrong tool', x: 0.52, y: -0.52, kind: 'unknown',
+      fix: 'Eval first, then tune the tool policy — and consider RLVR if the outcome is verifiable.' }
+  ];
+  var B = { pick: el('wnt-quad-pick') };
+  var setupB = Guide.setupCanvas(el('wnt-quad-canvas'), 640, 340, drawB);
+
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 40, padR = 20, padT = 34, padB = 40;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    function X(v) { return padL + (v + 1) / 2 * plotW; }
+    function Y(v) { return padT + (1 - (v + 1) / 2) * plotH; }
+
+    ctx.fillStyle = 'rgba(43,95,255,0.06)';
+    ctx.fillRect(padL, padT, plotW / 2, plotH / 2);
+    ctx.fillStyle = 'rgba(214,0,108,0.06)';
+    ctx.fillRect(padL + plotW / 2, padT, plotW / 2, plotH / 2);
+    ctx.fillStyle = 'rgba(120,120,120,0.07)';
+    ctx.fillRect(padL, padT + plotH / 2, plotW, plotH / 2);
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL + plotW / 2, padT); ctx.lineTo(padL + plotW / 2, padT + plotH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padL, padT + plotH / 2); ctx.lineTo(padL + plotW, padT + plotH / 2); ctx.stroke();
+
+    ctx.fillStyle = c.accent700; ctx.font = '600 10px ' + c.font;
+    ctx.textAlign = 'left'; ctx.fillText('RAG', padL + 8, padT + 16);
+    ctx.textAlign = 'right'; ctx.fillText('TUNE', padL + plotW - 8, padT + 16);
+    ctx.fillStyle = c.accent2; ctx.textAlign = 'left';
+    ctx.fillText('EVAL FIRST (then RAG)', padL + 8, padT + plotH - 24);
+    ctx.textAlign = 'right';
+    ctx.fillText('EVAL FIRST (then tune the policy)', padL + plotW - 8, padT + plotH - 24);
+
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.fillText('knowledge  ←   deficit   →  behaviour', padL + plotW / 2, H - 6);
+    ctx.save(); ctx.translate(12, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('measurable →', 0, 0); ctx.restore();
+
+    var pick = Math.max(0, Math.min(EXAMPLES.length - 1, +B.pick.value));
+    EXAMPLES.forEach(function (e, i) {
+      var sel = i === pick;
+      ctx.beginPath(); ctx.arc(X(e.x), Y(e.y), sel ? 7 : 4.5, 0, 2 * Math.PI);
+      ctx.fillStyle = sel ? c.accent2 : (e.kind === 'behaviour' ? c.accent : (e.kind === 'knowledge' ? c.accent700 : c.divider));
+      ctx.fill();
+      if (sel) { ctx.strokeStyle = c.accent2; ctx.lineWidth = 2; ctx.stroke(); }
+    });
+    var e = EXAMPLES[pick];
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText((pick + 1) + '. ' + e.name, padL, 18);
+
+    el('wnt-quad-readout').innerHTML =
+      '<div><span class="k">failure</span> <span class="hi">' + e.name + '</span></div>' +
+      '<div><span class="k">deficit</span> ' + (e.kind === 'unknown' ? 'not yet measurable' : e.kind) + '</div>' +
+      '<div class="k">' + e.fix + '</div>';
+  }
+  Guide.bindSliders([B.pick], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — the upgrade treadmill
+  // ------------------------------------------------------------------
+  var C = { gain: el('wnt-gain'), retrain: el('wnt-retrain') };
+  var setupC = Guide.setupCanvas(el('wnt-tread-canvas'), 640, 340, drawC);
+  var CURATION_HOURS = 40;
+
+  function drawC() {
+    if (!setupC) return;
+    var gain = +C.gain.value / 100;
+    var refit = +C.retrain.value;
+    var N = 3, r = AppSim.rng(17);
+    var base = [], each = [], keep = [];
+    var cumEach = 0, cumKeep = 0, q0 = 0.55;
+    for (var g = 0; g < N; g++) {
+      var bq = q0 + g * gain + (r() - 0.5) * 0.012;
+      base.push({ x: g, y: bq });
+      var eachQ = bq + 0.05 + (r() - 0.5) * 0.02;
+      var keepQ = bq + 0.05 + 0.035 * g + (r() - 0.5) * 0.015;
+      each.push({ x: g, y: eachQ });
+      keep.push({ x: g, y: keepQ });
+      cumEach += refit + 6;
+      cumKeep += (g === 0 ? CURATION_HOURS : 0) + refit * 0.6 + 4;
+    }
+    var axes = Guide.drawLines(setupC.ctx, 640, 340, [
+      { points: base, color: c.divider, width: 1.6, dashed: true },
+      { points: each, color: c.accent, width: 2.4 },
+      { points: keep, color: c.accent2, width: 2.6 }
+    ], [0, N - 1], [0.45, 1.0], { xLabel: 'base-model generation', yLabel: 'task quality', padL: 62, padB: 30 });
+    var ctx = setupC.ctx;
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.divider; ctx.fillText('base model alone', axes.padL + 8, axes.padT + 12);
+    ctx.fillStyle = c.accent; ctx.fillText('refit every upgrade (weights are the asset)', axes.padL + 8, axes.padT + 26);
+    ctx.fillStyle = c.accent2; ctx.fillText('keep dataset + eval (they are the asset)', axes.padL + 8, axes.padT + 40);
+
+    var last = N - 1;
+    el('wnt-tread-readout').innerHTML =
+      '<div><span class="k">final quality</span> refit <span class="hi">' + (each[last].y).toFixed(2) + '</span> · dataset ' +
+      '<span class="hi">' + (keep[last].y).toFixed(2) + '</span></div>' +
+      '<div><span class="k">cumulative GPU-hours</span> refit ' + cumEach.toFixed(0) + ' · dataset ' + cumKeep.toFixed(0) +
+      ' (includes ' + CURATION_HOURS + ' once for curation)</div>' +
+      '<div><span class="k">quality gap</span> ' + ((keep[last].y - each[last].y).toFixed(3)) +
+      ' — earned by three evaluations, not three retrains</div>' +
+      '<div class="k">every base-model upgrade resets the refit path; the dataset path inherits the base improvement</div>';
+  }
+  Guide.bindSliders([C.gain, C.retrain], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — what you own
+  // ------------------------------------------------------------------
+  var D = { decay: el('wnt-decay') };
+  var setupD = Guide.setupCanvas(el('wnt-own-canvas'), 640, 320, drawD);
+
+  function drawD() {
+    if (!setupD) return;
+    var decay = +D.decay.value / 100;
+    var rows = [];
+    var weights = [], dataset = [];
+    for (var g = 0; g < 3; g++) {
+      var wv = 100 * Math.pow(1 - decay, g);
+      var dv = 34 + 34 * g;
+      weights.push(wv); dataset.push(dv);
+      rows.push({ label: 'weights · after v' + (g + 1), value: wv, color: c.accent400,
+        valueLabel: wv.toFixed(0) });
+      rows.push({ label: 'dataset + eval · after v' + (g + 1), value: dv, color: c.accent2,
+        valueLabel: dv.toFixed(0) });
+    }
+    Guide.drawBars(setupD.ctx, 640, 320, rows, { padL: 168, padR: 46, padT: 16, padB: 12, gap: 6, maxV: 160 });
+    var ctx = setupD.ctx;
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('relative value of each asset as the base model is retired and replaced', 16, 12);
+
+    el('wnt-own-readout').innerHTML =
+      '<div><span class="k">weights</span> 100 → <span class="hi">' + weights[2].toFixed(0) + '</span> across three upgrades</div>' +
+      '<div><span class="k">dataset + eval</span> 34 → <span class="hi">' + dataset[2].toFixed(0) + '</span>, and they transfer to whichever base wins next</div>' +
+      '<div class="k">at ' + (decay * 100).toFixed(0) + '% value lost per upgrade, the weights asset is nearly worthless by the third base model</div>';
+  }
+  Guide.bindSliders([D.decay], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var tuning = (data && data.tuning) || FALLBACK.tuning;
+    el('wnt-tuning-source').textContent = tuning.source || FALLBACK.tuning.source;
+    var evals = (data && data.evals) || FALLBACK.evals;
+    el('wnt-evals-source').textContent = evals.source || FALLBACK.evals.source;
+    var rag = (data && data.rag) || FALLBACK.rag;
+    el('wnt-rag-source').textContent = rag.source || FALLBACK.rag.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'when-not-to-tune-order',
+      kind: 'choice',
+      prompt: 'A new failure appears in your agent. Where does fine-tuning sit in the order of responses?',
+      options: [
+        { label: 'Last — after prompt engineering, retrieval and an eval you trust; RL sits beyond it.', correct: true },
+        { label: 'First — it is the most reliable fix available.', correct: false },
+        { label: 'Immediately after prompting, before retrieval.', correct: false },
+        { label: 'Only after reinforcement learning has failed.', correct: false }
+      ],
+      explanation: 'Fine-tuning changes behaviour, and it is expensive to repeat on every base-model upgrade. Exhaust prompt and retrieval first, make the failure measurable, and only then tune — with RL reserved for verifiable, policy-shaped problems.'
+    },
+    {
+      id: 'when-not-to-tune-knowledge',
+      kind: 'choice',
+      prompt: 'The model confidently gives an old price for a product whose price changed today. What is the right fix?',
+      options: [
+        { label: 'Retrieval — put the current price in the context at request time.', correct: true },
+        { label: 'Fine-tune on a dataset of current prices.', correct: false },
+        { label: 'Raise the temperature so it guesses differently.', correct: false },
+        { label: 'Add more few-shot examples of prices.', correct: false }
+      ],
+      explanation: 'This is a knowledge gap, and knowledge changes. Weights freeze a snapshot that rots; retrieval supplies the current fact with a citation and costs nothing to update.'
+    },
+    {
+      id: 'when-not-to-tune-behaviour',
+      kind: 'choice',
+      prompt: 'The model knows the answer but reliably returns the wrong JSON schema and ignores your house style. This is:',
+      options: [
+        { label: 'A behaviour problem — the case fine-tuning exists for.', correct: true },
+        { label: 'A knowledge problem that RAG will fix.', correct: false },
+        { label: 'Unfixable without a bigger context window.', correct: false },
+        { label: 'A sign the base model is too small.', correct: false }
+      ],
+      explanation: 'Schema, format and style are behaviour. Prompting is a soft lever; examples of the target output harden the behaviour, which is exactly what supervised tuning does.'
+    },
+    {
+      id: 'when-not-to-tune-selected',
+      kind: 'numeric',
+      prompt: 'A team expects its base model to be replaced roughly five more times. A fresh LoRA refit after each upgrade costs about 18 GPU-hours. How many GPU-hours go into refits that the next upgrade discards?',
+      answer: 90,
+      unit: 'GPU-hours',
+      tolerance: 0.5,
+      explanation: 'Five upgrades × 18 GPU-hours = 90 GPU-hours of treadmill work. The labelled dataset and eval you would build instead survive all five upgrades unchanged, which is why they, not the weights, are the asset.'
+    },
+    {
+      id: 'when-not-to-tune-rlvr',
+      kind: 'choice',
+      prompt: 'When does RLVR (reinforcement learning from verifiable rewards) genuinely apply?',
+      options: [
+        { label: 'When the outcome is programmatically checkable and the target is a reasoning or tool-use policy.', correct: true },
+        { label: 'Whenever supervised fine-tuning is too slow to run.', correct: false },
+        { label: 'For any task where you have more than a thousand examples.', correct: false },
+        { label: 'Only when the model is a frontier closed model.', correct: false }
+      ],
+      explanation: 'RLVR needs a verifier — a test passes, a tool call is valid — and it shines where a multi-step policy must be learned rather than a single output graded. It is expensive, and its signature failure is reward hacking: the policy exploits the checker instead of solving the task.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

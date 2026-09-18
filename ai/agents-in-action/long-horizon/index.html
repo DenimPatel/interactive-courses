@@ -1,0 +1,732 @@
+---
+title: "Agents in Action, Interactively — Part 7: Long-horizon agents and harness design"
+description: "Context folding, step budgets, loop detection, sandboxing, permission gates, computer use, and deep research as the composite case; the harness contributes as much variance as the model."
+permalink: "/ai/agents-in-action/long-horizon/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Long-horizon agents and harness design</h1>
+    <p>A one-shot prompt is a function call. A sixty-step agent run is a control system, and the thing doing the controlling is not the model. Once a task spans many steps and many tool calls, the context grows, small mistakes stop being independent, and the run can drift or fall into a loop without ever raising an error. This part is about the harness around the model — context folding, step budgets, loop detection, sandboxing, permission gates, checkpointing — and about the uncomfortable finding that the harness moves benchmark scores about as much as swapping the model does.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="what">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>What makes a task long-horizon</h2></div>
+    <p class="g-eyebrow">Many steps, many calls, a growing context, a real risk of drift</p>
+    <p>A task is long-horizon when it cannot be finished in one model call and the intermediate work has to be carried forward. Three properties define it. It takes <strong>many steps</strong>, so an error at step nine is inherited by every later step. It makes <strong>many tool calls</strong>, so the transcript accumulates raw results that are individually useful and collectively enormous. And its <strong>context grows</strong> monotonically, so the same prompt that was cheap at step one is expensive and diluted by step forty.</p>
+    <p>That last point is why long-horizon runs fail differently from short ones. A short task fails because the model answered badly. A long run fails because a fact was folded away, a plan silently changed, or the agent re-issued the same call for the tenth time — none of which is an exception you can catch. Reliability compounds arithmetically: at 95% per step, a twenty-step run finishes about 36% of the time (0.95<sup>20</sup> ≈ 0.36). Raising per-step reliability is the model's job; keeping the run from needing perfection is the harness's.</p>
+    <p>Below is a sixty-step research run, drawn one stacked column per step, with a step budget you can set and a loop detector you can switch on. From step 18 the scripted agent re-issues the same search; switch detection on and the harness halts the run instead of paying for the rest of the budget.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lh-run-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">One stacked column per step, by context segment. The grey block is budget the loop detector refused to spend.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Step budget <span class="val">48</span></label><input type="range" id="lh-budget" min="24" max="60" step="1" value="48"></div>
+        <div class="g-btnrow">
+          <button id="lh-mode-summarize" class="g-primary">Fold context</button>
+          <button id="lh-mode-none">No folding</button>
+        </div>
+        <div class="g-btnrow">
+          <button id="lh-detect" class="g-primary">Loop detection on</button>
+        </div>
+        <div class="g-readout" id="lh-run-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lh-agents-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> the unit of reliability is the <b>step</b>, not the answer. A harness earns its keep by making the run survivable — bounded context, bounded steps, bounded blast radius — so per-step reliability does not have to be near-perfect.</span></div>
+  </section>
+
+  <section class="g-step" id="harness">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The harness's jobs</h2></div>
+    <p class="g-eyebrow">Six responsibilities the model does not have</p>
+    <p>The harness is everything around the model call: the loop, the context policy, the tool layer, the sandbox, and the point at which a human is consulted. Six responsibilities are load-bearing once a run gets long.</p>
+    <ul>
+      <li><strong>Context folding (compaction).</strong> Keep the live window bounded as history grows. Folding is lossy and adversarial: an evicted fact is indistinguishable from one that never existed, so the agent silently redoes work.</li>
+      <li><strong>Step budgets.</strong> A hard cap on steps, tool calls, tokens and wall-clock. A budget does not make the agent smarter; it converts an unbounded failure into a bounded one you can retry, escalate or report.</li>
+      <li><strong>Loop and repetition detection.</strong> The single most common long-run failure is not a wrong action, it is the same action. Detect repeated tool calls, repeated state hashes or repeated low-information turns and break the cycle.</li>
+      <li><strong>Sandboxing.</strong> Give write and execution capability only inside a disposable domain — a container, a scratch branch, a filesystem jail — so a bad step is recoverable rather than permanent.</li>
+      <li><strong>Permission gates.</strong> Classify actions by risk and require approval for the irreversible ones. Read is free; spend and send are not.</li>
+      <li><strong>Checkpointing and resumption.</strong> Persist state at step boundaries so a crashed, halted or escalated run can resume instead of restarting — and so a halted run is still an inspectable artifact.</li>
+    </ul>
+    <div class="g-code"><span class="k">// the loop's contract, not the model's</span>
+run step:
+  <span class="s">assert</span> step &lt; budget && tokens &lt; ceiling && wall &lt; limit
+  <span class="s">if</span> loop_detector(history)        -&gt; halt(reason=<span class="s">"repeat"</span>), checkpoint()
+  <span class="s">if</span> context &gt; ceiling            -&gt; fold(oldest_turns)      <span class="k">// lossy: record what folded</span>
+  action = model(context)
+  <span class="s">if</span> risk(action) &gt; threshold     -&gt; approval_gate(action)    <span class="k">// blocks the run</span>
+  result = sandbox.run(action)
+  checkpoint(step, notes, action, result)</div>
+    <p>The detector is the one most often missing. The demo below is a stuck agent: thirty identical tool calls in a row. An n-gram detector over the recent action signatures — or a state hash that is unchanged for k turns — catches it after a handful of repeats. The readout is the point: the wasted steps and the dollars they would have cost.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lh-loop-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Thirty identical calls. The trace turns red where the detector fires; the bar underneath is the part of the run it saved.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Repeat threshold <span class="val">3</span></label><input type="range" id="lh-threshold" min="2" max="8" step="1" value="3"></div>
+        <div class="g-btnrow">
+          <button id="lh-loop-detect" class="g-primary">Detector on</button>
+        </div>
+        <div class="g-readout" id="lh-loop-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lh-cost-source"></p>
+  </section>
+
+  <section class="g-step" id="gates">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Permission gates and the human in the loop</h2></div>
+    <p class="g-eyebrow">Classify by risk, then decide who approves</p>
+    <p>A long-horizon agent with tools has four kinds of capability, and they do not deserve the same trust. A <strong>read</strong> touches nothing the world can see. A <strong>write</strong> changes state, but inside a sandbox it is reversible. A <strong>spend</strong> moves money or quota. A <strong>send</strong> leaves your boundary — an email, a webhook, a posted message — and cannot be recalled. The gate policy is a threshold over that ordering: auto-approve everything below it, require explicit human approval above it.</p>
+    <p>The trap is that the safe-looking policy is not the cheap one. Gating reads adds human reviews without adding safety, and each review has a real cost in attention and latency. The defensible design gates the irreversible actions, keeps the reversible ones in a sandbox, and accepts that the human-in-the-loop cost is the price of the actions that need it. Move the threshold and watch the mix.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lh-gate-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Each action is classified by risk, then routed: auto-approved, or blocked on a human. The bottom bar is the price of that decision per 1,000 actions.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Approve up to risk <span class="val">2</span></label><input type="range" id="lh-risk" min="1" max="4" step="1" value="2"></div>
+        <div class="g-btnrow">
+          <button id="lh-sandbox" class="g-primary">Writes in a sandbox</button>
+        </div>
+        <div class="g-readout" id="lh-gate-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lh-security-source"></p>
+    <div class="g-warn">⚠️ <span><b>The gate is not a defense against injection.</b> A gate decides whether a <em>capability</em> may fire; it does not decide whether the instruction that asked for it was authorised. An agent with a send tool and untrusted content in its context is one prompt away from using a legitimately granted capability for someone else's purpose.</span></div>
+  </section>
+
+  <section class="g-step" id="variance">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Computer use, deep research, and why the harness is half the variance</h2></div>
+    <p class="g-eyebrow">The composite cases, and the empirical claim</p>
+    <p><strong>Computer use</strong> is the purest long-horizon case: the tool is a screen. The loop is screenshot → decide → act, where the action is a click, a keystroke or a scroll, and the result is another screenshot. The token cost is dominated by images, the latency is dominated by round trips rather than by generation, and the error profile is nasty — a misclick is not a wrong answer, it is a wrong <em>world state</em>, and every later step reasons from it. OSWorld was built precisely to grade the end state rather than the transcript, and its scores move when the environment version changes, which is why an OSWorld number without a pinned environment is not a number.</p>
+    <p><strong>Deep research</strong> is the composite case that exercises every harness responsibility at once: search → read → synthesise → cite, over dozens of sources. It is <em>read-heavy</em>, so it tolerates parallel fan-out; it is context-hungry, so folding is mandatory; it is citation-dependent, so an evicted fact is not just a redo, it is an uncited claim. Anthropic's multi-agent research system is the reference design, and it reports the honest cost: breadth was bought with roughly an order of magnitude more tokens.</p>
+    <p>Both cases point at the same conclusion, which is the part's sharpest claim. On SWE-bench Verified the scaffold — the harness, the tooling, the retry policy — contributes at least as much variance as the model does; on τ²-bench the score moves with the user simulator and the harness around it. So a public benchmark number is a statement about a <em>model plus a harness</em>, and reporting the model alone is misleading. The demo below takes one model and runs it under two harnesses. The gap between them is 15 points, decomposed into the three harness decisions that caused it — and it is the same size as the gap you get by changing the model.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lh-variance-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: the same model under two harnesses, always 15 points apart. Right: where those 15 points come from.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Model strength <span class="val">50</span></label><input type="range" id="lh-strength" min="0" max="100" step="1" value="50"></div>
+        <div class="g-btnrow">
+          <button id="lh-decomp" class="g-primary">View: the decomposition</button>
+        </div>
+        <div class="g-readout" id="lh-variance-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="lh-evals-source"></p>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>When is a task long-horizon?</td><td>Many steps, many tool calls, a growing context, and a real risk of drift — not just a long prompt.</td></tr>
+        <tr><td>Why does reliability matter so much?</td><td>It compounds: 0.95 per step over twenty steps is about 36% end to end.</td></tr>
+        <tr><td>What does context folding buy?</td><td>A bounded window. It is lossy and adversarial: an evicted fact looks like one that never existed, so work is silently redone.</td></tr>
+        <tr><td>What is a step budget for?</td><td>Converting an unbounded failure into a bounded one you can retry, escalate or report.</td></tr>
+        <tr><td>What is the commonest long-run failure?</td><td>The same action, repeated. Detect repeated calls, n-grams or unchanged state hashes and halt the cycle.</td></tr>
+        <tr><td>What does sandboxing change?</td><td>It makes write and execute steps reversible, so a bad step is recoverable.</td></tr>
+        <tr><td>Which actions should a gate block?</td><td>The irreversible ones: spend and send. Reads are free; writes belong in a sandbox.</td></tr>
+        <tr><td>Does a gate stop injection?</td><td>No. It gates a capability; it does not verify that the instruction authorising it was legitimate.</td></tr>
+        <tr><td>What does computer use add?</td><td>A screenshot action space with a wrong-world-state failure mode, and image-dominated token cost.</td></tr>
+        <tr><td>Why is deep research the composite case?</td><td>Read-heavy fan-out, mandatory folding, and citations that fail when a fact is evicted.</td></tr>
+        <tr><td>Why is a benchmark score not the model's?</td><td>It is a model-plus-harness score; the scaffold contributes at least as much variance as the weights.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024 — the scaffold-dependence that makes a bare model score misleading.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — pass^k, and a benchmark whose score moves with the harness.</li>
+      <li>Xie et al., <a href="https://arxiv.org/abs/2404.07972">"OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks in Real Computer Environments"</a>, 2024 — computer use graded on the end state, with a pinned environment.</li>
+      <li>Mialon et al., <a href="https://arxiv.org/abs/2311.12983">"GAIA: a benchmark for General AI Assistants"</a>, 2023 — multi-step assistant work, and how answer-string grading hides partial trajectories.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/multi-agent-research-system">"How we built our multi-agent research system"</a>, 13 June 2025 — deep research as the reference composite case, and its token multiplier.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — write/select/compress/isolate, the taxonomy behind context folding.</li>
+      <li>Debenedetti et al., <a href="https://arxiv.org/abs/2503.18813">"Defeating Prompt Injections by Design"</a>, 2025 — capability-based information flow, and why a permission gate is not an injection defense.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The harness keeps a run alive. Whether it is <em>good</em> is a separate question, and answering it is the hard part of the whole volume. Next: look at your traces, code the failures, and build the taxonomy nothing else works without.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    agents: {
+      source: "Anthropic, 'Effective context engineering for AI agents' (2025-09-29) for the write/select/compress/isolate taxonomy and 'Building effective agents' (2024-12) for the workflow-versus-agent split; Anthropic, 'How we built our multi-agent research system' (2025-06-13); Cognition, 'Don't Build Multi-Agents' (2025-06). Reliability compounding is arithmetic: 0.95^20 ≈ 0.36. Harness design: context folding, step budgets, loop detection, sandboxing and permission gates are now as load-bearing as the model. Offline fallback constants.",
+      compactionTax: "Compaction is lossy and adversarial: an evicted fact is indistinguishable from a fact that never existed, so the agent silently redoes work.",
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    security: {
+      source: "Indirect prompt injection named and demonstrated by Greshake et al., arXiv:2302.12173 (2023). The 'lethal trifecta' framing is Simon Willison (2025-06). CaMeL, capability-based information-flow control for agents: Debenedetti et al., arXiv:2503.18813 (2025). OWASP Top 10 for LLM Applications lists prompt injection as LLM01. Offline fallback constants.",
+      trifecta: ["access to private data", "exposure to untrusted content", "an exfiltration channel"],
+      attackVariants: 8
+    },
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); τ-bench (arXiv:2406.12045, 2024) and τ²-bench (2025). Public scores are contaminated by scaffolding differences and harness version drift. Offline fallback constants.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    }
+  };
+
+  var SEG_NAMES = ['system', 'tools', 'task', 'history', 'summary', 'facts', 'notes', 'retrieved'];
+  var SEG_COLORS = [c.accent, c.accent2, c.accent400, c.accent700, '#c9a227', '#7a5c9e', '#5f8a3a', '#b0552d'];
+  var PRICES = { inputPerM: 3, outputPerM: 15, cachedPerM: 0.3 };
+
+  // ------------------------------------------------------------------
+  // Demo A — a sixty-step run, a step budget and a loop detector
+  // ------------------------------------------------------------------
+  var A = { budget: el('lh-budget'), detect: true, mode: 'summarize' };
+  var setupA = Guide.setupCanvas(el('lh-run-canvas'), 640, 380, drawA);
+  var MAXSTEPS = 60, CEIL = 12000, LOOP_START = 18, HALT_STEP = 20;
+
+  function runA() {
+    return AppSim.agentRun('research', { compaction: A.mode, maxTokens: CEIL, steps: MAXSTEPS, seed: 11 });
+  }
+  function sumTokens(run, n) {
+    var inp = 0;
+    for (var i = 0; i < n; i++) inp += run.steps[i].total;
+    return inp;
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    var budget = parseInt(A.budget.value, 10);
+    if (!isFinite(budget)) budget = 48;
+    var run = runA();
+    var executed = A.detect ? Math.min(HALT_STEP + 1, budget) : budget;
+
+    var columns = [];
+    for (var i = 0; i < budget; i++) {
+      if (i < executed) {
+        var st = run.steps[i];
+        columns.push({
+          label: String(i),
+          segments: st.segments.map(function (sg, j) { return { value: sg.tokens, color: SEG_COLORS[j % SEG_COLORS.length] }; })
+        });
+      } else {
+        columns.push({ label: String(i), segments: [] });
+      }
+    }
+    var maxTotal = Math.max(CEIL, run.maxTotal) * 1.06;
+    var geo = Guide.drawStackedColumns(ctx, W, H, columns, {
+      maxTotal: maxTotal, padL: 54, padR: 14, padT: 58, padB: 40, gap: 1, labelEvery: Math.ceil(budget / 8)
+    });
+
+    SEG_NAMES.forEach(function (nm, i) {
+      var col = i % 4, row = Math.floor(i / 4);
+      var lx = 16 + col * 156, ly = 10 + row * 14;
+      ctx.fillStyle = SEG_COLORS[i % SEG_COLORS.length]; ctx.fillRect(lx, ly, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(nm, lx + 12, ly + 9);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('per-step prompt composition · ' + (A.mode === 'none' ? 'no folding' : 'context folded') +
+      ' · ceiling ' + Guide.fmtNum(CEIL), 16, 44);
+
+    // budget the detector refused to spend
+    var savedH = geo.plotH * (CEIL / geo.maxTotal);
+    for (var k = executed; k < budget; k++) {
+      var sx = geo.px(k) - geo.colW / 2;
+      ctx.fillStyle = 'rgba(120,120,120,0.10)';
+      ctx.fillRect(sx, geo.py(CEIL), Math.max(1, geo.colW), savedH);
+    }
+    if (budget > executed) {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('not executed — ' + (budget - executed) + ' steps of budget saved', geo.px(executed) + 4, geo.py(CEIL) + 13);
+    }
+
+    var cy = geo.py(CEIL);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(geo.padL, cy); ctx.lineTo(628, cy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.textAlign = 'left';
+    ctx.fillText('ceiling', geo.padL + 2, cy - 3);
+
+    if (LOOP_START < executed) {
+      var lx2 = geo.px(LOOP_START);
+      ctx.strokeStyle = c.accent2; ctx.globalAlpha = 0.6; ctx.setLineDash([4, 3]); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(lx2, geo.padT); ctx.lineTo(lx2, geo.padT + geo.plotH); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('same search repeated from step ' + LOOP_START, Math.min(lx2 + 4, 470), geo.padT + 12);
+    }
+    if (A.detect && HALT_STEP < budget) {
+      var hx = geo.px(HALT_STEP);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(hx, geo.padT); ctx.lineTo(hx, geo.padT + geo.plotH); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('detector halts', Math.min(hx + 4, 520), geo.py(CEIL) + 28);
+    }
+
+    var peak = 0, overflows = 0;
+    for (var q = 0; q < executed; q++) {
+      peak = Math.max(peak, run.steps[q].total);
+      if (run.steps[q].overflow > 0) overflows++;
+    }
+    var drops = run.drops.filter(function (d) { return d.step < executed; });
+    var redos = run.redos.filter(function (d) { return d.step < executed; });
+    var execInput = sumTokens(run, executed), fullInput = sumTokens(run, budget);
+    var costExec = AppSim.costModel({ inputTokens: execInput, outputTokens: executed * 260, prices: PRICES }).total;
+    var costFull = AppSim.costModel({ inputTokens: fullInput, outputTokens: budget * 260, prices: PRICES }).total;
+    var saved = budget - executed;
+
+    el('lh-run-readout').innerHTML =
+      '<div><span class="k">steps</span> executed <span class="hi">' + executed + '</span> of a ' + budget + '-step budget' +
+      ' &nbsp; <span class="k">peak context</span> ' + Guide.fmtNum(peak) + ' tok</div>' +
+      '<div><span class="k">folding</span> ' + (A.mode === 'none' ? 'off' : 'on') +
+      ' &nbsp; <span class="k">evictions</span> ' + drops.length +
+      ' &nbsp; <span class="k">redos</span> ' + redos.length +
+      ' &nbsp; <span class="k">over ceiling</span> ' + (overflows ? '<span class="bad">' + overflows + ' steps</span>' : '0') + '</div>' +
+      '<div><span class="k">loop detector</span> ' + (A.detect ? '<span class="hi">fired at step ' + HALT_STEP + '</span>' : 'off') +
+      (saved > 0 ? ' &nbsp; <span class="k">wasted steps avoided</span> <span class="hi">' + saved + '</span>' : '') + '</div>' +
+      '<div><span class="k">cost</span> run $' + costExec.toFixed(3) +
+      (saved > 0 ? ' vs $' + costFull.toFixed(3) + ' unbounded — <span class="hi">$' + (costFull - costExec).toFixed(3) + '</span> not spent' : '') +
+      ' <span class="k">(illustrative $3/$15 per 1M)</span></div>' +
+      '<div class="k">' + (A.detect
+        ? 'the detector does not make the agent smarter; it stops the run from paying for a loop it cannot escape'
+        : 'with detection off the loop burns the whole budget and the run never reaches the answer step') + '</div>';
+  }
+  Guide.bindSliders([A.budget], drawA);
+  el('lh-detect').addEventListener('click', function () {
+    A.detect = !A.detect;
+    this.className = A.detect ? 'g-primary' : '';
+    this.textContent = A.detect ? 'Loop detection on' : 'Loop detection off';
+    drawA();
+  });
+  ['summarize', 'none'].forEach(function (m) {
+    el('lh-mode-' + m).addEventListener('click', function () {
+      A.mode = m;
+      ['summarize', 'none'].forEach(function (x) { el('lh-mode-' + x).className = x === m ? 'g-primary' : ''; });
+      drawA();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — the n-gram / state-hash detector, measured
+  // ------------------------------------------------------------------
+  var B = { threshold: el('lh-threshold'), detect: true };
+  var setupB = Guide.setupCanvas(el('lh-loop-canvas'), 640, 320, drawB);
+  var STUCK_TOTAL = 30;
+  function loopStats() {
+    var th = parseInt(B.threshold.value, 10);
+    if (!isFinite(th)) th = 3;
+    var detected = Math.min(STUCK_TOTAL, th);
+    var executed = B.detect ? detected : STUCK_TOTAL;
+    return { th: th, detected: detected, executed: executed, avoided: STUCK_TOTAL - executed };
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 320;
+    var s = loopStats();
+    var steps = [];
+    for (var i = 0; i < STUCK_TOTAL; i++) {
+      var state = i < s.executed ? 'done' : 'pending';
+      if (B.detect && i === s.executed - 1) state = 'error';
+      steps.push({ id: 'c' + i, label: 'c' + i, state: state });
+    }
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('thirty identical calls — search("docs") issued again and again', 16, 20);
+    var geo = Guide.drawTraceTrack(ctx, W, H, steps, { padT: 40, padB: 190, nodeR: 8, labelEvery: 4 });
+
+    var executed = s.executed, avoided = s.avoided;
+    var barY = 176, barH = 26, barX = 40, barW = 560;
+    var perStep = AppSim.costModel({ inputTokens: 6000, outputTokens: 300, prices: PRICES }).total;
+    ctx.fillStyle = c.accent; ctx.fillRect(barX, barY, barW * (executed / STUCK_TOTAL), barH);
+    ctx.fillStyle = 'rgba(120,120,120,0.18)'; ctx.fillRect(barX + barW * (executed / STUCK_TOTAL), barY, barW * (avoided / STUCK_TOTAL), barH);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(barX, barY, barW, barH);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('executed ' + executed, barX + 6, barY - 6);
+    if (avoided > 0) {
+      ctx.fillStyle = c.accent700;
+      ctx.fillText('avoided ' + avoided + ' steps  ·  $' + (avoided * perStep).toFixed(2) + ' not spent', barX + barW * (executed / STUCK_TOTAL) + 6, barY - 6);
+    }
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('state-hash detector: the action signature is unchanged for ' + s.th + ' turns → halt, checkpoint, escalate', 16, 246);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('an ' + s.th + '-gram over the recent action sequence catches the identical loop without re-reading the whole transcript', 16, 264);
+    ctx.fillStyle = c.text;
+    ctx.fillText('per-step cost is illustrative: 6,000 input + 300 output tokens at $3/$15 per 1M', 16, 288);
+
+    el('lh-loop-readout').innerHTML =
+      '<div><span class="k">repeats observed</span> <span class="hi">' + STUCK_TOTAL + '</span>' +
+      ' &nbsp; <span class="k">detector</span> ' + (B.detect ? '<span class="hi">on</span>, threshold ' + s.th : 'off') + '</div>' +
+      '<div><span class="k">halted after</span> ' + executed + ' call' + (executed === 1 ? '' : 's') +
+      ' &nbsp; <span class="k">wasted steps avoided</span> <span class="' + (avoided ? 'hi' : 'bad') + '">' + avoided + '</span></div>' +
+      '<div><span class="k">cost avoided</span> $' + (avoided * perStep).toFixed(3) +
+      ' <span class="k">· cost if undetected</span> $' + (STUCK_TOTAL * perStep).toFixed(3) + '</div>' +
+      '<div class="k">' + (B.detect
+        ? 'the detector trades a small number of repeats for a bounded, resumable failure — and the checkpoint means the work before the loop is not lost'
+        : 'undetected, a loop consumes the step budget and looks like a slow run rather than a broken one') + '</div>';
+  }
+  Guide.bindSliders([B.threshold], drawB);
+  el('lh-loop-detect').addEventListener('click', function () {
+    B.detect = !B.detect;
+    this.className = B.detect ? 'g-primary' : '';
+    this.textContent = B.detect ? 'Detector on' : 'Detector off';
+    drawB();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo C — permission gates by risk
+  // ------------------------------------------------------------------
+  var ACTIONS = [
+    { name: 'search corpus', kind: 'read', risk: 1, freq: 520 },
+    { name: 'fetch web page', kind: 'read', risk: 1, freq: 180 },
+    { name: 'write scratch file', kind: 'write', risk: 2, freq: 96 },
+    { name: 'edit repo file', kind: 'write', risk: 2, freq: 74 },
+    { name: 'run tests', kind: 'write', risk: 2, freq: 60 },
+    { name: 'call paid API', kind: 'spend', risk: 3, freq: 38 },
+    { name: 'place order', kind: 'spend', risk: 3, freq: 9 },
+    { name: 'send email', kind: 'send', risk: 4, freq: 16 },
+    { name: 'post external webhook', kind: 'send', risk: 4, freq: 7 }
+  ];
+  var RISK_LABEL = { 1: 'read', 2: 'write', 3: 'spend', 4: 'send' };
+  var RISK_COLOR = { 1: c.accent400, 2: c.accent, 3: '#c9a227', 4: c.accent2 };
+  var REVIEW_SECONDS = 22, REVIEW_PER_MIN = 0.75;
+  var C = { risk: el('lh-risk'), sandbox: true };
+  var setupC = Guide.setupCanvas(el('lh-gate-canvas'), 640, 380, drawC);
+  function gateDecisions() {
+    var th = parseInt(C.risk.value, 10);
+    if (!isFinite(th)) th = 2;
+    return ACTIONS.map(function (a) {
+      var effective = (C.sandbox && a.kind === 'write') ? 1 : a.risk;
+      return { a: a, effective: effective, gated: effective > th };
+    });
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var rows = gateDecisions();
+    var th = parseInt(C.risk.value, 10);
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('action', 16, 18);
+    ctx.fillText('risk', 250, 18);
+    ctx.fillText('routing', 320, 18);
+    ctx.fillText('share of 1,000 actions', 510, 18);
+
+    var y0 = 34, rowH = 30;
+    rows.forEach(function (r, i) {
+      var y = y0 + i * rowH;
+      ctx.fillStyle = 'rgba(120,120,120,0.05)';
+      ctx.fillRect(16, y, 608, rowH - 6);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(r.a.name, 22, y + 18);
+      ctx.fillStyle = RISK_COLOR[r.effective];
+      ctx.fillRect(250, y + 5, 8, 14);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(r.a.kind + (r.effective !== r.a.risk ? ' (sandboxed)' : ''), 262, y + 18);
+      Guide.drawArrow(ctx, 316, y + (rowH - 6) / 2, 372, y + (rowH - 6) / 2, {
+        color: r.gated ? c.accent2 : c.accent, width: 1.6, head: 7
+      });
+      if (r.gated) {
+        ctx.fillStyle = 'rgba(214,0,108,0.10)'; ctx.fillRect(378, y + 3, 122, 20);
+        ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+        ctx.fillText('human approves', 386, y + 17);
+      } else {
+        ctx.fillStyle = 'rgba(43,95,255,0.08)'; ctx.fillRect(378, y + 3, 122, 20);
+        ctx.fillStyle = c.accent700; ctx.font = '600 10px ' + c.font;
+        ctx.fillText('auto-approved', 386, y + 17);
+      }
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(r.a.freq + ' (' + (r.a.freq / 10).toFixed(0) + '%)', 512, y + 18);
+    });
+
+    var gated = rows.filter(function (r) { return r.gated; });
+    var gatedFreq = gated.reduce(function (a, r) { return a + r.a.freq; }, 0);
+    var autoFreq = 1000 - gatedFreq;
+    var barY = 320, barH = 22, barX = 16, barW = 608;
+    ctx.fillStyle = c.accent700; ctx.fillRect(barX, barY, barW * (autoFreq / 1000), barH);
+    ctx.fillStyle = c.accent2; ctx.fillRect(barX + barW * (autoFreq / 1000), barY, barW * (gatedFreq / 1000), barH);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(barX, barY, barW, barH);
+    ctx.fillStyle = '#fff'; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    if (autoFreq > 80) ctx.fillText('auto ' + (autoFreq / 10).toFixed(0) + '%', barX + 6, barY + 15);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('human review ' + (gatedFreq / 10).toFixed(0) + '%  ·  ' + Math.round(gatedFreq * REVIEW_SECONDS / 60) +
+      ' min per 1,000 actions  ·  ~$' + (gatedFreq * REVIEW_SECONDS / 60 * REVIEW_PER_MIN).toFixed(2), 16, barY - 6);
+
+    el('lh-gate-readout').innerHTML =
+      '<div><span class="k">threshold</span> risk ≤ ' + th + ' auto-approved' +
+      ' &nbsp; <span class="k">sandbox</span> ' + (C.sandbox ? '<span class="hi">on</span> (writes are reversible)' : 'off') + '</div>' +
+      '<div><span class="k">auto-approved</span> <span class="hi">' + (autoFreq / 10).toFixed(0) + '%</span> of actions' +
+      ' &nbsp; <span class="k">gated</span> ' + (gatedFreq / 10).toFixed(0) + '% (' + (gated.length ? gated.map(function (r) { return r.a.name; }).join(', ') : 'none') + ')</div>' +
+      '<div><span class="k">human cost</span> ' + Math.round(gatedFreq * REVIEW_SECONDS / 60) + ' min and ~$' +
+      (gatedFreq * REVIEW_SECONDS / 60 * REVIEW_PER_MIN).toFixed(2) + ' per 1,000 actions <span class="k">(illustrative 22 s at $0.75/min)</span></div>' +
+      '<div class="k">' + (C.sandbox
+        ? 'sandboxed writes are reversible, so gating them buys paperwork rather than safety — gate the irreversible spend and send actions instead'
+        : 'with the sandbox off, writes are irreversible and must be gated; the human cost climbs accordingly') + '</div>';
+  }
+  Guide.bindSliders([C.risk], drawC);
+  el('lh-sandbox').addEventListener('click', function () {
+    C.sandbox = !C.sandbox;
+    this.className = C.sandbox ? 'g-primary' : '';
+    this.textContent = C.sandbox ? 'Writes in a sandbox' : 'Writes are irreversible';
+    drawC();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — the same model under two harnesses
+  // ------------------------------------------------------------------
+  var D = { strength: el('lh-strength'), showDecomp: true };
+  var setupD = Guide.setupCanvas(el('lh-variance-canvas'), 640, 340, drawD);
+  var GAP = 15;                       // the harness gap, in points
+  var DECOMP = [                       // and where it comes from
+    { label: 'context management', pts: 6.0, color: c.accent },
+    { label: 'retry / verification', pts: 5.0, color: c.accent400 },
+    { label: 'tool design', pts: 4.0, color: c.accent2 }
+  ];
+  function modelRate(u) { return 0.42 + 0.30 * u; }   // u in [0,1]
+  function panel(ctx, x0, y0, w, h, xRange, yRange, opts) {
+    opts = opts || {};
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    function X(x) { return x0 + w * (x - xRange[0]) / (xRange[1] - xRange[0]); }
+    function Y(y) {
+      var v = Math.max(yRange[0], Math.min(yRange[1], y));
+      return y0 + h * (1 - (v - yRange[0]) / (yRange[1] - yRange[0]));
+    }
+    if (opts.grid) {
+      ctx.strokeStyle = 'rgba(120,120,120,0.18)'; ctx.setLineDash([3, 4]);
+      opts.grid.forEach(function (g) { ctx.beginPath(); ctx.moveTo(x0, Y(g)); ctx.lineTo(x0 + w, Y(g)); ctx.stroke(); });
+      ctx.setLineDash([]);
+    }
+    (opts.series || []).forEach(function (s) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2.2;
+      if (s.dashed) ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      s.points.forEach(function (p, i) { if (i === 0) ctx.moveTo(X(p.x), Y(p.y)); else ctx.lineTo(X(p.x), Y(p.y)); });
+      ctx.stroke(); ctx.setLineDash([]);
+      if (s.dots) {
+        ctx.fillStyle = s.color; ctx.globalAlpha = 0.5;
+        s.dots.forEach(function (p) { ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 1.8, 0, 2 * Math.PI); ctx.fill(); });
+        ctx.globalAlpha = 1;
+      }
+    });
+    if (opts.title) { ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left'; ctx.fillText(opts.title, x0, y0 - 10); }
+    if (opts.xLabel) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.fillText(opts.xLabel, x0 + w / 2, y0 + h + 24); }
+    if (opts.yLabel) {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.save();
+      ctx.translate(x0 - 30, y0 + h / 2); ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center'; ctx.fillText(opts.yLabel, 0, 0); ctx.restore();
+    }
+    return { X: X, Y: Y, x0: x0, y0: y0, w: w, h: h };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var u = parseInt(D.strength.value, 10) / 100;
+    if (!isFinite(u)) u = 0.5;
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('one model, two harnesses — and where the 15 points come from', 16, 20);
+
+    var Apts = [], Bpts = [], Adots = [], Bdots = [];
+    for (var i = 0; i <= 40; i++) {
+      var x = i / 40;
+      var ra = modelRate(x) - 0.01, rb = Math.min(0.99, ra + GAP / 100);
+      Apts.push({ x: x, y: ra }); Bpts.push({ x: x, y: rb });
+      var ja = ra + AppSim.gaussian(AppSim.rng(700 + i * 17)) * 0.012;
+      var jb = rb + AppSim.gaussian(AppSim.rng(9100 + i * 29)) * 0.012;
+      Adots.push({ x: x, y: Math.max(0, Math.min(1, ja)) });
+      Bdots.push({ x: x, y: Math.max(0, Math.min(1, jb)) });
+    }
+    var left = panel(ctx, 52, 54, 250, 196, [0, 1], [0.3, 1.0], {
+      title: 'task pass rate', xLabel: 'model strength', yLabel: 'pass rate',
+      grid: [0.4, 0.6, 0.8],
+      series: [
+        { points: Apts, dots: Adots, color: c.accent700 },
+        { points: Bpts, dots: Bdots, color: c.accent2 }
+      ]
+    });
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('minimal harness', left.x0 + 6, left.y0 + left.h - 8);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('engineered harness', left.x0 + 6, left.y0 + 16);
+    var mx = left.X(u);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(mx, left.y0); ctx.lineTo(mx, left.y0 + left.h); ctx.stroke(); ctx.globalAlpha = 1;
+
+    var rateA = modelRate(u) - 0.01, rateB = Math.min(0.99, rateA + GAP / 100);
+    var right = panel(ctx, 350, 54, 274, 196, [0, 1], [0, 1], {
+      title: D.showDecomp ? 'the 15-point decomposition' : 'where the variance comes from',
+      xLabel: D.showDecomp ? 'points of pass rate' : 'share', yLabel: 'share', grid: [0.25, 0.5]
+    });
+    var bx = right.x0 + 8, by = right.y0 + 12, bwidth = right.w - 16;
+    var parts = D.showDecomp
+      ? DECOMP
+      : [{ label: 'model choice', pts: 45, color: c.accent }, { label: 'harness design', pts: 40, color: c.accent2 }, { label: 'eval noise', pts: 15, color: '#7a5c9e' }];
+    var total = parts.reduce(function (a, d) { return a + d.pts; }, 0);
+    var cursor = bx;
+    parts.forEach(function (d) {
+      var w = bwidth * (d.pts / total);
+      ctx.fillStyle = d.color; ctx.fillRect(cursor, by, w, 26);
+      cursor += w;
+    });
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(bx, by, bwidth, 26);
+    parts.forEach(function (d, i) {
+      ctx.fillStyle = d.color; ctx.fillRect(bx, by + 42 + i * 18, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(d.label + (D.showDecomp ? '  +' + d.pts.toFixed(1) + ' pts' : '  ' + d.pts + '%'), bx + 14, by + 51 + i * 18);
+    });
+    ctx.fillStyle = c.accent700; ctx.font = '600 10px ' + c.font;
+    ctx.fillText(D.showDecomp ? 'gap = ' + total.toFixed(1) + ' points' : 'harness ≈ model in explained variance', bx, by + 122);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText('model change across the slider: up to 30 points', bx, by + 138);
+    ctx.fillText('harness change: ' + GAP + ' points — same order of magnitude', bx, by + 154);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('so a bare model score is not the system\'s score', bx, by + 170);
+
+    el('lh-variance-readout').innerHTML =
+      '<div><span class="k">model strength</span> ' + (u * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">minimal harness</span> <span class="hi">' + (rateA * 100).toFixed(1) + '%</span>' +
+      ' &nbsp; <span class="k">engineered</span> <span class="hi">' + (rateB * 100).toFixed(1) + '%</span></div>' +
+      '<div><span class="k">harness gap</span> <span class="hi">' + GAP + ' points</span> — constant across the slider, because it is the harness, not the weights</div>' +
+      '<div><span class="k">decomposition</span> ' + DECOMP.map(function (d) { return d.label + ' +' + d.pts.toFixed(1); }).join(' · ') + '</div>' +
+      '<div class="k">SWE-bench Verified scores are scaffold-dependent and τ²-bench scores move with the harness and the user simulator; a public number is a model-plus-harness result</div>';
+  }
+  Guide.bindSliders([D.strength], drawD);
+  el('lh-decomp').addEventListener('click', function () {
+    D.showDecomp = !D.showDecomp;
+    this.className = D.showDecomp ? 'g-primary' : '';
+    this.textContent = D.showDecomp ? 'View: the decomposition' : 'View: the variance split';
+    drawD();
+  });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var agents = (data && data.agents) || FALLBACK.agents;
+    el('lh-agents-source').textContent = (agents.source || FALLBACK.agents.source) +
+      (agents.compactionTax ? ' ' + agents.compactionTax : '');
+    el('lh-cost-source').textContent = (data && data.cost_latency && data.cost_latency.source) || FALLBACK.cost_latency.source;
+    el('lh-security-source').textContent = (data && data.security && data.security.source) || FALLBACK.security.source;
+    el('lh-evals-source').textContent = (data && data.evals && data.evals.source) || FALLBACK.evals.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'long-horizon-what',
+      kind: 'choice',
+      prompt: 'Which set of properties makes a task "long-horizon" rather than merely long?',
+      options: [
+        { label: 'Many steps, many tool calls, a growing context, and a real risk of drift.', correct: true },
+        { label: 'A prompt longer than the context window.', correct: false },
+        { label: 'A task that streams its output token by token.', correct: false },
+        { label: 'Any task that uses more than one model call.', correct: false }
+      ],
+      explanation: 'Length of prompt is not the property. What matters is that intermediate work is carried forward across many steps and calls, the context accumulates, and a mistake at one step is inherited by the rest.'
+    },
+    {
+      id: 'long-horizon-compounding',
+      kind: 'choice',
+      prompt: 'Why does a long-horizon run need a harness rather than just a better model?',
+      options: [
+        { label: 'Per-step reliability compounds, so the run must not require near-perfection at every step.', correct: true },
+        { label: 'Because models cannot call tools without a harness.', correct: false },
+        { label: 'Because a harness makes each step deterministic.', correct: false },
+        { label: 'Because the context window is unbounded without one.', correct: false }
+      ],
+      explanation: 'At 95% per step a twenty-step run finishes about 36% of the time. The harness bounds context, steps and blast radius so the run survives the occasional bad step instead of inheriting it.'
+    },
+    {
+      id: 'long-horizon-loop-waste',
+      kind: 'numeric',
+      prompt: 'With the step budget at 48 and loop detection on, the detector halts the run at step 20 — that is, 21 steps have executed. How many steps of budget are saved?',
+      answer: 27,
+      unit: "steps",
+      tolerance: 0,
+      explanation: 'The run executes steps 0 through 20 (21 steps) and the detector closes the loop. The remaining 48 − 21 = 27 steps of budget are never spent, which is the difference between a bounded failure and a run that quietly burns its whole allowance.'
+    },
+    {
+      id: 'long-horizon-gates',
+      kind: 'choice',
+      prompt: 'Which actions should require human approval, and why?',
+      options: [
+        { label: 'The irreversible ones — spend and send — because they leave a boundary you cannot undo.', correct: true },
+        { label: 'Reads and writes, because they touch the most data.', correct: false },
+        { label: 'Everything, because any tool use is a risk.', correct: false },
+        { label: 'Nothing, as long as the agent is prompted to be careful.', correct: false }
+      ],
+      explanation: 'Reads touch nothing visible; sandboxed writes are reversible. The gate is for actions you cannot take back — moving money or emitting something outside your boundary. Gating reads buys paperwork rather than safety.'
+    },
+    {
+      id: 'long-horizon-variance',
+      kind: 'choice',
+      prompt: 'What does it mean to say "the harness contributes as much variance as the model"?',
+      options: [
+        { label: 'A benchmark score is a model-plus-harness score; the scaffold can move it as much as swapping the weights.', correct: true },
+        { label: 'The harness runs on the same hardware as the model.', correct: false },
+        { label: 'Harnesses are trained alongside the model.', correct: false },
+        { label: 'The harness can replace the model for most tasks.', correct: false }
+      ],
+      explanation: 'SWE-bench Verified is explicitly scaffold-dependent and τ²-bench scores move with the harness and user simulator. Reporting the model alone hides a contribution of the same size as the model, which is why evaluating a model without its harness is misleading.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

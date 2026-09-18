@@ -1,0 +1,488 @@
+---
+title: "Statistics, Interactively — Part 29: Particle filters and MCL"
+description: "A robot's belief as a cloud of weighted samples: how systematic resampling keeps the cloud alive, why the effective sample size is the number to watch, and what happens when the robot is kidnapped."
+permalink: "/math/statistics/particle-filter/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-toggles { display: flex; flex-direction: column; gap: 7px; margin: 4px 0 12px; font-size: 12.5px; line-height: 1.45; }
+  .g-toggles label { display: flex; gap: 8px; align-items: flex-start; }
+  .g-toggles input { margin-top: 2px; flex: 0 0 auto; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Particle filters and MCL</h1>
+    <p>A Kalman filter carries a mean and a covariance; a histogram filter carries a vector of bin probabilities. A particle filter carries neither. It carries a cloud of samples: each is one hypothesis about where the robot is, each carries a weight saying how well it explains the latest range reading, and systematic resampling stops the cloud collapsing onto a point. This part builds the Bayes filter out of those samples, and watches the effective sample size decide when to resample.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">How do you filter with samples instead of parameters?</p>
+    <p>Every filter in this part of the series answers the same question &mdash; where is the robot? &mdash; and stores the belief in a different shape. The histogram filter keeps one probability per bin; the Kalman filter keeps a mean and a covariance. Both are <em>parameterisations</em>: a fixed, finite description of a belief usually far too rich to write down. The particle filter takes the other road, describing the distribution not with parameters but with samples drawn from it.</p>
+    <p>Formally, the belief after observations $z_{1:t}$ is approximated by a weighted set of points:</p>
+    <div class="g-math g-katex">$$p(x_t \mid z_{1:t}) \;\approx\; \sum_{i=1}^{N} w_t^{(i)}\,\delta\!\left(x_t - x_t^{(i)}\right)$$</div>
+    <p>Each $x_t^{(i)}$ is a hypothesis and each weight $w_t^{(i)}$ says how plausible it is. Nothing assumes the belief is a bump, a bell, or even connected: two hypotheses on opposite sides of a landmark can both live in the cloud, which is exactly what a robot needs in a corridor it has never seen. The cost is that the approximation is random: a different cloud gives a different answer.</p>
+    <p>The recursion is unchanged: prediction pushes every particle through the motion model, correction reweights every particle by the measurement. Only the place the probabilities live has changed.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a cloud of weighted samples can stand in for a Bayes filter, why the effective sample size is the number that tells you the cloud is dying, and how systematic resampling, particle deprivation and random injections decide whether a kidnapped robot is ever found again.</span></div>
+    <div class="g-toc">
+      <a href="#particles">2 · Particles and weights</a>
+      <a href="#ess">3 · Resampling and effective sample size</a>
+      <a href="#deprivation">4 · Particle deprivation</a>
+      <a href="#kidnap">5 · The kidnapped-robot problem</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="particles">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Particles and weights</h2></div>
+    <p class="g-eyebrow">Sequential importance sampling in one picture</p>
+    <p>Scatter $N$ particles across the state space, drawn from a proposal that is easy to sample &mdash; here, a uniform draw over the corridor, because the robot has no idea where it is. Because the proposal is not the true prior, each particle enters with an <em>importance weight</em> that corrects the mismatch: high where the belief exceeds the proposal, low where it falls short.</p>
+    <p><em>Prediction</em> propagates each particle through the motion model with independent noise, using the control the robot actually executed. Each particle carries its own perturbation, so the cloud spreads by exactly the process noise. Prediction never looks at the sensor.</p>
+    <p><em>Correction</em> multiplies each weight by the measurement likelihood:</p>
+    <div class="g-math g-katex">$$w_t^{(i)} \;\propto\; w_{t-1}^{(i)}\, p\!\left(z_t \mid x_t^{(i)}\right)$$</div>
+    <p>A particle where the range says the robot must be keeps its weight; one that could not have produced the reading is suppressed. After normalising, the estimate of position is the weighted mean of the cloud, and any other quantity is a weighted average in the same way. The cloud <em>is</em> the distribution; there is no separate formula to consult.</p>
+    <p>The trouble is in the formula. Every observation multiplies every weight by a number below one, and the particles that happen to be right are multiplied by larger numbers than those that happen to be wrong. After a few steps a handful carry almost all the weight while the rest carry almost none &mdash; <em>weight degeneracy</em>. They still cost time to carry, and contribute nothing. The measure of how many are actually working is the effective sample size, and the remedy is resampling.</p>
+  </section>
+
+  <section class="g-step" id="ess">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Resampling and effective sample size</h2></div>
+    <p class="g-eyebrow">Throw away the dead hypotheses, duplicate the live ones</p>
+    <p>Resampling rebuilds the cloud by drawing $N$ new particles from the old ones in proportion to weight, then resetting every weight to $1/N$. Heavy particles are likely to be duplicated, light ones to vanish. The belief is unchanged in expectation, but the representation is now efficient. The catch is that resampling adds variance and destroys diversity: it can copy a mediocre particle many times and never invent a better one.</p>
+    <p>Systematic resampling is the low-variance draw. A single uniform offset $u_0$ generates $N$ evenly spaced thresholds:</p>
+    <div class="g-math g-katex">$$\text{copy } x^{(j)} \text{ where } \sum_{k \le j} w^{(k)} \ge \frac{i - 1 + u_0}{N}, \qquad i = 1, \dots, N$$</div>
+    <p>One random number decides the whole selection, so each particle's copy count differs from its expected count by at most one &mdash; far less noisy than independent draws, and a single ordered pass in $O(N)$.</p>
+    <p>The <em>effective sample size</em>, $\mathrm{ESS} = 1 / \sum_i \tilde w_i^2$, is the trigger. It is $N$ when all weights are equal and falls toward $1$ as one particle takes over &mdash; the number still genuinely contributing. Resample every step and you needlessly destroy diversity; never resample and the dead weight piles up. The compromise is to resample only when the ESS falls below a fraction of $N$, here $N/2$, the dashed line on the lower canvas.</p>
+    <p>The demo is a one-dimensional robot in a corridor with five landmarks at known positions. It follows a fixed control sequence &mdash; right, back, right again &mdash; measuring its range to one landmark at a time, cycling through them. The horizontal axis of the top canvas is the corridor and time runs upward: each faint row is the particle cloud at one instant, the solid magenta line is the true path and the dashed line the filter's estimate. Press <b>Predict</b> to move the robot and its particles, <b>Update + resample</b> to fold in the next reading, or <b>Run</b> to track automatically. Early on, one range leaves two mirror-image candidate positions and the next landmark rules one out: multimodal for a moment, then snapped to the truth.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="pf-canvas" width="640" height="330"></canvas>
+        <canvas id="ess-canvas" width="640" height="180"></canvas>
+        <p class="g-canvas-hint">Top: particles over the corridor, time running upward &mdash; dot size and colour track weight. Bottom: effective sample size each step, with the resampling threshold at N/2.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Particles N <span class="val">150</span></label><input type="range" id="n-slider" min="20" max="400" step="10" value="150"></div>
+        <div class="g-field"><label>Measurement noise σ (m) <span class="val">2.5</span></label><input type="range" id="sigma-slider" min="0.5" max="8" step="0.1" value="2.5"></div>
+        <div class="g-btnrow">
+          <button type="button" id="predict-btn">Predict</button>
+          <button type="button" id="update-btn" class="g-primary">Update + resample</button>
+          <button type="button" id="run-btn">Run</button>
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="kidnap-btn">Kidnap robot</button>
+          <button type="button" id="reset-btn">Reset</button>
+        </div>
+        <div class="g-toggles">
+          <label><input type="checkbox" id="adaptive-toggle" checked> <span><b>Adaptive resampling</b> &mdash; resample only when the ESS drops below N/2, instead of every update.</span></label>
+          <label><input type="checkbox" id="inject-toggle"> <span><b>Random injections</b> &mdash; augmented MCL: replace about 6% of particles with uniform draws at each prediction, so the cloud can rediscover a state it has thrown away.</span></label>
+        </div>
+        <div class="g-readout" id="pf-readout"></div>
+      </div>
+    </div>
+    <p>Resampling does not manufacture information: a cloud that has thrown away the true state cannot resample its way back to it. What lets the cloud explore is the noise injected during prediction &mdash; too little and the particles are near-identical copies, enough and a resampling step has something new to choose from.</p>
+  </section>
+
+  <section class="g-step" id="deprivation">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Particle deprivation and the number of particles</h2></div>
+    <p class="g-eyebrow">Too few hypotheses is not a smaller approximation; it is a different one</p>
+    <p>Drag the particle count to twenty and let the filter run. After a few resamples the readout's <em>distinct particles</em> collapses far below $N$: the same positions recur because systematic resampling copied them. This is <em>particle deprivation</em>. The cloud no longer samples the belief but a small set of duplicates, and any region none of them occupy is effectively declared impossible. With a thousand particles the corridor is covered densely enough that the truth is always represented; with twenty, one unlucky resample can delete it, and no later measurement brings it back.</p>
+    <p>The number needed is not fixed. It grows with the volume of the state space and, worst case, exponentially with its dimension &mdash; the curse of dimensionality that pushes high-dimensional problems toward parametric filters or optimisation. A few hundred particles is generous in one dimension; a full 3-D pose with heading, or SLAM, runs into thousands. Cost is linear in $N$ per step, which is why the filter is affordable and why accuracy saturates: past some count, more particles buy less than fixing the models.</p>
+    <p>The estimate is random too: a weighted mean of random samples jitters from run to run, and a different seed gives a different cloud. The <a href="{{ '/vision/multi-view-geometry/ransac/' | relative_url }}">RANSAC fitting guide</a> makes the same trade: a small random subset is cheap and usually right, but the guarantee is probabilistic.</p>
+  </section>
+
+  <section class="g-step" id="kidnap">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The kidnapped-robot problem</h2></div>
+    <p class="g-eyebrow">Confidently wrong, and unable to tell</p>
+    <p>So far the truth has always been somewhere in the cloud. Now break that. Press <b>Kidnap robot</b>: the robot is placed elsewhere along the corridor without the filter being told, as if a person carried it to another room. Prediction still applies the old control, so the cloud marches on from where it believed the robot was, and the estimate keeps moving smoothly while the true path jumps away.</p>
+    <p>The next measurement contains the information, but the filter cannot use it. Every particle is far from a position consistent with the reading, so every likelihood is tiny and the weights end up nearly equal. With nothing to distinguish them, resampling just re-copies the same wrong cloud. The effective sample size can even stay high &mdash; the subtlest lesson here: a high ESS means the weights are evenly spread, not that the belief is correct. The cloud is uniform and wrong. This is <em>global localisation</em> with a bad prior.</p>
+    <p>The cure is <em>augmented MCL</em>: each prediction, a small fraction of particles is replaced by fresh uniform draws. Turn on <b>Random injections</b>, kidnap the robot again, and watch: nothing happens for a while, then one injected particle lands near the truth, its weight spikes, the ESS plunges, a resample duplicates it, and the cloud snaps back. The cost is a few percent of particles spent on almost-certainly-wrong positions; the benefit is that the filter can never be permanently fooled.</p>
+    <div class="g-warn">⚠ <span><b>Adaptive resampling is not just an optimisation.</b> Resampling every step injects variance even when the weights are healthy, slowly eroding diversity. Gating on a low ESS resamples only when the weights have actually concentrated. Turning it off is a good way to feel the difference: the same filter, visibly noisier.</span></div>
+    <p>The inheritance is clear. This is the Bayes filter with bins replaced by samples, and it degrades to a Kalman filter when the belief is one narrow Gaussian and the models are linear. Its advantage is that it assumes no shape at all; its price is that the representation is random and the particle count is itself a modelling decision.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The filter behind most robots that know where they are</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Odometry meets a map</h3>
+        <p style="margin-bottom:0;">The <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry chapter</a> tracks pose by integrating wheel and inertial motion, and that dead reckoning drifts without bound. A particle filter is the natural place to fuse it with range readings against a map: propagate each particle through the odometry model, weight it by the sensors, resample. Odometry supplies the proposal; the map supplies the correction.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision &amp; Geometry</div>
+        <h3 style="margin:6px 0;">SLAM and data association</h3>
+        <p style="margin-bottom:0;">In visual SLAM the robot estimates its trajectory and the map at once, and correspondences are uncertain. <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">The SLAM chapter</a> solves the joint problem by optimisation, but only after a front end supplies a good enough guess &mdash; and particle filters are one classic way to get one, because a cloud of trajectories can represent ambiguity that a single point estimate cannot.</p>
+      </div>
+    </div>
+    <p>Monte Carlo localisation became the default indoor method because it needs no linearisation, tolerates arbitrary belief shapes, and handles the global-localisation and kidnapped-robot cases a Kalman filter cannot. The same construction appears wherever a state is tracked under a nonlinear model with a non-Gaussian belief: radar target tracking, video object tracking, and sequence models that estimate latent state in time series. The moving parts are always the same &mdash; particles, weights, an effective sample size, and a decision about when to resample.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Particle filtering is one of the few modern methods whose founding paper is still among the clearest introductions. Take away the picture of a cloud spread by motion, reweighted by measurement and thinned by resampling.</p>
+    <p>Thrun, Burgard and Fox is the standard robotics treatment and the source of the MCL and augmented-MCL algorithms here. Gordon, Salmond and Smith introduced the resampling step that made the method work; Fox and colleagues' MCL paper is the robotics origin story.</p>
+    <ul class="g-refs">
+      <li>Sebastian Thrun, Wolfram Burgard and Dieter Fox, <em>Probabilistic Robotics</em>, MIT Press, 2005 &mdash; Chapter 4 (nonparametric filters) and Chapter 8 (the particle filter and Monte Carlo localisation).</li>
+      <li>N. J. Gordon, D. J. Salmond and A. F. M. Smith, <a href="https://doi.org/10.1049/ip-f-2.1993.0015">"Novel approach to nonlinear/non-Gaussian Bayesian state estimation"</a>, <em>IEE Proceedings F</em>, 1993 &mdash; the bootstrap filter.</li>
+      <li>Dieter Fox, Wolfram Burgard, Frank Dellaert and Sebastian Thrun, <a href="https://www.aaai.org/Papers/AAAI/1999/AAAI99-064.pdf">"Monte Carlo Localization: Efficient Position Estimation for Mobile Robots"</a>, AAAI 1999.</li>
+      <li>M. S. Arulampalam, S. Maskell, N. Gordon and T. Clapp, <a href="https://doi.org/10.1109/78.978374">"A tutorial on particle filters for online nonlinear/non-Gaussian Bayesian tracking"</a>, <em>IEEE Transactions on Signal Processing</em>, 2002.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Particle</td><td>One sample hypothesis about the state; the cloud is the belief</td></tr>
+        <tr><td>Weight</td><td>How well a particle explains the latest measurement, normalised to sum to one</td></tr>
+        <tr><td>Sequential importance sampling</td><td>Propagate through the motion model, then reweight by the likelihood</td></tr>
+        <tr><td>Weight degeneracy</td><td>Weights concentrating on a few particles, so most of the cloud contributes nothing</td></tr>
+        <tr><td>Effective sample size</td><td>$\mathrm{ESS} = 1/\sum_i \tilde w_i^2$; how many particles are effectively contributing</td></tr>
+        <tr><td>Systematic resampling</td><td>One random offset, $N$ evenly spaced thresholds; low-variance, $O(N)$</td></tr>
+        <tr><td>Particle deprivation</td><td>Too few distinct particles after resampling, so whole regions are never represented</td></tr>
+        <tr><td>Augmented MCL</td><td>Inject uniform random particles each step so a kidnapped robot can be rediscovered</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The cloud has tracked one robot through one corridor. The next part turns to a different kind of measurement &mdash; deciding which of two versions of a page actually works.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  var LANDMARKS = [8, 28, 50, 72, 92];
+  var M = LANDMARKS.length;
+  var PROC_SIGMA = 1.5;
+  var SEED = 20260914;
+  var MAX_ROWS = 60;
+
+  var N = 150;
+  var sigmaMeas = 2.5;
+  var adaptive = true;
+  var injections = false;
+
+  var t = 0;
+  var trueX = 30;
+  var measL = LANDMARKS[1];
+  var measRange = 0;
+  var filter = null;
+  var history = [];
+  var resamples = 0;
+  var lastEss = 150;
+  var running = false;
+  var runTimer = null;
+  var opRng = S.rng(SEED + 17);
+  var mapPlot = null;
+  var essPlot = null;
+
+  function el(id) { return document.getElementById(id); }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function fmt(x, d) {
+    d = d == null ? 2 : d;
+    var s = x.toFixed(d);
+    if (d > 0) s = s.replace(/\.?0+$/, '');
+    return s === '-0' ? '0' : s;
+  }
+
+  // The known control sequence the robot follows: right, then back, then right.
+  function controlAt(k) {
+    var phase = ((k % 60) + 60) % 60;
+    if (phase < 22) return 2.4;
+    if (phase < 40) return -1.6;
+    return 1.2;
+  }
+
+  function buildFilter() {
+    filter = S.filter.particle({
+      n: N,
+      rng: S.rng(SEED + 101),
+      initial: function (r) { return r() * 100; },
+      propagate: function (state, r) {
+        if (injections && r() < 0.06) return r() * 100;
+        return clamp(state + controlAt(t) + S.sample.normal(r, 0, PROC_SIGMA), 0, 100);
+      },
+      likelihood: function (state) {
+        var d = (measRange - Math.abs(state - measL)) / sigmaMeas;
+        var w = Math.exp(-0.5 * d * d);
+        return w > 1e-12 ? w : 1e-12;
+      }
+    });
+  }
+
+  function snapshot() {
+    var prs = filter.pairs(), out = [];
+    var stride = Math.max(1, Math.ceil(prs.length / 60));
+    for (var i = 0; i < prs.length; i += stride) out.push({ x: prs[i].state, w: prs[i].weight });
+    return out;
+  }
+
+  function initState() {
+    t = 0;
+    trueX = 30;
+    history = [];
+    resamples = 0;
+    lastEss = N;
+    opRng = S.rng(SEED + 17);
+    buildFilter();
+    measL = LANDMARKS[1];
+    measRange = 0;
+    history.push({ t: t, trueX: trueX, mean: filter.mean(), ess: N, particles: snapshot() });
+  }
+
+  function doPredict() {
+    trueX = clamp(trueX + controlAt(t) + S.sample.normal(opRng, 0, PROC_SIGMA), 0, 100);
+    filter.propagate();
+    t++;
+    history.push({ t: t, trueX: trueX, mean: filter.mean(), ess: lastEss, particles: snapshot() });
+    if (history.length > MAX_ROWS) history.shift();
+  }
+
+  function doUpdate() {
+    measL = LANDMARKS[((t % M) + M) % M];
+    measRange = Math.max(0, Math.abs(trueX - measL) + S.sample.normal(opRng, 0, sigmaMeas));
+    filter.update();
+    var ess = filter.ess();
+    lastEss = ess;
+    if (!adaptive || ess < N / 2) {
+      filter.resample();
+      resamples++;
+    }
+    var row = history[history.length - 1];
+    if (row) {
+      row.mean = filter.mean();
+      row.ess = ess;
+      row.particles = snapshot();
+    }
+    drawAll();
+  }
+
+  function doKidnap() {
+    var target = trueX, tries = 0;
+    do {
+      target = opRng() * 100;
+      tries++;
+    } while (Math.abs(target - filter.mean()) < 25 && tries < 30);
+    trueX = target;
+    var row = history[history.length - 1];
+    if (row) row.trueX = trueX;
+    drawAll();
+  }
+
+  function drawAll() { drawMap(); drawEss(); updateReadout(); }
+
+  function drawMap() {
+    if (!mapPlot || !filter) return;
+    var lo = history.length ? history[0].t : 0;
+    var hi = history.length ? history[history.length - 1].t : 1;
+    mapPlot.xRange[0] = 0;
+    mapPlot.xRange[1] = 100;
+    mapPlot.yRange[0] = lo - 1;
+    mapPlot.yRange[1] = hi + 1;
+    mapPlot.clear();
+    mapPlot.axes({ xLabel: 'position along the corridor', yLabel: 'time (step)', tickTarget: 5 });
+
+    var i, j;
+    for (i = 0; i < M; i++) {
+      mapPlot.vline(LANDMARKS[i], { color: c.divider, width: 1, dashed: true });
+      mapPlot.text('L' + (i + 1), LANDMARKS[i], lo - 0.9, { align: 'center', baseline: 'top', color: c.text, size: 10 });
+    }
+
+    for (i = 0; i < history.length - 1; i++) {
+      var row = history[i], pts = [];
+      for (j = 0; j < row.particles.length; j++) pts.push({ x: row.particles[j].x, y: row.t });
+      if (pts.length) mapPlot.points(pts, { r: 1.6, color: 'rgba(43,95,255,0.13)' });
+    }
+
+    var truePts = [], meanPts = [];
+    for (i = 0; i < history.length; i++) {
+      truePts.push([history[i].trueX, history[i].t]);
+      meanPts.push([history[i].mean, history[i].t]);
+    }
+    mapPlot.curve(truePts, { color: c.accent2, width: 2 });
+    mapPlot.curve(meanPts, { color: c.accent, width: 2, dashed: true });
+
+    var prs = filter.pairs(), weak = [], mid = [], strong = [];
+    for (i = 0; i < prs.length; i++) {
+      var frac = prs[i].weight * N / 2;
+      var pt = { x: prs[i].state, y: t + 0.28 * Math.sin(i * 12.9898) };
+      if (frac > 0.9) strong.push(pt);
+      else if (frac > 0.25) mid.push(pt);
+      else weak.push(pt);
+    }
+    if (weak.length) mapPlot.points(weak, { r: 2, color: 'rgba(43,95,255,0.30)' });
+    if (mid.length) mapPlot.points(mid, { r: 3, color: 'rgba(43,95,255,0.60)' });
+    if (strong.length) mapPlot.points(strong, { r: 4.5, color: c.accent });
+
+    mapPlot.points([{ x: trueX, y: t }], { r: 5, color: c.accent2, stroke: 'rgba(255,255,255,0.95)', width: 1.5 });
+    mapPlot.points([{ x: filter.mean(), y: t }], { r: 4, color: c.accent, stroke: 'rgba(255,255,255,0.95)', width: 1.5 });
+
+    mapPlot.legend([
+      { label: 'true path', color: c.accent2 },
+      { label: 'particle mean (estimate)', color: c.accent, dashed: true },
+      { label: 'particles, sized and coloured by weight', color: c.accent400 }
+    ], { dy: 4 });
+  }
+
+  function drawEss() {
+    if (!essPlot) return;
+    var lo = history.length ? history[0].t : 0;
+    var hi = history.length ? history[history.length - 1].t : 1;
+    essPlot.xRange[0] = lo - 1;
+    essPlot.xRange[1] = hi + 1;
+    essPlot.yRange[0] = 0;
+    essPlot.yRange[1] = Math.max(10, N);
+    essPlot.clear();
+    essPlot.axes({ xLabel: 'time (step)', yLabel: 'effective sample size', tickTarget: 5 });
+    essPlot.hline(N / 2, { color: c.accent2, dashed: true, width: 1.4 });
+    var pts = [];
+    for (var i = 0; i < history.length; i++) pts.push([history[i].t, history[i].ess]);
+    essPlot.curve(pts, { color: c.accent, width: 2 });
+    essPlot.text('resample below N/2', essPlot.xRange[1], N / 2, { align: 'right', baseline: 'bottom', color: c.accent2, size: 10, dx: -4, dy: -2 });
+  }
+
+  function updateReadout() {
+    if (!filter) return;
+    var est = filter.mean(), ess = filter.ess();
+    var prs = filter.pairs(), seen = {}, uniq = 0;
+    for (var i = 0; i < prs.length; i++) {
+      var key = Math.round(prs[i].state * 10);
+      if (!seen[key]) { seen[key] = 1; uniq++; }
+    }
+    el('pf-readout').innerHTML =
+      '<div><span class="k">true position</span> ' + fmt(trueX, 1) + '</div>' +
+      '<div><span class="k">particle mean</span> <span class="hi">' + fmt(est, 1) + '</span></div>' +
+      '<div><span class="k">error</span> ' + fmt(est - trueX, 1) + '</div>' +
+      '<div><span class="k">ESS after update</span> ' + fmt(lastEss, 0) + ' / ' + N + ' (' + fmt(100 * lastEss / N, 0) + '%)</div>' +
+      '<div><span class="k">current ESS</span> ' + fmt(ess, 0) + '</div>' +
+      '<div><span class="k">distinct particles</span> ' + uniq + ' / ' + N + '</div>' +
+      '<div><span class="k">resamples</span> ' + resamples + '</div>' +
+      '<div class="g-mini">ESS falls as the weights concentrate; a resample resets it to N.</div>';
+  }
+
+  function startRun() {
+    if (running) return;
+    running = true;
+    el('run-btn').textContent = 'Pause';
+    runTimer = window.setInterval(function () {
+      doPredict();
+      doUpdate();
+    }, 150);
+  }
+
+  function stopRun() {
+    running = false;
+    if (runTimer) { window.clearInterval(runTimer); runTimer = null; }
+    el('run-btn').textContent = 'Run';
+  }
+
+  mapPlot = S.plot(el('pf-canvas'), {
+    W: 640, H: 330, xRange: [0, 100], yRange: [-1, 10],
+    xLabel: 'position along the corridor', yLabel: 'time (step)',
+    padL: 54, onResize: drawAll
+  });
+  essPlot = S.plot(el('ess-canvas'), {
+    W: 640, H: 180, xRange: [0, 10], yRange: [0, 150],
+    xLabel: 'time (step)', yLabel: 'effective sample size',
+    padL: 54, onResize: drawAll
+  });
+
+  Guide.bindSliders([el('n-slider')], function (sl) {
+    N = parseInt(sl.value, 10);
+    initState();
+    drawAll();
+  });
+  Guide.bindSliders([el('sigma-slider')], function (sl) {
+    sigmaMeas = parseFloat(sl.value);
+  });
+
+  el('adaptive-toggle').addEventListener('change', function () { adaptive = this.checked; });
+  el('inject-toggle').addEventListener('change', function () { injections = this.checked; });
+
+  el('predict-btn').addEventListener('click', function () { if (running) return; doPredict(); drawAll(); });
+  el('update-btn').addEventListener('click', function () { if (running) return; doUpdate(); });
+  el('run-btn').addEventListener('click', function () { if (running) stopRun(); else startRun(); });
+  el('kidnap-btn').addEventListener('click', function () { doKidnap(); });
+  el('reset-btn').addEventListener('click', function () { stopRun(); initState(); drawAll(); });
+
+  initState();
+  drawAll();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'particle-filter-ess-purpose',
+      kind: 'choice',
+      prompt: 'Why does a particle filter resample, and what does the effective sample size tell you before you do?',
+      options: [
+        { label: 'Resampling discards low-weight hypotheses and duplicates high-weight ones; the ESS says how many particles are still effectively contributing.', correct: true },
+        { label: 'Resampling makes the particles more accurate by averaging them; the ESS is the average particle weight.', correct: false },
+        { label: 'Resampling moves the particles toward the measurement; the ESS is the number of distinct landmarks seen.', correct: false }
+      ],
+      explanation: 'Resampling is a re-draw proportional to weight: it thins the dead hypotheses and copies the live ones. It does not create information. The ESS, 1/Σw², runs from N when the weights are equal down toward 1 when one particle dominates, so it is the natural trigger for resampling.'
+    },
+    {
+      id: 'particle-filter-ess-uniform',
+      kind: 'numeric',
+      prompt: 'A cloud has 100 particles and all their normalised weights are equal. What is the effective sample size $1/\\sum_i \\tilde w_i^2$?',
+      answer: 100,
+      tolerance: 0.5,
+      explanation: 'With equal weights each is 1/100, so the sum of squares is 100 × (1/100)² = 1/100 and the ESS is 100. Equal weights mean every particle is pulling its weight, which is the best case.'
+    },
+    {
+      id: 'particle-filter-ess-formula',
+      kind: 'numeric',
+      prompt: 'After an update the sum of squared normalised weights is 0.05. What is the effective sample size?',
+      answer: 20,
+      tolerance: 0.01,
+      explanation: 'ESS = 1 / Σw² = 1 / 0.05 = 20. Out of however many particles exist, only about twenty are doing meaningful work, which is exactly the signal that it is time to resample.'
+    },
+    {
+      id: 'particle-filter-kidnapped',
+      kind: 'choice',
+      prompt: 'A converged particle filter is not told that its robot has been picked up and moved. Every particle now sits far from the true position. Why does ordinary resampling fail to recover, and what fixes it?',
+      options: [
+        { label: 'All particles are far from a position consistent with the reading, so no hypothesis near the truth exists for resampling to copy; uniform random injections restore the missing hypotheses.', correct: true },
+        { label: 'The measurements are being ignored; raising the measurement noise makes the filter treat them properly.', correct: false },
+        { label: 'The particles are too spread out; reducing the process noise to zero lets them converge on the truth.', correct: false }
+      ],
+      explanation: 'Resampling can only duplicate what is already in the cloud, so a fully collapsed filter with no particle near the truth is stuck no matter how informative the readings are. Augmented MCL injects a small fraction of uniform random particles each step so the cloud can rediscover the abandoned region.'
+    }
+  ];
+  GuideQuiz.init(el('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,388 @@
+---
+title: "LLM Training, Interactively — Part 8: Alignment — RLHF, Reward Models, and DPO"
+description: "How preference data trains a model to prefer better responses over worse ones — the KL-reward frontier, PPO's clipped objective, DPO's implicit reward, reward hacking, and DPO variants, illustrated with OLMo's Tulu 3 post-training recipe."
+permalink: "/ai/llm-training/rlhf/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-rlhf.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .llmt-pair { display: flex; gap: 14px; flex-wrap: wrap; flex-basis: 100%; }
+  .llmt-card { flex: 1 1 260px; background: var(--color-bg); border-radius: var(--radius-sm); padding: 12px 14px; border: 1px solid var(--color-divider); }
+  .llmt-card p { margin: 6px 0 0; font-size: 13.5px; }
+  .llmt-card .label { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .llmt-pipeline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12.5px; }
+  .llmt-pipeline .pbox { background: var(--color-bg); border: 1px solid var(--color-divider); border-radius: var(--radius-sm); padding: 8px 10px; }
+  .llmt-pipeline .arrow { opacity: 0.5; }
+  .llmt-btnrow button.llmt-chosen { outline: 2px solid var(--color-accent); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 8 of 15</span>
+    <h1>Alignment: RLHF, Reward Models, and DPO</h1>
+    <p>SFT teaches a model to produce <em>a</em> plausible response in the right format. It has no mechanism for the much more common real situation: two responses are both reasonable, but one is clearly better. That comparative judgment is what <strong>alignment</strong> is built to train on, using human (or model) preferences rather than single correct answers — and it comes with its own failure mode, reward hacking, that this part now makes concrete rather than just naming.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="prefdata">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Preference data: comparisons, not corrections</h2></div>
+    <p class="llmt-eyebrow">Where alignment data comes from</p>
+    <p>Instead of writing "the correct answer," labelers (human annotators, or sometimes another model acting as a judge — Part 10 covers the pitfalls of that) are shown a prompt with two candidate responses and asked which is better. Each judgment becomes one training example: a <strong>chosen</strong> response and a <strong>rejected</strong> response for the same prompt.</p>
+    <div class="llmt-demo">
+      <div class="llmt-pair">
+        <div class="llmt-card reveal"><span class="label">Response A</span><p id="s1-a"></p></div>
+        <div class="llmt-card reveal"><span class="label">Response B</span><p id="s1-b"></p></div>
+      </div>
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-btnrow">
+          <button id="s1-pick-a">Prefer A</button>
+          <button id="s1-pick-b">Prefer B</button>
+          <button id="s1-next">New pair</button>
+        </div>
+        <div class="llmt-readout" id="s1-readout">Pick the response you think a labeler would prefer, then compare with the intended answer.</div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Real preference data has real biases:</b> annotators (human or model) measurably favor longer responses (<strong>length/verbosity bias</strong>) and responses that flatter the asker's stated view (<strong>sycophancy bias</strong>), independent of actual quality — both get baked into whatever is trained on this data unless specifically corrected for.</span></div>
+  </section>
+
+  <section class="llmt-step" id="rewardmodel">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>Training a reward model</h2></div>
+    <p class="llmt-eyebrow">Method 1 of 2 — the RLHF route</p>
+    <p>The classic RLHF recipe first trains a separate <strong>reward model</strong>: a copy of the language model with its output head replaced by a single scalar score, trained so the chosen response scores higher than the rejected one — the Bradley-Terry loss, reused in Part 10's arena-rating math:</p>
+    <div class="llmt-math llmt-katex">$$L = -\log\sigma\big(r_\theta(x,y_w) - r_\theta(x,y_l)\big), \qquad y_w = \text{chosen},\ y_l = \text{rejected}$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <canvas id="s2-canvas" width="700" height="220"></canvas>
+      </div>
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-field"><label>Reward margin r(chosen) − r(rejected) <span class="val" id="s2-mval"></span></label><input type="range" id="s2-margin" min="-4" max="4" step="0.1" value="0.5"></div>
+        <div class="llmt-readout" id="s2-readout"></div>
+      </div>
+    </div>
+    <p>Reward models are themselves evaluated — Ai2's <strong>RewardBench</strong> is a standard benchmark specifically for how well a reward model's scores match held-out human preference judgments, since a flawed reward model quietly poisons everything trained against it downstream.</p>
+  </section>
+
+  <section class="llmt-step" id="ppo">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>PPO: the clipped objective, and the KL–reward frontier</h2></div>
+    <p class="llmt-eyebrow">Method 1 of 2, continued</p>
+    <p>With a trained reward model, the SFT model (now the <strong>policy</strong>) is optimized with <strong>PPO</strong> to generate higher-scoring responses. PPO's defining trick is the <strong>clipped surrogate objective</strong>: it caps how much the policy is allowed to change in one update relative to the policy that generated the data, based on the probability ratio $r = \pi_\theta(y|x)/\pi_{old}(y|x)$:</p>
+    <div class="llmt-math llmt-katex">$$L^{CLIP} = \min\big(r \cdot \hat{A},\ \text{clip}(r, 1-\epsilon, 1+\epsilon)\cdot \hat{A}\big)$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="ppo-canvas" width="480" height="240"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Advantage Â <span class="val" id="ppo-adv-val">1.0</span></label><input type="range" id="ppo-adv" min="-2" max="2" step="0.1" value="1.0"></div>
+        <div class="llmt-field"><label>Clip ε <span class="val" id="ppo-eps-val">0.2</span></label><input type="range" id="ppo-eps" min="0.05" max="0.5" step="0.05" value="0.2"></div>
+        <div class="llmt-readout" id="ppo-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-canvas-hint">With positive advantage (this action was better than expected), the objective flattens once the policy has already increased that action's probability past 1+ε — no incentive to keep pushing it further in one step. With negative advantage, clipping works the mirror way. This is what keeps a single batch from swinging the policy too far.</p>
+    <p>Separately, PPO's objective also includes a <strong>KL-divergence penalty</strong> against the frozen SFT reference, controlled by β, trading off reward against how far the policy drifts:</p>
+    <div class="llmt-math llmt-katex">$$\text{maximize}\ \ E[r_\theta(x,y)] - \beta \cdot \mathrm{KL}(\pi_\theta \Vert \pi_{ref})$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="kl-canvas" width="480" height="260"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>β (KL penalty weight) <span class="val" id="kl-beta-val">0.10</span></label><input type="range" id="kl-beta" min="0.01" max="1" step="0.01" value="0.10"></div>
+        <div class="llmt-readout" id="kl-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Reward hacking, made concrete:</b> as β shrinks, reward-model score keeps climbing but drifts past the point where it reflects real quality — the curve above is built so that past a KL "cliff," reward-model score and actual quality visibly diverge. This is the literal mechanism behind the classic failure of RLHF policies learning to pad responses, use confident-sounding hedge phrases, or otherwise exploit reward-model quirks rather than genuinely improve.</span></div>
+  </section>
+
+  <section class="llmt-step" id="bestofn">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Best-of-n: alignment without any training</h2></div>
+    <p class="llmt-eyebrow">A simpler baseline</p>
+    <p>Before reaching for RL, a surprisingly strong baseline: sample <var>n</var> responses from the SFT model, score each with the reward model, and simply return the highest-scoring one at inference time (<strong>rejection sampling</strong> / best-of-n). No policy update at all — just spending more inference compute to pick better among what the model could already produce.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="bon-canvas" width="480" height="220"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>n (samples per prompt) <span class="val" id="bon-n-val">4</span></label><input type="range" id="bon-n" min="1" max="64" step="1" value="4"></div>
+        <div class="llmt-readout" id="bon-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-canvas-hint">Best-of-n's achieved reward rises with n, but so does its own KL divergence from the reference policy — it's not a free lunch, and it costs n× the inference compute per response actually returned.</p>
+  </section>
+
+  <section class="llmt-step" id="dpo">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>DPO: skipping the reward model entirely</h2></div>
+    <p class="llmt-eyebrow">Method 2 of 2 — the simpler route</p>
+    <p><strong>Direct Preference Optimization (DPO)</strong> substitutes the KL-regularized objective's closed-form optimal policy back into the reward-model loss, producing an objective that trains the <em>policy directly</em> on preference pairs — no separate reward model, no RL loop:</p>
+    <div class="llmt-math llmt-katex">$$L = -\log\sigma\Big(\beta\big[\log\tfrac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log\tfrac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\big]\Big)$$</div>
+    <p>The bracketed quantity is DPO's <strong>implicit reward</strong> — the model's own log-probability ratio versus the reference, standing in for a learned reward score. Edit the four values below (each is a toy log-probability) and watch the implicit reward margin and per-pair gradient weight move:</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-grid2">
+        <div class="llmt-field"><label>log π_θ(chosen) <span class="val" id="dpo-lpc-val">-2.0</span></label><input type="range" id="dpo-lpc" min="-8" max="0" step="0.1" value="-2.0"></div>
+        <div class="llmt-field"><label>log π_ref(chosen) <span class="val" id="dpo-lrc-val">-2.5</span></label><input type="range" id="dpo-lrc" min="-8" max="0" step="0.1" value="-2.5"></div>
+        <div class="llmt-field"><label>log π_θ(rejected) <span class="val" id="dpo-lpr-val">-3.0</span></label><input type="range" id="dpo-lpr" min="-8" max="0" step="0.1" value="-3.0"></div>
+        <div class="llmt-field"><label>log π_ref(rejected) <span class="val" id="dpo-lrr-val">-2.4</span></label><input type="range" id="dpo-lrr" min="-8" max="0" step="0.1" value="-2.4"></div>
+      </div>
+      <div class="llmt-field"><label>β <span class="val" id="dpo-beta-val">0.10</span></label><input type="range" id="dpo-beta" min="0.01" max="1" step="0.01" value="0.10"></div>
+      <div class="llmt-readout" id="dpo-readout"></div>
+    </div>
+    <p>No reward model to train, no PPO rollouts — closer in engineering complexity to SFT than to a full RL pipeline. Since its introduction, a family of variants has emerged tweaking exactly how the implicit reward is shaped: <strong>IPO</strong> (a bounded loss less prone to overfitting confident preferences), <strong>KTO</strong> (trains on unpaired binary "good/bad" labels instead of pairs), <strong>SimPO</strong> and <strong>ORPO</strong> (drop the reference model entirely, trading a little robustness for simplicity). β itself controls how tightly the policy is tied to the reference in every variant — small β allows bigger behavior changes per preference pair, large β is more conservative.</p>
+    <div class="llmt-goal">💡 <span><b>Online vs. offline preference data:</b> DPO as described trains on a fixed, pre-collected preference dataset (<em>offline</em>). Newer setups instead sample fresh completions from the current policy and get them freshly judged during training (<em>online</em> DPO/RLHF) — closer to PPO's loop, at the cost of needing a live judge or reward model rather than a static dataset.</span></div>
+    <div class="llmt-goal">💡 <span><b>OLMo's actual recipe:</b> Ai2's Tulu 3 post-training pipeline combines SFT, then DPO on preference data, then RLVR (Part 9) — a concrete, published example of mixing these techniques rather than treating them as mutually exclusive.</span></div>
+  </section>
+
+  <section class="llmt-step" id="pitfalls">
+    <div class="llmt-step-head"><span class="llmt-step-num">6</span><h2>Preference-tuning at scale: delta, size, length, and turns</h2></div>
+    <p class="llmt-eyebrow">OLMo 3's preference stage</p>
+    <p>OLMo 3 turns preference tuning from a nicety into a capability stage, and in doing so surfaces four lessons that apply to any DPO run.</p>
+    <p><b>1 · Delta Learning — the contrast is the signal.</b> On a strong SFT checkpoint, continuing to imitate better responses from a larger model can <em>hurt</em>: OLMo 3's dev checkpoint dropped from <span class="lc-note">70.3 → 64.5</span> when supervised on Qwen3-32B thinking traces. Pairing those same strong completions (chosen) with deliberately weak ones from Qwen3-0.6B (rejected) and running DPO instead lifted the average to <span class="lc-note">72.9</span>. The quality of a preference pair depends on the gap between the two responses, not on the chosen response alone.</p>
+    <p><b>2 · Dataset size is a U-shape.</b> Preference performance does <em>not</em> improve monotonically with more pairs. AlpacaEval and ZebraLogic peak around <strong>75–100K</strong> pairs and then decline, while AIME is still improving at that budget. Early stopping matters, and the best size depends on the downstream task — so size is swept as a hyperparameter rather than fixed.</p>
+    <p><b>3 · Watch the length bias.</b> Chosen responses are systematically longer than rejected ones; at the 80th percentile the difference is <span class="lc-note">538 tokens</span> for GPT-judged pairs and <span class="lc-note">564</span> for delta-heuristic pairs. Models learn verbosity along with quality. OLMo 3 filters chat and multi-turn pairs to a <strong>100-token</strong> chosen-minus-rejected difference, accepting slightly lower length-sensitive benchmark scores for much more usable output.</p>
+    <p><b>4 · Teach multi-turn coherence explicitly.</b> Single-turn pairs say nothing about staying on topic across turns. OLMo 3 synthesizes multi-turn conversations two ways — <em>self-talk</em> (the model generates follow-ups) and <em>synthetic-context</em> (related independent questions become earlier turns) — and varies only the final turn, so there is no ambiguity about which turn the preference applies to.</p>
+    <p>Finally, <b>combine complementary signals</b>: delta-learning heuristic pairs and delta-aware GPT-judged pairs produce different spreads of gains, and using both beats either alone. The GPT-judged pipeline had to be redesigned to <em>maximize</em> the delta (force weaker models into the candidate pool, pick the worst response as rejected) — improving the judge or the generator pool alone did nothing.</p>
+    <div class="llmt-goal">📌 <span><b>Go deeper:</b> Part 15 shows the Delta Learning numbers, the DPO size sweep, and how the length-controlled DPO checkpoint becomes a better starting point for RL.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th></th><th>RLHF (PPO)</th><th>DPO</th></tr></thead>
+      <tbody>
+        <tr><td>Needs a separate reward model?</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Needs an RL loop?</td><td>Yes (PPO, clipped objective)</td><td>No — direct supervised-style loss</td></tr>
+        <tr><td>Models held in memory</td><td>Policy + reward model + frozen reference</td><td>Policy + frozen reference (or none, for SimPO/ORPO)</td></tr>
+        <tr><td>Main risk</td><td>Reward hacking against the reward model</td><td>Less flexible for reward signals beyond static preference pairs</td></tr>
+        <tr><td>Delta Learning</td><td colspan="2">Pair a strong chosen response with a deliberately weak rejected one; the contrast, not the chosen quality, carries the signal.</td></tr>
+        <tr><td>Dataset size</td><td colspan="2">U-shaped: peaks around 75–100K pairs for some evals while others keep rising — sweep size and early-stop.</td></tr>
+        <tr><td>Length bias</td><td colspan="2">Chosen responses skew long; cap the chosen-minus-rejected difference (OLMo 3 uses 100 tokens).</td></tr>
+        <tr><td>Multi-turn preferences</td><td colspan="2">Synthesize conversations and vary only the final turn so the ranking is unambiguous.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Ouyang et al., <a href="https://arxiv.org/abs/2203.02155">"Training Language Models to Follow Instructions with Human Feedback"</a> (2022).</li>
+      <li>Schulman et al., <a href="https://arxiv.org/abs/1707.06347">"Proximal Policy Optimization Algorithms"</a> (2017).</li>
+      <li>Rafailov et al., <a href="https://arxiv.org/abs/2305.18290">"Direct Preference Optimization: Your Language Model is Secretly a Reward Model"</a> (2023).</li>
+      <li>Lambert et al. (Ai2), <a href="https://arxiv.org/abs/2403.13787">"RewardBench: Evaluating Reward Models for Language Modeling"</a> (2024).</li>
+      <li>Lambert et al. (Ai2), <a href="https://arxiv.org/abs/2411.15124">"Tulu 3"</a> (2024) — SFT + DPO + RLVR recipe used for OLMo.</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>For tasks with an automatically checkable answer, there's now a whole parallel track that skips human preferences entirely.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/reasoning/' | relative_url }}">Continue: reasoning &amp; RL with verifiable rewards →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+  function sigmoid(x){ return 1/(1+Math.exp(-x)); }
+
+  // ---- Step 1: preference picker ----
+  (function(){
+    var pairs = [
+      { prompt: 'How do I safely jump-start a car battery?',
+        a: 'Connect any two cables to any terminals — polarity doesn\'t really matter for a quick jump.',
+        b: 'Connect red to both positive terminals first, then black to the working battery\'s negative terminal, then black to an unpainted metal surface on the dead car (not its negative terminal) — this order reduces spark risk near the battery.',
+        better: 'b' },
+      { prompt: 'Summarize the plot of a mystery novel in one sentence.',
+        a: 'A detective investigates a series of clues to uncover who committed a crime, and the story resolves with the culprit\'s identity revealed.',
+        b: 'A detective investigates a series of clues to uncover who committed a crime, and the story resolves with the culprit\'s identity revealed, and then there is a trial, and then an appeal, and then a television adaptation, and then a sequel, and then...',
+        better: 'a' },
+      { prompt: 'What\'s a good first step for someone learning to code?',
+        a: 'Just start; you\'ll figure it out.',
+        b: 'Pick one beginner-friendly language (Python is a common choice), work through a short structured tutorial, and build one small project you\'re personally motivated to finish — momentum matters more than picking the "perfect" first language.',
+        better: 'b' }
+    ];
+    var idx = 0;
+    var aEl = document.getElementById('s1-a'), bEl = document.getElementById('s1-b');
+    var readout = document.getElementById('s1-readout');
+    var pickA = document.getElementById('s1-pick-a'), pickB = document.getElementById('s1-pick-b');
+    function render(){
+      var p = pairs[idx];
+      aEl.textContent = p.a; bEl.textContent = p.b;
+      readout.textContent = 'Prompt: "' + p.prompt + '" — pick the response you think a labeler would prefer.';
+      pickA.classList.remove('llmt-chosen'); pickB.classList.remove('llmt-chosen');
+    }
+    function pick(choice){
+      var p = pairs[idx];
+      var correct = choice === p.better;
+      readout.innerHTML = '<span class="k">you picked:</span> Response ' + choice.toUpperCase() +
+        '<br><span class="k">labeler preference used for this example:</span> <span class="hi">Response ' + p.better.toUpperCase() + '</span>' +
+        (correct ? ' — matches what you picked.' : ' — recorded as chosen/rejected for training regardless of which felt more natural to pick.');
+      (choice==='a'?pickA:pickB).classList.add('llmt-chosen');
+    }
+    pickA.addEventListener('click', function(){ pick('a'); });
+    pickB.addEventListener('click', function(){ pick('b'); });
+    document.getElementById('s1-next').addEventListener('click', function(){ idx = (idx+1) % pairs.length; render(); });
+    render();
+  })();
+
+  // ---- Step 2: reward margin / sigmoid loss ----
+  (function(){
+    var canvas = document.getElementById('s2-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var marginEl = document.getElementById('s2-margin'), mval = document.getElementById('s2-mval');
+    var readout = document.getElementById('s2-readout');
+    function loss(margin){ return -Math.log(sigmoid(margin) + 1e-9); }
+    function draw(){
+      var m = parseFloat(marginEl.value);
+      mval.textContent = m.toFixed(1);
+      var pts = []; for (var x=-4;x<=4;x+=0.05) pts.push({x:x, y:Math.min(loss(x),4)});
+      var axes = G.drawLines(ctx, W, H, [{points:pts,color:c.accent}], [-4,4], [0,4], {xLabel:'margin (chosen − rejected)', yLabel:'loss'});
+      var mx = axes.px(m), my = axes.py(Math.min(loss(m),4));
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(mx,my,5,0,2*Math.PI); ctx.fill();
+      readout.innerHTML = '<span class="k">margin:</span> ' + m.toFixed(1) + '&nbsp;&nbsp;<span class="k">loss:</span> <span class="hi">' + loss(m).toFixed(3) + '</span>';
+    }
+    marginEl.addEventListener('input', draw);
+    draw();
+  })();
+
+  // ---- PPO clipped objective ----
+  (function(){
+    var advS = document.getElementById('ppo-adv'), epsS = document.getElementById('ppo-eps');
+    var advV = document.getElementById('ppo-adv-val'), epsV = document.getElementById('ppo-eps-val');
+    var canvas = document.getElementById('ppo-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('ppo-readout');
+    var W = canvas.width, H = canvas.height;
+    function render(){
+      var A = parseFloat(advS.value), eps = parseFloat(epsS.value);
+      advV.textContent = A.toFixed(1); epsV.textContent = eps.toFixed(2);
+      var pts = [];
+      for (var r=0; r<=2; r+=0.02){
+        var unclipped = r*A;
+        var clippedR = Math.max(1-eps, Math.min(1+eps, r));
+        var clipped = clippedR*A;
+        var obj = A>=0 ? Math.min(unclipped, clipped) : Math.max(unclipped, clipped);
+        pts.push({x:r, y:obj});
+      }
+      var yMin = Math.min.apply(null, pts.map(function(p){return p.y;})) - 0.2;
+      var yMax = Math.max.apply(null, pts.map(function(p){return p.y;})) + 0.2;
+      G.drawLines(ctx, W, H, [{points:pts, color:c.accent}], [0,2], [yMin,yMax], {xLabel:'probability ratio r = π_θ/π_old', yLabel:'clipped objective'});
+      readout.innerHTML = '<span class="k">advantage:</span> '+A.toFixed(1)+'  <span class="k">clip range:</span> ['+(1-eps).toFixed(2)+', '+(1+eps).toFixed(2)+']<br>' +
+        '<span style="opacity:0.6">'+(A>=0?'flat region above r=1+ε removes incentive to keep increasing an already-more-likely good action':'flat region below r=1-ε removes incentive to keep decreasing an already-less-likely bad action')+'</span>';
+    }
+    advS.addEventListener('input', render); epsS.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- KL-reward frontier ----
+  (function(){
+    var betaS = document.getElementById('kl-beta'), betaV = document.getElementById('kl-beta-val');
+    var canvas = document.getElementById('kl-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('kl-readout');
+    var W = canvas.width, H = canvas.height;
+    // stylized model: as KL grows, reward-model score keeps rising (log-ish) but true quality peaks then falls (hacking)
+    function rewardScore(kl){ return 3*Math.log(1+kl*4); }
+    function trueQuality(kl){ return 3*Math.log(1+kl*4) - 2.2*Math.pow(kl,1.6); }
+    function render(){
+      var beta = parseFloat(betaS.value);
+      betaV.textContent = beta.toFixed(2);
+      var klAtBeta = Math.min(2.5, 0.35/beta); // smaller beta -> policy drifts further (larger KL)
+      var pts1=[], pts2=[];
+      for (var kl=0; kl<=2.5; kl+=0.03){ pts1.push({x:kl,y:rewardScore(kl)}); pts2.push({x:kl,y:trueQuality(kl)}); }
+      var axes = G.drawLines(ctx, W, H, [{points:pts1,color:c.accent},{points:pts2,color:c.accent2}], [0,2.5], [-2,6], {xLabel:'KL(policy‖reference)', yLabel:'score'});
+      ctx.font='11px '+c.font; ctx.fillStyle=c.accent; ctx.fillText('reward-model score', axes.padL+8, axes.padT+14);
+      ctx.fillStyle=c.accent2; ctx.fillText('true response quality', axes.padL+8, axes.padT+28);
+      var mx = axes.px(klAtBeta), my1=axes.py(rewardScore(klAtBeta)), my2=axes.py(trueQuality(klAtBeta));
+      ctx.fillStyle=c.text; ctx.beginPath(); ctx.arc(mx,my1,4,0,2*Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(mx,my2,4,0,2*Math.PI); ctx.fill();
+      var hacking = rewardScore(klAtBeta) - trueQuality(klAtBeta);
+      readout.innerHTML = '<span class="k">operating point (this β):</span> KL ≈ '+klAtBeta.toFixed(2)+
+        '<br><span class="k">reward-model score:</span> '+rewardScore(klAtBeta).toFixed(2)+'  <span class="k">true quality:</span> '+trueQuality(klAtBeta).toFixed(2)+
+        '<br><span class="'+(hacking>2?'bad':'hi')+'">gap (reward-hacking indicator): '+hacking.toFixed(2)+'</span>';
+    }
+    betaS.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Best-of-n ----
+  (function(){
+    var nS = document.getElementById('bon-n'), nV = document.getElementById('bon-n-val');
+    var canvas = document.getElementById('bon-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('bon-readout');
+    var W = canvas.width, H = canvas.height;
+    function expectedMaxReward(n){
+      // expected max of n draws from N(0,1)-ish reward distribution, approximated
+      return 0.5*Math.sqrt(2*Math.log(Math.max(1,n)));
+    }
+    function render(){
+      var n = parseInt(nS.value,10);
+      nV.textContent = n;
+      var pts = []; for (var i=1;i<=64;i++) pts.push({x:i, y:expectedMaxReward(i)});
+      var axes = G.drawLines(ctx, W, H, [{points:pts,color:c.accent}], [1,64], [0,2], {xLabel:'n (samples)', yLabel:'expected best-of-n reward'});
+      var mx = axes.px(n), my = axes.py(expectedMaxReward(n));
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(mx,my,5,0,2*Math.PI); ctx.fill();
+      readout.innerHTML = '<span class="k">n:</span> '+n+'  <span class="k">expected reward:</span> '+expectedMaxReward(n).toFixed(2)+'  <span class="k">inference cost:</span> '+n+'× one sample';
+    }
+    nS.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- DPO gradient inspector ----
+  (function(){
+    var ids = ['dpo-lpc','dpo-lrc','dpo-lpr','dpo-lrr','dpo-beta'];
+    var els = {}; ids.forEach(function(id){ els[id]=document.getElementById(id); });
+    var readout = document.getElementById('dpo-readout');
+    function render(){
+      ids.forEach(function(id){ document.getElementById(id+'-val').textContent = parseFloat(els[id].value).toFixed(2); });
+      var lpc=+els['dpo-lpc'].value, lrc=+els['dpo-lrc'].value, lpr=+els['dpo-lpr'].value, lrr=+els['dpo-lrr'].value, beta=+els['dpo-beta'].value;
+      var implicitRewardChosen = beta*(lpc-lrc);
+      var implicitRewardRejected = beta*(lpr-lrr);
+      var margin = implicitRewardChosen - implicitRewardRejected;
+      var loss = -Math.log(sigmoid(margin)+1e-9);
+      var gradWeight = sigmoid(-margin); // how much this pair still pushes the gradient
+      readout.innerHTML = '<span class="k">implicit reward (chosen):</span> '+implicitRewardChosen.toFixed(3)+
+        '<br><span class="k">implicit reward (rejected):</span> '+implicitRewardRejected.toFixed(3)+
+        '<br><span class="k">margin:</span> <span class="hi">'+margin.toFixed(3)+'</span>  <span class="k">DPO loss:</span> '+loss.toFixed(3)+
+        '<br><span class="k">gradient weight on this pair:</span> '+gradWeight.toFixed(3)+' <span style="opacity:0.6">('+(gradWeight>0.4?'still a lot of learning signal from this pair':'model already confidently prefers chosen — little left to learn here')+')</span>';
+    }
+    ids.forEach(function(id){ els[id].addEventListener('input', render); });
+    render();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

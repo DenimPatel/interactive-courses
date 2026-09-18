@@ -1,0 +1,360 @@
+---
+title: "Video as a 3D signal"
+description: "The causal 3-D VAE, spatiotemporal patches, 3-D against factorised attention, and the token and FLOP budget a clip really costs."
+permalink: "/ai/generative-media/video-basics/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Video as a 3D signal</h1>
+    <p>An image is a grid with two axes. A video is a grid with three, and the third axis is not like the others: it is ordered, and every frame must be consistent with the ones before it. Video diffusion is mostly the story of making that third axis affordable. A causal 3-D autoencoder compresses it, spatiotemporal patches tokenise it, and factorised attention splits the quadratic cost into a spatial term and a temporal one. This part counts what a clip actually costs.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="signal">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A clip is a 3-D signal</h2></div>
+    <p class="g-eyebrow">One more axis, and an ordering</p>
+    <p>The strip below is a few frames of a moving pattern, drawn frame by frame. Read it left to right and it is a signal indexed by time as well as by the two spatial axes, and the temporal index carries something the spatial ones do not: a direction. Frame $k$ is the past of frame $k+1$, and a model that predicts the next frame is forbidden from looking ahead. That arrow of time is what makes a video model more than a stack of image models, and every architectural choice that follows is a response to it.</p>
+    <p>The naive extension is obvious: treat the video as a batch of images and diffuse each frame independently. It fails immediately, because nothing ties the frames together and the result flickers. The useful extension is to let the model see the time axis explicitly, which raises a cost problem before it raises a modelling one. A clip has $F$ times as many pixels as a frame, and full attention over all of them is quadratic in a number that just grew by a factor of $F$.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vtok-frame-canvas" width="640" height="52"></canvas>
+        <p class="g-canvas-hint">A strip of frames drawn with <code>GenMedia.raster</code>. The vertical guides group frames into the temporal compression window of the causal VAE.</p>
+      </div>
+      <div class="g-controls">
+        <p class="g-mini">The pixel count is not the only thing that grows. Latent tokens, attention operations and memory all scale with the temporal axis, and the way they scale is the subject of the rest of this part.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> explain why the VAE is causal, why attention is factorised into spatial and temporal passes, and estimate the token count and the attention ratio for a clip of a given length and resolution.</span></div>
+    <div class="g-toc">
+      <a href="#vae">2 · The causal VAE</a>
+      <a href="#attention">3 · Patches and attention</a>
+      <a href="#budget">4 · The token budget</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="vae">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The causal VAE</h2></div>
+    <p class="g-eyebrow">Compress time without peeking ahead</p>
+    <p>Latent diffusion already compresses space by a factor of eight per axis before the diffusion model ever sees the data. Video does the same and adds a temporal axis, typically compressing four frames into one latent frame. A three-second clip at 24 frames per second is 72 frames; after a temporal factor of four it is 18 latent frames, and the diffusion model works on that. The compression is not cosmetic &mdash; it is the difference between a transformer that fits and one that does not.</p>
+    <p>The autoencoder must be <em>causal</em> along time. A convolutional encoder that looked at both directions would let latent frame $k$ depend on pixel frame $k+1$, which would leak the future into the representation and make autoregressive or streaming use impossible. The fix is causal temporal convolutions: the kernel only sees current and past frames, so latent frame $k$ is a function of frames up to $k$. The property is what lets one model serve both full-sequence diffusion and the frame-by-frame rollout discussed in the next chapter.</p>
+    <div class="g-warn">⚠ <span><b>Temporal compression is a prior, not a free lunch.</b> Four frames folded into one latent frame means the decoder must invent the motion between them. Fast motion, cuts and fine temporal texture are exactly what a large compression factor loses, which is why the factor is usually small compared with the spatial one.</span></div>
+  </section>
+
+  <section class="g-step" id="attention">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Patches and attention</h2></div>
+    <p class="g-eyebrow">Full 3-D against the factorised form</p>
+    <p>After compression, the latent clip is cut into spatiotemporal patches and flattened into a token sequence, just as an image is. The count is easy to read off: latent frames times the patches per frame. The trouble is attention. Full 3-D attention lets every token see every other token, which is quadratic in that count and, for a clip of any length, astronomically expensive.</p>
+    <p>The standard fix is to factorise the attention into two passes. A <em>spatial</em> pass runs full attention within each frame, letting positions on a frame talk to each other; a <em>temporal</em> pass runs attention across frames at each position, letting a patch look at the same patch over time. The two passes together see the whole clip, but their cost is the sum of two much smaller quadratics rather than one big one. The bars below compare them at the current settings, on a log scale because the gap is large.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vtok-cost-canvas" width="620" height="260"></canvas>
+        <p class="g-canvas-hint">Attention operations on a log scale at the current frames, resolution and patch size. The ratio is printed in the readout.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Pixel frames F <span class="val">192</span></label><input type="range" id="vtok-frames" min="8" max="384" step="8" value="192"></div>
+        <div class="g-field"><label>Resolution (square) <span class="val">640</span></label><input type="range" id="vtok-res" min="128" max="768" step="32" value="640"></div>
+        <div class="g-field"><label>Latent patch <span class="val">2</span></label><input type="range" id="vtok-patch" min="0" max="2" step="1" value="0"></div>
+        <div class="g-readout" id="vtok-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>Factorisation is the single most important trick in video diffusion. It does not just make attention cheaper; it gives the model an explicit spatial module and an explicit temporal module, each of which can be regularised and conditioned separately.</span></div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The token budget</h2></div>
+    <p class="g-eyebrow">Why a clip costs about a hundred images</p>
+    <p>The plot traces the two attention costs as the clip lengthens at the current resolution and patch size. The factorised curve grows, but gently; the full 3-D curve climbs the log axis almost twice as fast, because its cost is quadratic in a token count that is itself linear in frame count. This is the whole reason a video backbone is not an image backbone with a longer sequence: at any useful clip length the full 3-D form is unaffordable, and the factorised form is what makes the problem finite.</p>
+    <p>The budget is also measured against a single image, which is the comparison a user feels. The number of latent tokens in the clip divided by the tokens in one latent frame is the temporal factor &mdash; with a compression of four, a 96-frame clip holds 24 latent frames' worth of tokens. Attention, though, grows faster than tokens, so the honest summary is that a few-second clip costs tens to hundreds of times an image depending on whether attention is full or factorised, and that most of the engineering budget goes into keeping that multiplier down.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vtok-token-canvas" width="620" height="300"></canvas>
+        <p class="g-canvas-hint">Attention operations against clip length, log scale, for full 3-D and factorised attention at the settings above.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="vtok-budget-readout"></div>
+        <p class="g-mini">Token count grows linearly in frames; full 3-D attention grows quadratically in it. The gap between the curves is the attention ratio.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every video backbone makes these three choices</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Video</div>
+        <h3 style="margin:6px 0;">Latent video diffusion</h3>
+        <p style="margin-bottom:0;">Sora, Veo and their contemporaries are all causal 3-D VAEs plus a spatiotemporal transformer, and all of them factorise attention. The <a href="{{ '/ai/generative-media/latent-diffusion/' | relative_url }}">latent diffusion</a> machinery is unchanged except that the compressor is now three-dimensional and the compressor's causality is a requirement rather than a nicety.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Backbones</div>
+        <h3 style="margin:6px 0;">From U-Net to DiT over time</h3>
+        <p style="margin-bottom:0;">Early video models inflated the <a href="{{ '/ai/generative-media/unet/' | relative_url }}">U-Net</a> with a temporal axis at the coarse levels; current ones patchify the latent clip and run a <a href="{{ '/ai/generative-media/dit/' | relative_url }}">DiT</a> whose attention is factorised. The <a href="{{ '/ai/generative-media/samplers/' | relative_url }}">sampler</a> is the same story, with a step count that now multiplies an already larger per-step cost.</p>
+      </div>
+    </div>
+    <p>The next chapter takes the temporal axis seriously as a modelling problem rather than a cost problem: how to condition on a first frame, how errors accumulate over a long rollout, and why native audio and world models are the frontier claims of the moment.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Video generation moved from inflating image models to designing around the temporal axis. These papers mark the arc: the first latent video model, the causal compressor, the factorised transformer, and the scaling studies that made clip length a headline number.</p>
+    <p>Ho and coauthors factorise the image backbone into spatial and temporal components; Blattmann and coauthors put the video model in a latent space; Blattmann and coauthors add the causal 3-D autoencoder; and Brooks and coauthors report the spatiotemporal transformer at scale.</p>
+    <ul class="g-refs">
+      <li>Jonathan Ho, Tim Salimans, Alexey Gritsenko and coauthors, <a href="https://arxiv.org/abs/2204.03458">"Video Diffusion Models"</a>, 2022 &mdash; the factorised spatial and temporal attention introduced for video.</li>
+      <li>Andreas Blattmann, Robin Rombach, Huan Ling and coauthors, <a href="https://arxiv.org/abs/2304.08818">"Align your Latents: High-Resolution Video Synthesis with Latent Diffusion Models"</a>, 2023 &mdash; video diffusion in a compressed latent.</li>
+      <li>Andreas Blattmann, Tim Dockhorn, Sumith Kulal and coauthors, <a href="https://arxiv.org/abs/2311.15127">"Stable Video Diffusion: Scaling Latent Video Diffusion Models to Large Datasets"</a>, 2023 &mdash; the causal 3-D VAE and data curation.</li>
+      <li>Tim Brooks, Bill Peebles, Connor Holmes and coauthors, <a href="https://openai.com/research/video-generation-models-as-world-simulators">"Video Generation Models as World Simulators"</a>, 2024 &mdash; spatiotemporal patches and variable resolution and duration.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Causal 3-D VAE</td><td>Compresses space and time; temporal kernel sees only current and past frames</td></tr>
+        <tr><td>Temporal compression</td><td>Typically 4 pixel frames per latent frame; bounds the token count</td></tr>
+        <tr><td>Latent frames</td><td>$\lceil F / t_\text{comp}\rceil$; what the diffusion transformer actually sees</td></tr>
+        <tr><td>Spatiotemporal patches</td><td>Latent clip cut into tokens, exactly as an image is patchified</td></tr>
+        <tr><td>Full 3-D attention</td><td>Every token attends to every token; quadratic in clip tokens</td></tr>
+        <tr><td>Factorised attention</td><td>Spatial pass within frames plus temporal pass across frames; a sum of two quadratics</td></tr>
+        <tr><td>Token budget</td><td>Tokens grow linearly in frames; attention grows quadratically</td></tr>
+        <tr><td>Cost vs an image</td><td>Tens to hundreds of times an image, depending on length and attention form</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Tiling and factorising attention makes a single clip affordable, but nothing yet makes a long one coherent. The final part is about the temporal axis as a modelling problem: conditioning, drift, cascades, and the claim that these models are world simulators.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var T_COMP = 4, S_COMP = 8;
+  var PATCHES = [2, 4, 8];
+  var PATCH_NAMES = ['2 (fine)', '4 (medium)', '8 (coarse)'];
+
+  var frames = 192, res = 640, patchIdx = 0;
+  var patch = PATCHES[patchIdx];
+
+  function costAt(fr) {
+    var vt = GM.cost.videoTokens(fr, res, res, patch, T_COMP, S_COMP);
+    var vac = D.videoAttentionCost({ frames: vt.latentFrames, h: vt.latentH, w: vt.latentW, patch: patch });
+    return { vt: vt, vac: vac };
+  }
+  function log10(v) { return Math.log(Math.max(1, v)) / Math.LN10; }
+
+  // ---- frame strip ----------------------------------------------------------
+  var STRIP_FRAMES = 16, CELL = 16;
+  var stripRaster = GM.raster(document.getElementById('vtok-frame-canvas'), {
+    cols: STRIP_FRAMES * CELL, rows: CELL, channels: 3, W: 640, H: 52,
+    onResize: function () { drawStrip(); }
+  });
+  function drawStrip() {
+    if (!stripRaster) return;
+    stripRaster.fill(function (x, y) {
+      var f = Math.floor(x / CELL);
+      var local = x - f * CELL;
+      var cx = 8 + 5 * Math.sin(2 * Math.PI * f / STRIP_FRAMES);
+      var d = Math.hypot(local - cx, y - (CELL - 1) / 2);
+      var v = Math.max(0, 1 - d / 7);
+      return [0.15 + 0.8 * v, 0.1 + 0.25 * v, 0.2 + 0.6 * v];
+    });
+    stripRaster.draw();
+    var ctx = stripRaster.ctx, step = stripRaster.W / STRIP_FRAMES;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    for (var f = T_COMP; f < STRIP_FRAMES; f += T_COMP) {
+      var X = Math.round(f * step) + 0.5;
+      ctx.beginPath(); ctx.moveTo(X, 0); ctx.lineTo(X, stripRaster.H); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.textAlign = 'left';
+    ctx.fillText('temporal compression ×' + T_COMP + ' (guides every ' + T_COMP + ' frames)', 6, stripRaster.H - 4);
+  }
+
+  // ---- attention bars -------------------------------------------------------
+  var barSetup = Guide.setupCanvas(document.getElementById('vtok-cost-canvas'), 620, 260, function () { drawBars(); });
+  function drawBars() {
+    if (!barSetup) return;
+    var cc = costAt(frames), vac = cc.vac;
+    var data = [
+      { label: 'full 3-D', value: log10(vac.full), valueLabel: Guide.fmtNum(vac.full) + ' ops', color: c.accent2 },
+      { label: 'spatial only', value: log10(vac.spatial), valueLabel: Guide.fmtNum(vac.spatial), color: c.accent400 },
+      { label: 'temporal only', value: log10(vac.temporal), valueLabel: Guide.fmtNum(vac.temporal), color: c.accent700 },
+      { label: 'factorised', value: log10(vac.factorized), valueLabel: Guide.fmtNum(vac.factorized) + ' ops', color: c.accent }
+    ];
+    Guide.drawBars(barSetup.ctx, 620, 260, data, { padL: 104, fontSize: 12 });
+    var ctx = barSetup.ctx;
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('log10 attention operations', 104, 14);
+  }
+
+  // ---- token plot -----------------------------------------------------------
+  var tokenPlot = GM.plot(document.getElementById('vtok-token-canvas'), {
+    W: 620, H: 300, xRange: [8, 384], yRange: [3, 12],
+    xLabel: 'pixel frames F', yLabel: 'log10 attention ops',
+    onResize: function () { redrawTokens(); }
+  });
+  function redrawTokens() {
+    if (!tokenPlot) return;
+    tokenPlot.clear();
+    // recompute range from the current settings
+    var lo = 99, hi = 0;
+    for (var f = 8; f <= 384; f += 8) {
+      var o = costAt(f).vac;
+      lo = Math.min(lo, log10(o.factorized));
+      hi = Math.max(hi, log10(o.full));
+    }
+    tokenPlot.yRange[0] = Math.max(0, Math.floor(lo) - 1);
+    tokenPlot.yRange[1] = Math.ceil(hi) + 1;
+    tokenPlot.axes({ xLabel: 'pixel frames F', yLabel: 'log10 attention ops' });
+    tokenPlot.curve(function (x) {
+      var o = costAt(Math.max(1, Math.round(x))).vac;
+      return log10(o.full);
+    }, { color: c.accent2, width: 2.4, samples: 40 });
+    tokenPlot.curve(function (x) {
+      var o = costAt(Math.max(1, Math.round(x))).vac;
+      return log10(o.factorized);
+    }, { color: c.accent, width: 2.4, samples: 40 });
+    tokenPlot.vline(frames, { color: c.text, dashed: true, width: 1.2, label: 'F = ' + frames, labelY: tokenPlot.yRange[0] + 0.4 });
+    tokenPlot.legend([
+      { label: 'full 3-D attention', color: c.accent2 },
+      { label: 'factorised attention', color: c.accent }
+    ], { dy: 6 });
+  }
+
+  function redrawReadout() {
+    var cc = costAt(frames), vt = cc.vt, vac = cc.vac;
+    var el = document.getElementById('vtok-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">pixel frames</span> ' + frames + '</div>' +
+        '<div><span class="k">latent frames</span> <span class="hi">' + vt.latentFrames + '</span> (÷' + T_COMP + ')</div>' +
+        '<div><span class="k">latent grid</span> ' + vt.latentH + '×' + vt.latentW + '</div>' +
+        '<div><span class="k">patches / frame</span> ' + vac.perFrame + '</div>' +
+        '<div><span class="k">clip tokens</span> <span class="hi">' + Guide.fmtNum(vac.tokens) + '</span></div>' +
+        '<div><span class="k">3-D / factorised</span> <span class="bad">' + vac.ratio.toFixed(1) + '×</span></div>' +
+        '<div class="g-mini">Patch: ' + PATCH_NAMES[patchIdx] + '; spatial compression ÷' + S_COMP + ' at the VAE.</div>';
+    }
+    var be = document.getElementById('vtok-budget-readout');
+    if (be) {
+      var oneFrame = vac.perFrame;
+      var vsImage = vac.tokens / Math.max(1, oneFrame);
+      be.innerHTML =
+        '<div><span class="k">clip tokens</span> ' + Guide.fmtNum(vac.tokens) + '</div>' +
+        '<div><span class="k">tokens ≈ images</span> ' + vsImage.toFixed(0) + ' latent frames</div>' +
+        '<div><span class="k">factorised ops</span> ' + Guide.fmtNum(vac.factorized) + '</div>' +
+        '<div><span class="k">one-frame spatial ops</span> ' + Guide.fmtNum(oneFrame * oneFrame) + '</div>' +
+        '<div><span class="k">factorised ÷ one image</span> <span class="hi">' +
+        (vac.factorized / Math.max(1, oneFrame * oneFrame)).toFixed(0) + '×</span></div>' +
+        '<div class="g-mini">Full 3-D attention would multiply a single image by ' + (vsImage * vsImage).toFixed(0) + '×.</div>';
+    }
+  }
+
+  function redraw() { drawBars(); redrawTokens(); redrawReadout(); }
+
+  Guide.bindSliders(document.querySelectorAll('#vtok-frames'), function (el) {
+    frames = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vtok-res'), function (el) {
+    res = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vtok-patch'), function (el) {
+    patchIdx = parseInt(el.value, 10);
+    patch = PATCHES[patchIdx];
+    var p = el.parentElement;
+    if (p) { var lab = p.querySelector('.val'); if (lab) lab.textContent = String(patch); }
+    redraw();
+  });
+
+  drawStrip();
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'video-vae-causal',
+      kind: 'choice',
+      prompt: 'Why must the video autoencoder be causal along time?',
+      options: [
+        { label: 'So a latent frame depends only on current and past pixel frames, never on the future.', correct: true },
+        { label: 'So that the compression factor is an integer.', correct: false },
+        { label: 'Because causal convolutions are cheaper than ordinary ones.', correct: false }
+      ],
+      explanation: 'A non-causal temporal kernel would leak future frames into a latent frame, which breaks streaming and autoregressive use. Causality guarantees latent frame k is a function of frames up to k.'
+    },
+    {
+      id: 'video-tokens',
+      kind: 'numeric',
+      prompt: 'A clip has 96 pixel frames, and the causal VAE compresses time by 4. How many latent frames does the diffusion transformer see?',
+      answer: 24,
+      tolerance: 0.5,
+      explanation: 'Temporal compression folds four pixel frames into one latent frame, so 96 frames become 96 / 4 = 24 latent frames. The token count is that number times the patches per latent frame.'
+    },
+    {
+      id: 'video-factorised',
+      kind: 'choice',
+      prompt: 'What does factorised attention do instead of one full 3-D pass?',
+      options: [
+        { label: 'A spatial pass within each frame, then a temporal pass across frames at each position.', correct: true },
+        { label: 'It attends only to the first frame and copies the result forward.', correct: false },
+        { label: 'It drops attention entirely and uses convolutions along time.', correct: false }
+      ],
+      explanation: 'The two passes together let any token influence any other, but their cost is a sum of two smaller quadratics rather than one quadratic in the whole clip. That is what makes clip lengths beyond a few frames affordable.'
+    },
+    {
+      id: 'video-cost',
+      kind: 'choice',
+      prompt: 'Token count grows linearly with clip length. How does full 3-D attention grow?',
+      options: [
+        { label: 'Quadratically, because every token attends to every other token.', correct: true },
+        { label: 'Linearly as well, since each token has three coordinates.', correct: false },
+        { label: 'Logarithmically, because attention is sparse at long range.', correct: false }
+      ],
+      explanation: 'Attention cost is quadratic in the number of tokens. Since tokens are linear in frames, full 3-D attention is quadratic in frame count — which is why factorisation is not optional for any useful clip length.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

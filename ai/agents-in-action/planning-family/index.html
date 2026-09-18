@@ -1,0 +1,592 @@
+---
+title: "Agents in Action, Interactively — Part 3: ReAct and the planning family"
+description: "ReAct, Plan-and-Execute, Reflexion, Tree of Thoughts and LATS: what each algorithm added, where each one pays off, and why the ideas outlived the algorithms in production loops."
+permalink: "/ai/agents-in-action/planning-family/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>ReAct and the planning family</h1>
+    <p>Once you have a loop and tools, the obvious next question is whether the model should plan before it acts — and for three years the literature answered with a family of algorithms: ReAct, Plan-and-Execute, Reflexion, Tree of Thoughts, LATS. Almost none of them survives in production by name. What survived are their ideas, folded into a single loop with better context engineering. This part takes each algorithm on its own terms, shows where its shape pays off and where it only adds latency, and then maps every name onto the production mechanism that inherited its contribution.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="react">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>ReAct: reasons and acts in one trajectory</h2></div>
+    <p class="g-eyebrow">Interleave thought with action, and let the transcript carry the state</p>
+    <p><strong>ReAct</strong> (Yao et al., 2022, arXiv:2210.03629) is the algorithm the previous part quietly implemented. Its claim was that reasoning and acting should not be separated: the model emits a thought, then an action, then reads the observation, then emits the next thought. The thought conditions the action; the observation conditions the next thought. The model never plans the whole path — it navigates, one grounded step at a time, and the transcript is the state.</p>
+    <p><strong>Plan-and-Execute</strong> splits the two (prompt-only form: Plan-and-Solve, Wang et al., 2023, arXiv:2305.04091). A planner call produces a list of subtasks up front; an executor then works through them one at a time, each with a smaller context because it only needs to know its own subtask and the plan. The argument for it is straightforward: a small executor context is cheaper and less prone to drift, and the plan is an explicit artefact you can inspect.</p>
+    <p>The trade is where the interesting part lives. When a task is long and genuinely decomposable, planning pays: it stops the loop from re-deriving the same strategy every step, and it keeps each executor call small. When a task is short or not really decomposable, the planner is pure overhead — one extra call, one extra artefact to keep in context, and a plan that the executor ignores or contradicts. Drag the controls and watch the two traces on the same task.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pf-react-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Two traces on one task. Below them, the model calls and the context cost projected by <code>AppSim.agentRun</code> for each run length.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Actions the task needs <span class="val">6</span></label><input type="range" id="pf-task" min="2" max="12" step="1" value="6"></div>
+        <div class="g-field"><label>Decomposability <span class="val">60</span></label><input type="range" id="pf-decomp" min="0" max="100" step="5" value="60"></div>
+        <div class="g-btnrow">
+          <button id="pf-step" class="g-primary">Step</button>
+          <button id="pf-play">Play both</button>
+          <button id="pf-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="pf-react-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="pf-src-cost"></p>
+    <div class="g-goal">💡 <span><b>The lesson the papers already agree on:</b> planning is a bet that the task decomposes cleanly. Take the bet when the task is long and modular; skip it when it is short, and do not keep a prescriptive planner/executor split that costs a call and buys nothing.</span></div>
+  </section>
+
+  <section class="g-step" id="reflexion">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Reflexion: retry with a critique</h2></div>
+    <p class="g-eyebrow">Verbal self-feedback across attempts</p>
+    <p><strong>Reflexion</strong> (Shinn et al., 2023, arXiv:2303.11366) adds memory of failure. After an attempt, the model is asked to reflect — in words — on what went wrong, and that reflection is carried into the next attempt as context. The mechanism is not a gradient and not a new policy; it is a second piece of text that changes the distribution of the retry. Across attempts, the success rate rises.</p>
+    <p>It rises with diminishing returns, and that shape is the whole lesson. A good critique removes a class of errors the model can name; once those are gone, further reflections mostly restate the same advice, and the curve flattens. Compare it to a plain retry with no critique: the per-attempt probability never moves, and only the arithmetic of repeated tries helps you.</p>
+    <p>Set the critique quality and the number of attempts below. The solid line is reflexion, the dashed line is retrying the same thing, and the marker is the attempt budget you chose.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pf-reflexion-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Cumulative success after k attempts. Reflexion lifts the per-attempt probability; plain retries only compound the original one.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Critique quality <span class="val">60</span></label><input type="range" id="pf-critique" min="0" max="100" step="5" value="60"></div>
+        <div class="g-field"><label>Attempts allowed <span class="val">3</span></label><input type="range" id="pf-attempts" min="1" max="6" step="1" value="3"></div>
+        <div class="g-readout" id="pf-reflexion-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="pf-src-evals"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> a critique that only restates the failure is not feedback, it is a longer prompt. Reflexion buys you a better retry only when the reflection names a <em>specific</em> fix the next attempt can act on — otherwise you are paying tokens for a flatter curve.</span></div>
+  </section>
+
+  <section class="g-step" id="search">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Tree of Thoughts and LATS: search with a budget</h2></div>
+    <p class="g-eyebrow">Branch, estimate, and pay for exploration</p>
+    <p><strong>Tree of Thoughts</strong> (Yao et al., 2023, arXiv:2305.10601) treats reasoning as search. Instead of one chain, the model proposes several candidate “thoughts” at each step, a value estimate scores them, and the search expands the most promising branches. <strong>LATS</strong> (Zhou et al., 2023, arXiv:2310.04406) makes that search explicit: Monte-Carlo-tree-search style exploration with a value function, backed by real tool observations, under a node budget.</p>
+    <p>Both buy accuracy with search budget, and both are fighting the same exponential: the number of leaves grows as <var>b</var><sup>depth</sup>. A branching factor of four at depth three is sixty-four leaves; one more level of depth makes it two hundred and fifty-six. The search is only worth it when a value estimate is cheap and informative enough that you rarely expand a bad branch — which is exactly why the useful residue in production is not “run MCTS” but “generate a few candidates and pick with a cheap check, under a step budget”.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pf-search-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: one search tree, with expanded leaves filled. Right: expected accuracy against the number of leaves evaluated.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Branching factor <span class="val">3</span></label><input type="range" id="pf-branch" min="2" max="4" step="1" value="3"></div>
+        <div class="g-field"><label>Search budget (leaves evaluated) <span class="val">5</span></label><input type="range" id="pf-budget" min="1" max="9" step="1" value="5"></div>
+        <div class="g-readout" id="pf-search-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The blow-up is the point:</b> search turns a latency problem into a cost problem. The harness must cap the budget, because the tree does not. Bounded best-of-<var>n</var> captures most of the gain at a fraction of the leaves.</span></div>
+  </section>
+
+  <section class="g-step" id="survived">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What actually survived</h2></div>
+    <p class="g-eyebrow">The ideas outlived the algorithms</p>
+    <p>None of these papers ships as-written in a production agent, and that is not a failure of the papers — it is what happens when a good idea is absorbed. The named algorithm is a research artefact with a fixed control structure; the production mechanism is a single loop whose <em>context</em> carries the same information. Explicit state, decomposition, retry-with-critique and bounded search are all now things you engineer into that loop rather than algorithms you install.</p>
+    <p>Click each algorithm to see the mechanism that inherited its idea.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pf-survived-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Each research algorithm mapped to the production mechanism that carries its contribution today. The highlighted row is the one you selected.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="pf-map-row">
+          <button id="pf-map-0" class="g-primary">ReAct</button>
+          <button id="pf-map-1">Plan-and-Execute</button>
+          <button id="pf-map-2">Reflexion</button>
+          <button id="pf-map-3">Tree of Thoughts</button>
+          <button id="pf-map-4">LATS</button>
+        </div>
+        <div class="g-readout" id="pf-survived-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="pf-src-agents"></p>
+    <p>The same story is told from the other side by Volume 1: the mechanism that makes a single loop carry all this is <a href="{{ '/ai/building-with-llms/context-engineering/' | relative_url }}">context engineering</a>, and the reason a chain of thought helps a multi-step task at all is the subject of <a href="{{ '/ai/building-with-llms/reasoning/' | relative_url }}">the reasoning part</a>. This part is what to do with that reasoning once the task needs tools and retries.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that survives production</th></tr></thead>
+      <tbody>
+        <tr><td>What is ReAct?</td><td>Interleaved reasoning and acting: thought → action → observation → thought, in one transcript.</td></tr>
+        <tr><td>What does Plan-and-Execute add?</td><td>A planner call and an explicit subtask list, so each executor call has a smaller context.</td></tr>
+        <tr><td>When does planning pay?</td><td>Long, genuinely decomposable tasks. On short tasks the plan is an extra call that buys nothing.</td></tr>
+        <tr><td>What is Reflexion?</td><td>A verbal self-critique after a failed attempt, carried into the retry as context.</td></tr>
+        <tr><td>Why do reflexion gains flatten?</td><td>Once the nameable errors are gone, further critiques restate the same advice — diminishing returns.</td></tr>
+        <tr><td>What is Tree of Thoughts?</td><td>Reasoning as search: propose several candidate thoughts, score them, expand the best.</td></tr>
+        <tr><td>What does LATS add?</td><td>MCTS-style exploration with value estimates and real tool observations, under a node budget.</td></tr>
+        <tr><td>Why is search expensive?</td><td>Leaves grow as <var>b</var><sup>depth</sup>. The harness has to bound the budget; the tree will not.</td></tr>
+        <tr><td>What survived to production?</td><td>The ideas: explicit state, decomposition, retry-with-critique, bounded best-of-<var>n</var> — folded into one loop.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Yao et al., <a href="https://arxiv.org/abs/2210.03629">“ReAct: Synergizing Reasoning and Acting in Language Models”</a>, arXiv:2210.03629, 2022 — the interleaved reason/act loop.</li>
+      <li>Shinn et al., <a href="https://arxiv.org/abs/2303.11366">“Reflexion: Language Agents with Verbal Reinforcement Learning”</a>, arXiv:2303.11366, NeurIPS 2023 — verbal self-reflection across attempts.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2305.10601">“Tree of Thoughts: Deliberate Problem Solving with Large Language Models”</a>, arXiv:2305.10601, NeurIPS 2023 — reasoning as search over candidate thoughts.</li>
+      <li>Zhou et al., <a href="https://arxiv.org/abs/2310.04406">“Language Agent Tree Search Unifies Reasoning, Acting, and Planning in Language Models”</a>, arXiv:2310.04406, ICML 2024 — MCTS-style exploration with value estimates and tool observations.</li>
+      <li>Wang et al., <a href="https://arxiv.org/abs/2305.04091">“Plan-and-Solve Prompting”</a>, arXiv:2305.04091, ACL 2023 — the planner/executor split in its prompt-only form.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">“Building effective agents”</a>, December 2024 — why the evaluator-optimiser and the simple loop absorb most of what these algorithms were reaching for.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The loop can reason, plan and retry. Next: what it connects to — the Model Context Protocol, skill loading, and the rule that stops the window from becoming a data bus.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    agents: {
+      source: "Anthropic, “Effective context engineering for AI agents” (2025-09-29) for the write/select/compress/isolate taxonomy and “Building effective agents” (2024-12) for the workflow-versus-agent split; Anthropic, “How we built our multi-agent research system” (2025-06-13). Offline fallback constants.",
+      workflowPatterns: ["prompt chaining", "routing", "parallelisation", "orchestrator-worker", "evaluator-optimiser"],
+      compactionTax: "Compaction is lossy and adversarial: an evicted fact is indistinguishable from a fact that never existed, so the agent silently redoes work.",
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    evals: {
+      source: "τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench (2025) for tool-agent-user interaction, which introduced pass^k; SWE-bench Verified (OpenAI, 2024-08); GAIA (Mialon et al., arXiv:2311.12983, 2023). Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts — the reliability counterpart to pass@k's capability measure.",
+      benchmarks: [{ name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable end state", caveat: "scores move with the user simulator" }]
+    }
+  };
+  var NUM = FALLBACK;
+
+  // ------------------------------------------------------------------
+  // Demo A — ReAct versus Plan-and-Execute on one task
+  // ------------------------------------------------------------------
+  var A = { task: el("pf-task"), decomp: el("pf-decomp"), active: 0, maxLen: 1 };
+  var setupA = Guide.setupCanvas(el("pf-react-canvas"), 640, 360, drawA);
+  function buildPlan() {
+    var L = +A.task.value, d = (+A.decomp.value) / 100;
+    var r = AppSim.rng(41 + L * 7);
+    var reactWander = Math.max(0, Math.round(0.45 * L * (1 - 0.25 * d) + r()));
+    var peWander = Math.max(0, Math.round(0.35 * L * (1 - d) + r()));
+    var reactSteps = L + reactWander;
+    var peSteps = L + peWander;
+    var reactNodes = [], peNodes = [], i;
+    for (i = 0; i < reactSteps; i++) reactNodes.push({ label: i % 2 === 0 ? "think" : "act" });
+    reactNodes.push({ label: "answer" });
+    peNodes.push({ label: "plan" });
+    for (i = 0; i < peSteps; i++) peNodes.push({ label: "sub " + (i + 1) });
+    peNodes.push({ label: "answer" });
+    var reactRun = AppSim.agentRun("react", { steps: reactNodes.length, seed: 3 });
+    var peRun = AppSim.agentRun("plan-execute", { steps: peNodes.length, seed: 7 });
+    function billed(run) {
+      return run.steps.reduce(function (a, s) { return a + s.total; }, 0);
+    }
+    return {
+      L: L, d: d, reactNodes: reactNodes, peNodes: peNodes,
+      calls: { react: reactNodes.length, pe: peNodes.length },
+      tokens: { react: billed(reactRun), pe: billed(peRun) }
+    };
+  }
+  function drawMiniTrack(ctx, nodes, x0, x1, y, active) {
+    var n = nodes.length;
+    var gap = n > 1 ? (x1 - x0) / (n - 1) : 0;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x0 + gap * (n - 1), y); ctx.stroke();
+    var labelEvery = n > 12 ? Math.ceil(n / 8) : 1;
+    nodes.forEach(function (nd, i) {
+      var x = x0 + i * gap;
+      var isActive = i === active;
+      var col = i < active ? (c.accent700 || c.accent) : (isActive ? c.accent2 : c.accent400);
+      ctx.beginPath(); ctx.arc(x, y, isActive ? 6 : 4.5, 0, 2 * Math.PI);
+      ctx.fillStyle = col; ctx.fill();
+      if (isActive) { ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5; ctx.stroke(); }
+      if (i % labelEvery === 0 || isActive) {
+        ctx.fillStyle = c.text; ctx.font = (isActive ? "600 " : "") + "9px " + c.font; ctx.textAlign = "center";
+        ctx.fillText(String(nd.label).slice(0, 10), x, y + 16);
+      }
+    });
+    ctx.textAlign = "left";
+  }
+  function drawCompareRow(ctx, y, title, aVal, bVal, maxVal, fmt) {
+    ctx.fillStyle = c.text; ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText(title, 16, y);
+    var bx = 150, bw = 400;
+    ctx.fillStyle = c.accent; ctx.fillRect(bx, y + 6, Math.max(2, bw * (aVal / maxVal)), 18);
+    ctx.fillStyle = c.accent2; ctx.fillRect(bx, y + 30, Math.max(2, bw * (bVal / maxVal)), 18);
+    ctx.fillStyle = c.accent700; ctx.font = "10px " + c.font; ctx.textAlign = "right";
+    ctx.fillText("ReAct", bx - 8, y + 19);
+    ctx.fillText("Plan/Exec", bx - 8, y + 43);
+    ctx.fillStyle = c.text; ctx.textAlign = "left";
+    ctx.fillText(fmt(aVal), bx + bw * (aVal / maxVal) + 8, y + 20);
+    ctx.fillText(fmt(bVal), bx + bw * (bVal / maxVal) + 8, y + 44);
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var p = buildPlan();
+    A.maxLen = Math.max(p.reactNodes.length, p.peNodes.length);
+    if (A.active >= A.maxLen) A.active = A.maxLen - 1;
+    var reactActive = Math.min(A.active, p.reactNodes.length - 1);
+    var peActive = Math.min(A.active, p.peNodes.length - 1);
+    ctx.fillStyle = c.text; ctx.font = "600 12px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("ReAct — no plan; reason and act every step", 16, 20);
+    drawMiniTrack(ctx, p.reactNodes, 30, 610, 48, reactActive);
+    ctx.fillStyle = c.text; ctx.font = "600 12px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("Plan-and-Execute — plan once, then run subtasks", 16, 108);
+    drawMiniTrack(ctx, p.peNodes, 30, 610, 136, peActive);
+    var maxCalls = Math.max(p.calls.react, p.calls.pe) || 1;
+    var maxTokens = Math.max(p.tokens.react, p.tokens.pe) || 1;
+    drawCompareRow(ctx, 200, "model calls", p.calls.react, p.calls.pe, maxCalls, function (x) { return Guide.fmtNum(x); });
+    drawCompareRow(ctx, 262, "cumulative context billed (tokens)", p.tokens.react, p.tokens.pe, maxTokens, function (x) { return Guide.fmtNum(x); });
+    var planningPays = p.tokens.pe < p.tokens.react && p.d >= 0.4 && p.L >= 5;
+    var overheadPays = !planningPays && (p.tokens.pe > p.tokens.react || p.calls.pe > p.calls.react);
+    el("pf-react-readout").innerHTML =
+      '<div><span class="k">task</span> ' + p.L + ' actions · decomposability ' + Math.round(p.d * 100) + '%</div>' +
+      '<div><span class="k">calls</span> ReAct <span class="hi">' + p.calls.react + '</span> · Plan/Exec <span class="hi">' + p.calls.pe + '</span></div>' +
+      '<div><span class="k">cumulative context</span> ReAct ' + Guide.fmtNum(p.tokens.react) + ' · Plan/Exec ' + Guide.fmtNum(p.tokens.pe) + ' tokens billed across the run</div>' +
+      (planningPays
+        ? '<div class="hi">planning pays here: the task is long and decomposable, and the plan stops the loop re-deriving its strategy every step.</div>'
+        : (overheadPays
+          ? '<div class="bad">planning is overhead here: the task is short or tightly coupled, so the plan call adds calls, tokens and a coordination step that buys nothing.</div>'
+          : '<div class="k">the two are close: planning is a bet on decomposability, and this task sits near the break-even.</div>'));
+  }
+  Guide.bindSliders([A.task, A.decomp], drawA);
+  el("pf-step").addEventListener("click", function () { A.active = (A.active + 1) % A.maxLen; drawA(); });
+  el("pf-reset").addEventListener("click", function () { A.active = 0; drawA(); });
+  Guide.loop({
+    onStep: function () { A.active = (A.active + 1) % A.maxLen; drawA(); },
+    button: el("pf-play"), interval: 650, playLabel: "Play both", pauseLabel: "Pause"
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — Reflexion retry loop
+  // ------------------------------------------------------------------
+  var B = { q: el("pf-critique"), att: el("pf-attempts") };
+  var setupB = Guide.setupCanvas(el("pf-reflexion-canvas"), 640, 320, drawB);
+  var P0 = 0.35;
+  function pAt(base, quality, k) {
+    return Math.min(0.95, 1 - (1 - base) * Math.pow(1 - 0.6 * quality, k));
+  }
+  function drawB() {
+    if (!setupB) return;
+    var q = (+B.q.value) / 100, k = +B.att.value;
+    var reflexion = [], plain = [];
+    var cumR = 0, cumP = 0;
+    for (var i = 0; i < 6; i++) {
+      var pr = pAt(P0, q, i);
+      cumR = 1 - (1 - cumR) * (1 - pr);
+      cumP = 1 - Math.pow(1 - P0, i + 1);
+      reflexion.push({ x: i + 1, y: cumR * 100 });
+      plain.push({ x: i + 1, y: cumP * 100 });
+    }
+    var geo = Guide.drawLines(setupB.ctx, 640, 320,
+      [
+        { points: reflexion, color: c.accent, width: 2.4 },
+        { points: plain, color: c.accent2, width: 1.8, dashed: true }
+      ],
+      [1, 6], [0, 105],
+      { xLabel: "attempts", yLabel: "cumulative success (%)", padL: 54, padT: 34, padB: 30 });
+    var ctx = setupB.ctx;
+    ctx.fillStyle = c.accent700; ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("cycle: attempt → critique → retry", 18, 16);
+    var yR = geo.py(reflexion[k - 1].y);
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(geo.px(k), geo.padT); ctx.lineTo(geo.px(k), geo.padT + geo.plotH); ctx.stroke();
+    ctx.fillStyle = c.accent700;
+    ctx.beginPath(); ctx.arc(geo.px(k), yR, 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.font = "10px " + c.font; ctx.textAlign = "left";
+    ctx.fillStyle = c.accent; ctx.fillText("reflexion (critique carried into the retry)", geo.padL + 10, geo.padT + 14);
+    ctx.fillStyle = c.accent2; ctx.fillText("plain retry (same probability every time)", geo.padL + 10, geo.padT + 28);
+    // simulated check
+    var r = AppSim.rng(31), trials = 1500, hits = 0;
+    for (var t = 0; t < trials; t++) {
+      for (var a = 0; a < k; a++) {
+        if (r() < pAt(P0, q, a)) { hits++; break; }
+      }
+    }
+    var sim = hits / trials;
+    var lastGain = k >= 2 ? (reflexion[k - 1].y - reflexion[k - 2].y) : reflexion[k - 1].y;
+    var firstGain = reflexion[0].y;
+    el("pf-reflexion-readout").innerHTML =
+      '<div><span class="k">per-attempt probability</span> ' + reflexion.slice(0, k).map(function (p) { return (pAt(P0, q, reflexion.indexOf(p)) * 100).toFixed(0) + '%'; }).join(" → ") + '</div>' +
+      '<div><span class="k">after ' + k + ' attempt' + (k === 1 ? '' : 's') + '</span> reflexion <span class="hi">' + reflexion[k - 1].y.toFixed(1) + '%</span> · plain retry ' + plain[k - 1].y.toFixed(1) + '%</div>' +
+      '<div><span class="k">seeded check, 1,500 trials</span> ' + (sim * 100).toFixed(1) + '%</div>' +
+      '<div class="k">the first attempt gains ' + firstGain.toFixed(1) + ' points; the last gains ' + lastGain.toFixed(1) + ' — diminishing returns are the shape, not a bug.</div>';
+  }
+  Guide.bindSliders([B.q, B.att], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — ToT / LATS search tree
+  // ------------------------------------------------------------------
+  var C = { b: el("pf-branch"), budget: el("pf-budget") };
+  var setupC = Guide.setupCanvas(el("pf-search-canvas"), 640, 340, drawC);
+  function leafValue(seed, idx) {
+    var r = AppSim.rng(seed * 131 + idx * 17 + 5);
+    return r();
+  }
+  function leafEstimate(seed, idx, value) {
+    var r = AppSim.rng(seed * 97 + idx * 13 + 3);
+    return value + 0.22 * AppSim.gaussian(r);
+  }
+  function treeState(b, budget, seed) {
+    var leaves = [], i, j;
+    for (i = 0; i < b; i++) {
+      var group = [];
+      for (j = 0; j < b; j++) {
+        var idx = i * b + j;
+        var v = leafValue(seed, idx);
+        group.push({ idx: idx, child: i, v: v, est: leafEstimate(seed, idx, v) });
+      }
+      leaves.push(group);
+    }
+    var flat = [];
+    leaves.forEach(function (g) { g.forEach(function (l) { flat.push(l); }); });
+    var bestV = flat.reduce(function (m, l) { return Math.max(m, l.v); }, 0);
+    flat.sort(function (x, y) { return y.est - x.est; });
+    var chosen = {}, chosenBest = 0;
+    for (i = 0; i < budget && i < flat.length; i++) { chosen[flat[i].idx] = true; chosenBest = Math.max(chosenBest, flat[i].v); }
+    return { leaves: leaves, flat: flat, bestV: bestV, chosen: chosen, foundBest: chosenBest >= bestV - 1e-9 };
+  }
+  function expectedAccuracy(b, budget) {
+    var trees = 120, wins = 0;
+    for (var t = 0; t < trees; t++) {
+      if (treeState(b, budget, 1000 + t * 7).foundBest) wins++;
+    }
+    return wins / trees;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var b = +C.b.value;
+    var leaves = b * b;
+    C.budget.max = String(leaves);
+    if (+C.budget.value > leaves) C.budget.value = String(leaves);
+    var vSpan = C.budget.parentElement ? C.budget.parentElement.querySelector(".val") : null;
+    if (vSpan) vSpan.textContent = C.budget.value;
+    var budget = +C.budget.value;
+    // curve first (drawLines clears the canvas), then the tree on top
+    var pts = [];
+    for (var k = 1; k <= leaves; k++) pts.push({ x: k, y: expectedAccuracy(b, k) * 100 });
+    var geo = Guide.drawLines(setupC.ctx, 640, 340,
+      [{ points: pts, color: c.accent, width: 2.2 }],
+      [1, leaves], [0, 105],
+      { xLabel: "leaves evaluated", padL: 360, padR: 16, padT: 26, padB: 30 });
+    var ctx = setupC.ctx;
+    ctx.fillStyle = c.text; ctx.font = "10.5px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("expected accuracy (%)", 360, 16);
+    var py = geo.py(pts[budget - 1].y);
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(geo.px(budget), geo.padT); ctx.lineTo(geo.px(budget), geo.padT + geo.plotH); ctx.stroke();
+    ctx.fillStyle = c.accent700;
+    ctx.beginPath(); ctx.arc(geo.px(budget), py, 5, 0, 2 * Math.PI); ctx.fill();
+    // tree
+    var st = treeState(b, budget, 101);
+    var x0 = 20, x1 = 300, rootX = (x0 + x1) / 2, yRoot = 30, yChild = 105, yLeaf = 190;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1.2;
+    ctx.font = "9px " + c.font; ctx.textAlign = "center";
+    ctx.beginPath(); ctx.arc(rootX, yRoot, 7, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent700; ctx.fill();
+    ctx.fillStyle = c.text; ctx.fillText("root", rootX, yRoot - 12);
+    var slot = (x1 - x0) / b;
+    for (var i = 0; i < b; i++) {
+      var cx = x0 + (i + 0.5) * slot;
+      ctx.strokeStyle = c.divider;
+      ctx.beginPath(); ctx.moveTo(rootX, yRoot + 7); ctx.lineTo(cx, yChild - 7); ctx.stroke();
+      var childVal = st.leaves[i].reduce(function (m, l) { return Math.max(m, l.v); }, 0);
+      ctx.beginPath(); ctx.arc(cx, yChild, 6, 0, 2 * Math.PI);
+      ctx.fillStyle = c.accent; ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = "8px " + c.font;
+      ctx.fillText(childVal.toFixed(2), cx, yChild - 10);
+      var leafStep = slot / b;
+      for (var j = 0; j < b; j++) {
+        var lx = x0 + i * slot + (j + 0.5) * leafStep;
+        var lf = st.leaves[i][j];
+        ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(cx, yChild + 6); ctx.lineTo(lx, yLeaf - 5); ctx.stroke();
+        ctx.beginPath(); ctx.arc(lx, yLeaf, st.chosen[lf.idx] ? 5 : 3.5, 0, 2 * Math.PI);
+        ctx.fillStyle = st.chosen[lf.idx] ? c.accent2 : c.accent400; ctx.fill();
+      }
+    }
+    ctx.fillStyle = c.text; ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("search tree · depth 2, branching " + b, 16, 240);
+    ctx.font = "10px " + c.font; ctx.fillStyle = c.accent2;
+    ctx.fillText("filled = leaf evaluated under the budget", 16, 256);
+    ctx.fillStyle = c.text;
+    ctx.fillText("leaves at depth 2: " + leaves + " · at depth 3: " + (b * b * b), 16, 272);
+    el("pf-search-readout").innerHTML =
+      '<div><span class="k">budget</span> <span class="hi">' + budget + ' / ' + leaves + '</span> leaves evaluated (' + (budget / leaves * 100).toFixed(0) + '% of the tree)</div>' +
+      '<div><span class="k">this tree</span> best leaf found: <span class="' + (st.foundBest ? "hi" : "bad") + '">' + (st.foundBest ? "yes" : "no") + '</span></div>' +
+      '<div><span class="k">expected accuracy</span> <span class="hi">' + (expectedAccuracy(b, budget) * 100).toFixed(1) + '%</span> over 120 seeded trees</div>' +
+      '<div class="k">leaves grow as b^depth: branching ' + b + " gives " + leaves + " at depth 2 and " + (b * b * b) + " at depth 3. The harness must cap the budget; the tree will not.</div>";
+  }
+  Guide.bindSliders([C.b, C.budget], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — what survived
+  // ------------------------------------------------------------------
+  var MAP = [
+    { algo: "ReAct (2022)", mechanism: "the interleaved reason/act loop",
+      idea: "Reasoning and acting in one trajectory, with the transcript as the state. This is simply what an agent loop is today." },
+    { algo: "Plan-and-Execute (2023)", mechanism: "an explicit to-do list in context",
+      idea: "Separating deciding what to do from doing it. Production keeps the decomposition but folds the planner into the loop instead of a separate model." },
+    { algo: "Reflexion (2023)", mechanism: "retry-with-critique; the evaluator-optimiser",
+      idea: "Verbal self-feedback across attempts. It survives as a critique step before exit and as the retry logic in the harness." },
+    { algo: "Tree of Thoughts (2023)", mechanism: "best-of-n and beam-over-plans",
+      idea: "Generating several candidates and selecting with a cheap value check, rather than committing to one chain." },
+    { algo: "LATS (2023)", mechanism: "bounded search with a step budget",
+      idea: "Exploration with a value function under an explicit node budget — the harness discipline, not the full MCTS machinery." }
+  ];
+  var D = { idx: 0 };
+  var setupD = Guide.setupCanvas(el("pf-survived-canvas"), 640, 340, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = "10px " + c.font; ctx.textAlign = "left"; ctx.fillStyle = c.text;
+    ctx.fillText("research algorithm", 20, 18);
+    ctx.fillText("production mechanism that inherited the idea", 340, 18);
+    MAP.forEach(function (m, i) {
+      var y = 30 + i * 58;
+      var on = i === D.idx;
+      ctx.globalAlpha = on ? 1 : 0.55;
+      if (on) {
+        ctx.fillStyle = c.accent100 || "rgba(43,95,255,0.10)";
+        ctx.fillRect(12, y, 616, 50);
+      }
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(16, y, 230, 42);
+      ctx.strokeRect(330, y, 294, 42);
+      ctx.fillStyle = on ? c.accent2 : c.accent700;
+      ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText(m.algo, 26, y + 26);
+      ctx.fillStyle = c.text; ctx.font = "10.5px " + c.font;
+      ctx.fillText(m.mechanism, 340, y + 26);
+      Guide.drawArrow(ctx, 248, y + 21, 328, y + 21, { color: on ? c.accent2 : c.divider, width: 2, head: 7 });
+      ctx.globalAlpha = 1;
+    });
+    el("pf-survived-readout").innerHTML =
+      '<div><span class="k">' + MAP[D.idx].algo + '</span> → <span class="hi">' + MAP[D.idx].mechanism + '</span></div>' +
+      '<div class="k">' + MAP[D.idx].idea + '</div>' +
+      '<div class="k">The pattern repeats: the named algorithm disappears, the idea is absorbed into one loop whose context carries explicit state, decomposition, critique and bounded search.</div>';
+  }
+  MAP.forEach(function (m, i) {
+    var b = el("pf-map-" + i);
+    if (b) b.addEventListener("click", function () {
+      D.idx = i;
+      MAP.forEach(function (_, j) {
+        var bb = el("pf-map-" + j);
+        if (bb) bb.className = j === i ? "g-primary" : "";
+      });
+      drawD();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var sc = el("pf-src-cost"), se = el("pf-src-evals"), sa = el("pf-src-agents");
+    if (sc) sc.textContent = (NUM.cost_latency && NUM.cost_latency.source) || FALLBACK.cost_latency.source;
+    if (se) se.textContent = (NUM.evals && NUM.evals.source) || FALLBACK.evals.source;
+    if (sa) sa.textContent = (NUM.agents && NUM.agents.source) || FALLBACK.agents.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: "planning-family-react",
+      kind: "choice",
+      prompt: "What does ReAct interleave?",
+      options: [
+        { label: "Reasoning traces and actions, so each thought conditions the next call and each observation conditions the next thought.", correct: true },
+        { label: "A planner model and an executor model in separate processes." },
+        { label: "Several independent chains whose answers are voted on." },
+        { label: "A value network and a policy network trained jointly." }
+      ],
+      explanation: "ReAct's contribution is one trajectory that alternates thought, action and observation. The plan is not written up front; it emerges from the grounded steps, and the transcript is the state."
+    },
+    {
+      id: "planning-family-plan-execute",
+      kind: "choice",
+      prompt: "When does a separate planner/executor split tend to be worth its overhead?",
+      options: [
+        { label: "On long, genuinely decomposable tasks, where the plan keeps each executor context small and stops the loop re-deriving strategy.", correct: true },
+        { label: "On short tasks, where a plan removes all ambiguity." },
+        { label: "On any task, because an explicit plan is always cheaper than a loop." },
+        { label: "Only when the model is fine-tuned for planning." }
+      ],
+      explanation: "Planning is a bet on decomposability. It pays on long modular tasks by shrinking executor contexts; on short or tightly coupled tasks it adds a call and an artefact that buys nothing."
+    },
+    {
+      id: "planning-family-reflexion",
+      kind: "choice",
+      prompt: "Why do Reflexion's gains flatten after a few attempts?",
+      options: [
+        { label: "Once the nameable errors are fixed, further critiques restate the same advice, so the retry stops improving.", correct: true },
+        { label: "The context window fills and the model forgets the task." },
+        { label: "Self-critique is disabled after two attempts by every provider." },
+        { label: "The model's temperature drops with each attempt." }
+      ],
+      explanation: "Reflexion lifts the per-attempt success probability by naming a fix. When the clear failures are gone, the reflection becomes repetitive and the marginal gain shrinks — diminishing returns, not a bug."
+    },
+    {
+      id: "planning-family-leaves",
+      kind: "numeric",
+      prompt: "A Tree-of-Thoughts search branches by a factor of 4 and explores 3 levels deep. How many leaf nodes does the tree have?",
+      answer: 64,
+      unit: "leaves",
+      tolerance: 0.5,
+      explanation: "Leaves grow as b^depth = 4^3 = 64. One more level would make it 256, which is why LATS-style search must run under an explicit node budget rather than to completion."
+    }
+  ];
+  GuideQuiz.init(document.getElementById("quiz-root"), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

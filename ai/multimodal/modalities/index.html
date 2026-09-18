@@ -1,0 +1,392 @@
+---
+title: "The modality zoo"
+description: "Audio, video and 3D encoders aligned into the same space, what a hub modality binds, and what aligned does and does not mean."
+permalink: "/ai/multimodal/modalities/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-demo-stack { display: flex; flex-direction: column; gap: 14px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>The modality zoo</h1>
+    <p>Contrastive pretraining &mdash; training that pulls matching pairs of examples together and pushes mismatched ones apart &mdash; is the recipe that aligned pictures to captions. A "pair" here means two things that belong together, such as a photograph and the sentence describing it. It turns out that the same recipe works for any pair of signals that can be tokenised and embedded, where tokenising means chopping a signal into small discrete units and embedding means mapping each unit to a vector of numbers. A spectrogram &mdash; a picture of how much energy each frequency carries over time, which is how sound is usually turned into an image &mdash; can be paired against a transcript. A video clip can be paired against a description, and a point cloud &mdash; a set of 3-D coordinates sampled from a shape's surface &mdash; against a shape name. The wilder version of the idea is to align all of them at once, into a single space where a photo of a barking dog, the sound of a bark and the sentence "a dog barking" all sit near one another. Picture a city map with neighbourhoods: similar things land on the same block, and the distance between two points tells you how related they are; here the map holds sounds and shapes as well as images and words. A modality, in this vocabulary, is one kind of signal &mdash; image, text, audio, video or 3-D &mdash; and a tower is the encoder network that a single modality is pushed through. This part is about how those towers are built, what a hub modality (one anchor that every other tower is trained against) is for, and the careful reading of the word "aligned".</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="zoo">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>More than pictures</h2></div>
+    <p class="g-eyebrow">Every signal becomes tokens, then a vector</p>
+    <p>The recipe is uniform even though the signals are not. Every modality &mdash; a modality being one kind of signal, such as an image, a sound, a video or a 3-D shape &mdash; is first turned into a sequence of units. For an image those units are patches, small square tiles cut from the grid. For audio they are mel-spectrogram frames: a mel spectrogram is a picture of how much energy each frequency band carries over time, and each frame is one thin vertical slice of it. For video they are sampled frames, and for a 3-D shape they are points or voxels, where a voxel is the 3-D equivalent of a pixel, a small cube of space. You then run a transformer over that sequence, and pool the output into one vector, pooling meaning combining the many per-unit vectors into a single summary vector, usually by averaging them. A text tower does exactly the same thing with subwords, the word pieces a tokeniser splits text into. Once every tower produces a vector of the same width &mdash; the same fixed number of numbers per vector &mdash; the contrastive loss from <a href="{{ '/ai/multimodal/contrastive/' | relative_url }}">two parts back</a> applies without modification: matched pairs together, everything else apart. That clause is the whole objective; everything else in this part is a change of front end, meaning the tokeniser that turns a raw signal into a sequence.</p>
+    <p>What changes from modality to modality is the tokeniser, meaning the rule that decides what counts as one unit, and the cost of running the transformer over the resulting sequence. An image is one grid, so its token count is fixed by the patch size. A video is a grid per frame, and it adds a second, harsher scaling problem in time: more frames means more tokens, and a long clip can easily produce a sequence too long to attend over cheaply. Audio is a time-frequency image whose frame rate sets the token count, so a higher sampling rate buys finer detail at a higher price. 3-D data arrives unordered and sparse: a point cloud has no natural reading order the way pixels do, and most of the space it describes is empty, so the tokeniser has to group nearby points into neighbourhoods before the transformer can use them. The cards below are the zoo as the site's data lists it: five encoders &mdash; one network per modality, each turning its signal into vectors &mdash; five contrastive pairings, and five different notions of what one token is.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div class="g-grid2" id="mod-zoo"></div>
+      </div>
+      <div class="g-controls">
+        <p class="g-mini">These rows come from <code>Multimodal.modalities</code>. Each pair is a genuine contrastive objective in the literature; the point is that the architecture is the same and only the front end differs.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> name the encoder and pairing for audio, video and 3-D, explain what a hub modality is and why text usually plays that role, demonstrate cross-modal alignment on a similarity matrix, and state precisely what "aligned" does and does not imply. Those four abilities are exactly the vocabulary you need to read a paper in this area without being misled by the word.</span></div>
+    <div class="g-toc">
+      <a href="#towers">2 · Audio and video towers</a>
+      <a href="#hub">3 · 3-D and the hub problem</a>
+      <a href="#limits">4 · What aligned does not mean</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="towers">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Audio and video towers</h2></div>
+    <p class="g-eyebrow">The same matrix, a different front end</p>
+    <p><em>CLAP</em> is the audio analogue of CLIP &mdash; the model from the earlier parts that matched images to captions. CLAP swaps the image tower for an audio tower, so the pairing becomes sound against text. The audio tower consumes a mel spectrogram through a transformer, the text tower consumes a caption, and an InfoNCE loss &mdash; the specific contrastive objective that treats every other item in a batch as a negative example for a given pair &mdash; pulls matched audio-caption pairs together. The tokens are time-frequency cells, meaning each cell records the energy in one frequency band during one short slice of time. The caption might be "a dog barking" or the audio's tags, where tags are a few keywords describing the clip. Trained this way, the result classifies sound events, meaning it labels a clip as a bark, a siren or a doorbell, and retrieves audio with text, meaning it takes a typed phrase and returns the matching recordings. Video follows the same shape with a spatiotemporal torso, "spatiotemporal" meaning the model covers both space within a frame and time across frames. Concretely, you patchify each sampled frame, cutting it into patches the way the vision transformer does, add the temporal axis so the model can tell which frame a patch came from, and contrast clips against captions with VideoCLIP or InternVideo.</p>
+    <p>The demo builds one base vector per concept, then gives each modality its own noisy copy of that vector, and draws the cross-modal similarity matrix: a grid whose cell in row i and column j is the cosine between concept i in one modality and concept j in the other. The cosine is the standard similarity score for these spaces, measuring how closely two vectors point in the same direction rather than how far apart they are. The diagonal holds the matching pairs, the name-tags-at-a-party idea from the previous part, where each item should be closest to its own partner. The noise slider controls how well the towers agree. At low noise the diagonal is bright and the alignment is clean, so every matched pair is each other's nearest neighbour. Turn it up and the signal dissolves into a near-uniform matrix, which is what a badly trained or badly paired objective looks like: no better than guessing.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="mod-sim-canvas" width="440" height="340"></canvas>
+        <p class="g-canvas-hint">Cross-modal cosine similarity from <code>GenMedia.attn.simMatrix</code> for the selected pair. Diagonal cells are outlined; the readout reports top-1 alignment.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-controls">
+          <div class="g-field"><label>Modality pair <span class="val">0</span></label><input type="range" id="mod-pair" min="0" max="3" step="1" value="0"></div>
+          <div class="g-field"><label>Noise <span class="val">0.2</span></label><input type="range" id="mod-noise" min="0" max="4" step="1" value="0"></div>
+        </div>
+        <div class="g-readout" id="mod-sim-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The front end is where the difficulty hides.</b> A mel-spectrogram at 50 frames per second is a long, narrow image; how you patch it, window it and merge tokens decides both the cost and what the encoder can hear. A window here is a short span of frames treated as one unit before neighbouring spans are merged together, and the choices interact: a coarser merge is cheaper but blurs exactly the fast transients that make a bark sound like a bark. "Same loss, different tokeniser" is true and also where all the engineering lives.</span></div>
+  </section>
+
+  <section class="g-step" id="hub">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>3-D and the hub problem</h2></div>
+    <p class="g-eyebrow">One anchor, many spokes</p>
+    <p>Aligning two modalities needs data in which the two co-occur, meaning examples where the same content appears in both at once, such as a clip and its transcript. Aligning five does not scale that way, because not every pair has such a dataset: there is no large corpus of paired point clouds and dog barks. Training every pair directly would need a dataset for each of the ten pairs, and most of those datasets do not exist. The workaround is a <em>hub modality</em>, a single anchor modality that every other tower is trained against instead of being trained against one another. Text is the usual choice, and the reason is largely practical: people have written captions, transcripts and descriptions for almost everything, so text can be paired with almost any other signal. Each tower is trained only against the hub, and transitivity does the rest: if audio lands near text and text lands near 3-D, then audio and 3-D are indirectly comparable, because both sit in the neighbourhood of the same text. The cost of the shortcut is that audio and 3-D never actually meet in training, so any error either one makes against text is inherited by that pair. ImageBind takes the extreme version, using images as the hub and binding six modalities through vision alone.</p>
+    <p>3-D encoders such as ULIP and OpenShape are the clearest case. A point cloud or voxel grid is encoded by a point transformer &mdash; a transformer whose tokens are groups of nearby 3-D points rather than image patches &mdash; then contrasted against shape captions or against rendered images of the same object. Through that objective the shape inherits a position in the same space as a sentence, so "a wooden chair" and the coordinates of a chair end up near each other. Notice that the comparison is not always point cloud against text directly: routing it through a rendered view of the shape is another instance of the hub idea, with images playing the anchor role. The diagram shows the arrangement: a central tower that every other one is pulled toward, and spokes that are trained one at a time.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mod-hub-canvas" width="460" height="300"></canvas>
+        <p class="g-canvas-hint">A hub-modality diagram: each tower is trained to land near the hub, and no tower is trained directly against another.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="mod-hub-readout"></div>
+        <p class="g-mini">A hub is a modelling choice, not a law. Text is convenient because captions exist for everything; images are convenient because vision models are strong. Either way, cross-modal skill that was never trained is inherited by transitivity, with all the error that implies.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="limits">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What aligned does not mean</h2></div>
+    <p class="g-eyebrow">Four readings of one word</p>
+    <p><em>Aligned does not mean interchangeable.</em> Two towers landing in one space does not let you feed a spectrogram to a text encoder or read an image vector as a sentence. The space is comparable, not shared in the sense of substitutable: both towers agree on how to measure similarity, but they do not agree on how to represent a signal, so a vector from one is meaningless to the other's decoder. There is also usually a measurable <em>modality gap</em>: embeddings of one modality occupy a slightly different region even for matched pairs, so a within-modality similarity &mdash; two audio clips compared with each other &mdash; is typically higher than a matched cross-modal one, such as an audio clip compared with its own caption. That gap is not a bug so much as the fingerprint of two encoders trained separately, which never had a reason to occupy identical coordinates. The bars below show that gap.</p>
+    <p><em>Aligned does not mean equivalent information.</em> A point cloud and a caption both describe a chair, but the caption cannot tell you the chair's dimensions and the point cloud cannot tell you its material name. The two signals overlap without either containing the other, so the aligned vector can only carry the part they share. Alignment matches the parts that co-occur in the training pairs and ignores the rest, which is exactly why the shared space fails on the compositionality, counting and typographic cases catalogued in <a href="{{ '/ai/multimodal/shared-embedding-space/' | relative_url }}">the previous part</a>: those failures are the price of summarising each signal by the features it happens to share with its partner.</p>
+    <p><em>Aligned does not mean generative.</em> A contrastive space gives you a similarity and a nearest neighbour; it does not produce a sound or a mesh, a mesh being a 3-D surface model built from vertices and faces. Turning one modality into another is a separate model &mdash; a decoder, a diffusion model or a language model &mdash; and the alignment is only a useful conditioning signal for it. The shared space tells you which things belong together; it cannot draw or speak, so the generation has to happen somewhere else. And <em>aligned does not mean transitive in practice</em>: the hub inherits every pairwise weakness, so audio and 3-D compare well only to the extent that each compares well to text. If the audio tower is sloppy about pitch, no amount of good 3-D training can repair the audio-to-3-D comparison.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mod-limit-canvas" width="440" height="200"></canvas>
+        <p class="g-canvas-hint">Mean cosine within each modality, for matched cross-modal pairs, and for mismatched ones, at the current noise level. Matched cross-modal sits below within-modality: the modality gap.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>When someone says two modalities are "aligned", ask three questions: aligned by what objective, through which hub, and on what pairs of data? The answers are the whole story, and they differ enormously between systems that use the same word. A tower aligned on ten thousand hand-labelled clips and one aligned on a million weakly captioned videos can both be called "aligned", and the word will not tell you which one you are looking at.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One trunk, many front ends</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Omni models</div>
+        <h3 style="margin:6px 0;">Early fusion instead of contrastive alignment</h3>
+        <p style="margin-bottom:0;">The frontier answer to the zoo is not a hub at all but a single trunk &mdash; one shared backbone network &mdash; that consumes text, image, audio and video tokens in one early-fused stream. Early fusion means the modalities are mixed together at the input, before any deep processing, rather than encoded separately and compared afterwards. Alignment by shared space becomes alignment by shared <em>architecture</em>, and the contrastive objective is replaced by next-token prediction over interleaved modalities, where interleaved means the sequence holds text tokens, then image tokens, then audio tokens in the order they occurred, much as a conversation alternates speakers. You can picture the difference as one shared language learned from birth, rather than two speakers raised apart who must be compared after the fact.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Applications</div>
+        <h3 style="margin:6px 0;">Search and grounding across signals</h3>
+        <p style="margin-bottom:0;">The practical wins are text-to-audio search, video moment retrieval &mdash; finding the few seconds of a clip that match a phrase &mdash; shape search by description and sound-event tagging. Each is a nearest-neighbour query in a space whose diagonal was made bright by the loss in <a href="{{ '/ai/multimodal/contrastive/' | relative_url }}">the contrastive part</a>, on top of the trunk from <a href="{{ '/ai/multimodal/vit/' | relative_url }}">the first part</a>. Concretely, you embed the thing you are looking for and return the stored vectors closest to it, which is why the same few lines of ranking code serve such different-sounding tasks.</p>
+      </div>
+    </div>
+    <p>This closes the volume's account of how a model is made to see. The rest of the series takes the aligned encoder and bolts it onto a language model, then pushes resolution, training and serving until one trunk reads every modality at once. The pattern worth carrying forward is that the architecture barely changes from one modality to the next: what changes is how the signal becomes tokens and which pairs the objective is trained on.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers extend the two-tower recipe past images, then bind the towers to a single hub. Read together they make the point that alignment is one loss applied to many front ends, the same contrastive objective pointed in turn at audio, video, 3-D and finally at a whole set of modalities at once. Taken in that order, they also show the two ways the field has responded to the zoo: train everything against a shared anchor, or replace the anchor with one model that reads every signal directly.</p>
+    <ul class="g-refs">
+      <li>Benjamin Elizalde, Soham Deshmukh, Mahmoud Al Ismail and Huaming Wang, <a href="https://arxiv.org/abs/2206.04769">"CLAP: Learning Audio Concepts from Natural Language Supervision"</a>, 2022 &mdash; the audio-text analogue of CLIP.</li>
+      <li>Rohit Girdhar, Alaaeldin El-Nouby, Zhuang Liu and coauthors, <a href="https://arxiv.org/abs/2305.05665">"ImageBind: One Embedding Space To Bind Them All"</a>, 2023 &mdash; six modalities bound through the image as a hub.</li>
+      <li>Le Xue, Mingfei Gao, Chen Xing and coauthors, <a href="https://arxiv.org/abs/2209.04993">"ULIP: Learning a Unified Representation of Language, Images, and Point Clouds for 3D Understanding"</a>, 2022 &mdash; 3-D shapes aligned to text through rendered images.</li>
+      <li>Hu Xu, Gargi Ghosh, Po-Yao Huang and coauthors, <a href="https://arxiv.org/abs/2208.02816">"VideoCLIP: Contrastive Pre-training for Zero-shot Video-Text Understanding"</a>, 2021 &mdash; the video-text version of the same objective.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Audio tower</td><td>Mel-spectrogram frames as tokens; CLAP aligns them to captions</td></tr>
+        <tr><td>Video tower</td><td>Patchified frames plus a temporal axis; contrasted with clip descriptions</td></tr>
+        <tr><td>3-D tower</td><td>Points or voxels through a point transformer; ULIP and OpenShape align it to text</td></tr>
+        <tr><td>Hub modality</td><td>The anchor every tower is trained against, usually text; cross-modal skill is inherited by transitivity</td></tr>
+        <tr><td>Modality gap</td><td>Matched cross-modal similarity still sits below within-modality similarity</td></tr>
+        <tr><td>Aligned ≠ interchangeable</td><td>Vectors are comparable, not substitutable across encoders</td></tr>
+        <tr><td>Aligned ≠ generative</td><td>Similarity is not synthesis; producing one modality from another is a separate model</td></tr>
+        <tr><td>Early fusion</td><td>The omni-model alternative: one trunk over interleaved modality tokens</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the whole arc from pixels to a shared space to the modality zoo. The series continues with how those aligned encoders are bolted onto a language model, and how one trunk comes to read every modality at once. If "aligned" now feels like a claim to interrogate rather than a fact to accept, this part has done its job.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var DIM = 16, K = 8;
+  var PAIR_NAMES = ['audio ↔ text', 'video ↔ text', 'video ↔ audio', '3-D ↔ text'];
+  var NOISES = [0.2, 0.4, 0.6, 0.9, 1.3];
+  var pairIdx = 0, noiseIdx = 0;
+
+  function fixUnit(seed) {
+    var r = GM.rng(seed), v = [];
+    for (var k = 0; k < DIM; k++) v.push(GM.gauss(r));
+    return GM.attn.normalize(v);
+  }
+  var BIAS_A = fixUnit(11), BIAS_B = fixUnit(22);
+  function noisy(base, seed, s, bias) {
+    var r = GM.rng(seed), v = [];
+    for (var k = 0; k < DIM; k++) v.push(base[k] + s * GM.gauss(r) + 0.7 * bias[k]);
+    return GM.attn.normalize(v);
+  }
+  function pairVectors(noise) {
+    var A = [], A2 = [], B = [], B2 = [];
+    for (var i = 0; i < K; i++) {
+      var rb = GM.rng(3000 + i * 71), base = [];
+      for (var k = 0; k < DIM; k++) base.push(GM.gauss(rb));
+      base = GM.attn.normalize(base);
+      A.push(noisy(base, 5000 + i * 131, noise, BIAS_A));
+      A2.push(noisy(base, 5300 + i * 211, noise, BIAS_A));
+      B.push(noisy(base, 6000 + i * 197, noise, BIAS_B));
+      B2.push(noisy(base, 6300 + i * 251, noise, BIAS_B));
+    }
+    return { A: A, A2: A2, B: B, B2: B2 };
+  }
+  function top1Of(sim) {
+    var acc = 0;
+    for (var r = 0; r < sim.length; r++) {
+      var best = 0;
+      for (var j = 1; j < sim[r].length; j++) if (sim[r][j] > sim[r][best]) best = j;
+      if (best === r) acc++;
+    }
+    return acc / sim.length;
+  }
+  function means(sim) {
+    var diag = 0, off = 0, offN = 0;
+    for (var i = 0; i < sim.length; i++) for (var j = 0; j < sim[i].length; j++) {
+      if (i === j) diag += sim[i][j]; else { off += sim[i][j]; offN++; }
+    }
+    return { diag: diag / sim.length, off: offN ? off / offN : 0 };
+  }
+
+  // ---- 1. zoo cards --------------------------------------------------------
+  function renderZoo() {
+    var host = document.getElementById('mod-zoo');
+    if (!host || !MM.modalities) return;
+    host.innerHTML = '';
+    MM.modalities.forEach(function (m) {
+      var div = document.createElement('div');
+      div.className = 'g-card reveal';
+      div.innerHTML =
+        '<div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">' +
+        String(m.id).toUpperCase() + '</div>' +
+        '<h3 style="margin:6px 0;">' + m.encoder + '</h3>' +
+        '<p style="margin-bottom:0;">Contrastive pairing: ' + m.contrastive + '. Token unit: ' + m.resolution + '.</p>';
+      host.appendChild(div);
+    });
+  }
+
+  // ---- 2. cross-modal similarity ------------------------------------------
+  var simSetup = Guide.setupCanvas(document.getElementById('mod-sim-canvas'), 440, 340, function () { drawSim(); });
+  function drawSim() {
+    if (!simSetup) return;
+    var pr = pairVectors(NOISES[noiseIdx]);
+    var sim = GM.attn.simMatrix(pr.A, pr.B);
+    var geo = Guide.drawHeatmap(simSetup.ctx, 440, 340, sim, {
+      min: -1, max: 1, colorLow: [234, 240, 255], colorHigh: [43, 95, 255], fontSize: 9
+    });
+    var ctx = simSetup.ctx;
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    for (var i = 0; i < sim.length; i++) {
+      ctx.strokeRect(geo.padL + i * geo.cellW + 1.5, geo.padT + i * geo.cellH + 1.5,
+        Math.max(1, geo.cellW - 3), Math.max(1, geo.cellH - 3));
+    }
+    ctx.restore();
+    var m = means(sim);
+    var el = document.getElementById('mod-sim-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">pair</span> ' + PAIR_NAMES[pairIdx] + '</div>' +
+        '<div><span class="k">concepts</span> ' + K + '</div>' +
+        '<div><span class="k">mean diagonal</span> <span class="hi">' + m.diag.toFixed(3) + '</span></div>' +
+        '<div><span class="k">mean off-diagonal</span> ' + m.off.toFixed(3) + '</div>' +
+        '<div><span class="k">top-1 alignment</span> ' + Guide.fmtPct(top1Of(sim), 0) + '</div>' +
+        '<div class="g-mini">Noise ' + NOISES[noiseIdx] + '. More noise means the towers agree less and the diagonal fades.</div>';
+    }
+  }
+
+  // ---- 3. hub diagram ------------------------------------------------------
+  var hubSetup = Guide.setupCanvas(document.getElementById('mod-hub-canvas'), 460, 300, function () { drawHub(); });
+  function drawHub() {
+    if (!hubSetup) return;
+    var ctx = hubSetup.ctx, W = 460, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var cx = W / 2, cy = H / 2 - 6;
+    var towers = ['audio', 'video', 'image', '3-D'];
+    var ang = [-Math.PI * 0.78, -Math.PI * 0.22, Math.PI * 0.78, Math.PI * 0.22];
+    var i, tx, ty;
+    for (i = 0; i < towers.length; i++) {
+      tx = cx + Math.cos(ang[i]) * 155;
+      ty = cy + Math.sin(ang[i]) * 108;
+      Guide.drawArrow(ctx, tx, ty, cx, cy, { color: c.accent2, width: 1.6, head: 9 });
+    }
+    for (i = 0; i < towers.length; i++) {
+      tx = cx + Math.cos(ang[i]) * 155;
+      ty = cy + Math.sin(ang[i]) * 108;
+      ctx.beginPath(); ctx.arc(tx, ty, 30, 0, 2 * Math.PI);
+      ctx.fillStyle = c.accent400; ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = '11px ' + c.font;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(towers[i], tx, ty);
+    }
+    ctx.beginPath(); ctx.arc(cx, cy, 46, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent; ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 14px ' + c.font;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('text hub', cx, cy);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('each tower is trained only against the hub', 8, H - 8);
+    var el = document.getElementById('mod-hub-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">hub</span> text (subwords)</div>' +
+        '<div><span class="k">spokes</span> ' + towers.length + '</div>' +
+        '<div><span class="k">direct pairings trained</span> <span class="hi">0</span></div>' +
+        '<div class="g-mini">Audio and 3-D are comparable only through the hub, so their agreement is inherited, not trained.</div>';
+    }
+  }
+
+  // ---- 4. modality gap -----------------------------------------------------
+  var limSetup = Guide.setupCanvas(document.getElementById('mod-limit-canvas'), 440, 200, function () { drawLimit(); });
+  function drawLimit() {
+    if (!limSetup) return;
+    var pr = pairVectors(NOISES[noiseIdx]);
+    var cross = GM.attn.simMatrix(pr.A, pr.B);
+    var mm = means(cross);
+    var wA = 0, wB = 0;
+    for (var i = 0; i < K; i++) {
+      wA += GM.attn.cosine(pr.A[i], pr.A2[i]);
+      wB += GM.attn.cosine(pr.B[i], pr.B2[i]);
+    }
+    wA = wA / K; wB = wB / K;
+    var maxV = Math.max(wA, wB, mm.diag, mm.off) * 1.12 || 1;
+    Guide.drawBars(limSetup.ctx, 440, 200, [
+      { label: 'within A', value: Math.max(0, wA), valueLabel: wA.toFixed(3), color: c.accent },
+      { label: 'within B', value: Math.max(0, wB), valueLabel: wB.toFixed(3), color: c.accent },
+      { label: 'matched A–B', value: Math.max(0, mm.diag), valueLabel: mm.diag.toFixed(3), color: c.accent2 },
+      { label: 'mismatched A–B', value: Math.max(0, mm.off), valueLabel: mm.off.toFixed(3), color: c.accent400 }
+    ], { padL: 118, maxV: maxV });
+  }
+
+  function redraw() { drawSim(); drawHub(); drawLimit(); }
+
+  Guide.bindSliders(document.querySelectorAll('#mod-pair'), function (el) {
+    pairIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#mod-noise'), function (el) {
+    noiseIdx = parseInt(el.value, 10);
+    redraw();
+  });
+
+  renderZoo();
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'modalities-hub',
+      kind: 'choice',
+      prompt: 'What is a hub modality in a multi-modal system?',
+      options: [
+        { label: 'The modality every other tower is trained against, so cross-modal skill is inherited by transitivity.', correct: true },
+        { label: 'The modality that is cheapest to encode, so it is used as a fallback.', correct: false },
+        { label: 'The modality with the highest resolution, which sets the size of the shared space.', correct: false }
+      ],
+      explanation: 'Not every pair of modalities has a dataset of co-occurring examples. A hub such as text or images lets each tower be aligned once against the hub, and the towers become comparable to each other indirectly.'
+    },
+    {
+      id: 'modalities-spokes',
+      kind: 'numeric',
+      prompt: 'The five modalities in the zoo are image, video, audio, text and 3-D. If text is the hub and every other tower is aligned to it directly, how many alignment objectives are trained?',
+      answer: 4,
+      tolerance: 0.5,
+      explanation: 'Four non-hub towers (image, video, audio, 3-D) are each contrasted against text, giving four objectives. The text tower is the anchor, not a spoke, so it is not counted as one of them.'
+    },
+    {
+      id: 'modalities-clap',
+      kind: 'choice',
+      prompt: 'Which pairing does CLAP specialise in?',
+      options: [
+        { label: 'Audio against text, using mel-spectrogram frames as the audio tokens.', correct: true },
+        { label: '3-D shapes against images, using rendered views as supervision.', correct: false },
+        { label: 'Video clips against audio, using the soundtrack as the label.', correct: false }
+      ],
+      explanation: 'CLAP is the audio analogue of CLIP: an audio tower over mel-spectrogram frames contrasted with a text tower. ULIP and OpenShape handle the 3-D case; VideoCLIP handles video-text.'
+    },
+    {
+      id: 'modalities-aligned',
+      kind: 'choice',
+      prompt: 'Two towers produce vectors in the same space. What can you conclude?',
+      options: [
+        { label: 'Their vectors can be compared with a cosine, but they are not interchangeable and matched pairs still show a modality gap.', correct: true },
+        { label: 'Either encoder can be substituted for the other without retraining.', correct: false },
+        { label: 'The shared space can generate one modality from the other.', correct: false }
+      ],
+      explanation: 'Alignment means comparable, not equivalent, not substitutable and not generative. Even matched cross-modal pairs sit at a lower similarity than within-modality pairs, and turning one modality into another needs a separate decoder or model.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

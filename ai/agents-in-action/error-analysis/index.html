@@ -1,0 +1,649 @@
+---
+title: "Agents in Action, Interactively — Part 8: Why eval is the hard part, and error analysis"
+description: "Look at your data; open and axial coding; the failure taxonomy and its Pareto chart; build your own trace viewer."
+permalink: "/ai/agents-in-action/error-analysis/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Why eval is the hard part, and error analysis</h1>
+    <p>Everyone can write a prompt. Almost nobody can say whether the system got better. That asymmetry is the whole opportunity: evaluation — not prompting — is the hard part, and it is the only moat that survives a model upgrade. The work is unglamorous and mostly manual: read real traces, write one line about what went wrong, group those lines until a small taxonomy falls out, and turn that taxonomy into cases. This part builds the tool you cannot do it without, and shows why the obvious shortcut makes it worse.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="look">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Look at your data</h2></div>
+    <p class="g-eyebrow">You cannot fix what you cannot see</p>
+    <p>The first move is not to write an eval. It is to open ten real traces and read them end to end. Almost every team that "needs better evals" is actually a team that has never looked at its own failures, and the failure is usually obvious the moment it is on screen: the retriever returned the glossary page, the tool call used the wrong argument name, the agent re-issued the same search four times. None of those is visible in an aggregate accuracy number, and none of them is fixable from the prompt alone.</p>
+    <p>Which is why the single most valuable piece of infrastructure you can build is a <strong>trace viewer</strong>: one screen that shows a run's steps, the context composition at each step, and the tool calls in order. This is the page's most important widget, so it is the first one. Click any node on the trajectory to inspect that step; the panel below it is the context that was actually sent.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ea-trace-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Top: the step track. Middle: the selected step's context, stacked by segment. Bottom: the tool calls around it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Step <span class="val">6</span></label><input type="range" id="ea-step" min="0" max="25" step="1" value="6"></div>
+        <div class="g-readout" id="ea-trace-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="ea-evals-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> eval is a <b>reading</b> discipline before it is a measuring one. The metric is downstream of the taxonomy, and the taxonomy comes from a human reading failures. Skip the reading and you will build a precise measurement of the wrong thing.</span></div>
+  </section>
+
+  <section class="g-step" id="open-coding">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Open coding</h2></div>
+    <p class="g-eyebrow">One line per failure, then group</p>
+    <p><strong>Open coding</strong> is the first pass: for each failed trace, write a single line describing what went wrong. Not a category — a description. "It cited the KV-cache document for a question about reranking" is open coding. "Retrieval failure" is not. The discipline of writing one concrete line per trace is what stops you from collapsing everything into "the model was wrong", which is true and useless.</p>
+    <p><strong>Axial coding</strong> is the second pass: read your own lines back and group them. Nine of them will say some version of "the wrong document was retrieved"; seven will say "the tool call used the wrong argument". That is how you discover the taxonomy — from the data, bottom-up, rather than from a list of failure kinds you imagined in advance. Below are thirty seeded failed traces. Click a row to select it, then assign the preset label that fits. Label them in any order; the groups build as you go. Resist the urge to pre-read all thirty: label as you read, the way the work is actually done.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ea-code-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Thirty failed traces. A coloured dot marks a labelled row; the right column is the code you gave it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Scroll <span class="val">0</span></label><input type="range" id="ea-scroll" min="0" max="12" step="1" value="0"></div>
+        <div class="g-btnrow" id="ea-labels"></div>
+        <div class="g-btnrow">
+          <button id="ea-clear">Clear all labels</button>
+        </div>
+        <div class="g-readout" id="ea-code-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="pareto">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Axial coding and the Pareto</h2></div>
+    <p class="g-eyebrow">A handful of modes cause most of the failures</p>
+    <p>Grouped, the thirty traces collapse into six modes, and the distribution is badly uneven. That unevenness is the practical gift of error analysis: you do not have to fix everything, you have to fix the top two or three modes and re-measure. This is the Pareto shape, and it shows up in agent traces over and over because failure modes are not independent — a bad tool schema causes many downstream "reasons", and a bad chunking policy causes many "wrong answer" symptoms.</p>
+    <p>The chart below is the expert coding of the same thirty traces: the bars are mode frequency, the dashed line is the cumulative share. Read it as a work queue, not a report. Three modes account for the majority of the failures, so three fixes — plus three eval cases to prove they worked — buy most of the available improvement.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ea-pareto-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Bars: failures per mode. Dashed line: cumulative share, read against the right-hand percentage labels.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="ea-pareto-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cases">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>From taxonomy to eval cases</h2></div>
+    <p class="g-eyebrow">Each mode becomes a case with a check — code first, judge only where you must</p>
+    <p>The taxonomy is only worth the reading if it becomes cases. For each failure mode, write one example that reproduces it and one <strong>check</strong> that decides pass or fail. Prefer a deterministic check — does the output parse, does the citation resolve, did the same call repeat, is the label correct — because a code check is cheap, instant and identical every run. Reach for a model judge only where the criterion is genuinely irreducibly subjective, like whether the retrieved document is <em>relevant</em>.</p>
+    <p>Below, click a mode to add its eval case. The suite starts with the two easiest modes — structured output and refusal — which is exactly the trap: they are the cheapest to measure, they are barely present in your failures, and a suite built only from them reports high coverage of nothing. Watch the coverage bar climb as you add the modes that actually break.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ea-cases-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Click a mode to toggle its eval case. Bar length is the mode's share of the failures; the tag is code or judge.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="ea-cases-reset">Start over from the easy modes</button>
+        </div>
+        <div class="g-readout" id="ea-cases-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The measurement trap:</b> a suite built from what is easy to check will report a high pass rate because it is testing the easy things. Coverage of the <em>failure volume</em>, not the number of cases, is the honest denominator — and the taxonomy is what tells you which volume you are missing.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What is the hard part of an agent product?</td><td>Evaluation, not prompting — and it is the moat a model upgrade does not erase.</td></tr>
+        <tr><td>What is the first move?</td><td>Read ten real traces end to end. Do not write an eval first.</td></tr>
+        <tr><td>What is open coding?</td><td>One concrete line per failure: "it cited the KV-cache doc for a reranking question".</td></tr>
+        <tr><td>What is axial coding?</td><td>Grouping those lines into a small taxonomy of failure modes, bottom-up.</td></tr>
+        <tr><td>Why does the Pareto shape appear?</td><td>Failure modes are not independent: one bad schema or chunking policy produces many symptoms.</td></tr>
+        <tr><td>What should you build before agents?</td><td>A trace viewer. You cannot fix what you cannot see.</td></tr>
+        <tr><td>What is the right check for a case?</td><td>A deterministic one — parse, citation resolves, call did not repeat, label matches. Use a judge only for irreducibly subjective criteria.</td></tr>
+        <tr><td>What does the taxonomy feed?</td><td>Eval cases now, and the datasets, judges and CI of the next three parts.</td></tr>
+        <tr><td>What is the trap?</td><td>Measuring only what is easy to measure, then reporting a pass rate that covers none of your actual failures.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024 — an eval built from real failures, with the check being the repository's own test suite.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — end-state grading, and why reading the trajectory beats reading the score.</li>
+      <li>Cemri et al., <a href="https://arxiv.org/abs/2503.13657">"Why Do Multi-Agent LLM Systems Fail?"</a>, 2025 — an open-coded taxonomy of coordination failures, built by reading traces.</li>
+      <li>Liang et al., <a href="https://arxiv.org/abs/2211.09110">"Holistic Evaluation of Language Models (HELM)"</a>, 2022 — multi-metric reporting, and the argument against a single headline number.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — context as the object under inspection, which is what a context-composition panel shows.</li>
+      <li>OpenAI, <a href="https://cookbook.openai.com/examples/evaluation/getting_started_with_openai_evals">"Getting started with OpenAI Evals"</a> — a worked example of turning observed failures into a dataset and a grader.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A taxonomy is a list of things to test. Next: build the set you trust, the set you must not tune against, and the gate that stops a prompt change from shipping a regression.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08, a 500-instance human-validated subset); τ-bench (Yao et al., arXiv:2406.12045, 2024) for tool-agent-user interaction; GAIA (Mialon et al., arXiv:2311.12983, 2023) for general assistant tasks; OSWorld (Xie et al., arXiv:2404.07972, 2024) for computer use; HELM (Liang et al., arXiv:2211.09110, 2022) for holistic multi-metric reporting. Public scores are contaminated by training-data leakage, scaffolding differences and harness version drift. Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    }
+  };
+
+  var SEG_NAMES = ['system', 'tools', 'task', 'history', 'summary', 'facts', 'notes', 'retrieved'];
+  var SEG_COLORS = [c.accent, c.accent2, c.accent400, c.accent700, '#c9a227', '#7a5c9e', '#5f8a3a', '#b0552d'];
+
+  // ------------------------------------------------------------------
+  // Demo A — the trace viewer
+  // ------------------------------------------------------------------
+  var A = { sel: 6 };
+  var setupT = Guide.setupCanvas(el('ea-trace-canvas'), 640, 380, drawT);
+  var TRACE_RUN = AppSim.agentRun('research', { compaction: 'evict', maxTokens: 9000, steps: 26, seed: 23 });
+  var TRACE_FACTS = {};
+  TRACE_RUN.facts.forEach(function (f) { TRACE_FACTS[f.id] = f; });
+  function shortFact(id) {
+    var f = TRACE_FACTS[id];
+    if (!f) return 'docs';
+    return f.label.length > 28 ? f.label.slice(0, 26) + '…' : f.label;
+  }
+  function glyph(action) {
+    return action === 'tool' ? 'T' : (action === 'redo' ? 'R' : (action === 'use' ? 'U' : (action === 'answer' ? 'A' : '·')));
+  }
+  function toolFor(st) {
+    var key = st.needed[0] || st.learned[0] || null;
+    var q = key ? '"' + shortFact(key) + '"' : '"docs"';
+    if (st.action === 'tool') return { tool: 'bm25_search', args: 'q=' + q, res: '8 hits' };
+    if (st.action === 'redo') return { tool: 'bm25_search', args: 'q=' + q + ' (repeat)', res: '8 hits, wasted' };
+    if (st.action === 'use') return { tool: 'read_chunk', args: 'doc#' + (st.i % 9 + 1), res: '1 chunk' };
+    if (st.action === 'answer') return { tool: 'final', args: 'synthesise + cite', res: 'answer' };
+    return { tool: '—', args: 'reasoning', res: '—' };
+  }
+  function drawT() {
+    if (!setupT) return;
+    var ctx = setupT.ctx, W = 640, H = 380;
+    var run = TRACE_RUN, n = run.steps.length;
+    var sel = Math.max(0, Math.min(n - 1, A.sel));
+    var steps = run.steps.map(function (st, i) {
+      return { id: i, label: glyph(st.action), state: i === sel ? 'active' : (i < sel ? 'done' : 'pending') };
+    });
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('agent trajectory — ' + n + ' steps · click a node to inspect it', 16, 18);
+    var track = Guide.drawTraceTrack(ctx, W, H, steps, { padT: 34, padB: 240, nodeR: 8, labelEvery: 2, active: sel });
+
+    var st = run.steps[sel];
+    var bx = 16, by = 148, bw = 608, bh = 22;
+    var total = st.segments.reduce(function (a, s) { return a + s.tokens; }, 0) || 1;
+    var cursor = bx;
+    st.segments.forEach(function (sg, j) {
+      var w = bw * (sg.tokens / total);
+      ctx.fillStyle = SEG_COLORS[j % SEG_COLORS.length];
+      ctx.fillRect(cursor, by, Math.max(0, w), bh);
+      cursor += w;
+    });
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('context at step ' + sel + ' — ' + Guide.fmtNum(st.total) + ' tokens', bx, by - 6);
+    ctx.fillText(st.segments.map(function (s, j) {
+      var nm = SEG_NAMES[j] || s.name;
+      return nm + ' ' + Guide.fmtNum(s.tokens);
+    }).join(' · '), bx, by + bh + 14);
+
+    var rowsTop = 224, rowH = 15;
+    var from = Math.max(0, sel - 3), to = Math.min(n - 1, sel + 4);
+    ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font;
+    ctx.fillText('tool calls', 16, rowsTop - 10);
+    for (var i = from; i <= to; i++) {
+      var s2 = run.steps[i], desc = toolFor(s2);
+      var y = rowsTop + (i - from) * rowH;
+      if (i === sel) { ctx.fillStyle = 'rgba(43,95,255,0.10)'; ctx.fillRect(8, y - 11, 624, rowH); }
+      ctx.fillStyle = i === sel ? c.accent700 : c.text;
+      ctx.font = (i === sel ? '600 ' : '') + '10px ' + c.font;
+      ctx.textAlign = 'left';
+      ctx.fillText('#' + pad2(i) + '  ' + s2.action, 16, y);
+      ctx.fillText(desc.tool, 110, y);
+      ctx.fillText(desc.args.length > 40 ? desc.args.slice(0, 38) + '…' : desc.args, 220, y);
+      ctx.fillText('→ ' + desc.res, 470, y);
+      ctx.textAlign = 'right';
+      ctx.fillText(Guide.fmtNum(s2.total) + ' tok', 624, y);
+    }
+    ctx.textAlign = 'left';
+
+    var dropsHere = run.drops.filter(function (d) { return d.step === sel; });
+    var redosHere = run.redos.filter(function (d) { return d.step === sel; });
+    el('ea-trace-readout').innerHTML =
+      '<div><span class="k">step</span> <span class="hi">' + sel + '</span>' +
+      ' &nbsp; <span class="k">action</span> ' + st.action +
+      ' &nbsp; <span class="k">prompt</span> ' + Guide.fmtNum(st.total) + ' tok' +
+      (st.overflow > 0 ? ' &nbsp; <span class="bad">over ceiling by ' + Guide.fmtNum(st.overflow) + '</span>' : '') + '</div>' +
+      '<div><span class="k">tool</span> ' + toolFor(st).tool + ' ' + toolFor(st).args + ' → ' + toolFor(st).res +
+      ' &nbsp; <span class="k">facts in context</span> ' + st.factsInContext + '</div>' +
+      '<div>' + (dropsHere.length || redosHere.length
+        ? '<span class="bad">this step: ' + dropsHere.map(function (d) { return 'evicted ' + d.fact; }).concat(redosHere.map(function (d) { return 'redid ' + d.fact; })).join(' · ') + '</span>'
+        : '<span class="k">this step changes no memory</span>') + '</div>' +
+      '<div class="k">the composition strip is the thing worth internalising: at a long step, history and retrieved dominate the prompt and the instructions are a rounding error</div>';
+  }
+  Guide.bindSliders([el('ea-step')], function () { A.sel = parseInt(el('ea-step').value, 10) || 0; drawT(); });
+  el('ea-trace-canvas').addEventListener('pointerdown', function (ev) {
+    var p = Guide.hitTest(el('ea-trace-canvas'), ev);
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < TRACE_RUN.steps.length; i++) {
+      var x = 34 + (640 - 68) * (i / (TRACE_RUN.steps.length - 1));
+      var d = Math.hypot(p.x - x, p.y - trackY());
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    if (best != null && bestD < 18) { A.sel = best; el('ea-step').value = best; drawT(); }
+  });
+  function trackY() { return 34 + (380 - 34 - 240) / 2; }
+
+  // ------------------------------------------------------------------
+  // Demo B — open coding
+  // ------------------------------------------------------------------
+  var MODES = [
+    { id: 'retrieval', label: 'wrong chunk retrieved', short: 'retrieval', check: 'judge', color: c.accent,
+      texts: [
+        'cited the KV-cache doc for a question about reranking',
+        'retrieved a training doc for a serving question',
+        'top hit was the glossary; the answer never reached a source',
+        'matched the word "context" and missed the eval-harness doc',
+        'pulled three near-duplicate chunks from the same page',
+        'missed the only document that mentions pass^k',
+        'used a stale cached chunk after the document was edited',
+        'retriever returned the parent doc; the model quoted the wrong section',
+        'the answer cites a source that does not contain the claim'
+      ] },
+    { id: 'toolarg', label: 'bad tool argument', short: 'tool arg', check: 'code', color: c.accent2,
+      texts: [
+        'called search with an empty query string',
+        'passed the entire question as the filter value',
+        'used the wrong field name in the JSON tool call',
+        'read_chunk with a doc id from a different corpus',
+        'called search with a negative top_k',
+        'sent a date filter as free text',
+        'the tool call omitted the required query parameter'
+      ] },
+    { id: 'uncited', label: 'answer not grounded or uncited', short: 'uncited', check: 'code', color: '#c9a227',
+      texts: [
+        'answered from memory and cited nothing',
+        'asserted a number with no source',
+        'summarised three documents without linking any',
+        'fabricated a citation id',
+        'quoted a chunk but never named the document'
+      ] },
+    { id: 'loop', label: 'repeated identical call', short: 'loop', check: 'code', color: c.accent700,
+      texts: [
+        're-issued the same search for six consecutive steps',
+        'alternated two searches without making progress',
+        'retried the same failing tool call unchanged',
+        're-read the same chunk three times in a row'
+      ] },
+    { id: 'format', label: 'malformed structured output', short: 'format', check: 'code', color: '#7a5c9e',
+      texts: [
+        'returned prose where the schema required JSON',
+        'emitted a JSON object with a trailing comma',
+        'used a key that is not in the schema'
+      ] },
+    { id: 'refusal', label: 'over-refusal', short: 'refusal', check: 'code', color: '#5f8a3a',
+      texts: [
+        'refused a benign question about pricing',
+        'declined to answer, citing a safety policy'
+      ] }
+  ];
+  var TRACE_TOTAL = MODES.reduce(function (a, m) { return a + m.texts.length; }, 0);
+  var MODE_BY_ID = {};
+  MODES.forEach(function (m) { MODE_BY_ID[m.id] = m; });
+
+  var TRACES = [];
+  MODES.forEach(function (m) { m.texts.forEach(function (t) { TRACES.push({ text: t, mode: m.id }); }); });
+  (function shuffle(a, seed) {
+    var r = AppSim.rng(seed);
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(r() * (i + 1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+  })(TRACES, 37);
+
+  var F = { sel: 0, labels: {} };
+  var setupC = Guide.setupCanvas(el('ea-code-canvas'), 640, 380, drawCode);
+  var CODE_TOP = 34, CODE_ROW = 16, CODE_VISIBLE = 18;
+  function labelledCount() { return Object.keys(F.labels).length; }
+  function drawCode() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var offset = parseInt(el('ea-scroll').value, 10);
+    if (!isFinite(offset)) offset = 0;
+    offset = Math.max(0, Math.min(TRACES.length - CODE_VISIBLE, offset));
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('thirty failed traces — click a row, then assign the code that fits', 16, 18);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('showing #' + offset + '–#' + Math.min(TRACES.length - 1, offset + CODE_VISIBLE - 1) +
+      ' · labelled ' + labelledCount() + ' of ' + TRACE_TOTAL, 16, 30);
+    for (var k = 0; k < CODE_VISIBLE; k++) {
+      var idx = offset + k;
+      if (idx >= TRACES.length) break;
+      var tr = TRACES[idx];
+      var y = CODE_TOP + 11 + k * CODE_ROW;
+      if (idx === F.sel) { ctx.fillStyle = 'rgba(43,95,255,0.10)'; ctx.fillRect(8, y - 11, 624, CODE_ROW); }
+      var lab = F.labels[idx];
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('#' + pad2(idx), 16, y);
+      ctx.fillText(tr.text.length > 78 ? tr.text.slice(0, 76) + '…' : tr.text, 52, y);
+      if (lab) {
+        ctx.fillStyle = MODE_BY_ID[lab].color;
+        ctx.fillRect(560, y - 8, 8, 8);
+        ctx.textAlign = 'right';
+        ctx.fillText(MODE_BY_ID[lab].short, 620, y);
+      } else {
+        ctx.fillStyle = 'rgba(120,120,120,0.55)'; ctx.textAlign = 'right';
+        ctx.fillText('unlabelled', 620, y);
+      }
+    }
+    // group summary bar
+    var barX = 16, barY = 336, barW = 608, barH = 16, cursor = barX;
+    var labelled = labelledCount();
+    MODES.forEach(function (m) {
+      var n = 0;
+      Object.keys(F.labels).forEach(function (idx) { if (F.labels[idx] === m.id) n++; });
+      if (!n) return;
+      var w = barW * (n / Math.max(1, labelled));
+      ctx.fillStyle = m.color; ctx.fillRect(cursor, barY, w, barH);
+      cursor += w;
+    });
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(barX, barY, barW, barH);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    if (!labelled) ctx.fillText('no labels yet — the bar fills as you code', barX + 6, barY + 12);
+    var lx = 16;
+    MODES.forEach(function (m) {
+      var n = 0;
+      Object.keys(F.labels).forEach(function (idx) { if (F.labels[idx] === m.id) n++; });
+      ctx.fillStyle = m.color; ctx.fillRect(lx, barY + 24, 8, 8);
+      ctx.fillStyle = c.text;
+      ctx.fillText(m.short + ' ' + n, lx + 12, barY + 32);
+      lx += 100;
+    });
+    var unlabelled = TRACE_TOTAL - labelled;
+    el('ea-code-readout').innerHTML =
+      '<div><span class="k">labelled</span> <span class="hi">' + labelled + '</span> of ' + TRACE_TOTAL +
+      ' &nbsp; <span class="k">remaining</span> ' + unlabelled + '</div>' +
+      '<div>' + MODES.map(function (m) {
+        var n = 0;
+        Object.keys(F.labels).forEach(function (idx) { if (F.labels[idx] === m.id) n++; });
+        return '<span class="k">' + m.short + '</span> ' + n;
+      }).join(' · ') + '</div>' +
+      '<div class="k">' + (unlabelled
+        ? 'keep going — the grouping only becomes obvious once a few lines are on the page'
+        : 'thirty lines, six modes: this is the taxonomy, and it came from the data rather than from a list you imagined') + '</div>';
+  }
+  MODES.forEach(function (m) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = m.short;
+    btn.addEventListener('click', function () {
+      F.labels[F.sel] = m.id;
+      var next = F.sel;
+      for (var s = 0; s < TRACES.length; s++) {
+        var idx = (F.sel + 1 + s) % TRACES.length;
+        if (!F.labels[idx]) { next = idx; break; }
+      }
+      F.sel = next;
+      if (next < parseInt(el('ea-scroll').value, 10)) el('ea-scroll').value = String(next);
+      if (next > parseInt(el('ea-scroll').value, 10) + CODE_VISIBLE - 1) el('ea-scroll').value = String(Math.max(0, next - CODE_VISIBLE + 1));
+      drawCode();
+    });
+    el('ea-labels').appendChild(btn);
+  });
+  el('ea-clear').addEventListener('click', function () { F.labels = {}; F.sel = 0; el('ea-scroll').value = '0'; drawCode(); });
+  Guide.bindSliders([el('ea-scroll')], drawCode);
+  el('ea-code-canvas').addEventListener('pointerdown', function (ev) {
+    var p = Guide.hitTest(el('ea-code-canvas'), ev);
+    var offset = parseInt(el('ea-scroll').value, 10) || 0;
+    var k = Math.floor((p.y - (CODE_TOP - 4)) / CODE_ROW);
+    var idx = offset + k;
+    if (k >= 0 && k < CODE_VISIBLE && idx >= 0 && idx < TRACES.length) { F.sel = idx; drawCode(); }
+  });
+
+  // ------------------------------------------------------------------
+  // Demo C — the Pareto
+  // ------------------------------------------------------------------
+  var setupP = Guide.setupCanvas(el('ea-pareto-canvas'), 640, 340, drawP);
+  function drawP() {
+    if (!setupP) return;
+    var ctx = setupP.ctx, W = 640, H = 340;
+    var sorted = MODES.slice().sort(function (a, b) { return b.texts.length - a.texts.length; });
+    var data = sorted.map(function (m, i) {
+      return { x0: i + 0.10, x1: i + 0.90, y: m.texts.length, color: m.color };
+    });
+    var geo = Guide.drawColumns(ctx, W, H, data, {
+      xRange: [0, sorted.length], yRange: [0, 32], maxY: 32, padL: 54, padR: 46, padT: 30, padB: 66
+    });
+    var cum = 0, pts = [];
+    sorted.forEach(function (m, i) { cum += m.texts.length; pts.push({ x: i + 0.5, y: cum }); });
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.8; ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    pts.forEach(function (p, i) {
+      var X = geo.px(p.x), Y = geo.py(p.y);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke(); ctx.setLineDash([]);
+    pts.forEach(function (p, i) {
+      var X = geo.px(p.x), Y = geo.py(p.y);
+      ctx.fillStyle = c.accent700;
+      ctx.beginPath(); ctx.arc(X, Y, 3, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText((p.y / TRACE_TOTAL * 100).toFixed(0) + '%', X, Y - 7);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(sorted[i].short, X, geo.py(0) + 16);
+      ctx.fillStyle = sorted[i].color; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(sorted[i].texts.length, X - 4, geo.py(sorted[i].texts.length) - 6);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('failures per mode (bars) and cumulative share (dashed)', 16, 18);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('dashed line: cumulative share of all failures', 16, 300);
+
+    var top3 = sorted.slice(0, 3).reduce(function (a, m) { return a + m.texts.length; }, 0);
+    el('ea-pareto-readout').innerHTML =
+      '<div><span class="k">top 3 modes</span> <span class="hi">' + top3 + ' of ' + TRACE_TOTAL + '</span> failures (' +
+      (top3 / TRACE_TOTAL * 100).toFixed(0) + '%) &nbsp; <span class="k">top 2</span> ' +
+      (sorted[0].texts.length + sorted[1].texts.length) + ' (' +
+      ((sorted[0].texts.length + sorted[1].texts.length) / TRACE_TOTAL * 100).toFixed(0) + '%)</div>' +
+      '<div>' + sorted.map(function (m) {
+        return '<span class="k">' + m.short + '</span> ' + m.texts.length;
+      }).join(' · ') + '</div>' +
+      '<div class="k">read this as a work queue: fix the top three modes, write one case each, and re-measure — ' +
+      'the long tail is real but it is not where the improvement is</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo D — taxonomy to eval cases
+  // ------------------------------------------------------------------
+  var CASES = {};
+  function resetCases() {
+    CASES = {};
+    MODES.forEach(function (m) { CASES[m.id] = false; });
+    CASES.format = true;    // the two easiest to measure
+    CASES.refusal = true;
+  }
+  resetCases();
+  var setupK = Guide.setupCanvas(el('ea-cases-canvas'), 640, 360, drawK);
+  var K_TOP = 50, K_ROW = 46;
+  function drawK() {
+    if (!setupK) return;
+    var ctx = setupK.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var sorted = MODES.slice().sort(function (a, b) { return b.texts.length - a.texts.length; });
+    var maxVol = sorted[0].texts.length;
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('click a mode to add its eval case — code check where possible, judge where you must', 16, 18);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('the suite starts with the two easiest modes, which is the trap', 16, 32);
+
+    var covered = 0, codeCovered = 0;
+    sorted.forEach(function (m, i) {
+      var y = K_TOP + i * K_ROW;
+      var has = CASES[m.id];
+      if (has) { covered += m.texts.length; if (m.check === 'code') codeCovered += m.texts.length; }
+      ctx.fillStyle = has ? 'rgba(43,95,255,0.06)' : 'rgba(120,120,120,0.05)';
+      ctx.fillRect(12, y - 14, 616, K_ROW - 10);
+      ctx.fillStyle = c.text; ctx.font = (has ? '600 ' : '') + '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(m.label, 20, y + 4);
+      var barW = 250, barX = 250, barY = y - 8, barH = 20;
+      ctx.fillStyle = m.color; ctx.globalAlpha = has ? 1 : 0.30;
+      ctx.fillRect(barX, barY, barW * (m.texts.length / maxVol), barH);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(m.texts.length + ' failures', barX + barW * (m.texts.length / maxVol) + 6, barY + 14);
+      ctx.fillStyle = has ? c.accent700 : c.accent2;
+      ctx.fillRect(556, barY + 4, 8, 12);
+      ctx.fillStyle = has ? c.accent700 : c.accent2;
+      ctx.fillText(has ? ('case built · ' + (m.check === 'code' ? 'code check' : 'judge')) : 'no case — click to add', 570, barY + 14);
+    });
+
+    var barY2 = 320, barH2 = 18, barX2 = 16, barW2 = 608;
+    ctx.fillStyle = c.accent700; ctx.fillRect(barX2, barY2, barW2 * (covered / TRACE_TOTAL), barH2);
+    ctx.fillStyle = 'rgba(120,120,120,0.18)'; ctx.fillRect(barX2 + barW2 * (covered / TRACE_TOTAL), barY2, barW2 * (1 - covered / TRACE_TOTAL), barH2);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(barX2, barY2, barW2, barH2);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('failure volume covered by a case: ' + (covered / TRACE_TOTAL * 100).toFixed(0) + '%', barX2, barY2 - 6);
+
+    el('ea-cases-readout').innerHTML =
+      '<div><span class="k">coverage of failure volume</span> <span class="hi">' + (covered / TRACE_TOTAL * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">cases built</span> ' + sorted.filter(function (m) { return CASES[m.id]; }).length + ' of ' + sorted.length + '</div>' +
+      '<div><span class="k">deterministic (code) checks cover</span> ' + codeCovered + ' failures' +
+      ' &nbsp; <span class="k">judge required for</span> ' + sorted.filter(function (m) { return m.check === 'judge' && CASES[m.id]; }).map(function (m) { return m.short; }).join(', ') + '</div>' +
+      '<div class="k">' + (covered < TRACE_TOTAL
+        ? 'uncovered modes: ' + sorted.filter(function (m) { return !CASES[m.id]; }).map(function (m) { return m.short; }).join(', ') + ' — the cheap cases you started with cover ' + (covered / TRACE_TOTAL * 100).toFixed(0) + '% of the failures'
+        : 'full coverage: every failure mode now has a case, five of them checkable with code and one needing a judge') + '</div>';
+  }
+  el('ea-cases-reset').addEventListener('click', function () { resetCases(); drawK(); });
+  el('ea-cases-canvas').addEventListener('pointerdown', function (ev) {
+    var p = Guide.hitTest(el('ea-cases-canvas'), ev);
+    var sorted = MODES.slice().sort(function (a, b) { return b.texts.length - a.texts.length; });
+    var i = Math.floor((p.y - (K_TOP - 14)) / K_ROW);
+    if (i >= 0 && i < sorted.length) { CASES[sorted[i].id] = !CASES[sorted[i].id]; drawK(); }
+  });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    el('ea-evals-source').textContent = (data && data.evals && data.evals.source) || FALLBACK.evals.source;
+    drawT(); drawCode(); drawP(); drawK();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawT(); drawCode(); drawP(); drawK();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'error-analysis-hard-part',
+      kind: 'choice',
+      prompt: 'What does this part claim is the hard part of an agent product — and the durable moat?',
+      options: [
+        { label: 'Evaluation, not prompting; it is the asset a model upgrade does not erase.', correct: true },
+        { label: 'Prompt engineering, because prompts are model-specific.', correct: false },
+        { label: 'Choosing a model, because capability is the binding constraint.', correct: false },
+        { label: 'Latency tuning, because users notice delay most.', correct: false }
+      ],
+      explanation: 'Prompts are cheap to write and cheap to replace. A labelled dataset, a taxonomy of your failures and a harness that measures them are what transfer across models — and nobody else has yours.'
+    },
+    {
+      id: 'error-analysis-coding',
+      kind: 'choice',
+      prompt: 'What is the difference between open coding and axial coding?',
+      options: [
+        { label: 'Open coding writes one concrete line per failure; axial coding groups those lines into a small taxonomy.', correct: true },
+        { label: 'Open coding is automatic; axial coding is manual.', correct: false },
+        { label: 'Open coding assigns scores; axial coding assigns labels.', correct: false },
+        { label: 'Open coding is for retrieval; axial coding is for tool use.', correct: false }
+      ],
+      explanation: 'The order matters. Write the concrete line first — "it cited the KV-cache doc for a reranking question" — and let the categories emerge from the lines. Starting from categories gives you a taxonomy you imagined, not the one your system has.'
+    },
+    {
+      id: 'error-analysis-pareto',
+      kind: 'numeric',
+      prompt: 'The taxonomy has six modes over 30 failed traces. The three largest modes have 9, 7 and 5 failures. How many of the 30 traces does the top three cover?',
+      answer: 21,
+      unit: "traces",
+      tolerance: 0,
+      explanation: '9 + 7 + 5 = 21, or 70% of the failures, from half the modes. That is the Pareto shape, and it is why the taxonomy is a work queue: fix the top modes first and re-measure.'
+    },
+    {
+      id: 'error-analysis-viewer',
+      kind: 'choice',
+      prompt: 'Why build your own trace viewer rather than relying on the provider dashboard?',
+      options: [
+        { label: 'You cannot fix what you cannot see; the view you need is your run, your context and your tool calls.', correct: true },
+        { label: 'Provider dashboards are always wrong.', correct: false },
+        { label: 'A trace viewer is required for the model to call tools.', correct: false },
+        { label: 'Because traces cannot be logged otherwise.', correct: false }
+      ],
+      explanation: 'The dashboard shows calls and cost. What you need for error analysis is the step sequence, the context composition at each step and the tool calls in order, filtered to the failures you are coding.'
+    },
+    {
+      id: 'error-analysis-trap',
+      kind: 'choice',
+      prompt: 'What is the trap of building an eval suite from the checks that are easiest to write?',
+      options: [
+        { label: 'It reports a high pass rate while covering almost none of your actual failure volume.', correct: true },
+        { label: 'Easy checks are slower to run than judges.', correct: false },
+        { label: 'Easy checks cannot be run in CI.', correct: false },
+        { label: 'Easy checks are always less accurate than a judge.', correct: false }
+      ],
+      explanation: 'A suite of format and refusal checks is cheap and green, and it says nothing about the retrieval and tool-argument failures doing the damage. Measure coverage of the failure volume, and let the taxonomy tell you what is missing.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

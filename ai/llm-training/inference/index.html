@@ -1,0 +1,457 @@
+---
+title: "LLM Training, Interactively — Part 11: Inference, Serving & Efficiency"
+description: "What happens after training ends — sampling strategies, the KV cache, why decode is memory-bandwidth-bound while prefill is compute-bound, continuous batching, and quantization."
+permalink: "/ai/llm-training/inference/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-inference.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .tok-strip { display:flex; flex-wrap:wrap; gap:4px; }
+  .tok-strip .llmt-tok.removed { opacity: 0.25; text-decoration: line-through; }
+  .batch-row { display:flex; align-items:center; gap:6px; margin-bottom:4px; font-family: var(--font-mono); font-size: 11px; }
+  .batch-seg { height: 16px; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 11 of 15</span>
+    <h1>Inference, Serving &amp; Efficiency</h1>
+    <p>Training produces a fixed set of weights. Everything from here is about the very different problem of running that fixed function fast, cheaply, and for many users at once — which turns out to have its own rich set of mechanisms, none of them touched by training itself.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="sampling">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Choosing the next token: the full sampler</h2></div>
+    <p class="llmt-eyebrow">Decoding</p>
+    <p>Part 1 sampled greedily; a real serving stack layers several filters onto the softmax distribution before sampling. Each rule below removes or reshapes probability mass differently — toggle them to see exactly which tokens survive.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-grid3">
+        <div class="llmt-field"><label>Temperature <span class="val" id="sm-temp-val">0.8</span></label><input type="range" id="sm-temp" min="0.1" max="2" step="0.05" value="0.8"></div>
+        <div class="llmt-field"><label>Top-k <span class="val" id="sm-topk-val">off</span></label><input type="range" id="sm-topk" min="0" max="15" step="1" value="0"></div>
+        <div class="llmt-field"><label>Top-p (nucleus) <span class="val" id="sm-topp-val">off</span></label><input type="range" id="sm-topp" min="0" max="1" step="0.02" value="1"></div>
+        <div class="llmt-field"><label>Min-p <span class="val" id="sm-minp-val">off</span></label><input type="range" id="sm-minp" min="0" max="0.5" step="0.01" value="0"></div>
+        <div class="llmt-field"><label>Repetition penalty <span class="val" id="sm-rep-val">1.0</span></label><input type="range" id="sm-rep" min="1" max="2" step="0.05" value="1"></div>
+      </div>
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;"><canvas id="sm-canvas" width="620" height="260"></canvas></div>
+      <div class="llmt-readout" id="sm-readout"></div>
+    </div>
+    <div style="overflow-x:auto; margin-top:14px;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Rule</th><th>What it removes</th></tr></thead>
+      <tbody>
+        <tr><td>Temperature</td><td>Nothing removed — reshapes sharpness (÷T before softmax)</td></tr>
+        <tr><td>Top-k</td><td>Everything outside the k highest-probability tokens</td></tr>
+        <tr><td>Top-p / nucleus</td><td>Tokens outside the smallest set whose cumulative probability ≥ p</td></tr>
+        <tr><td>Min-p</td><td>Tokens whose probability is below a fraction of the top token's probability — adapts to how peaked the distribution is, unlike a fixed top-k</td></tr>
+        <tr><td>Repetition penalty</td><td>Down-weights tokens already generated earlier in the response</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="kvcache">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>The KV cache</h2></div>
+    <p class="llmt-eyebrow">Making autoregressive decoding tractable</p>
+    <p>Generating token <var>t+1</var> needs every earlier token's key and value vectors for attention. Recomputing them from scratch at every new token would make generation quadratic in sequence length for no reason — so instead, every key/value computed is <strong>cached</strong> and reused, and only the newest token's K/V is computed each step. The cost: the cache itself takes real memory, growing linearly with context length, layers, and KV heads.</p>
+    <div class="llmt-math llmt-katex">$$\text{KV cache size} = 2 \times L \times n_{kv} \times d_{head} \times T \times \text{bytes} \times \text{batch}$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-grid3">
+          <div class="llmt-field"><label>Context length T <span class="val" id="kv-t-val">4096</span></label><input type="range" id="kv-t" min="512" max="131072" step="512" value="4096"></div>
+          <div class="llmt-field"><label>KV heads (GQA) <span class="val" id="kv-h-val">32</span></label><input type="range" id="kv-h" min="1" max="32" step="1" value="32"></div>
+          <div class="llmt-field"><label>Batch (concurrent requests) <span class="val" id="kv-b-val">8</span></label><input type="range" id="kv-b" min="1" max="64" step="1" value="8"></div>
+        </div>
+        <div class="llmt-readout" id="kv-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-goal">💡 <span><b>Why GQA (Part 3) matters here:</b> dropping from 32 independent KV heads to, say, 4 shared groups shrinks the cache by 8× for free — this is the actual production motivation for grouped-query attention, not just a training-time nicety.</span></div>
+  </section>
+
+  <section class="llmt-step" id="roofline">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Prefill vs. decode</h2></div>
+    <p class="llmt-eyebrow">Two very different workloads in one request</p>
+    <p><strong>Prefill</strong> processes the whole prompt at once — one matrix multiply over many tokens, which keeps the GPU's compute units busy (compute-bound; high arithmetic intensity). <strong>Decode</strong> generates one token at a time — each step reloads the full model weights (and KV cache) from GPU memory to produce a single new token, so it's bottlenecked on memory bandwidth, not compute (memory-bound; low arithmetic intensity). This is why decode throughput barely improves on a faster-but-not-more-bandwidth GPU, and why batching many concurrent requests' decode steps together (below) is the main lever for decode efficiency.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <canvas id="roof-canvas" width="620" height="260"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="batching">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Continuous batching</h2></div>
+    <p class="llmt-eyebrow">Serving many requests at once</p>
+    <p>Static batching waits for a fixed group of requests to all finish before starting the next batch — one long response blocks the whole batch's GPU slot from being reused. <strong>Continuous batching</strong> (also called in-flight batching) instead swaps a finished request out and a new one in at every decode step, keeping the GPU's batch dimension full. Click below to compare.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow">
+        <button id="batch-static" class="llmt-primary">Static batching</button>
+        <button id="batch-continuous">Continuous batching</button>
+      </div>
+      <div id="batch-viz"></div>
+      <div class="llmt-readout" id="batch-readout"></div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="quant">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>Quantization</h2></div>
+    <p class="llmt-eyebrow">Trading precision for memory and speed</p>
+    <p>Weights trained in bf16 can be stored (and often computed) in fewer bits at serving time — int8 or int4 — shrinking memory and often improving throughput, at some cost in output quality. Below, a synthetic weight distribution (roughly what a trained layer's weights look like) is quantized at different bit widths; watch the size shrink and the reconstruction error (mean squared error against the original) grow.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="quant-canvas" width="480" height="220"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow">
+          <button data-bits="32" class="llmt-primary">fp32</button>
+          <button data-bits="16">bf16</button>
+          <button data-bits="8">int8</button>
+          <button data-bits="4">int4</button>
+        </div>
+        <div class="llmt-readout" id="quant-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-canvas-hint">Real quantization methods (GPTQ, AWQ) are smarter than uniform rounding — they choose scales per-channel or per-group and account for which weights matter most to the output — but the basic size/error trade-off shown here is the same one they're managing.</p>
+  </section>
+
+  <section class="llmt-step" id="more-inference">
+    <div class="llmt-step-head"><span class="llmt-step-num">6</span><h2>Further serving techniques</h2></div>
+    <p class="llmt-eyebrow">Named, not demoed</p>
+    <div class="llmt-grid2">
+      <div class="llmt-card reveal"><b>Speculative decoding</b> — a small "draft" model proposes several tokens ahead; the large model verifies them in one batched forward pass, accepting the correct prefix. When the draft model's guesses are often right, this turns several slow decode steps into one, at the cost of running two models.</div>
+      <div class="llmt-card reveal"><b>Context-length extension</b> — techniques like position interpolation or YaRN rescale RoPE's rotation frequencies so a model trained at, say, 4K context can be used (often with brief fine-tuning) well beyond it, at some quality cost near the new limit.</div>
+      <div class="llmt-card reveal"><b>Constrained / structured decoding</b> — restricting the sampler to only tokens that keep a generation valid against a grammar or JSON schema, by masking out disallowed tokens at each step — how "guaranteed valid JSON" output modes work.</div>
+      <div class="llmt-card reveal"><b>Tool calling</b> — the model emits a structured request (usually constrained-decoded) that the serving stack intercepts, executes against a real function or API, and feeds the result back in as additional context before continuing generation.</div>
+      <div class="llmt-card reveal"><b>RAG (retrieval-augmented generation)</b> — before generation starts, a retrieval system (often the same embedding idea from Part 2, at a much larger scale) finds relevant documents and prepends them to the prompt, so the model can answer from up-to-date or private text it never saw in pretraining.</div>
+      <div class="llmt-card reveal"><b>Beam search</b> — instead of sampling one path, keep the top-B partial sequences by cumulative probability at every step; used less often for open-ended chat (where diverse, sampled text feels better) than for tasks with a single correct answer, like translation.</div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="rl-serving">
+    <div class="llmt-step-head"><span class="llmt-step-num">7</span><h2>Serving at scale: inference for RL</h2></div>
+    <p class="llmt-eyebrow">Why the biggest serving customer is training</p>
+    <p>The largest recent consumer of inference is not a chatbot endpoint — it's reinforcement learning. Generating long chains of thought means rollouts up to 32K tokens (mean ≈ 14,628 for a reasoning model), and the learner spends roughly <strong>75% of its time waiting for data</strong>. In OLMo 3's 32B run, 8 H100 nodes trained while 20 generated rollouts (5× the inference compute); the 7B run used 2 training and 7 inference nodes (14×). Every serving technique from this page therefore shows up directly inside the RL system — and in fact the fixes are the same continuous-batching and scheduling machinery, adapted to a workload where sequences are highly variable in length and the "requests" are policy samples.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="rl-throughput" width="640" height="240"></canvas>
+        <p class="llmt-canvas-hint">OLMoRL training throughput as each serving/systems improvement is added. MBU = memory-bandwidth utilization; MFU = model FLOPs utilization.</p>
+      </div>
+    </div>
+    <div style="overflow-x:auto; margin:14px 0;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Change</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td>Continuous batching</td><td>Rollouts have wildly different lengths. Static batching wastes ≈54% of slot-steps waiting for the longest one (mean 14,628 vs max 32,768 tokens); continuous batching backfills freed slots immediately.</td></tr>
+        <tr><td>Active sampling</td><td>Instead of DAPO's fixed 3× oversampling, pull completed prompt–completion pairs continuously from a result queue — stable batch size and loss even as filtering drops easy prompts.</td></tr>
+        <tr><td>Inflight weight updates</td><td>Push updated policy weights to the inference workers without pausing generation or invalidating the KV cache. Up to 4× faster than stopping to sync.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Stacked together, these took training throughput from <strong>881 to 2,949 tokens/second</strong> and memory-bandwidth utilization from <strong>12.9% to 43.2%</strong>. The lesson generalizes: once long-context generation is in the loop, RL is an inference-systems problem first and an optimization problem second.</p>
+    <div class="llmt-goal">📌 <span><b>Cross-link:</b> <a href="{% endraw %}{{ '/ai/llm-training/posttraining-scale/' | relative_url }}{% raw %}">Part 15</a> shows the full OLMoRL recipe and the batching timeline this section summarizes.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td>KV cache</td><td>Cached per-token key/value vectors so decode doesn't recompute the whole sequence's attention every step</td></tr>
+        <tr><td>Prefill vs. decode</td><td>Compute-bound (whole prompt at once) vs. memory-bandwidth-bound (one token at a time)</td></tr>
+        <tr><td>Continuous batching</td><td>Swap finished requests out and new ones in every decode step, not per fixed batch</td></tr>
+        <tr><td>Quantization</td><td>Storing/computing weights at lower precision (int8/int4) to save memory and increase throughput</td></tr>
+        <tr><td>Speculative decoding</td><td>A small model drafts tokens; the large model verifies them in one pass</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">"Efficient Memory Management for Large Language Model Serving with PagedAttention"</a> (2023) — vLLM.</li>
+      <li>Yu et al., <a href="https://www.usenix.org/conference/osdi22/presentation/yu">"Orca: A Distributed Serving System for Transformer-Based Generative Models"</a> (2022) — continuous batching.</li>
+      <li>Leviathan et al., <a href="https://arxiv.org/abs/2211.17192">"Fast Inference from Transformers via Speculative Decoding"</a> (2023).</li>
+      <li>Frantar et al., <a href="https://arxiv.org/abs/2210.17323">"GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"</a> (2023).</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>Speed and cost solved, the remaining question is how anyone knows whether the model is actually any good. <em>The sequel — <a href="{{ '/ai/llm-serving/' | relative_url }}">LLM Serving, Interactively</a> — takes this part's sampler, KV cache and batching and rebuilds them as a quantitative model you plug your own hardware into, all the way out to disaggregated prefill/decode pools and $/M tokens.</em></span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/evaluation/' | relative_url }}">Continue: evaluation →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+  function fmtBytes(b){
+    if (b >= 1e9) return (b/1e9).toFixed(2)+' GB';
+    if (b >= 1e6) return (b/1e6).toFixed(2)+' MB';
+    if (b >= 1e3) return (b/1e3).toFixed(2)+' KB';
+    return b.toFixed(0)+' B';
+  }
+
+  // ---- Sampler playground ----
+  (function(){
+    var vocab = ['the','a','cat','dog','sat','ran','quickly','on','mat','roof','and','then','slept','purred','barked'];
+    var baseLogits = [3.1,2.6,2.2,2.0,1.8,1.6,1.1,0.9,0.7,0.6,0.4,0.3,0.2,0.1,-0.2];
+    var generated = {}; // repetition tracking (toy: none generated by default)
+    var canvas = document.getElementById('sm-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var readout = document.getElementById('sm-readout');
+    var els = {
+      temp: document.getElementById('sm-temp'), topk: document.getElementById('sm-topk'),
+      topp: document.getElementById('sm-topp'), minp: document.getElementById('sm-minp'), rep: document.getElementById('sm-rep')
+    };
+    var vals = {
+      temp: document.getElementById('sm-temp-val'), topk: document.getElementById('sm-topk-val'),
+      topp: document.getElementById('sm-topp-val'), minp: document.getElementById('sm-minp-val'), rep: document.getElementById('sm-rep-val')
+    };
+
+    function render(){
+      var temp = parseFloat(els.temp.value), k = parseInt(els.topk.value,10), p = parseFloat(els.topp.value),
+          minp = parseFloat(els.minp.value), rep = parseFloat(els.rep.value);
+      vals.temp.textContent = temp.toFixed(2);
+      vals.topk.textContent = k===0 ? 'off' : k;
+      vals.topp.textContent = p>=1 ? 'off' : p.toFixed(2);
+      vals.minp.textContent = minp===0 ? 'off' : minp.toFixed(2);
+      vals.rep.textContent = rep.toFixed(2);
+
+      var logits = baseLogits.slice();
+      var probs = G.softmax(logits, temp);
+      var order = probs.map(function(pr,i){return {i:i,p:pr};}).sort(function(a,b){return b.p-a.p;});
+      var kept = order.map(function(o){return true;});
+      // top-k
+      if (k>0) order.forEach(function(o,idx){ if (idx>=k) kept[o.i]=false; });
+      // top-p
+      if (p<1){
+        var cum=0;
+        order.forEach(function(o){ if(!kept[o.i]) return; cum+=o.p; if (cum>p && cum-o.p>=p) kept[o.i]=false; });
+      }
+      // min-p
+      if (minp>0){
+        var topP = order[0].p;
+        order.forEach(function(o){ if (o.p < minp*topP) kept[o.i]=false; });
+      }
+      var survivors = order.filter(function(o){return kept[o.i];});
+      var renorm = survivors.reduce(function(a,o){return a+o.p;},0);
+
+      ctx.clearRect(0,0,W,H);
+      var data = order.map(function(o){
+        return { label: vocab[o.i], value: kept[o.i] ? o.p/renorm : 0.0001,
+          valueLabel: kept[o.i] ? (100*o.p/renorm).toFixed(1)+'%' : 'removed',
+          color: kept[o.i] ? c.accent : '#ccc' };
+      });
+      G.drawBars(ctx, W, H, data, {maxV: Math.max.apply(null, survivors.map(function(o){return o.p/renorm;}))});
+      readout.innerHTML = '<span class="k">candidates kept:</span> '+survivors.length+' of '+vocab.length;
+    }
+    Object.keys(els).forEach(function(k){ els[k].addEventListener('input', render); });
+    render();
+  })();
+
+  // ---- KV cache ----
+  (function(){
+    var tS=document.getElementById('kv-t'), hS=document.getElementById('kv-h'), bS=document.getElementById('kv-b');
+    var tV=document.getElementById('kv-t-val'), hV=document.getElementById('kv-h-val'), bV=document.getElementById('kv-b-val');
+    var readout = document.getElementById('kv-readout');
+    var L=32, dHead=128, bytesPerElem=2;
+    function render(){
+      var T=+tS.value, nkv=+hS.value, batch=+bS.value;
+      tV.textContent=T; hV.textContent=nkv; bV.textContent=batch;
+      var size = 2*L*nkv*dHead*T*bytesPerElem*batch;
+      readout.innerHTML = '<span class="k">KV cache size (OLMo-2-7B-scale, L=32, d_head=128):</span> <span class="hi">'+fmtBytes(size)+'</span><br>' +
+        '<span class="k">at full 32 KV heads (no GQA) vs this setting:</span> ' + (nkv<32 ? (32/nkv).toFixed(1)+'× smaller' : 'no GQA applied');
+    }
+    [tS,hS,bS].forEach(function(el){el.addEventListener('input',render);});
+    render();
+  })();
+
+  // ---- Prefill vs decode roofline ----
+  (function(){
+    var canvas = document.getElementById('roof-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var peakCompute = 989; // TFLOPs bf16, illustrative H100-scale peak
+    var peakBW = 3.35; // TB/s, illustrative H100-scale HBM bandwidth
+    var ridge = peakCompute/peakBW; // FLOPs/byte
+    var lines = [];
+    var pts=[];
+    for (var i=0;i<=100;i++){
+      var logAI = -1 + 4*i/100;
+      var AI = Math.pow(10, logAI);
+      var perf = Math.min(peakCompute, AI*peakBW);
+      pts.push({x:logAI, y:perf});
+    }
+    var axes = G.drawLines(ctx, W, H, [{points:pts, color:c.accent}], [-1,3], [0, peakCompute*1.1], {xLabel:'log10(arithmetic intensity, FLOPs/byte)', yLabel:'achievable TFLOP/s'});
+    function markPoint(logAI, label, color){
+      var AI = Math.pow(10, logAI);
+      var perf = Math.min(peakCompute, AI*peakBW);
+      var x = axes.px(logAI), y = axes.py(perf);
+      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x,y,5,0,2*Math.PI); ctx.fill();
+      ctx.font='11px '+c.font; ctx.fillText(label, x+8, y-4);
+    }
+    markPoint(2.5, 'prefill (compute-bound)', c.accent2);
+    markPoint(0.3, 'decode (memory-bound)', c.text);
+    ctx.fillStyle = c.text; ctx.font='10px '+c.font;
+    ctx.fillText('ridge point ≈ '+ridge.toFixed(0)+' FLOPs/byte (illustrative H100-class GPU)', axes.padL+8, axes.padT+12);
+  })();
+
+  // ---- Continuous batching ----
+  (function(){
+    var viz = document.getElementById('batch-viz');
+    var readout = document.getElementById('batch-readout');
+    var staticBtn = document.getElementById('batch-static'), contBtn = document.getElementById('batch-continuous');
+    var requests = [
+      {len: 3, arrive: 0}, {len: 8, arrive: 0}, {len: 2, arrive: 0}, {len: 5, arrive: 0},
+      {len: 4, arrive: 2}, {len: 6, arrive: 3}, {len: 2, arrive: 5}
+    ];
+    function renderStatic(){
+      viz.innerHTML = '';
+      var maxLen = Math.max.apply(null, requests.slice(0,4).map(function(r){return r.len;}));
+      requests.slice(0,4).forEach(function(r,i){
+        var row = document.createElement('div'); row.className='batch-row';
+        var seg = document.createElement('div'); seg.className='batch-seg'; seg.style.background=c.accent;
+        seg.style.width = (r.len/maxLen*100)+'%'; seg.style.opacity = 0.9;
+        var idle = document.createElement('div'); idle.className='batch-seg'; idle.style.background='#ddd';
+        idle.style.width = ((maxLen-r.len)/maxLen*100)+'%';
+        row.appendChild(document.createTextNode('req '+i+' ')); row.appendChild(seg); row.appendChild(idle);
+        viz.appendChild(row);
+      });
+      var wasted = requests.slice(0,4).reduce(function(a,r){return a+(maxLen-r.len);},0);
+      readout.innerHTML = '<span class="k">batch of 4, all wait for the longest (len '+maxLen+'):</span> <span class="hi">'+wasted+' idle GPU-slot-steps wasted</span> on shorter requests before slot 5 can even start.';
+    }
+    function renderContinuous(){
+      viz.innerHTML = '';
+      var maxT = 12, slots = 4;
+      var timeline = [];
+      var queue = requests.slice();
+      var active = [];
+      for (var t=0;t<maxT;t++){
+        queue = queue.filter(function(r){
+          if (r.arrive<=t && active.length<slots && active.indexOf(r)===-1 && !r.done){ active.push(r); r.start=t; return false; }
+          return true;
+        });
+        active.forEach(function(r){ if (r.start!=null && t-r.start>=r.len) r.done=true; });
+        active = active.filter(function(r){ return !r.done; });
+        timeline.push(active.length);
+      }
+      requests.forEach(function(r){ r.done=false; r.start=null; });
+      timeline.forEach(function(count,t){
+        var row = document.createElement('div'); row.className='batch-row';
+        var seg = document.createElement('div'); seg.className='batch-seg'; seg.style.background=c.accent;
+        seg.style.width = (count/slots*100)+'%';
+        row.appendChild(document.createTextNode('t='+t+' ')); row.appendChild(seg);
+        row.appendChild(document.createTextNode(' '+count+'/'+slots+' slots busy'));
+        viz.appendChild(row);
+      });
+      readout.innerHTML = '<span class="k">continuous batching:</span> a finished request\'s slot is immediately handed to the next queued one — slots stay full instead of idling for the batch\'s slowest member.';
+    }
+    staticBtn.addEventListener('click', function(){ staticBtn.className='llmt-primary'; contBtn.className=''; renderStatic(); });
+    contBtn.addEventListener('click', function(){ contBtn.className='llmt-primary'; staticBtn.className=''; renderContinuous(); });
+    renderStatic();
+  })();
+
+  // ---- Quantization ----
+  (function(){
+    var canvas = document.getElementById('quant-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var readout = document.getElementById('quant-readout');
+    var rng = G.seededRandom(11);
+    var weights = [];
+    for (var i=0;i<2000;i++){
+      var u1=rng(), u2=rng();
+      weights.push(Math.sqrt(-2*Math.log(u1+1e-9))*Math.cos(2*Math.PI*u2)*0.4);
+    }
+    function quantize(bits){
+      if (bits===32) return weights.slice();
+      if (bits===16) return weights.map(function(w){ return Math.fround ? Math.round(w*256)/256 : w; }); // coarse bf16-ish rounding
+      var levels = Math.pow(2,bits);
+      var maxAbs = Math.max.apply(null, weights.map(Math.abs));
+      var step = 2*maxAbs/(levels-1);
+      return weights.map(function(w){ return Math.round(w/step)*step; });
+    }
+    function render(bits){
+      var q = quantize(bits);
+      var mse = weights.reduce(function(a,w,i){ return a+(w-q[i])*(w-q[i]); },0)/weights.length;
+      var bytes = weights.length*(bits/8);
+      ctx.clearRect(0,0,W,H);
+      var bins = 40, minV=-1.5, maxV=1.5;
+      var counts = new Array(bins).fill(0), countsQ = new Array(bins).fill(0);
+      weights.forEach(function(w){ var b=Math.floor((w-minV)/(maxV-minV)*bins); if(b>=0&&b<bins) counts[b]++; });
+      q.forEach(function(w){ var b=Math.floor((w-minV)/(maxV-minV)*bins); if(b>=0&&b<bins) countsQ[b]++; });
+      var maxC = Math.max.apply(null, counts);
+      for (var b=0;b<bins;b++){
+        var x = W*(b/bins), bw = W/bins;
+        ctx.fillStyle = c.accent400; ctx.globalAlpha=0.6;
+        ctx.fillRect(x, H-(H*0.85)*(counts[b]/maxC), bw-1, (H*0.85)*(counts[b]/maxC));
+        ctx.fillStyle = c.accent2; ctx.globalAlpha=0.5;
+        ctx.fillRect(x, H-(H*0.85)*(countsQ[b]/maxC), bw-1, (H*0.85)*(countsQ[b]/maxC));
+        ctx.globalAlpha=1;
+      }
+      readout.innerHTML = '<span class="k">bits:</span> '+bits+'<br><span class="k">size:</span> '+fmtBytes(bytes)+' (for these 2000 weights)<br><span class="k">reconstruction MSE vs fp32:</span> '+mse.toExponential(2);
+    }
+    document.querySelectorAll('[data-bits]').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        document.querySelectorAll('[data-bits]').forEach(function(b){b.className='';});
+        btn.className='llmt-primary';
+        render(parseInt(btn.getAttribute('data-bits'),10));
+      });
+    });
+    render(32);
+  })();
+
+  // ---- RL training throughput ----
+  (function(){
+    var canvas = document.getElementById('rl-throughput'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var rows = [
+      { label:'OLMo 2 baseline', v:881, mbu:12.9 },
+      { label:'+ continuous batching', v:975, mbu:14.3 },
+      { label:'+ better threading', v:1358, mbu:19.9 },
+      { label:'+ inflight updates', v:2949, mbu:43.2 }
+    ];
+    var data = rows.map(function(r){ return { label:r.label, value:r.v, valueLabel:r.v+' tok/s · MBU '+r.mbu+'%' }; });
+    G.drawBars(ctx, W, H, data, { maxV:3200 });
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

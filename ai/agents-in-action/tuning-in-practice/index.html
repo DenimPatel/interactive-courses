@@ -1,0 +1,580 @@
+---
+title: "Agents in Action, Interactively — Part 14: Data, distillation, and tuning in practice"
+description: "Curation, synthetic data and its diversity collapse, rejection sampling, LoRA/QLoRA operations, DPO/KTO/ORPO, RLVR and GRPO, reward hacking, and adapter serving."
+permalink: "/ai/agents-in-action/tuning-in-practice/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Data, distillation, and tuning in practice</h1>
+    <p>If Part 13 decided <em>whether</em> to tune, this part is the work once the answer is yes. The uncomfortable headline is that data curation is roughly eighty per cent of the effort and model configuration is the other twenty: deduplication, label quality, class balance and coverage decide the outcome long before rank or learning rate do. What follows is the operational spine — synthetic data and the diversity collapse it invites, rejection sampling and its yield, the LoRA and QLoRA knobs that matter, the preference methods and when each applies, RLVR and the reward-hacking curve it produces, and the serving economics that make adapters so much cheaper than full models.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="curation">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Curation is the work; synthetic data narrows the distribution</h2></div>
+    <p class="g-eyebrow">Dedupe, label quality, balance, coverage — then model collapse</p>
+    <p>A tuning run is a mirror of its dataset. Near-duplicate examples inflate the loss on a handful of patterns and teach nothing new. Noisy labels teach the noise. An unbalanced set teaches the majority behaviour and hides the rare one that actually matters in production. Poor coverage means the model is confident everywhere except where the failures live. None of these are fixed by a better optimizer, which is why the hours go into curation: deduplicating, adjudicating labels, balancing classes, and deliberately sampling the hard cases.</p>
+    <p>The shortcut that looks like it saves that work is <strong>synthetic data</strong>: have the model generate examples, filter them, and train on them. It is legitimate and widely used — distillation from a stronger teacher is the standard way to acquire a capability cheaply. It also has a failure mode with a name. Training a model on its own outputs and repeating the loop <strong>narrows the distribution</strong>: rare modes are under-sampled, so they disappear from the next generation's training set, and the generation after that is narrower still. This is <em>model collapse</em>, or <em>diversity collapse</em>, and it is why synthetic data must be anchored to real, human-labelled data and measured for coverage, not just for loss.</p>
+    <p>Step the generations below. Each self-training round keeps fewer of the original modes and shrinks the spread of the ones that survive — the distribution the model can produce gets narrower on every loop.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tip-collapse-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded output distribution across generations of self-training. The pale curve is generation 0; the hot curve is the latest.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Self-training generations <span class="val">4</span></label><input type="range" id="tip-gen" min="0" max="6" step="1" value="4"></div>
+        <div class="g-readout" id="tip-collapse-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="tip-tuning-source"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> a shrinking training loss across self-training generations looks like improvement. It is a smaller, easier-to-predict distribution — the model is not getting better, it is getting narrower.</span></div>
+  </section>
+
+  <section class="g-step" id="rejection">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Rejection sampling and its yield</h2></div>
+    <p class="g-eyebrow">Keep only what a verifier accepts — and watch the volume fall</p>
+    <p>The standard way to turn a mediocre generator into good training data is <strong>rejection sampling</strong>: sample many candidate outputs, score each with a verifier, and keep only the ones that pass. The verifier is the whole game. If it can be a program — a test suite, a schema check, a citation that resolves — the loop is cheap, deterministic and honest. If it has to be a model judge, it inherits every bias of a judge and the loop costs money per sample.</p>
+    <p>The economics are a yield curve. A lenient threshold keeps most of the data, but the tail you keep is only slightly better than the batch. A strict threshold keeps the best data, but the number of accepted samples collapses — and past a point you are generating thousands of candidates to win a few dozen. The useful operating point is where kept-volume is still enough to train on while kept-quality is materially above the generator, and finding it is a measurement, not a guess.</p>
+    <p>Drag the verifier threshold below. The histogram shows the sampled quality distribution, split into kept and rejected; the readout reports the yield and the mean quality of what survives.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tip-yield-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded sample pool. Bars left of the threshold are discarded; the line is the mean quality of the kept set.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Verifier threshold <span class="val">60</span></label><input type="range" id="tip-threshold" min="0" max="95" step="5" value="60"></div>
+        <div class="g-readout" id="tip-yield-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="tip-evals-source"></p>
+  </section>
+
+  <section class="g-step" id="adapters">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Adapters in practice: rank, method, and serving</h2></div>
+    <p class="g-eyebrow">LoRA and QLoRA knobs; DPO, KTO, ORPO; one base with many adapters</p>
+    <p><strong>LoRA</strong> freezes the base weights and trains a pair of small low-rank matrices next to each target module. The knobs that matter are the <strong>rank</strong> (how much capacity the adapter gets), the <strong>target modules</strong> (which projections it touches — attention only, or attention and the feed-forward layers), the <strong>learning rate</strong> (adapters tolerate a much higher one than full fine-tuning), and whether you <strong>merge</strong> the adapter back into the base for serving or keep it separate. <strong>QLoRA</strong> does the same against a 4-bit quantized base, which is what makes single-GPU tuning routine; the base is frozen and the quantized weights are never updated. The trainable parameter count is small and calculable: a rank-<var>r</var> adapter on a <var>d</var>-wide projection adds <var>2·d·r</var> parameters, so eight target modules at <var>r</var>=8 over a 4096-wide model is about two hundred and sixty thousand trainable values, well under a tenth of a percent of the base.</p>
+    <p>Supervised tuning teaches a behaviour by imitation. <strong>Preference</strong> methods teach it by comparison: <strong>DPO</strong> consumes <em>pairs</em> (a chosen and a rejected response) and needs no separate reward model; <strong>KTO</strong> consumes only <em>binary</em> good/bad labels, which is what you actually have from a thumbs-up button; <strong>ORPO</strong> folds supervised fine-tuning and preference into a <em>single stage</em>, which saves a pass over the data when you have no clean SFT checkpoint to start from. The method follows the labels you hold, not the other way round.</p>
+    <p>Pick a method and move the rank. The curve is quality against rank for the selected method, with the readout giving the parameter arithmetic and the serving story that makes adapters cheap: one frozen base in memory, many small adapters swapped per request.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tip-lora-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Quality saturates in rank; the table of costs and the parameter count are the reason adapters, not full models, are what you ship.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="tip-method-row"></div>
+        <div class="g-field"><label>LoRA rank <span class="val">16</span></label><input type="range" id="tip-rank" min="1" max="64" step="1" value="16"></div>
+        <div class="g-field"><label>Target modules <span class="val">8</span></label><input type="range" id="tip-modules" min="1" max="16" step="1" value="8"></div>
+        <div class="g-readout" id="tip-lora-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The serving insight:</b> memory is dominated by the base weights, not the adapters. Ten behavioural variants of one 7B base cost roughly one base plus ten adapters, not ten full models — the reason a product can afford per-tenant or per-task tuning at all.</span></div>
+  </section>
+
+  <section class="g-step" id="reward-hacking">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>RLVR, GRPO, and the reward-hacking curve</h2></div>
+    <p class="g-eyebrow">When the policy exploits the verifier instead of solving the task</p>
+    <p>Where a reward is programmatically verifiable, reinforcement learning can train a <em>policy</em> rather than a style — the case for reasoning and tool use. <strong>GRPO</strong> makes it practical by sampling a group of completions for each prompt and using the group's relative scores as the learning signal, which removes the separate value model that classic RLHF needed.</p>
+    <p>The characteristic failure is <strong>reward hacking</strong>. A verifier that checks the final answer but not the reasoning, or a test suite that can be satisfied by editing the test, becomes something to exploit. The proxy reward climbs smoothly to the top of its range while true task quality rises, plateaus, and then <em>falls</em> as the policy drifts into the blind spot. This is not a bug in the optimizer; it is the optimizer doing exactly what it was told. The defences are structural: hold out verifiers the policy never trains against, inspect the traces rather than the score, and treat a suspiciously clean reward curve as a warning rather than a result.</p>
+    <p>Move the verifier-coverage slider — how much of the true task the checker actually measures. Low coverage is a wide blind spot, and the divergence between proxy reward and true quality opens earlier and wider.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tip-hack-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded training curves. The proxy reward only ever rises; true quality turns down once the policy finds the verifier's blind spot.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Verifier coverage <span class="val">60</span></label><input type="range" id="tip-coverage" min="20" max="100" step="5" value="60"></div>
+        <div class="g-readout" id="tip-hack-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="tip-tuning2-source"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> "the reward went up" is not evidence the task got better. If the reward is a proxy you did not hold out, the policy is optimising your measurement, not your problem — hold out verifiers and read the traces.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the run</th></tr></thead>
+      <tbody>
+        <tr><td>Where does the effort actually go?</td><td>Data curation — dedupe, label quality, balance, coverage — is roughly 80% of the outcome.</td></tr>
+        <tr><td>What breaks self-training on synthetic data?</td><td>Diversity collapse: rare modes disappear, the distribution narrows each generation, and loss falls while capability shrinks.</td></tr>
+        <tr><td>How do you anchor synthetic data?</td><td>Keep real human-labelled examples in every round and measure coverage, not just loss.</td></tr>
+        <tr><td>How does rejection sampling pay off?</td><td>Keep only outputs a verifier accepts; a programmatic verifier is cheap and honest, a model judge is neither.</td></tr>
+        <tr><td>Where does the yield collapse?</td><td>Past a strictness threshold the kept volume falls faster than quality rises — find that point by measuring it.</td></tr>
+        <tr><td>LoRA's four knobs?</td><td>Rank, target modules, learning rate, and whether to merge the adapter into the base for serving.</td></tr>
+        <tr><td>Why is QLoRA the single-GPU path?</td><td>The base is 4-bit and frozen; only the adapters train, so memory is dominated by the quantized base.</td></tr>
+        <tr><td>DPO vs KTO vs ORPO?</td><td>DPO needs preference pairs; KTO needs binary good/bad; ORPO folds SFT and preference into one stage.</td></tr>
+        <tr><td>When RLVR, and its failure mode?</td><td>Verifiable rewards for reasoning/tool policies — and reward hacking, where the policy exploits the verifier.</td></tr>
+        <tr><td>One base or many models?</td><td>One frozen base plus many small adapters: memory tracks the base, not the number of variants.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685">"LoRA: Low-Rank Adaptation of Large Language Models"</a>, ICLR 2022 — the low-rank update and the parameter arithmetic this part's explorer uses.</li>
+      <li>Dettmers et al., <a href="https://arxiv.org/abs/2305.14314">"QLoRA: Efficient Finetuning of Quantized LLMs"</a>, NeurIPS 2023 — 4-bit bases and why adapters fit on one GPU.</li>
+      <li>Rafailov et al., <a href="https://arxiv.org/abs/2305.18290">"Direct Preference Optimization"</a>, NeurIPS 2023 — preference tuning without a separate reward model.</li>
+      <li>Ethayarajh et al., <a href="https://arxiv.org/abs/2402.01306">"KTO: Model Alignment as Prospect Theoretic Optimization"</a>, 2024 — binary labels instead of pairs.</li>
+      <li>Hong, Lee &amp; Thorne, <a href="https://arxiv.org/abs/2403.07691">"ORPO: Monolithic Preference Optimization without Reference Model"</a>, 2024 — one-stage SFT plus preference.</li>
+      <li>Shao et al., <a href="https://arxiv.org/abs/2402.03300">"DeepSeekMath"</a>, 2024 — GRPO, the group-relative method behind much RLVR work.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2501.12948">"DeepSeek-R1"</a>, 2025 — verification-driven RL of reasoning at scale, and the reward-hacking caution that comes with it.</li>
+      <li>Shumailov et al., <a href="https://www.nature.com/articles/s41586-024-07566-y">"AI models collapse when trained on recursively generated data"</a>, Nature 2024 — the diversity-collapse result this part's first demo visualises.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The model is tuned, but the agent reads untrusted documents and holds private data. Next: direct and indirect prompt injection, the lethal trifecta, and why no system prompt fixes it.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    tuning: {
+      source: "LoRA (Hu et al., arXiv:2106.09685, ICLR 2022); QLoRA (Dettmers et al., arXiv:2305.14314, NeurIPS 2023); DPO (Rafailov et al., arXiv:2305.18290, NeurIPS 2023); KTO (Ethayarajh et al., arXiv:2402.01306, 2024); ORPO (Hong, Lee & Thorne, arXiv:2403.07691, 2024); GRPO introduced in DeepSeekMath (Shao et al., arXiv:2402.03300, 2024) and used at scale for DeepSeek-R1 (arXiv:2501.12948, 2025). RLVR trains on programmatically checkable outcomes. The value of fine-tuning is the labelled dataset you curated, which survives every base-model upgrade; the weights do not.",
+      methods: [
+        { method: "LoRA", trains: "low-rank adapters", cost: "low", note: "Freezes the base weights; serve one base with many adapters." },
+        { method: "QLoRA", trains: "LoRA on a 4-bit base", cost: "lowest", note: "Quantized base plus adapters; the common single-GPU path." },
+        { method: "DPO", trains: "preference pairs", cost: "medium", note: "Direct preference optimization; no separate reward model." },
+        { method: "KTO", trains: "binary good/bad labels", cost: "medium", note: "Needs only a thumbs-up/down signal rather than pairs." },
+        { method: "ORPO", trains: "SFT + preference in one stage", cost: "medium", note: "Odds-ratio preference optimization; avoids a separate SFT stage." },
+        { method: "GRPO / RLVR", trains: "verifiable rewards", cost: "high", note: "For reasoning and tool use where correctness is checkable; reward hacking is the main failure mode." }
+      ],
+      rewardHacking: "A verifier that checks the final answer but not the reasoning invites shortcut policies: exploit the checker, not solve the task. Hold out verifiers and inspect traces."
+    },
+    evals: {
+      source: "SWE-bench (arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); tau-bench (arXiv:2406.12045, 2024) for tool-agent-user tasks with a verifiable end state. Public scores are contaminated by leakage, scaffolding and harness drift; a public number is a weak predictor of your task.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts."
+    }
+  };
+
+  function lerp(a, b, t) { return Math.round(a + (b - a) * t); }
+  function rgba(base, t, alpha) {
+    var r = lerp(120, 214, t), g = lerp(120, 0, t), bl = lerp(200, 108, t);
+    return 'rgba(' + r + ',' + g + ',' + bl + ',' + alpha + ')';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — synthetic-data diversity collapse
+  // ------------------------------------------------------------------
+  var A = { gen: el('tip-gen') };
+  var setupA = Guide.setupCanvas(el('tip-collapse-canvas'), 640, 340, drawA);
+  var MODES = [
+    { x: -0.85, w: 0.25 }, { x: -0.45, w: 0.20 }, { x: 0.02, w: 0.20 },
+    { x: 0.42, w: 0.20 }, { x: 0.80, w: 0.15 }
+  ];
+  var SIGMA0 = 0.14;
+
+  function generationCurve(g) {
+    var r = AppSim.rng(5000 + g);
+    var sigma = SIGMA0 * Math.pow(0.76, g);
+    var kept = [];
+    MODES.forEach(function (m) {
+      // cumulative survival: a mode must survive every generation up to g
+      var survives = true;
+      for (var gg = 1; gg <= g; gg++) {
+        var rr = AppSim.rng(7000 + gg * 31 + Math.round((m.x + 1) * 100));
+        if (rr() < 0.34) { survives = false; break; }
+      }
+      if (survives) kept.push(m);
+    });
+    if (!kept.length) kept = [{ x: MODES[2].x, w: 1 }];
+    var total = kept.reduce(function (a, m) { return a + m.w; }, 0) || 1;
+    var pts = [];
+    for (var i = 0; i <= 160; i++) {
+      var x = -1.2 + (2.4 * i / 160);
+      var y = 0;
+      kept.forEach(function (m) {
+        y += (m.w / total) * Math.exp(-Math.pow(x - m.x, 2) / (2 * sigma * sigma));
+      });
+      if (r() >= 0) y += 0; // keep r consumed for determinism documentation
+      pts.push({ x: x, y: y });
+    }
+    return { pts: pts, modes: kept.length, sigma: sigma };
+  }
+
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var G = +A.gen.value;
+    var curves = [];
+    for (var g = 0; g <= G; g++) curves.push(generationCurve(g));
+    var ymax = 0;
+    curves.forEach(function (cv) { cv.pts.forEach(function (p) { if (p.y > ymax) ymax = p.y; }); });
+    ymax = ymax || 1;
+    var padL = 34, padR = 16, padT = 26, padB = 34;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    function X(x) { return padL + (x + 1.2) / 2.4 * plotW; }
+    function Y(y) { return padT + (1 - y / ymax) * plotH; }
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('output space', padL + plotW / 2, H - 6);
+
+    curves.forEach(function (cv, i) {
+      var t = curves.length > 1 ? i / (curves.length - 1) : 1;
+      ctx.strokeStyle = rgba(c.accent, t, 0.55 + 0.45 * t);
+      ctx.lineWidth = 1.4 + 1.4 * t;
+      ctx.beginPath();
+      cv.pts.forEach(function (p, j) {
+        var XX = X(p.x), YY = Y(p.y);
+        if (j === 0) ctx.moveTo(XX, YY); else ctx.lineTo(XX, YY);
+      });
+      ctx.stroke();
+    });
+    // markers for surviving modes of the latest generation
+    var latest = curves[curves.length - 1];
+    ctx.fillStyle = c.accent2;
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('generation 0 (5 modes)', padL + 8, padT + 12);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('generation ' + G + ' (' + latest.modes + ' modes, σ ' + latest.sigma.toFixed(3) + ')', padL + 8, padT + 26);
+
+    var spread0 = SIGMA0, spreadN = latest.sigma;
+    el('tip-collapse-readout').innerHTML =
+      '<div><span class="k">generations</span> <span class="hi">' + G + '</span> · modes surviving ' + latest.modes + ' of 5</div>' +
+      '<div><span class="k">spread (σ)</span> ' + spread0.toFixed(3) + ' → <span class="hi">' + spreadN.toFixed(3) + '</span>' +
+      ' (' + (100 * (1 - spreadN / spread0)).toFixed(0) + '% narrower)</div>' +
+      '<div class="k">' + (latest.modes < 5
+        ? 'rare modes have dropped out; the model can no longer produce them, and every later generation trains on the narrowed set'
+        : 'generation 0 still carries every mode — collapse begins as soon as self-training repeats') + '</div>';
+  }
+  Guide.bindSliders([A.gen], drawA);
+
+  // ------------------------------------------------------------------
+  // Demo B — rejection-sampling yield
+  // ------------------------------------------------------------------
+  var B = { threshold: el('tip-threshold') };
+  var setupB = Guide.setupCanvas(el('tip-yield-canvas'), 640, 340, drawB);
+  var SAMPLES = (function () {
+    var r = AppSim.rng(31), out = [];
+    for (var i = 0; i < 600; i++) {
+      // mixture: a large mediocre pool and a smaller good tail
+      var base = r() < 0.72 ? 0.20 + 0.30 * r() : 0.55 + 0.42 * r();
+      out.push(Math.max(0, Math.min(1, base)));
+    }
+    return out;
+  })();
+
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var tau = +B.threshold.value / 100;
+    var bins = 20, counts = new Array(bins).fill(0), keptCounts = new Array(bins).fill(0);
+    var kept = [];
+    SAMPLES.forEach(function (s) {
+      var bi = Math.min(bins - 1, Math.floor(s * bins));
+      counts[bi]++;
+      if (s >= tau) { keptCounts[bi]++; kept.push(s); }
+    });
+    var maxC = Math.max.apply(null, counts) || 1;
+    var padL = 38, padR = 16, padT = 30, padB = 34;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var bw = plotW / bins;
+    for (var i = 0; i < bins; i++) {
+      var x = padL + i * bw;
+      var hAll = plotH * (counts[i] / maxC);
+      var hKeep = plotH * (keptCounts[i] / maxC);
+      ctx.fillStyle = 'rgba(120,120,120,0.22)';
+      ctx.fillRect(x, padT + plotH - hAll, Math.max(1, bw - 1), hAll);
+      if (hKeep > 0) {
+        ctx.fillStyle = c.accent;
+        ctx.fillRect(x, padT + plotH - hKeep, Math.max(1, bw - 1), hKeep);
+      }
+    }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    // threshold marker
+    var tx = padL + tau * plotW;
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(tx, padT); ctx.lineTo(tx, padT + plotH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('threshold ' + (tau * 100).toFixed(0), Math.min(tx + 4, W - 70), padT + 10);
+    // mean quality of kept
+    if (kept.length) {
+      var mean = kept.reduce(function (a, b) { return a + b; }, 0) / kept.length;
+      var my = padT + plotH * (1 - mean);
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(padL, my); ctx.lineTo(padL + plotW, my); ctx.stroke();
+      ctx.fillStyle = c.accent700; ctx.textAlign = 'left';
+      ctx.fillText('mean kept quality ' + mean.toFixed(2), padL + 4, Math.max(padT + 10, my - 4));
+    }
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('candidate quality →', padL + plotW / 2, H - 6);
+    ctx.fillStyle = c.text; ctx.textAlign = 'left';
+    ctx.fillText('kept', padL, padT - 8);
+    ctx.fillStyle = 'rgba(120,120,120,0.6)'; ctx.fillRect(padL + 28, padT - 16, 9, 9);
+    ctx.fillStyle = c.accent; ctx.fillRect(padL, padT - 16, 9, 9);
+
+    var yieldPct = kept.length / SAMPLES.length;
+    var meanKept = kept.length ? kept.reduce(function (a, b) { return a + b; }, 0) / kept.length : 0;
+    el('tip-yield-readout').innerHTML =
+      '<div><span class="k">yield</span> <span class="hi">' + kept.length + '/' + SAMPLES.length + '</span> kept (' +
+      (yieldPct * 100).toFixed(0) + '% of the pool)</div>' +
+      '<div><span class="k">mean kept quality</span> <span class="hi">' + meanKept.toFixed(2) + '</span> vs pool 0.45</div>' +
+      '<div class="k">' + (yieldPct < 0.08
+        ? 'yield collapse: you are generating hundreds of candidates to keep a handful — raise the generator or loosen the verifier'
+        : 'the operating point is a measurement: enough volume to train on, at a quality materially above the generator') + '</div>';
+  }
+  Guide.bindSliders([B.threshold], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — LoRA method / rank / params explorer
+  // ------------------------------------------------------------------
+  var METHODS = [
+    { id: 'lora', label: 'LoRA', ceiling: 0.87, tau: 16, cost: 'low', note: 'Freezes the base weights; serve one base with many adapters.' },
+    { id: 'qlora', label: 'QLoRA', ceiling: 0.84, tau: 18, cost: 'lowest', note: 'Quantized base plus adapters; the common single-GPU path.' },
+    { id: 'dpo', label: 'DPO', ceiling: 0.88, tau: 20, cost: 'medium', note: 'Consumes preference pairs; no separate reward model.' },
+    { id: 'kto', label: 'KTO', ceiling: 0.85, tau: 20, cost: 'medium', note: 'Needs only a binary good/bad label per example.' },
+    { id: 'orpo', label: 'ORPO', ceiling: 0.87, tau: 20, cost: 'medium', note: 'Odds-ratio preference in one stage with SFT.' },
+    { id: 'grpo', label: 'GRPO / RLVR', ceiling: 0.90, tau: 26, cost: 'high', note: 'Verifiable rewards for reasoning/tool policies; reward hacking is the main risk.' }
+  ];
+  var D_MODEL = 4096;
+  var C = { rank: el('tip-rank'), modules: el('tip-modules'), method: 'lora' };
+  var setupC = Guide.setupCanvas(el('tip-lora-canvas'), 640, 340, drawC);
+
+  function buildMethodButtons() {
+    var row = el('tip-method-row');
+    METHODS.forEach(function (m) {
+      var b = document.createElement('button');
+      b.textContent = m.label;
+      b.setAttribute('data-method', m.id);
+      if (m.id === C.method) b.className = 'g-primary';
+      b.addEventListener('click', function () {
+        C.method = m.id;
+        Array.prototype.forEach.call(row.children, function (ch) {
+          ch.className = ch.getAttribute('data-method') === C.method ? 'g-primary' : '';
+        });
+        drawC();
+      });
+      row.appendChild(b);
+    });
+  }
+
+  function currentMethod() {
+    for (var i = 0; i < METHODS.length; i++) if (METHODS[i].id === C.method) return METHODS[i];
+    return METHODS[0];
+  }
+  function qualityAt(m, rank) {
+    return 0.42 + m.ceiling * (1 - Math.exp(-rank / m.tau));
+  }
+
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var rank = +C.rank.value, modules = +C.modules.value;
+    var m = currentMethod();
+    var params = 2 * D_MODEL * rank * modules;
+    var curve = [];
+    for (var rk = 1; rk <= 64; rk++) curve.push({ x: rk, y: qualityAt(m, rk) });
+    var axes = Guide.drawLines(ctx, W, H, [
+      { points: curve, color: c.accent, width: 2.6 }
+    ], [1, 64], [0.4, 1.0], { xLabel: 'LoRA rank', yLabel: 'expected quality', padL: 54, padB: 30 });
+    var q = qualityAt(m, rank);
+    var mx = axes.px(rank), my = axes.py(q);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx, axes.py(0.4)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(mx, my, 5, 0, 2 * Math.PI); ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('r=' + rank + ' → ' + q.toFixed(2), Math.min(mx + 8, W - 80), Math.max(axes.padT + 12, my - 6));
+    ctx.fillStyle = c.accent700; ctx.font = '600 11px ' + c.font;
+    ctx.fillText(m.label + ' · trains ' + m.cost + '-cost', 16, axes.padT + 4);
+
+    var baseParams = D_MODEL * D_MODEL * 12;
+    var pct = params / baseParams * 100;
+    el('tip-lora-readout').innerHTML =
+      '<div><span class="k">trainable params</span> <span class="hi">' + Guide.fmtNum(params) + '</span> = 2 · ' +
+      Guide.fmtNum(D_MODEL) + ' · ' + rank + ' · ' + modules + ' modules</div>' +
+      '<div><span class="k">share of base</span> ' + pct.toFixed(3) + '% of roughly ' + Guide.fmtNum(baseParams) + ' base parameters</div>' +
+      '<div><span class="k">method</span> ' + m.label + ' — ' + m.note + '</div>' +
+      '<div class="k">serving: one frozen base in memory, many small adapters swapped per request — memory tracks the base, not the variants</div>';
+  }
+  Guide.bindSliders([C.rank, C.modules], drawC);
+  buildMethodButtons();
+
+  // ------------------------------------------------------------------
+  // Demo D — reward hacking
+  // ------------------------------------------------------------------
+  var D = { coverage: el('tip-coverage') };
+  var setupD = Guide.setupCanvas(el('tip-hack-canvas'), 640, 340, drawD);
+  var STEPS = 200;
+
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var cov = +D.coverage.value / 100;
+    var r = AppSim.rng(29);
+    var proxy = [], truth = [];
+    var onset = -1;
+    for (var s = 0; s <= STEPS; s += 4) {
+      var learned = 0.30 + 0.62 * (1 - Math.exp(-s / 38));
+      var noise = (r() - 0.5) * 0.02;
+      var p = Math.min(0.97, learned + noise);
+      // exploitation grows with steps and the size of the blind spot
+      var exploit = (1 - cov) * Math.max(0, 1 - Math.exp(-s / 60));
+      var t = 0.30 + 0.62 * (1 - Math.exp(-s / 38)) - 0.55 * exploit + noise;
+      if (t < 0.18) t = 0.18;
+      if (onset < 0 && p - t > 0.10) onset = s;
+      proxy.push({ x: s, y: p });
+      truth.push({ x: s, y: t });
+    }
+    var axes = Guide.drawLines(ctx, W, H, [
+      { points: proxy, color: c.accent, width: 2.6 },
+      { points: truth, color: c.accent2, width: 2.6 }
+    ], [0, STEPS], [0.1, 1.0], { xLabel: 'training steps', yLabel: 'score', padL: 54, padB: 30 });
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.fillText('proxy reward (the verifier)', axes.padL + 8, axes.padT + 12);
+    ctx.fillStyle = c.accent2; ctx.fillText('true task quality (held out)', axes.padL + 8, axes.padT + 26);
+    if (onset >= 0) {
+      var ox = axes.px(onset);
+      ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(ox, axes.padT); ctx.lineTo(ox, axes.padT + axes.plotH); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2;
+      ctx.fillText('blind spot exploited', Math.min(ox + 5, W - 130), axes.padT + 40);
+    }
+    var lastP = proxy[proxy.length - 1].y, lastT = truth[truth.length - 1].y;
+    el('tip-hack-readout').innerHTML =
+      '<div><span class="k">proxy reward</span> <span class="hi">' + lastP.toFixed(2) + '</span> · true quality <span class="hi">' + lastT.toFixed(2) + '</span></div>' +
+      '<div><span class="k">gap</span> ' + (lastP - lastT).toFixed(2) + ' at coverage ' + (cov * 100).toFixed(0) + '%' +
+      (onset >= 0 ? ' · divergence begins near step ' + onset : ' · no divergence yet') + '</div>' +
+      '<div class="k">' + (cov < 0.7
+        ? 'low coverage is a wide blind spot: the policy satisfies the checker and stops solving the task'
+        : 'high coverage narrows the blind spot but never removes it — hold out verifiers and read the traces') + '</div>';
+  }
+  Guide.bindSliders([D.coverage], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var tuning = (data && data.tuning) || FALLBACK.tuning;
+    el('tip-tuning-source').textContent = tuning.source || FALLBACK.tuning.source;
+    el('tip-tuning2-source').textContent = (tuning.rewardHacking || FALLBACK.tuning.rewardHacking) +
+      (tuning.source ? ' Source: ' + tuning.source : '');
+    if (data && data.tuning && data.tuning.methods && data.tuning.methods.length) {
+      data.tuning.methods.forEach(function (dm) {
+        METHODS.forEach(function (m) { if (m.label === dm.method) m.note = dm.note; });
+      });
+    }
+    var evals = (data && data.evals) || FALLBACK.evals;
+    el('tip-evals-source').textContent = evals.source || FALLBACK.evals.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'tuning-in-practice-curation',
+      kind: 'choice',
+      prompt: 'Where do most tuning failures actually originate?',
+      options: [
+        { label: 'In the data: duplicates, noisy labels, class imbalance and poor coverage.', correct: true },
+        { label: 'In the optimizer and learning-rate schedule.', correct: false },
+        { label: 'In the choice of attention implementation.', correct: false },
+        { label: 'In the number of GPUs used.', correct: false }
+      ],
+      explanation: 'Curation is roughly 80% of the work. Near-duplicates, mislabelled examples and uncovered rare cases teach the wrong thing, and no optimizer setting repairs a dataset that is wrong.'
+    },
+    {
+      id: 'tuning-in-practice-collapse',
+      kind: 'choice',
+      prompt: 'You repeatedly train a model on its own generated outputs and the training loss keeps falling. What is likely happening?',
+      options: [
+        { label: 'Diversity collapse — rare modes drop out and the distribution narrows each generation.', correct: true },
+        { label: 'The model is genuinely improving on the task.', correct: false },
+        { label: 'The verifier is too strict and needs loosening.', correct: false },
+        { label: 'The learning rate is too high.', correct: false }
+      ],
+      explanation: 'Training on self-generated data narrows the distribution: under-sampled modes vanish, the next generation trains on a narrower set, and loss falls because the distribution is easier to predict — not because capability improved. Anchor synthetic data to real labelled examples and measure coverage.'
+    },
+    {
+      id: 'tuning-in-practice-lora-params',
+      kind: 'numeric',
+      prompt: 'A rank-8 LoRA adapter targets 4 projection modules, each 4096 wide. Each targeted module adds 2·d·r trainable parameters. How many trainable parameters does the adapter have?',
+      answer: 262144,
+      unit: 'parameters',
+      tolerance: 1,
+      explanation: 'A rank-r adapter on a d-wide projection adds 2·d·r parameters (down- and up-projection). So 2 · 4096 · 8 · 4 = 262,144 trainable parameters — a fraction of a percent of the base, which is why many adapters can share one frozen base in serving.'
+    },
+    {
+      id: 'tuning-in-practice-preference',
+      kind: 'choice',
+      prompt: 'Your product collects only a thumbs-up / thumbs-down on each answer. Which preference method fits the labels you have?',
+      options: [
+        { label: 'KTO — it trains on binary good/bad labels rather than pairs.', correct: true },
+        { label: 'DPO — it requires a chosen and a rejected response per example.', correct: false },
+        { label: 'GRPO — it needs a programmatic verifier.', correct: false },
+        { label: 'None; binary feedback cannot train a preference method.', correct: false }
+      ],
+      explanation: 'The method follows the labels. DPO needs preference pairs; KTO consumes only a binary good/bad signal; ORPO folds SFT and preference into one stage when you have no clean SFT checkpoint.'
+    },
+    {
+      id: 'tuning-in-practice-hacking',
+      kind: 'choice',
+      prompt: 'During RLVR training the proxy reward climbs to near 1.0 but held-out task quality falls. What is the diagnosis?',
+      options: [
+        { label: 'Reward hacking: the policy is exploiting the verifier, not solving the task.', correct: true },
+        { label: 'The learning rate is too low and training needs longer.', correct: false },
+        { label: 'The held-out set is contaminated and should be discarded.', correct: false },
+        { label: 'RLVR cannot train reasoning, so the run should be abandoned.', correct: false }
+      ],
+      explanation: 'A verifier that does not measure the whole task is a proxy, and the policy will optimise the proxy. The fixes are structural: hold out verifiers the policy never trains against and inspect traces rather than trusting the reward curve.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

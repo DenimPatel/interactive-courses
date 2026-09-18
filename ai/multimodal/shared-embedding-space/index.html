@@ -1,0 +1,492 @@
+---
+title: "What a shared space buys"
+description: "Zero-shot classification, retrieval and prompt templates from one aligned space, and the compositionality, counting and typographic failures it inherits."
+permalink: "/ai/multimodal/shared-embedding-space/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-demo-stack { display: flex; flex-direction: column; gap: 14px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>What a shared space buys</h1>
+    <p>Contrastive pretraining leaves behind a shared embedding space: a single coordinate system in which both images and sentences become vectors, so that an image vector and a text vector can be compared with a cosine &mdash; a measure of how closely two vectors point in the same direction, where a value near 1 means they point the same way, a value near 0 means they are unrelated, and a negative value means they point opposite ways. Picture a city map with neighbourhoods: similar things are placed on the same block, and the distance between two points says how related they are. That one property pays for a surprising amount of behaviour: classify an image into classes that were never in the training set, search a gallery with a sentence, and steer a model with a prompt instead of a retrained head. Ask for "a dog on a beach" and a retrieval system returns the photographs whose vectors sit nearest those words, even though no one ever labelled those particular photographs with that phrase. It also imports a specific set of failures, because a cosine flattens a whole vector down to one number, so it measures overall similarity and knows nothing about order, number or letters. This part spends the alignment, then catalogs what it cannot do.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="space">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>One space</h2></div>
+    <p class="g-eyebrow">Images and sentences, measured with the same ruler</p>
+    <p>After training, the two towers have done something no classifier head does: they have placed pictures and sentences in the <em>same</em> coordinates. Picture a city map in which every image and every sentence has an address: a photograph of a red square sits on the same block as the words "a red square", and both are far from the block that holds "a blue circle". An image vector is close to the text vector of its caption and far from the text vector of an unrelated one. That is the entire interface. Everything this part demonstrates &mdash; zero-shot classification (sorting images into classes the model was never given labelled examples of), retrieval (ranking a gallery by similarity to a query), prompt steering &mdash; is a cosine and an <code>argmax</code> on top of it, with no additional training at all. Compare that with the usual classifier, which is a separate small network trained on labelled examples of exactly the classes you care about: there is no such head here, so a new class never requires a new round of training. The <code>argmax</code> is the operation that picks whichever option scored highest, and nothing about it needs to know what a picture is.</p>
+    <p>The matrix below is the aligned space made visible: rows are the image vectors of a set of concepts, columns are the text vectors of their captions, and the entry is their cosine similarity &mdash; the number that says how closely that image and that caption point in the same direction. The diagonal holds the matched pairs, so compare name tags at a party: each image should be closest to the caption that belongs to it, the way each guest should be closest to their own tag. A well-trained model has a bright diagonal and a dark off-diagonal, which is exactly the structure the contrastive loss was pushing for. The mean gap between the two is the margin the rest of this part gets to spend. That gap is worth pausing on, because every ability in this part is a decision made by ranking cosines, and a model with a large margin can rank correctly even when a question is phrased in a way it has never seen.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="ses-sim-canvas" width="440" height="360"></canvas>
+        <p class="g-canvas-hint">Cosine similarity of image against text embeddings (<code>GenMedia.attn.simMatrix</code>), with the diagonal outlined. Loaded from <code>multimodal-embeddings.json</code>.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-readout" id="ses-sim-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The data in these demos is illustrative, not real CLIP output.</b> The page loads a small hand-built set of concept vectors that share a block structure so the geometry is legible and the failures are reproducible. That is deliberate: real vectors are high-dimensional and noisy, and a clean toy set makes each pattern easier to see. Treat every number here as a demonstration of the mechanism, not as a benchmark of any real encoder.</span></div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> turn a class name into a vector and read the resulting softmax as a classifier, rank a gallery with a caption, explain why a prompt template changes the answer, and name the failure modes &mdash; word order, counting, typographic attacks &mdash; that follow from measuring similarity alone.</span></div>
+    <div class="g-toc">
+      <a href="#zeroshot">2 · Zero-shot classification</a>
+      <a href="#retrieval">3 · Retrieval and word order</a>
+      <a href="#breaks">4 · What breaks</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="zeroshot">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Zero-shot classification</h2></div>
+    <p class="g-eyebrow">A classifier you build out of sentences</p>
+    <p>To classify an image with no training examples, write the class names down, embed them, and take the softmax over their cosines with the image. Softmax here is the same normalising step you have met before: it takes a row of raw scores &mdash; in this case the cosines, one per class &mdash; and turns them into positive numbers that sum to one, so the row can be read as a probability distribution over the classes. That is <em>zero-shot classification</em>, where "zero-shot" means the model sorts images into categories it was never given labelled examples of; it works because the text tower already placed "red" near the images that look red. The classes are not fixed when the model is trained; they are whatever strings you type at inference, which is why new classes need no new labels and no gradient step. That freedom has a cost worth naming up front: because the classifier was never calibrated on the classes you actually care about, its probabilities can be confidently wrong, and adding a class to the list changes the scores of the others.</p>
+    <p>Each class vector here is built from the embedding set by averaging the text vectors of the concepts that share an attribute value &mdash; every "red" concept is pooled into one direction, every "blue" concept into another &mdash; so the block of class names you select is a genuine partition of the data, with every image belonging to exactly one class. Change the concept being classified, the attribute block, and the softmax temperature, and watch the probabilities move. In a real system the class vector would come from a prompt such as "a photo of a red object": a prompt is the sentence you feed to the text tower to stand in for a class, and its exact wording is part of the input. That is the subject of the next step.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ses-zero-canvas" width="440" height="200"></canvas>
+        <p class="g-canvas-hint">Class probabilities from <code>Multimodal.contrastive.zeroShot</code>: cosines of the query image against each class vector, softmaxed at the current temperature.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Concept index <span class="val">0</span></label><input type="range" id="ses-concept-a" min="0" max="15" step="1" value="0"></div>
+        <div class="g-field"><label>Attribute block <span class="val">0</span></label><input type="range" id="ses-block" min="0" max="4" step="1" value="0"></div>
+        <div class="g-field"><label>Temperature τ <span class="val">0.07</span></label><input type="range" id="ses-tau" min="0" max="5" step="1" value="2"></div>
+        <div class="g-readout" id="ses-zero-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>The class vector is a prompt. Rewrite the class name from "red" to "a photo of something red" and the embedding changes, so the prediction can change too. A prompt template is the frame around the class name &mdash; "a photo of a ___" &mdash; and swapping the frame swaps the vector the model compares against. Prompt engineering for CLIP is not a trick; it is the only input you control.</span></div>
+  </section>
+
+  <section class="g-step" id="retrieval">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Retrieval and word order</h2></div>
+    <p class="g-eyebrow">Rank a gallery with a sentence</p>
+    <p>Retrieval is the same cosine run in the other direction. Embed a query &mdash; a caption, a sentence, a keyword &mdash; and rank a gallery of image vectors by similarity, returning the closest matches first. This is a soft keyword search over meaning rather than over literal text: the query and the gallery need not share a single word, they land near each other on the city map. There is no classifier and no index training; the aligned space already orders the gallery. The top-$k$ list below comes from <code>Multimodal.retrieval.topK</code>, and the score is just the cosine the training objective arranged to be meaningful. The <em>k</em> is how many results you keep: a search interface might show the best five, while a deduplication pass might keep everything above a fixed score. Ranking costs one cosine per gallery item, which is why this scales to millions of images with an approximate index, and it needs no labels for the gallery at all.</p>
+    <p>The second canvas is where the failure begins. Rewriting a caption into a different template &mdash; a template being the sentence frame around the attributes, such as "a photo of a ___" &mdash; or reordering its words produces a different text vector, but for a model trained on similarity the difference is often tiny. That is surprising at first: two sentences a reader would call clearly different come out as almost the same point. The bars compare the image against four caption variants: its own caption, the same attributes in a different word order, a template naming the wrong colour, and a bare shape template. The reordered caption sits almost on top of the original, which is the bag-of-words problem. A "bag of words" discards order and keeps only the collection of words, and that is what this space has learned: it encodes <em>which</em> attributes are present, not how they are related.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="ses-retrieval-canvas" width="440" height="220"></canvas>
+        <p class="g-canvas-hint">Top-5 gallery matches for the selected concept's caption, scored by <code>Multimodal.retrieval.topK</code>.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="ses-template-canvas" width="440" height="200"></canvas>
+        <p class="g-canvas-hint">Cosine of the concept's image to several caption templates. The reordered caption lands almost exactly on the original.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-controls">
+          <div class="g-field"><label>Concept index <span class="val">0</span></label><input type="range" id="ses-concept-b" min="0" max="15" step="1" value="0"></div>
+        </div>
+        <div class="g-readout" id="ses-retrieval-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Word order is nearly invisible.</b> Pick the concept whose sibling differs only by word order ("a red square" against "a square that is red") and the two captions retrieve the same top result. The vector is closer to a bag of attributes than a parse of the sentence. Nothing in the demo is broken; the metric is doing exactly what it was trained to do.</span></div>
+  </section>
+
+  <section class="g-step" id="breaks">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What breaks</h2></div>
+    <p class="g-eyebrow">Four failures that follow from using a cosine</p>
+    <p>The compositionality failure above is the general pattern. Compositionality is the idea that the meaning of a phrase is built from its parts and the way they are combined, so "a horse riding a person" ought to mean something different from "a person riding a horse"; here relations between attributes are flattened into a sum-like code. Why a sum? Because pooling and averaging are the only operations the two-tower setup uses to combine information, and an average has no notion of which word modified which. "A horse riding a person" and "a person riding a horse" share almost all their words and land near each other, and a model that measures similarity cannot tell which relation is which. The same flatness costs <em>counting</em>: "two red circles" and "three red circles" differ in one token, so the vectors are close and the predicted count is unreliable. This counting failure is easy to see once you know where to look, because a count is a discrete, ordinal property &mdash; two is less than three and the step between them is exact &mdash; while a cosine is a continuous, symmetric one that has no slot for "how many".</p>
+    <p><em>Typographic attacks</em> exploit the text tower directly. A typographic attack is printed text inside the picture, and it works because the vision tower was trained on images of signs and labels, so it can read: pasting the word "ipod" onto an apple can flip the label, because the image encoder sees letters it was trained to associate with text and the word fights with the fruit. Negation is a fourth casualty &mdash; "a photo without a dog" embeds near "a photo of a dog", so asking for the absence of a thing tends to retrieve the thing. None of these are bugs in the training code; they are the predictable consequence of squeezing two very different structures into one metric.</p>
+    <p>The failures are also why the encoder in a vision-language model is used differently from the encoder in a retrieval index. In both cases the same trunk produces the vectors, but what happens next differs. A VLM that has to answer a question about an image gets a language model after the vision tower, and the language model can reason about relations &mdash; who is riding whom, how many objects there are, whether something is absent &mdash; that the embedding space alone cannot represent. The shared space is a fast, cheap, untrained classifier and search index; it is not a reasoning module. Keep the two jobs separate in your head: one is a lookup, the other is a conversation.</p>
+    <div class="g-goal">💡 <span>Read the failures as a specification. If a task depends on order, count, negation or spelling, do not ask the embedding space to solve it. Give it to a model with a language head, or change the task so that a similarity is the right answer.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The reasons the aligned space is built at all</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Search</div>
+        <h3 style="margin:6px 0;">Text-to-image and image-to-text retrieval</h3>
+        <p style="margin-bottom:0;">Every photo search box is a nearest-neighbour query in a space like this one: embed the text you typed, then return the stored image vectors whose cosine to it is highest. The same geometry powers deduplication, dataset filtering and content moderation, all by thresholding a cosine &mdash; choosing a cutoff and keeping everything above it &mdash; rather than training a classifier. Near-duplicate photos, for instance, collapse onto almost the same point, so "too close to an existing item" becomes a quantity you can compare against a number.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Backbones</div>
+        <h3 style="margin:6px 0;">The encoder inside a VLM</h3>
+        <p style="margin-bottom:0;">A vision-language model uses a contrastively trained encoder like SigLIP as its eyes, from <a href="{{ '/ai/multimodal/contrastive/' | relative_url }}">the previous part</a>. The alignment gives the projector a meaningful starting point: the image vectors already sit in a space the text tower understands, so the small learned module that bridges the two has a sensible direction to move in rather than a random one. The failures are then handled by the language model on top. The <a href="{{ '/ai/multimodal/vit/' | relative_url }}">patch transformer</a> underneath is the same trunk throughout.</p>
+      </div>
+    </div>
+    <p>The same recipe scales past images. Aligning audio to text (CLAP), video to text and 3-D shapes to text produces the modality zoo of <a href="{{ '/ai/multimodal/modalities/' | relative_url }}">the next part</a>, where the shared space becomes a hub that every tower has to agree on. Nothing in the objective is specific to pictures: supply a matched pair in any two modalities, keep the same cosine and the same softmax, and the same map with neighbourhoods appears.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The shared space is best understood through its uses and its documented failures, because the same alignment that makes the successes possible is also what produces the failures. These papers cover zero-shot transfer, the failure taxonomy, and the typographic attack that shows the image tower reading letters. Read them together and the picture is coherent: one mechanism with two faces.</p>
+    <ul class="g-refs">
+      <li>Alec Radford, Jong Wook Kim, Chris Hallacy and coauthors, <a href="https://arxiv.org/abs/2103.00020">"Learning Transferable Visual Models From Natural Language Supervision"</a>, 2021 &mdash; zero-shot transfer and the prompt templates that make it work.</li>
+      <li>Mert Yuksekgonul, Federico Bianchi, Pratyusha Kalluri and coauthors, <a href="https://arxiv.org/abs/2210.01936">"When and Why Vision-Language Models Behave like Bags-of-Words"</a>, 2022 &mdash; the compositionality failure made quantitative.</li>
+      <li>Gabriel Goh, Nick Cammarata, Chelsea Voss and coauthors, <a href="https://arxiv.org/abs/2104.08885">"Multimodal Neurons in Artificial Neural Networks"</a>, 2021 &mdash; typographic attacks and the text-like features in the vision tower.</li>
+      <li>Xiaohua Zhai, Basil Mustafa, Alexander Kolesnikov and Lucas Beyer, <a href="https://arxiv.org/abs/2303.15343">"Sigmoid Loss for Language Image Pre-Training"</a>, 2023 &mdash; the encoder family most current VLMs are built on.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Shared embedding space</td><td>One coordinate system where image and text vectors are compared directly</td></tr>
+        <tr><td>Zero-shot classification</td><td>Embed class names, take the softmax over cosines with the image; no training</td></tr>
+        <tr><td>Class vector</td><td>The text embedding of a class name or prompt; the only input you control</td></tr>
+        <tr><td>Prompt template</td><td>The wrapper around a class name &mdash; "a photo of a …" &mdash; which changes the vector</td></tr>
+        <tr><td>Retrieval</td><td>Rank a gallery by cosine to a query; top-k is the answer</td></tr>
+        <tr><td>Compositionality failure</td><td>Attribute order is flattened; "red square" and "square that is red" match alike</td></tr>
+        <tr><td>Counting failure</td><td>Number words are weak features; "two" and "three" embed close together</td></tr>
+        <tr><td>Typographic attack</td><td>Printed text in the image steers the vision tower's label</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Images are only the first tower. The last part generalises the shared space to audio, video and 3-D, and asks what it means for five modalities to agree on a hub &mdash; one city map that every kind of signal has to share.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>var EMB_URL = "{{ '/assets/data/multimodal-embeddings.json' | relative_url }}";</script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var DIM = 16;
+  var TAUS = [0.03, 0.05, 0.07, 0.1, 0.2, 0.5];
+  var tauIdx = 2;
+  var tau = TAUS[tauIdx];
+  var ci = 0, blockIdx = 0;
+
+  var BLOCK_DEF = {
+    color: ['red', 'blue', 'green', 'yellow'],
+    shape: ['square', 'circle', 'triangle'],
+    size: ['small', 'large'],
+    count: ['one', 'two'],
+    scene: ['plain', 'table']
+  };
+  var BLOCK_ORDER = ['color', 'shape', 'size', 'count', 'scene'];
+
+  function cycleAttrs(i) {
+    return {
+      color: BLOCK_DEF.color[i % 4],
+      shape: BLOCK_DEF.shape[Math.floor(i / 4) % 3],
+      size: BLOCK_DEF.size[i % 2],
+      count: BLOCK_DEF.count[Math.floor(i / 3) % 2],
+      scene: BLOCK_DEF.scene[Math.floor(i / 5) % 2]
+    };
+  }
+
+  function buildFallback() {
+    var cs = [];
+    for (var i = 0; i < 16; i++) {
+      var r = GM.rng(1100 + i * 57), v = [];
+      for (var k = 0; k < DIM; k++) v.push(GM.gauss(r));
+      v = GM.attn.normalize(v);
+      var r2 = GM.rng(2200 + i * 91), t = [];
+      for (var k2 = 0; k2 < DIM; k2++) t.push(v[k2] + 0.35 * GM.gauss(r2));
+      t = GM.attn.normalize(t);
+      var a = cycleAttrs(i);
+      cs.push({
+        id: 'synthetic-' + i,
+        caption: a.color + ' ' + a.shape + ' (' + a.size + ')',
+        attrs: a, image: v, text: t
+      });
+    }
+    return { dims: DIM, blocks: BLOCK_DEF, concepts: cs };
+  }
+
+  var DATA = null;
+
+  function concepts() { return (DATA && DATA.concepts && DATA.concepts.length) ? DATA.concepts : buildFallback().concepts; }
+  function blocks() { return (DATA && DATA.blocks) ? DATA.blocks : BLOCK_DEF; }
+
+  function hashStr(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h >>> 0;
+  }
+
+  function classVector(blockKey, attrName) {
+    var cs = concepts(), acc = [], k, i;
+    for (k = 0; k < DIM; k++) acc.push(0);
+    var n = 0;
+    for (i = 0; i < cs.length; i++) {
+      if (cs[i].attrs && cs[i].attrs[blockKey] === attrName) {
+        for (k = 0; k < DIM; k++) acc[k] += (cs[i].text[k] || 0);
+        n++;
+      }
+    }
+    if (!n) {
+      var rf = GM.rng(hashStr(blockKey + ':' + attrName));
+      for (k = 0; k < DIM; k++) acc[k] = GM.gauss(rf);
+    }
+    return GM.attn.normalize(acc);
+  }
+
+  function blockNames() { var b = blocks(); return b[BLOCK_ORDER[blockIdx]] || b[Object.keys(b)[blockIdx]] || []; }
+  function blockKey() { return BLOCK_ORDER[blockIdx] || Object.keys(blocks())[blockIdx]; }
+
+  function clampState() {
+    var n = concepts().length;
+    if (ci >= n) ci = n - 1;
+    if (ci < 0) ci = 0;
+    if (blockIdx >= BLOCK_ORDER.length) blockIdx = 0;
+  }
+
+  // ---- 1. similarity matrix ------------------------------------------------
+  var simSetup = Guide.setupCanvas(document.getElementById('ses-sim-canvas'), 440, 360, function () { drawSim(); });
+  function drawSim() {
+    if (!simSetup) return;
+    var cs = concepts();
+    var imgs = [], txts = [], i;
+    for (i = 0; i < cs.length; i++) { imgs.push(cs[i].image); txts.push(cs[i].text); }
+    var sim = GM.attn.simMatrix(imgs, txts);
+    var rowLabels = [], colLabels = [];
+    for (i = 0; i < cs.length && i < 16; i++) { rowLabels.push(String(i)); colLabels.push(String(i)); }
+    var geo = Guide.drawHeatmap(simSetup.ctx, 440, 360, sim, {
+      min: -1, max: 1, colorLow: [234, 240, 255], colorHigh: [43, 95, 255],
+      rowLabels: rowLabels, colLabels: colLabels, fontSize: 9
+    });
+    var ctx = simSetup.ctx;
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    for (i = 0; i < sim.length; i++) {
+      ctx.strokeRect(geo.padL + i * geo.cellW + 1.5, geo.padT + i * geo.cellH + 1.5,
+        Math.max(1, geo.cellW - 3), Math.max(1, geo.cellH - 3));
+    }
+    ctx.restore();
+    var diag = 0, off = 0, offN = 0;
+    for (i = 0; i < sim.length; i++) for (var j = 0; j < sim[i].length; j++) {
+      if (i === j) diag += sim[i][j]; else { off += sim[i][j]; offN++; }
+    }
+    diag /= sim.length; off = offN ? off / offN : 0;
+    var el = document.getElementById('ses-sim-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">concepts</span> ' + sim.length + ' × ' + sim.length + '</div>' +
+        '<div><span class="k">mean diagonal cosine</span> <span class="hi">' + diag.toFixed(3) + '</span></div>' +
+        '<div><span class="k">mean off-diagonal</span> ' + off.toFixed(3) + '</div>' +
+        '<div><span class="k">margin</span> ' + (diag - off).toFixed(3) + '</div>' +
+        '<div class="g-mini">Rows are image vectors, columns are text vectors. The gap is the alignment the training bought.</div>';
+    }
+  }
+
+  // ---- 2. zero-shot --------------------------------------------------------
+  var zeroSetup = Guide.setupCanvas(document.getElementById('ses-zero-canvas'), 440, 200, function () { drawZero(); });
+  function drawZero() {
+    if (!zeroSetup) return;
+    clampState();
+    var cs = concepts();
+    var names = blockNames(), key = blockKey();
+    var classEmbs = [];
+    for (var i = 0; i < names.length; i++) classEmbs.push(classVector(key, names[i]));
+    var res = MM.contrastive.zeroShot(cs[ci].image, classEmbs, tau);
+    var data = [], best = 0, maxV = 0;
+    for (i = 0; i < names.length; i++) {
+      if (res.probs[i] > res.probs[best]) best = i;
+      maxV = Math.max(maxV, res.probs[i]);
+      data.push({
+        label: names[i],
+        value: res.probs[i],
+        valueLabel: Guide.fmtPct(res.probs[i], 1),
+        color: i === best ? c.accent2 : c.accent400
+      });
+    }
+    Guide.drawBars(zeroSetup.ctx, 440, 200, data, { padL: 96, maxV: (maxV || 1) * 1.12 });
+    var el = document.getElementById('ses-zero-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">query</span> image ' + ci + ' (truth: ' + cs[ci].caption + ')</div>' +
+        '<div><span class="k">block</span> ' + key + ' · ' + names.join(', ') + '</div>' +
+        '<div><span class="k">prediction</span> <span class="hi">' + names[best] + '</span> at ' + Guide.fmtPct(res.probs[best], 1) + '</div>' +
+        '<div class="g-mini">The class vectors are averages of the text vectors sharing an attribute value; in a real system they would come from prompt strings.</div>';
+    }
+  }
+
+  // ---- 3. retrieval --------------------------------------------------------
+  var retSetup = Guide.setupCanvas(document.getElementById('ses-retrieval-canvas'), 440, 220, function () { drawRetrieval(); });
+  function topIds(queryText, k) {
+    var cs = concepts(), gallery = [];
+    for (var i = 0; i < cs.length; i++) gallery.push({ vec: cs[i].image, id: cs[i].id, caption: cs[i].caption });
+    var ranked = MM.retrieval.topK(queryText, gallery, k || 5);
+    var ids = [];
+    for (var j = 0; j < ranked.length; j++) ids.push(ranked[j].item.id);
+    return { ranked: ranked, ids: ids };
+  }
+  function findPair() {
+    var cs = concepts();
+    for (var i = 0; i < cs.length; i++) {
+      if (cs[i].sameAttributesAs) {
+        for (var j = 0; j < cs.length; j++) if (cs[j].id === cs[i].sameAttributesAs) return { a: i, b: j };
+      }
+    }
+    return null;
+  }
+  function drawRetrieval() {
+    if (!retSetup) return;
+    clampState();
+    var cs = concepts();
+    var out = topIds(cs[ci].text, 5);
+    var data = [], maxV = 0;
+    for (var i = 0; i < out.ranked.length; i++) {
+      var it = out.ranked[i].item, sc = out.ranked[i].score;
+      maxV = Math.max(maxV, sc);
+      var lab = it.id.length > 14 ? it.id.slice(0, 13) + '…' : it.id;
+      data.push({ label: lab, value: Math.max(0, sc), valueLabel: sc.toFixed(3), color: i === 0 ? c.accent2 : c.accent400 });
+    }
+    Guide.drawBars(retSetup.ctx, 440, 220, data, { padL: 118, maxV: (maxV || 1) * 1.12 });
+    var pair = findPair();
+    var el = document.getElementById('ses-retrieval-readout');
+    if (el) {
+      var msg = '';
+      if (pair) {
+        var ra = topIds(cs[pair.a].text, 1).ids[0];
+        var rb = topIds(cs[pair.b].text, 1).ids[0];
+        msg = '<div><span class="k">word-order pair</span> ' + cs[pair.a].caption + ' ⇄ ' + cs[pair.b].caption + '</div>' +
+          '<div><span class="k">top-1 for each</span> ' + ra + ' / ' + rb + ' <span class="bad">' +
+          (ra === rb ? 'identical' : 'different') + '</span></div>' +
+          '<div class="g-mini">The two captions share every attribute and differ only in order, so the space returns the same result for both.</div>';
+      } else {
+        msg = '<div class="g-mini">No word-order pair found in this data set.</div>';
+      }
+      el.innerHTML =
+        '<div><span class="k">query caption</span> ' + cs[ci].caption + '</div>' +
+        '<div><span class="k">top-1</span> <span class="hi">' + out.ids[0] + '</span></div>' +
+        msg;
+    }
+  }
+
+  // ---- template comparison -------------------------------------------------
+  var tplSetup = Guide.setupCanvas(document.getElementById('ses-template-canvas'), 440, 200, function () { drawTemplate(); });
+  function drawTemplate() {
+    if (!tplSetup) return;
+    clampState();
+    var cs = concepts(), own = cs[ci];
+    var otherColor = null;
+    for (var i = 0; i < BLOCK_DEF.color.length; i++) {
+      if (BLOCK_DEF.color[i] !== own.attrs.color) { otherColor = BLOCK_DEF.color[i]; break; }
+    }
+    var pair = findPair();
+    var variants = [
+      { label: 'own caption', vec: own.text },
+      { label: 'reordered', vec: (pair && (pair.b === ci || pair.a === ci)) ? cs[pair.b === ci ? pair.a : pair.b].text : own.text },
+      { label: 'other colour', vec: classVector('color', otherColor || own.attrs.color) },
+      { label: 'bare shape', vec: classVector('shape', own.attrs.shape) }
+    ];
+    var data = [], maxV = 0;
+    for (i = 0; i < variants.length; i++) {
+      var sc = GM.attn.cosine(own.image, variants[i].vec);
+      maxV = Math.max(maxV, sc);
+      data.push({ label: variants[i].label, value: Math.max(0, sc), valueLabel: sc.toFixed(3), color: i < 2 ? c.accent : c.accent400 });
+    }
+    Guide.drawBars(tplSetup.ctx, 440, 200, data, { padL: 104, maxV: (maxV || 1) * 1.12 });
+  }
+
+  function redraw() { drawSim(); drawZero(); drawRetrieval(); drawTemplate(); }
+
+  function setConcept(i) {
+    var n = concepts().length;
+    ci = Math.max(0, Math.min(n - 1, i));
+    ['ses-concept-a', 'ses-concept-b'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) {
+        el.value = ci;
+        var lab = el.parentElement ? el.parentElement.querySelector('.val') : null;
+        if (lab) lab.textContent = String(ci);
+      }
+    });
+    redraw();
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#ses-concept-a'), function (el) { setConcept(parseInt(el.value, 10)); });
+  Guide.bindSliders(document.querySelectorAll('#ses-concept-b'), function (el) { setConcept(parseInt(el.value, 10)); });
+  Guide.bindSliders(document.querySelectorAll('#ses-block'), function (el) {
+    blockIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ses-tau'), function (el) {
+    tauIdx = parseInt(el.value, 10);
+    tau = TAUS[tauIdx];
+    redraw();
+  });
+
+  redraw();
+
+  fetch(EMB_URL).then(function (r) { return r.json(); }).then(function (data) {
+    if (data && data.concepts && data.concepts.length) {
+      DATA = data;
+      redraw();
+    }
+  }).catch(function () { /* illustrative fallback is already painted */ });
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'shared-zero-shot',
+      kind: 'choice',
+      prompt: 'How does zero-shot classification work in a shared embedding space?',
+      options: [
+        { label: 'Embed the class names, take the softmax over their cosines with the image, and pick the largest.', correct: true },
+        { label: 'Fine-tune a classifier head on a few examples of each new class.', correct: false },
+        { label: 'Generate a description of the image and string-match the class name against it.', correct: false }
+      ],
+      explanation: 'The text tower already places class names near matching images, so the class vector plus a softmax is the whole classifier. No new labels and no gradient step are needed, which is what makes it zero-shot.'
+    },
+    {
+      id: 'shared-negatives',
+      kind: 'numeric',
+      prompt: 'A batch has 10 image-caption pairs. Across the whole similarity matrix, how many cells are negative pairs?',
+      answer: 90,
+      tolerance: 0.5,
+      explanation: 'The matrix has 10×10 = 100 cells. Ten are the matched diagonal, so 100 − 10 = 90 are negatives. Contrastive training turns each of those cells into a prediction the model must get right.'
+    },
+    {
+      id: 'shared-prompt',
+      kind: 'choice',
+      prompt: 'Why can changing a prompt template change a zero-shot prediction?',
+      options: [
+        { label: 'The template changes the text embedding, and the class vector is that embedding.', correct: true },
+        { label: 'The template retrains the text tower on the new phrasing.', correct: false },
+        { label: 'The template changes the softmax temperature used at inference.', correct: false }
+      ],
+      explanation: 'A class vector is the embedding of the string you supply. "Red" and "a photo of something red" are different strings and therefore different vectors, so they can change which cosine is largest.'
+    },
+    {
+      id: 'shared-failures',
+      kind: 'choice',
+      prompt: 'Which failure is the direct consequence of measuring a single overall cosine?',
+      options: [
+        { label: 'Word order is nearly invisible, so "a red square" and "a square that is red" match alike.', correct: true },
+        { label: 'The model cannot run on a GPU without a vision tower.', correct: false },
+        { label: 'Images must be resized to exactly 224×224 before embedding.', correct: false }
+      ],
+      explanation: 'A cosine summarises overall similarity and is symmetric in the attributes it compares, so relations and ordering are flattened. Counting, negation and typographic attacks are the same story in different clothes.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

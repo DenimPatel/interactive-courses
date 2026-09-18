@@ -1,0 +1,303 @@
+---
+title: "Flow matching and rectified flow"
+description: "Curved paths against straight ones, the velocity-field view of an ODE, why fewer steps become possible, and why the frontier trainers adopted it."
+permalink: "/ai/generative-media/flow-matching/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Flow matching and rectified flow</h1>
+    <p>The reverse process of a diffusion model is an ordinary differential equation, and the network that drives it is a velocity field. Flow matching trains that field directly: draw a noise sample, draw a data sample, connect them, and regress the velocity along the connecting path. The choice of path is not innocent &mdash; a straight path integrates in a handful of Euler steps while a curved one needs many &mdash; and that single observation is why the frontier trainers replaced the older noise schedules with flow matching and rectified flow.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="paths">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The two path families</h2></div>
+    <p class="g-eyebrow">A path from noise to data, and how straight it is</p>
+    <p>Every generative model that walks from noise to data needs a <em>bridge</em>: a curve that starts at a noise sample $x_0$ and ends at a data sample $x_1$. The simplest one is a straight line. With a path parameter $t$ running from $0$ to $1$, the point on the line is $x_t = (1-t)\,x_0 + t\,x_1$, which is exactly what <code>Diffusion.flowX</code> computes. The curve on the top canvas is a different bridge with the same two endpoints, $x_t = (1-t)x_0 + t x_1 + b\sin(\pi t)$, bowed upward by the constant $b$ &mdash; the kind of path a variance-preserving diffusion model actually induces.</p>
+    <p>The dashed polylines are what a sampler can build with a finite number of Euler steps. The straight bridge is reproduced exactly by a single step, because the velocity never changes direction along it. The curved bridge is not: each Euler step follows the tangent at the current point and drifts off the curve, and with few steps the surviving error is visible. Drag the slider and watch the two error curves below.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-plot-stack">
+        <canvas id="fm-path-canvas" width="600" height="340"></canvas>
+        <canvas id="fm-err-canvas" width="600" height="280"></canvas>
+        <p class="g-canvas-hint">Top: the two bridges between the same endpoints, with tangent arrows for each velocity field and dashed Euler polylines at the current step count. Bottom: endpoint error against the number of Euler steps, on a log scale.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Euler steps N <span class="val">8</span></label>
+          <input type="range" id="fm-steps" min="1" max="32" step="1" value="8">
+        </div>
+        <div class="g-readout" id="fm-readout"></div>
+        <p class="g-mini">The straight path is exact at $N=1$; the curved one keeps improving as $N$ grows. Substituting a straight target is what buys low-step sampling.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> read a flow-matching paper as a statement about a velocity field on a path, explain why the training target is just $x_1 - x_0$, and say why a straight interpolation needs far fewer sampling steps than a curved one.</span></div>
+    <div class="g-toc">
+      <a href="#ode">2 · The velocity field and the ODE</a>
+      <a href="#target">3 · The training target</a>
+      <a href="#cheaper">4 · Why straighter is cheaper</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="ode">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The velocity field and the ODE</h2></div>
+    <p class="g-eyebrow">The network is a field, the sampler is an integrator</p>
+    <p>The flow-matching view rewrites generation as a deterministic ordinary differential equation. There is a velocity field $v_\theta(x, t)$ defined at every point and time, and a sample follows it by integrating</p>
+    <p>$$ \frac{dx}{dt} = v_\theta(x, t), \qquad x(0) = x_0 \sim \mathcal{N}(0, I). $$</p>
+    <p>Nothing here is stochastic once the starting noise is fixed. The randomness that a diffusion sampler injects at every ancestral step is gone; what remains is a single trajectory through a vector field, determined by where it started. That is a real simplification, because ordinary differential equations come with a mature numerical toolkit. Euler's method is the crudest: take a step in the direction the field points right now, $x \leftarrow x + v_\theta(x, t)\,\Delta t$, and repeat. Higher-order integrators use a few field evaluations per step to follow curvature more accurately.</p>
+    <p>The arrows on the top canvas are the field sampled along each path. Along the straight bridge the arrows all point in the same direction and have the same length &mdash; the field is constant, which is precisely why one Euler step finishes the job. Along the curved bridge the arrows rotate, and no single step can capture the rotation. The forward direction is easy to state and the reverse is the hard part, exactly as in diffusion: $v_\theta$ is what has to be learned.</p>
+    <div class="g-warn">⚠ <span><b>An ODE is not automatically a good sampler.</b> Fewer stochastic terms makes the map deterministic and reproducible, but accuracy still depends on the field being easy to integrate. A badly curved field with a coarse step size gives a trajectory that misses the data manifold, and no amount of seed-fixing repairs it.</span></div>
+  </section>
+
+  <section class="g-step" id="target">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The training target</h2></div>
+    <p class="g-eyebrow">Regress $x_1 - x_0$</p>
+    <p>To train $v_\theta$ you need a target velocity at each point of the path, and for the straight bridge the answer is immediate. Differentiate $x_t = (1-t)x_0 + t x_1$ with respect to $t$ and the dependence on $t$ disappears:</p>
+    <p>$$ v = \frac{dx_t}{dt} = x_1 - x_0. $$</p>
+    <p>The target is the difference between the two endpoints, constant along the path. This is <em>conditional</em> flow matching: condition on a particular pair $(x_0, x_1)$, regress the network's velocity at $x_t$ toward that constant, and average the squared error over pairs. In code it is the one-liner <code>Diffusion.flowLoss(vPred, x0, x1)</code>, which returns $(v_\theta(x_t,t) - (x_1 - x_0))^2$. Sampling a training point is cheap: draw $x_1$ from the data, draw $x_0$ from the noise, draw $t$ uniformly, form $x_t$ on the line, and regress. There is no chain to unroll and no schedule to tune.</p>
+    <p>The conditional objectives average out to the right thing. If the network minimises the error against $x_1 - x_0$ at every point, its prediction converges to the conditional expectation of that difference given the current position, which is the marginal velocity field that transports the noise distribution onto the data distribution. The curved family needs the tangential derivative instead, <code>Diffusion.curvedVelocity</code>, which changes with $t$ and forces the network to represent rotation as well as translation.</p>
+    <div class="g-goal">💡 <span>The target $x_1 - x_0$ is why flow matching is so easy to implement: no signal-to-noise bookkeeping, no reparameterised $\epsilon$ or $v$, just a difference of two samples. The schedule is replaced by the geometry of the path.</span></div>
+  </section>
+
+  <section class="g-step" id="cheaper">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Why straighter is cheaper</h2></div>
+    <p class="g-eyebrow">One step, four steps, fifty</p>
+    <p>Look again at the bottom canvas. The straight-path error sits on the floor at every $N$, because a constant field is integrated exactly by Euler at any step size. The curved-path error falls as the steps multiply, and it never reaches the floor until the steps are dense enough that the polyline is indistinguishable from the curve. A sampler that must resolve curvature pays for it in network evaluations, and each evaluation is a forward pass through a large model.</p>
+    <p>Rectified flow turns that observation into an algorithm. Train the field on a set of pairs, then use the trained field to trace new pairs through the model &mdash; the noise that maps to a given data point under the current field &mdash; and retrain on those straighter pairings. Iterating this <em>reflow</em> step straightens the probability-flow trajectories, and as they straighten, the number of Euler steps needed to follow them collapses. Enough reflow passes and one or two steps suffice, which is what makes single-step and few-step image generators possible. The same argument motivates consistency and distillation methods, which also trade training compute for sampling compute.</p>
+    <div class="g-warn">⚠ <span><b>Fewer steps is not a free lunch.</b> Straightening is bought with extra training rounds, and a field that is easy to integrate is not automatically the field that reproduces the data distribution most faithfully. Very low-step samplers trade sample diversity for speed, the same tension that guidance introduces in the next part.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The frontier trainers, rewritten</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">Stable Diffusion 3 and Flux</h3>
+        <p style="margin-bottom:0;">Both replace the DDPM schedule with a rectified-flow objective over a straight interpolation between noise and latent. The <a href="{{ '/ai/generative-media/latent-diffusion/' | relative_url }}">latent diffusion</a> machinery is unchanged; only the target the network regresses changes. SD3 reports that the straight-path objective lets it sample well at far fewer steps than the equivalent diffusion model.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Control &amp; robotics</div>
+        <h3 style="margin:6px 0;">π₀ and action chunking</h3>
+        <p style="margin-bottom:0;">Robot policies run the same trick on a different modality: a flow-matching head predicts a velocity field over actions rather than pixels, and the policy integrates it in a handful of steps at control rate. The straight-path target is what makes a real-time budget feasible, and the <a href="{{ '/ai/generative-media/' | relative_url }}">sampling chapter</a> is where the step-count trade is made explicit.</p>
+      </div>
+    </div>
+    <p>The pattern generalises to video, audio and any continuous signal: replace the noise schedule with a path, regress the velocity, and integrate. The <a href="{{ '/math/calculus-in-motion/odes/' | relative_url }}">ODE guide</a> develops the numerical side of this picture &mdash; Euler, Runge&ndash;Kutta and their error orders &mdash; which is exactly the toolkit a flow sampler uses.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Flow matching grew out of an older idea &mdash; continuous normalising flows &mdash; that was rescued by a change of objective. These papers are the ones to read, in roughly this order, and the schedule-to-path rewrite in the third is the clearest statement of why the field changed.</p>
+    <p>Lipman and coauthors introduce the conditional-flow-matching objective and prove the averaging argument; Liu and coauthors give the rectified-flow algorithm and the reflow straightening step; Albergo and Vanden-Eijnden place both inside the stochastic-interpolant framework; and Esser and coauthors show the objective at production scale in SD3.</p>
+    <ul class="g-refs">
+      <li>Yaron Lipman, Ricky Chen, Heli Ben-Hamu, Maximilian Nickel and Matt Le, <a href="https://arxiv.org/abs/2210.02747">"Flow Matching for Generative Modeling"</a>, 2022 &mdash; the conditional objective and the velocity-field view.</li>
+      <li>Xingchao Liu, Chengyue Gong and Qiang Liu, <a href="https://arxiv.org/abs/2209.03003">"Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow"</a>, 2022 &mdash; reflow and the straightening argument.</li>
+      <li>Michael Albergo and Eric Vanden-Eijnden, <a href="https://arxiv.org/abs/2303.08797">"Building Normalizing Flows with Stochastic Interpolants"</a>, 2023 &mdash; paths, velocities and the general interpolation framework.</li>
+      <li>Patrick Esser and coauthors, <a href="https://arxiv.org/abs/2403.03206">"Scaling Rectified Flow Transformers for High-Resolution Image Synthesis"</a>, 2024 &mdash; SD3, and the case for rectified flow over the older schedule.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>$x_t = (1-t)x_0 + t x_1$</td><td>The straight bridge from noise to data; <code>Diffusion.flowX</code></td></tr>
+        <tr><td>$v = x_1 - x_0$</td><td>The conditional target velocity; constant along the straight path</td></tr>
+        <tr><td>ODE view</td><td>$\dfrac{dx}{dt} = v_\theta(x,t)$; sampling is numerical integration</td></tr>
+        <tr><td>Euler step</td><td>$x \leftarrow x + v_\theta(x,t)\,\Delta t$; exact only for a constant field</td></tr>
+        <tr><td>Curved path</td><td>Same endpoints, rotating tangent; needs many steps to integrate accurately</td></tr>
+        <tr><td>Reflow</td><td>Retrain on pairs traced through the current field, straightening the paths</td></tr>
+        <tr><td>Few-step sampling</td><td>1&ndash;4 Euler steps once trajectories are close to straight</td></tr>
+        <tr><td>Adopted by</td><td>SD3, Flux, π₀ and most current frontier trainers</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A velocity field is cheap to train because the target is a single subtraction. The next question is where the field lives: not on pixels, but on a compressed latent that an autoencoder produces. The next part builds that compressor and measures what the compression costs.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var X0 = -1.4, X1 = 1.4, BEND = 0.6;
+  var steps = 8;
+
+  var pathPlot = GM.plot(document.getElementById('fm-path-canvas'), {
+    W: 600, H: 340, xRange: [0, 1], yRange: [-2.4, 2.4],
+    xLabel: 'path parameter t', yLabel: 'x(t)', onResize: redrawPath
+  });
+  var errPlot = GM.plot(document.getElementById('fm-err-canvas'), {
+    W: 600, H: 280, xRange: [1, 32], yRange: [-7, 0.6],
+    xLabel: 'Euler steps N', yLabel: 'log10 endpoint error', onResize: redrawErr
+  });
+
+  function velStraight() { return D.flowVelocity(X0, X1); }
+  function velCurved(t) { return D.curvedVelocity(t, X0, X1, BEND); }
+
+  function eulerEnd(velFn, n) {
+    var x = X0, dt = 1 / n;
+    for (var i = 0; i < n; i++) x += velFn(i * dt) * dt;
+    return x;
+  }
+  function straightErr(n) { return Math.abs(eulerEnd(velStraight, n) - X1); }
+  function curvedErr(n) { return Math.abs(eulerEnd(velCurved, n) - X1); }
+  function eulerPts(velFn, n) {
+    var pts = [[0, X0]], x = X0, dt = 1 / n;
+    for (var i = 0; i < n; i++) { x += velFn(i * dt) * dt; pts.push([(i + 1) * dt, x]); }
+    return pts;
+  }
+
+  function sci(x) {
+    if (!isFinite(x)) return '—';
+    if (x !== 0 && (Math.abs(x) < 1e-3 || Math.abs(x) >= 1e5)) return x.toExponential(2);
+    return x.toFixed(4);
+  }
+
+  function redrawPath() {
+    if (!pathPlot) return;
+    pathPlot.clear();
+    pathPlot.axes({ xLabel: 'path parameter t', yLabel: 'x(t)' });
+    pathPlot.curve(eulerPts(velCurved, steps), { color: c.accent2, width: 1.2, dashed: true });
+    pathPlot.curve(eulerPts(velStraight, steps), { color: c.accent400, width: 1.2, dashed: true });
+    pathPlot.curve(function (t) { return D.flowX(t, X0, X1); }, { color: c.accent400, width: 2.8 });
+    pathPlot.curve(function (t) { return D.curvedPath(t, X0, X1, BEND); }, { color: c.accent2, width: 2.8 });
+    pathPlot.points([[0, X0], [1, X1]], { color: c.text, r: 4.5 });
+    pathPlot.raw(function (ctx) {
+      [0.12, 0.44, 0.76].forEach(function (t) {
+        var xs = D.flowX(t, X0, X1), vs = D.flowVelocity(X0, X1);
+        Guide.drawArrow(ctx, pathPlot.px(t), pathPlot.py(xs),
+          pathPlot.px(t + 0.1), pathPlot.py(xs + vs * 0.1), { color: c.accent400, width: 2, head: 7 });
+        var xc = D.curvedPath(t, X0, X1, BEND), vc = D.curvedVelocity(t, X0, X1, BEND);
+        Guide.drawArrow(ctx, pathPlot.px(t), pathPlot.py(xc),
+          pathPlot.px(t + 0.1), pathPlot.py(xc + vc * 0.1), { color: c.accent2, width: 2, head: 7 });
+      });
+    });
+    pathPlot.legend([
+      { label: 'straight bridge (flowX)', color: c.accent400 },
+      { label: 'curved bridge', color: c.accent2 },
+      { label: 'Euler polyline (N = ' + steps + ')', color: c.text, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function redrawErr() {
+    if (!errPlot) return;
+    errPlot.clear();
+    errPlot.axes({ xLabel: 'Euler steps N', yLabel: 'log10 endpoint error' });
+    errPlot.curve(function (x) {
+      return Math.log(Math.max(1e-6, straightErr(Math.max(1, Math.round(x))))) / Math.LN10;
+    }, { color: c.accent400, width: 2.4 });
+    errPlot.curve(function (x) {
+      return Math.log(Math.max(1e-6, curvedErr(Math.max(1, Math.round(x))))) / Math.LN10;
+    }, { color: c.accent2, width: 2.4 });
+    errPlot.vline(steps, { color: c.text, dashed: true, width: 1.2, label: 'N = ' + steps, labelY: 0.4 });
+    errPlot.legend([
+      { label: 'straight error (exact at any N)', color: c.accent400 },
+      { label: 'curved error', color: c.accent2 }
+    ], { dy: 6 });
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('fm-readout');
+    if (!el) return;
+    var se = straightErr(steps), ce = curvedErr(steps);
+    el.innerHTML =
+      '<div><span class="k">steps N</span> <span class="hi">' + steps + '</span></div>' +
+      '<div><span class="k">target velocity x₁ − x₀</span> ' + sci(D.flowVelocity(X0, X1)) + '</div>' +
+      '<div><span class="k">straight endpoint error</span> ' + sci(se) + '</div>' +
+      '<div><span class="k">curved endpoint error</span> ' + sci(ce) + '</div>' +
+      '<div class="g-mini">Curvature at the midpoint is b = ' + BEND.toFixed(2) +
+      '; the gap between the two bridges peaks there.</div>';
+  }
+
+  function redraw() { redrawPath(); redrawErr(); redrawReadout(); }
+
+  Guide.bindSliders(document.querySelectorAll('#fm-steps'), function (el) {
+    steps = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'flow-matching-target',
+      kind: 'numeric',
+      prompt: 'Conditional flow matching regresses the network toward $x_1 - x_0$. For $x_0 = -1$ and $x_1 = 3$, what is that target velocity?',
+      answer: 4,
+      tolerance: 0.001,
+      explanation: 'The straight-path velocity is constant and equals $x_1 - x_0 = 3 - (-1) = 4$. Differentiating $x_t = (1-t)x_0 + t x_1$ gives exactly this, with no dependence on $t$.'
+    },
+    {
+      id: 'flow-matching-ode',
+      kind: 'choice',
+      prompt: 'In the flow-matching view, what is the role of the network $v_\\theta$?',
+      options: [
+        { label: 'It is a velocity field; sampling integrates $dx/dt = v_\\theta(x,t)$ from noise to data.', correct: true },
+        { label: 'It predicts the noise that was added at one forward step, as in DDPM.', correct: false },
+        { label: 'It is a classifier that scores whether a sample is real.', correct: false }
+      ],
+      explanation: 'Flow matching reframes generation as a deterministic ODE. The network is the field the trajectory follows, and the sampler is a numerical integrator of that field.'
+    },
+    {
+      id: 'flow-matching-straight',
+      kind: 'choice',
+      prompt: 'Why can a rectified flow sample in one to four steps where a curved probability-flow path needs many?',
+      options: [
+        { label: 'A straight path has a constant velocity, so a single Euler step reproduces it exactly.', correct: true },
+        { label: 'A straight path is stochastic, so the sampler can guess the endpoint.', correct: false },
+        { label: 'A straight path removes the need for a neural network entirely.', correct: false }
+      ],
+      explanation: 'Curvature is what forces many small steps: each Euler step follows a tangent, so a rotating field is only approximated. Straighten the trajectories and Euler converges immediately. The network is still needed to predict which straight path a given noise sample lies on.'
+    },
+    {
+      id: 'flow-matching-reflow',
+      kind: 'choice',
+      prompt: 'What does a reflow step do?',
+      options: [
+        { label: 'It retrains the field on pairs traced through the current model, straightening the trajectories.', correct: true },
+        { label: 'It doubles the number of sampling steps to improve fidelity.', correct: false },
+        { label: 'It replaces the velocity target with the score function of the data.', correct: false }
+      ],
+      explanation: 'Reflow uses the current field to find which noise point maps to each data point, forms new straighter pairings, and retrains. Iterating it collapses the number of Euler steps needed for an accurate sample.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

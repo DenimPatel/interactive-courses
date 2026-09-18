@@ -1,0 +1,13 @@
+---
+layout: series-hub
+title: "Statistics, Interactively"
+section: "math"
+series: "statistics"
+permalink: "/math/statistics/"
+subtitle: "A step-by-step guide to the statistics the rest of the site assumes - descriptive statistics, estimation, testing, Bayesian inference, the statistics of machine learning, recursive state estimation, and causal inference - in the 3Blue1Brown tradition: geometry and simulation first, formulas second, every idea attached to something you can drag."
+description: "An interactive, step-by-step guide to statistics - sampling distributions and the central limit theorem, bias and maximum likelihood, confidence intervals and hypothesis tests, Bayesian inference and MCMC, the bias-variance trade-off, Kalman and particle filters, and causal inference."
+---
+
+<p class="section-lede" style="max-width:70ch;">Every subject on this site leans on statistics it never teaches. The <a href="{{ '/vision/multi-view-geometry/' | relative_url }}">multi-view geometry</a> guide assumes noise models and RANSAC inlier probabilities; the <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization</a> guide assumes that least squares is a maximum-likelihood estimate; the <a href="{{ '/ai/llm-training/' | relative_url }}">LLM guides</a> talk about sampling, temperature, cross-entropy, calibration and latency percentiles; and every robot that localises itself is running a Bayes filter. This series builds that machinery from pictures: a running sample you can redraw, an estimate you can watch wobble, a null distribution you can reshuffle by hand, and a covariance ellipse you can drag.</p>
+
+<p class="section-lede" style="max-width:70ch;">Parts build on each other but each one stands alone; the <a href="{{ '/math/statistics/glossary/' | relative_url }}">glossary</a> collects every term, the distribution table and the formula cards in one place. <strong>Probability is a prerequisite, not part of this series.</strong> It assumes you already know sample spaces and conditional probability, Bayes' rule as an identity, random variables and their PMF/PDF/CDF, expectation, variance and covariance, the named distributions (Bernoulli through Beta), joint and conditional distributions, and the statements of the law of large numbers and the central limit theorem. Part 1 recaps only the load-bearing pieces; if the symbols are new, start with the probability course and come back.</p>

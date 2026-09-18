@@ -1,0 +1,377 @@
+---
+title: "Pixels into tokens"
+description: "Patching an image into a sequence, position embeddings and the class token, attention maps you can read, and what a vision transformer gives up against a convolution."
+permalink: "/ai/multimodal/vit/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Pixels into tokens</h1>
+    <p>A language model reads a sequence of discrete tokens &mdash; separate, countable units, each one a whole integer id rather than a continuous value &mdash; and it expects them in order. A picture, by contrast, arrives as a dense grid of pixels, with no natural beginning, end, or word boundaries. The vision transformer closes that gap with the bluntest tool available: cut the image into patches, flatten each patch into a vector, and pretend the result is a sentence. Flattening here means reading the patch's pixels row by row and laying their colour values out in one long list, which is what turns a small square of an image into a single vector the model can treat like a token. Everything else &mdash; the position embeddings, the class token, the attention maps &mdash; exists to repair the two things that this trick destroys, which are order and locality. Order is lost because the transformer sees a set of tokens with no built-in sense of sequence, and locality is lost because nothing in the architecture knows that neighbouring pixels are related. This part builds that encoder patch by patch.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="cut">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Cutting the image up</h2></div>
+    <p class="g-eyebrow">A patch is a token</p>
+    <p>A transformer wants a sequence, so the first job is to manufacture one out of an image. The simplest way to do that is to chop the image into non-overlapping $P \times P$ patches, flatten each patch row by row into a vector of $P^2 C$ numbers, and pass that vector through a learned linear projection into the model's width. Take a single concrete patch: a $16 \times 16$ square cut from a colour photograph has $16 \times 16 = 256$ pixels, and each pixel carries three colour channels (red, green and blue), which is the $C$ in $P^2 C$. Flattening lays those $256 \times 3 = 768$ numbers out in one long list. The linear projection &mdash; a single learned matrix, nothing more &mdash; then rescales that list to the transformer's width, meaning the fixed number of numbers in every vector the model passes around internally, say $1024$. The count of patches is fixed arithmetic: an $H \times H$ image becomes $(H/P)^2$ tokens. At the familiar $224 \times 224$ and $P = 16$ that is $14 \times 14 = 196$ tokens, roughly the length of a short paragraph. Nothing has been learned about the content yet; this step only decides how many pieces the model will reason over and how large each piece is.</p>
+    <p>The patch is the model's unit of meaning, and its size is a real trade. A small patch keeps fine detail, because each token covers a small area and can represent a small feature precisely. But a smaller patch means more of them: halving $P$ quadruples the token count, and attention compares every token with every other token, so its cost grows with the square of the sequence length. A large patch is cheap for the same reason in reverse, but it throws away exactly the high-frequency structure &mdash; sharp edges, texture, fine text &mdash; that a convolution would have kept, because any detail smaller than the patch is averaged away the moment the patch is flattened. The slider below changes $P$ on a fixed $32 \times 32$ test image so you can watch the grid and the token count move together.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vit-patch-canvas" width="300" height="300"></canvas>
+        <p class="g-canvas-hint">A procedural test image drawn with <code>GenMedia.raster</code>, with the patch grid overlaid and the first patch outlined. The grid comes from <code>Multimodal.vit.patchify</code>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Patch size P <span class="val">4</span></label><input type="range" id="vit-patch" min="0" max="2" step="1" value="1"></div>
+        <div class="g-readout" id="vit-patch-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> compute the token count <span class="k">(H/P)²</span> for any image and patch size, explain what position embeddings (the addresses that tell the model where each patch sat) and the class token (the one vector asked to summarise the whole picture) are for, read an attention map, and say what a ViT has to learn that a convolution is born knowing.</span></div>
+    <div class="g-toc">
+      <a href="#tokens">2 · Tokens, positions and the class token</a>
+      <a href="#attention">3 · What attention looks at</a>
+      <a href="#bias">4 · Convolutional bias versus learned bias</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="tokens">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Tokens, positions and the class token</h2></div>
+    <p class="g-eyebrow">Order the patches cannot see</p>
+    <p>Attention begins by comparing every token against every other token, and that comparison has no idea where any token sits. Formally, attention is permutation invariant: shuffle the patches of an image, and the unmodified transformer produces the same set of outputs, only reordered. That is fatal, because a photo is not a bag of patches &mdash; a face, a horizon and a skyline mean something only because of where their parts are relative to one another. The fix is to add a <em>position embedding</em> to every patch token, so that two otherwise identical patches in different places look different to the model. You can picture it as writing a seat number on each token after a shuffle: the token's content stays the same, but its address travels with it. The original ViT used fixed sinusoidal embeddings, the construction shown below, in which each address is a fixed pattern of sines and cosines so that nearby rows get similar patterns; later work learned them as parameters instead, and both work, because the signal the model needs is just "where am I" and there are many encodings of it.</p>
+    <p>The second repair is the <em>class token</em>. A classifier needs one vector to represent the whole image, and the natural choice is an extra learned token prepended to the sequence &mdash; placed at the front, before all the patch tokens. Attention lets that token gather from every patch, so after the last block its output is a global summary of the whole picture rather than a description of one square of it; a small head on top of it produces the logits, the raw scores, one per class, that a softmax later turns into probabilities. More recent encoders drop the class token and pool the patch tokens instead, meaning they average their final vectors into one, but the idea is the same: some vector has to stand for the whole picture.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vit-pos-canvas" width="320" height="240"></canvas>
+        <p class="g-canvas-hint">Sinusoidal 2-D position embeddings from <code>Multimodal.vit.positional</code>, one row per patch token and one column per embedding dimension. The diagonal bands are the periodic encoding that tells the model where a patch sits.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="vit-pos-readout"></div>
+        <p class="g-mini">Self-supervised encoders such as DINOv2 skip labels entirely: they train the same patch-token trunk with a teacher-student objective, and the resulting features transfer to segmentation and depth without fine-tuning.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Position embeddings are not free.</b> They are fixed to a grid, so an encoder trained at $224 \times 224$ does not automatically accept a different resolution or aspect ratio: there is no embedding for patch 20 of 21 if the model only ever learned positions up to 14 of 14. Interpolating the embeddings is the usual fix &mdash; stretching the learned grid of addresses to fit the new one, like renumbering the seats when the room is rearranged &mdash; and it is one of the reasons high-resolution multimodal encoders are trained with variable-size inputs in the first place.</span></div>
+  </section>
+
+  <section class="g-step" id="attention">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>What attention looks at</h2></div>
+    <p class="g-eyebrow">Weights you can read as a map</p>
+    <p>Every block computes attention weights: for each token, a softmax over how much it looks at every other token. In this operation each token plays three roles at once. It asks a question (the query), it advertises what it has to offer (the key), and it carries the information itself (the value). The weight between two tokens measures how well one token's query matches another's key. Because those weights form a row that sums to one, they can be drawn directly as a heatmap, and the picture is legible. A row is a query, a column is a key, and a bright cell means the query token leaned on that key. Deep in a trained network the maps often localise on objects &mdash; a patch sitting on a dog attends to the other patches on the dog &mdash; while early in training they are nearly uniform, which is what the temperature slider exaggerates here.</p>
+    <p>Temperature divides the logits before the softmax, and its effect is easiest to see at the extremes: dividing by a small number lets the largest scores dominate, so a small temperature sharpens each row onto a few patches, while dividing by a large number flattens the differences, so a large temperature spreads attention evenly. That knob is the same one that governs the contrastive objectives in the next part; it is the standard way to trade off "attend precisely" against "attend broadly", and it is why the map below changes character &mdash; from a few bright spots to a wash &mdash; rather than merely getting brighter.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vit-attn-canvas" width="320" height="320"></canvas>
+        <p class="g-canvas-hint">Attention weights from <code>Multimodal.vit.attention</code> on the patch tokens of the test image. Rows are queries, columns are keys; each row is a softmax.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Softmax temperature <span class="val">0.2</span></label><input type="range" id="vit-temp" min="0" max="4" step="1" value="2"></div>
+        <div class="g-readout" id="vit-attn-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>A heatmap you can read is a diagnostic you can act on. When a vision encoder is paired with a language model, inspecting which patches the image tokens attend to is the first thing to reach for when the model ignores a region or latches onto the wrong one. If a region is never attended to, the model cannot have used it, so the map tells you where to look next.</span></div>
+  </section>
+
+  <section class="g-step" id="bias">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Convolutional bias versus learned bias</h2></div>
+    <p class="g-eyebrow">Built in against learned</p>
+    <p>A convolution is a small filter that slides across an image and responds to local patterns. It is born with two assumptions. The first is <em>locality</em>: nearby pixels matter to each other, so it is sensible to look at a small neighbourhood at a time. The second is <em>translation equivariance</em>: a feature is the same feature wherever it appears, so the same filter is reused at every position, and a corner learned in the top-left is recognised in the bottom-right. Stacking $3 \times 3$ convolutions grows the receptive field &mdash; the region of the input that can influence one output &mdash; by two pixels per layer, so an image-wide view of a $32 \times 32$ picture takes a dozen layers and an ImageNet-sized one takes far more. That slow growth is a restriction, and it is also a gift: the model does not have to learn from scratch that a corner is a corner in every location.</p>
+    <p>A patch transformer has the opposite profile. Self-attention connects every token to every other in the very first layer, so its receptive field is global immediately. The price is that locality and translation equivariance are not built in at all; they have to be discovered from data. In practice that makes ViTs data-hungry: they need far more examples than a comparable convolution to learn the same regularity, and they depend on strong augmentation or large-scale pretraining. Augmentation means manufacturing extra training variety from each image, with random crops, flips and colour shifts. It is also why hybrid designs exist &mdash; a convolutional stem in front of the transformer, attention restricted to local windows, or distillation from a trained convolution, in which the convolution's predictions become soft targets the transformer learns to match &mdash; all of them ways to hand the transformer a little of the prior it lacks.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vit-bias-canvas" width="420" height="260"></canvas>
+        <p class="g-canvas-hint">Fraction of the image a token can see as a function of depth, for a $3 \times 3$ convolutional stack and for self-attention. The dashed line marks the layer depth on the slider.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Depth L <span class="val">6</span></label><input type="range" id="vit-layers" min="2" max="12" step="1" value="6"></div>
+        <div class="g-readout" id="vit-bias-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Global from layer one is not automatically better.</b> A model that can see everything immediately has more freedom to fit spurious long-range correlations &mdash; coincidences between distant pixels that happen to line up in the training set but mean nothing in the world. The inductive-bias trade is real in both directions: convolutions generalise from less data because their assumptions are good ones, and attention scales further when there is enough data for the model to learn those assumptions for itself.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every vision tower is this encoder with a different training signal</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Encoders</div>
+        <h3 style="margin:6px 0;">The vision half of a VLM</h3>
+        <p style="margin-bottom:0;">Every vision-language model begins here: a patch transformer produces image tokens, and a projector &mdash; a small learned module that turns vision vectors into vectors the language model accepts &mdash; feeds them in. The encoder's patch grid and its token count set the resolution budget, which is exactly the token arithmetic and tiling you meet in <a href="{{ '/ai/multimodal/shared-embedding-space/' | relative_url }}">the shared embedding space</a> and in the resolution discussion of the sibling volume. Tiling means splitting a large image into several fixed-size pieces and patchifying each of them, so that detail survives without letting the token count grow without limit.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Pretraining</div>
+        <h3 style="margin:6px 0;">Contrastive and self-supervised trunks</h3>
+        <p style="margin-bottom:0;">CLIP and SigLIP train this trunk &mdash; the shared backbone network, in this case the patch encoder &mdash; against text with a contrastive objective, in which matching image-caption pairs are pulled together and mismatched pairs are pushed apart. That is <a href="{{ '/ai/multimodal/contrastive/' | relative_url }}">the next part</a>. DINOv2 trains the same trunk with no labels at all, using a self-supervised recipe in which a student network learns to reproduce a teacher's features on different views of the same image. That is why its patch features segment objects so cleanly: each patch vector has learned to describe the object it belongs to rather than the scene as a whole. Either way the architecture is the one built above; only the loss changes.</p>
+      </div>
+    </div>
+    <p>Further out, the same patch encoder reappears in video models with an added temporal axis, so a token can stand for a small patch of a single frame gathered across time as well as space. It reappears in audio encoders, which turn a waveform into a spectrogram &mdash; a picture of how much energy each frequency carries over time &mdash; and treat each mel band, a coarsened range of frequencies, as a row of tokens. And it reappears in 3-D point encoders, which group a point cloud into local neighbourhoods the way patchify groups pixels. The modality zoo in <a href="{{ '/ai/multimodal/modalities/' | relative_url }}">the last part</a> is mostly a list of ways to turn a signal into a patch sequence and then align it to a text tower.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The vision transformer started as "an image is worth 16&times;16 words" and grew into the default vision backbone. These papers cover the original architecture, the data-efficient training that made it practical, the self-supervised version that produces general-purpose features, and the windowed hybrid that puts locality back. Read them in that order and the arc is clear: a clever idea that needed an unreasonable amount of data, the recipe that fixed the data problem, a label-free alternative, and a design that reintroduces the prior the first paper threw away.</p>
+    <ul class="g-refs">
+      <li>Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov and coauthors, <a href="https://arxiv.org/abs/2010.11929">"An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"</a>, 2020 &mdash; the patchify-and-attend vision transformer and the class token.</li>
+      <li>Hugo Touvron, Matthieu Cord, Matthijs Douze and coauthors, <a href="https://arxiv.org/abs/2012.12877">"Training data-efficient image transformers &amp; distillation through attention"</a>, 2020 &mdash; DeiT, the distillation token and the augmentation recipe that made ViTs trainable without giant datasets.</li>
+      <li>Maxime Oquab, Timoth&eacute;e Darcet, Th&eacute;o Moutakanni and coauthors, <a href="https://arxiv.org/abs/2304.07193">"DINOv2: Learning Robust Visual Features without Supervision"</a>, 2023 &mdash; the self-supervised trunk whose patch features transfer to segmentation and depth.</li>
+      <li>Ze Liu, Yutong Lin, Yue Cao and coauthors, <a href="https://arxiv.org/abs/2103.14030">"Swin Transformer: Hierarchical Vision Transformer using Shifted Windows"</a>, 2021 &mdash; locality reintroduced as a window prior.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Patchify</td><td>Cut an image into $P \times P$ patches and flatten each to a vector of $P^2 C$ numbers</td></tr>
+        <tr><td>Token count</td><td>$(H/P)^2$ for a square image; the sequence length the transformer sees</td></tr>
+        <tr><td>Patch size P</td><td>Smaller keeps detail and costs sequence length; larger is cheaper and blurs</td></tr>
+        <tr><td>Position embedding</td><td>Added so permutation-invariant attention knows where a patch came from; learned or sinusoidal</td></tr>
+        <tr><td>Class token</td><td>An extra learned token whose final output is the whole-image summary</td></tr>
+        <tr><td>Attention map</td><td>A row of softmax weights per query; readable as a heatmap over patches</td></tr>
+        <tr><td>Inductive bias</td><td>Locality and translation equivariance: a convolution has them, a ViT learns them</td></tr>
+        <tr><td>Data hunger</td><td>ViTs need large-scale pretraining or strong augmentation to match conv generalisation</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The encoder now turns a picture into a sequence of vectors, and those vectors capture visual content. Nothing yet ties them to language, so a language model cannot read them and a sentence cannot point at them. The next part trains a matching text tower with a contrastive objective, so that a picture and its caption land in the same place in a shared space &mdash; the point where the visual and the verbal finally meet.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var IMG_SIZE = 32;
+  var PATCHES = [2, 4, 8];
+  var patchIdx = 1;
+  var patch = PATCHES[patchIdx];
+  var TEMPS = [0.05, 0.1, 0.2, 0.5, 1.0];
+  var tempIdx = 2;
+  var layers = 6;
+
+  var image = GM.img.circles(IMG_SIZE, 3, 5);
+
+  function gridN() { return MM.vit.grid(IMG_SIZE, patch); }
+  function tokenCount() { return MM.vit.tokens(IMG_SIZE, patch); }
+
+  // ---- 1. patchify ---------------------------------------------------------
+  var raster = GM.raster(document.getElementById('vit-patch-canvas'), {
+    cols: IMG_SIZE, rows: IMG_SIZE, channels: 3, W: 300, H: 300,
+    onResize: function () { drawPatch(); }
+  });
+
+  function drawPatch() {
+    if (!raster) return;
+    raster.fromArray(image.data);
+    raster.draw();
+    raster.patchGrid(patch, { color: 'rgba(255,255,255,0.75)', width: 1 });
+    var ctx = raster.ctx, n = gridN(), step = raster.W / n;
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, step - 2, step - 2);
+    ctx.restore();
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(6, raster.H - 22, 234, 16);
+    ctx.fillStyle = '#fff'; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(n + ' × ' + n + ' patches of ' + patch + 'px = ' + tokenCount() + ' tokens', 10, raster.H - 10);
+    ctx.restore();
+    var el = document.getElementById('vit-patch-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">image</span> ' + IMG_SIZE + '×' + IMG_SIZE + ' px</div>' +
+        '<div><span class="k">patch P</span> <span class="hi">' + patch + ' px</span></div>' +
+        '<div><span class="k">grid</span> ' + n + ' × ' + n + '</div>' +
+        '<div><span class="k">tokens (H/P)²</span> <span class="hi">' + tokenCount() + '</span></div>' +
+        '<div><span class="k">patch vector</span> ' + (patch * patch * 3) + ' numbers</div>' +
+        '<div class="g-mini">A smaller patch means finer detail and a much longer sequence.</div>';
+    }
+  }
+
+  // ---- 2. positions --------------------------------------------------------
+  var posSetup = Guide.setupCanvas(document.getElementById('vit-pos-canvas'), 320, 240, function () { drawPos(); });
+  function drawPos() {
+    if (!posSetup) return;
+    var n = tokenCount(), d = 12;
+    var P = MM.vit.positional(n, d);
+    var lo = Infinity, hi = -Infinity;
+    P.forEach(function (row) {
+      row.forEach(function (v) { if (v < lo) lo = v; if (v > hi) hi = v; });
+    });
+    Guide.drawHeatmap(posSetup.ctx, 320, 240, P, {
+      min: lo, max: hi, colorLow: [234, 240, 255], colorHigh: [43, 95, 255], fontSize: 9
+    });
+    var el = document.getElementById('vit-pos-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">tokens</span> ' + n + '</div>' +
+        '<div><span class="k">position dims</span> ' + d + '</div>' +
+        '<div><span class="k">class token</span> <span class="hi">prepended</span></div>' +
+        '<div class="g-mini">Every row is one patch address; the periodic bands are what make two identical patches in different places distinguishable.</div>';
+    }
+  }
+
+  // ---- 3. attention --------------------------------------------------------
+  function attnTokens() {
+    var pf = MM.vit.patchify(image, patch);
+    var pats = pf.patches, shown = Math.min(pats.length, 24);
+    var q = [], k = [], v = [];
+    for (var i = 0; i < shown; i++) {
+      var nv = GM.attn.normalize(pats[i]);
+      q.push(nv); k.push(nv); v.push(nv);
+    }
+    return { q: q, k: k, v: v, shown: shown };
+  }
+  var attnSetup = Guide.setupCanvas(document.getElementById('vit-attn-canvas'), 320, 320, function () { drawAttn(); });
+  function drawAttn() {
+    if (!attnSetup) return;
+    var t = TEMPS[tempIdx];
+    var tk = attnTokens();
+    var att = MM.vit.attention(tk.q, tk.k, tk.v, t);
+    var maxW = 0, diag = 0;
+    att.weights.forEach(function (row, i) {
+      maxW = Math.max(maxW, Math.max.apply(null, row));
+      diag += row[i] != null ? row[i] : 0;
+    });
+    diag = diag / att.weights.length;
+    Guide.drawHeatmap(attnSetup.ctx, 320, 320, att.weights, {
+      min: 0, max: maxW || 1, colorLow: [234, 240, 255], colorHigh: [214, 0, 108], fontSize: 9
+    });
+    var el = document.getElementById('vit-attn-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">tokens shown</span> ' + tk.shown + ' of ' + tokenCount() + '</div>' +
+        '<div><span class="k">temperature</span> ' + t + '</div>' +
+        '<div><span class="k">largest weight</span> <span class="hi">' + Guide.fmtPct(maxW, 1) + '</span></div>' +
+        '<div><span class="k">mean self-weight</span> ' + Guide.fmtPct(diag, 1) + '</div>' +
+        '<div class="g-mini">Each row is a softmax over every patch. A low temperature concentrates it onto a few keys; a high one flattens it.</div>';
+    }
+  }
+
+  // ---- 4. bias -------------------------------------------------------------
+  var biasPlot = GM.plot(document.getElementById('vit-bias-canvas'), {
+    W: 420, H: 260, xRange: [1, 12], yRange: [0, 1.05],
+    xLabel: 'layer', yLabel: 'fraction of image visible',
+    onResize: function () { drawBias(); }
+  });
+  function cnnFrac(L) { return Math.min(1, (1 + Math.max(0, L) * 2) / IMG_SIZE); }
+  function drawBias() {
+    if (!biasPlot) return;
+    biasPlot.clear();
+    biasPlot.axes({ xLabel: 'layer', yLabel: 'fraction of image visible' });
+    biasPlot.curve(function (L) { return cnnFrac(L); }, { color: c.accent400, width: 2.4, samples: 48 });
+    biasPlot.curve(function (L) { return L >= 1 ? 1 : 0; }, { color: c.accent2, width: 2.4, samples: 48 });
+    biasPlot.vline(layers, { color: c.text, dashed: true, width: 1.2, label: 'L = ' + layers, labelY: 0.04 });
+    biasPlot.legend([
+      { label: 'CNN stack (3×3 conv)', color: c.accent400 },
+      { label: 'self-attention (global)', color: c.accent2 }
+    ], { dy: 6 });
+    var el = document.getElementById('vit-bias-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">depth shown</span> ' + layers + '</div>' +
+        '<div><span class="k">CNN window</span> ' + (1 + layers * 2) + ' px</div>' +
+        '<div><span class="k">CNN fraction</span> ' + Guide.fmtPct(cnnFrac(layers), 0) + '</div>' +
+        '<div><span class="k">ViT fraction</span> <span class="hi">100%</span> from layer 1</div>' +
+        '<div class="g-mini">A 3×3 stack grows its window by two pixels per layer; a transformer is global immediately.</div>';
+    }
+  }
+
+  function redraw() { drawPatch(); drawPos(); drawAttn(); drawBias(); }
+
+  Guide.bindSliders(document.querySelectorAll('#vit-patch'), function (el) {
+    patchIdx = parseInt(el.value, 10);
+    patch = PATCHES[patchIdx];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vit-temp'), function (el) {
+    tempIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vit-layers'), function (el) {
+    layers = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'vit-token-count',
+      kind: 'choice',
+      prompt: 'A 224×224 image is cut into 16-pixel patches. How many patch tokens does the transformer see?',
+      options: [
+        { label: '196, because 224/16 = 14 and 14×14 = 196', correct: true },
+        { label: '256, because 16×16 = 256', correct: false },
+        { label: '14, one per row of patches', correct: false }
+      ],
+      explanation: 'Token count is (H/P)². With H = 224 and P = 16 the grid is 14×14, so 196 patch tokens before any class token is added.'
+    },
+    {
+      id: 'vit-tokens-numeric',
+      kind: 'numeric',
+      prompt: 'A 32×32 image is patchified with P = 4. How many patch tokens are produced?',
+      answer: 64,
+      tolerance: 0.5,
+      explanation: 'The grid is 32/4 = 8 patches per side, so there are 8×8 = 64 tokens. (H/P)² = (32/4)² = 64.'
+    },
+    {
+      id: 'vit-positions',
+      kind: 'choice',
+      prompt: 'Why does a vision transformer need position embeddings?',
+      options: [
+        { label: 'Attention is permutation invariant, so without them the model cannot tell where a patch came from.', correct: true },
+        { label: 'They increase the number of tokens so the sequence is longer.', correct: false },
+        { label: 'They normalise the patch vectors so their dot products stay bounded.', correct: false }
+      ],
+      explanation: 'Self-attention alone treats the input as a set. Adding a position embedding to each token is what turns the set of patches back into an ordered grid.'
+    },
+    {
+      id: 'vit-inductive-bias',
+      kind: 'choice',
+      prompt: 'What does a convolution have built in that a plain patch transformer must learn from data?',
+      options: [
+        { label: 'Locality and translation equivariance — nearby pixels matter, and a feature is the same wherever it appears.', correct: true },
+        { label: 'Global attention across the entire image in one layer.', correct: false },
+        { label: 'The softmax used to normalise the attention weights.', correct: false }
+      ],
+      explanation: 'A 3×3 convolution assumes locality and shares weights across positions, so it generalises from less data. A ViT has global attention from layer one but must discover locality and translation equivariance, which is why it is data-hungry.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

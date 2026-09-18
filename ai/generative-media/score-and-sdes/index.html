@@ -1,0 +1,523 @@
+---
+title: "The score function"
+description: "The score field drawn as arrows over a density, Langevin dynamics, the SMLD to DDPM equivalence, and the variance-exploding versus variance-preserving SDEs."
+permalink: "/ai/generative-media/score-and-sdes/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>The score function</h1>
+    <p>The previous parts trained a network to predict noise and ran it backwards. This part explains why that works at a deeper level: the noise prediction is, up to a known factor, the gradient of the log density of the data &mdash; a vector field that points uphill in probability everywhere. Once you can see that field, sampling becomes a walk that follows it, and the two great families of diffusion &mdash; variance-exploding and variance-preserving &mdash; become two ways of arranging the same walk.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="score">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>What the score is</h2></div>
+    <p class="g-eyebrow">The gradient of log density, and why anyone would learn it</p>
+    <p>For a density $p(x)$, the <em>score</em> is the vector field $\nabla_x \log p(x)$. It points in the direction in which the log density increases fastest, so following it climbs toward the modes. For a single Gaussian $\mathcal{N}(\mu, \sigma^2)$ there is nothing to compute &mdash; the score is $-(x-\mu)/\sigma^2$, a field of arrows all pointing straight at the mean with magnitude growing linearly with distance.</p>
+    <p>The reason score gets its own name is that it is often easier to estimate than the density itself. The density needs a normalising constant, which is an integral over everything and is generally intractable; the score does not, because the gradient of $\log Z$ is zero. That single observation is the foundation of score-based generative modelling: fit the gradient, never compute the constant, and never evaluate $p$ directly.</p>
+    <p>The difficulty is that in regions where the data are sparse, the score is badly estimated and the direction it gives is unreliable. The fix is to add noise: a noisy density has a smoother, better-behaved score, and if you anneal the noise down from large to small, the collection of scores at every level lets you walk from pure noise to data. That is exactly what the forward process was doing, and it is exactly what the network in part 3 was learning.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> read a score field, run Langevin dynamics by dragging a point, state the exact relation $\nabla\log p_t = -\varepsilon_\theta/\sqrt{1-\bar\alpha_t}$ between the denoiser and the score, and compare the VE and VP SDEs that formalise the whole picture.</span></div>
+    <div class="g-toc">
+      <a href="#langevin">2 · Langevin dynamics</a>
+      <a href="#denoiser">3 · The score is the denoiser</a>
+      <a href="#sdes">4 · VE versus VP SDEs</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="langevin">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Langevin dynamics</h2></div>
+    <p class="g-eyebrow">Drag the dot and watch it fall into a mode</p>
+    <p>If the score points uphill in probability, a point that repeatedly steps along it should find the modes. That is the idea of <em>Langevin dynamics</em>: take a gradient step, then add a little noise, and repeat. Written down, with a step size $\delta$,</p>
+    <p>$$ x_{k+1} = x_k + \delta\,\nabla_x\log p(x_k) + \sqrt{2\delta}\,z_k, \qquad z_k\sim\mathcal{N}(0,I) $$</p>
+    <p>The deterministic part climbs; the stochastic part stops the point from getting stuck at the top of a mode and lets it explore the whole distribution. The same $\sqrt{2\delta}$ balance that appears here reappears in the SDEs below, and it is not a liberty: with that coefficient, and only that coefficient, the stationary distribution of the walk is exactly $p$.</p>
+    <p>The demo draws the target density as blue shading and the score as a grid of arrows, coloured from grey (small) to blue (large). The pink dot is a starting point you can drag anywhere; the pink curve is 220 Langevin steps from that position. Drag it into a valley between two modes and watch it get pulled to one side by the field before the noise jitters it along.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sc-field-canvas" width="520" height="420"></canvas>
+        <p class="g-canvas-hint">Blue shading: the target density (three Gaussian modes). Arrows: the score field $\nabla\log p$. Pink curve: a Langevin walk from the draggable start dot.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Langevin step size <span class="val">0.05</span></label>
+          <input type="range" id="sc-step-size" min="0.005" max="0.15" step="0.005" value="0.05">
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="sc-reset">Reset start</button>
+        </div>
+        <div class="g-readout" id="sc-readout"></div>
+        <p class="g-mini">Drag the pink dot anywhere in the frame. The walk is recomputed from that point with a fixed seed, so the same start always gives the same path.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Step size is a real trade-off.</b> Too small and the walk crawls and never mixes; too large and each gradient step overshoots the mode and the walk flies off. The condition is roughly $\delta$ below the inverse of the largest curvature of $\log p$, and in high dimensions that is a serious constraint &mdash; which is why the noise-annealed multi-scale schedules exist in the first place.</span></div>
+  </section>
+
+  <section class="g-step" id="denoiser">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The score is the denoiser</h2></div>
+    <p class="g-eyebrow">One identity ties this part to the last three</p>
+    <p>Here is the bridge. The forward process gives a noisy density $p_t$ at every level, and for the Gaussian perturbation $q(x_t\mid x_0) = \mathcal{N}(\sqrt{\bar\alpha_t}\,x_0, (1-\bar\alpha_t)I)$ the score of the noisy density has a closed relation to the noise that was added:</p>
+    <p>$$ \nabla_{x_t}\log p_t(x_t) = -\,\frac{\mathbb{E}[\varepsilon \mid x_t]}{\sqrt{1-\bar\alpha_t}} = -\,\frac{\varepsilon_\theta(x_t,t)}{\sqrt{1-\bar\alpha_t}} $$</p>
+    <p>So a network trained to predict noise is a network trained to predict the score, up to one scalar that depends only on $t$. Nothing in part 3 needs to change; it was doing score matching the whole time under a different name. This equivalence is the SMLD-to-DDPM bridge: the older score-matching line of work learned $\nabla\log p$ with denoising autoencoders at a ladder of noise levels, and the diffusion line learned $\varepsilon$ at a ladder of timesteps, and the two are the same object rescaled.</p>
+    <p>The small plot below makes the rescaled factor visible. The curve is $-1/\sqrt{1-\bar\alpha_t}$, the multiplier that converts a unit noise prediction into a score, plotted against $\bar\alpha_t$. At high signal the factor is near one, so the two are almost the same number; near the end of the schedule it diverges, and that divergence is exactly the reason a sampler trained on noise predictions struggles to use them as scores at very low signal-to-noise ratio.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sc-eps-canvas" width="520" height="240"></canvas>
+        <p class="g-canvas-hint">The conversion factor $-1/\sqrt{1-\bar\alpha_t}$ as a function of $\bar\alpha_t$. The dashed line is the value selected by the slider.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>ᾱ_t <span class="val">0.8</span></label>
+          <input type="range" id="sc-ab" min="0" max="0.99" step="0.01" value="0.8">
+        </div>
+        <div class="g-readout" id="sc-eps-readout"></div>
+        <p class="g-mini">A unit noise prediction $\varepsilon=1$ becomes a score of $-1/\sqrt{1-\bar\alpha_t}$: a small number at high signal, a large one at low signal.</p>
+      </div>
+    </div>
+    <p>This identity also explains the sampler from the previous part. DDIM's deterministic update is a discretised ordinary differential equation whose drift is built from this score; DDPM's stochastic update adds the Langevin-style noise that keeps the walk at the right temperature. The two samplers are two ways of integrating the same field.</p>
+  </section>
+
+  <section class="g-step" id="sdes">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>VE versus VP SDEs</h2></div>
+    <p class="g-eyebrow">Two continuous-time limits of the same forward process</p>
+    <p>Take the number of forward steps to infinity and the discrete chain becomes a stochastic differential equation. Two parameterisations dominate the literature, and they differ in what they keep fixed as time runs.</p>
+    <ul>
+      <li><b>Variance-exploding (VE):</b> the drift is zero and only noise is added, $dx = g(t)\,dw$ with $g(t) = \sqrt{2\sigma(t)\sigma'(t)}$. The marginal variance grows without bound, so the process ends as pure noise of enormous amplitude &mdash; the choice of the SMLD line.</li>
+      <li><b>Variance-preserving (VP):</b> the drift is $-\tfrac12\beta(t)x$ and the diffusion is $\sqrt{\beta(t)}$, so signal is removed exactly as fast as noise is added and the marginal variance stays at one. This is the continuous limit of DDPM's forward chain.</li>
+    </ul>
+    <p>Both define a valid bridge from data to noise; both admit a reverse-time SDE driven by the score; and a sampler can be built from either. The demo plots the two quantities side by side, normalised so their shapes are comparable: either the marginal standard deviation as a function of time, or the diffusion coefficient $g(t)$ itself. Switch modes and move the slider to see how the choice of maximum noise scale reshapes the VE curve.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sc-sde-canvas" width="520" height="280"></canvas>
+        <p class="g-canvas-hint">VE in accent-2, VP in accent. Each curve is normalised to its own maximum so the shapes can be compared on one axis.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>VE σ_max <span class="val">50</span></label>
+          <input type="range" id="sc-sigma" min="5" max="200" step="5" value="50">
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="sc-mode-std" class="active">Marginal std</button>
+          <button type="button" id="sc-mode-coef">Diffusion coefficient</button>
+        </div>
+        <div class="g-readout" id="sc-sde-readout"></div>
+        <p class="g-mini">The two differ in more than shape. VE's score has magnitude proportional to $1/\sigma(t)$, so it explodes at small noise and needs careful weighting; VP's is bounded. That is why VP is the default for images and VE remains common for audio, where the dynamic range is enormous anyway.</p>
+      </div>
+    </div>
+    <p>A third parameterisation, the variance-preserving with a cosine schedule, is what most image models actually use; and flow matching, which the later parts of this volume cover, replaces the SDE entirely with a deterministic interpolation between noise and data. All of them are members of one family, and this part is the reason they can be compared at all.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One field, many samplers</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Probability in action</div>
+        <h3 style="margin:6px 0;">Langevin and MCMC</h3>
+        <p style="margin-bottom:0;">The walk you dragged is the same one that appears in Bayesian computation: Langevin and its Metropolis-adjusted cousin are workhorses of the <a href="{{ '/math/probability-in-action/bayesian-inference/' | relative_url }}">Bayesian inference chapter</a>. There the score comes from a likelihood; here it comes from a network, but the dynamics are identical.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Calculus</div>
+        <h3 style="margin:6px 0;">Gradient fields</h3>
+        <p style="margin-bottom:0;">A score is a gradient field, and the <a href="{{ '/math/calculus-in-motion/' | relative_url }}">calculus in motion guide</a> develops the machinery: gradient, divergence, and the continuous-time flows that the SDEs here describe. The reverse-time SDE is a Fokker&ndash;Planck problem in disguise.</p>
+      </div>
+    </div>
+    <p>This is the conceptual end of the first arc of the guide. The remaining parts take the same objects into practice: conditioning the score on a prompt, compressing the space so sampling is affordable, replacing the U-Net with a transformer, and extending the whole apparatus to video and audio. Every one of them assumes the picture on this page &mdash; a vector field you learn, and a walk you take through it.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The score-based line is older than diffusion and repays reading on its own terms. These references cover the field, the sampler, and the unification with diffusion, in that order.</p>
+    <p>If you read one, read the SDE paper: it is the paper in which all of the pieces in this volume finally became one piece.</p>
+    <ul class="g-refs">
+      <li>Yang Song and Stefano Ermon, <a href="https://arxiv.org/abs/1907.05600">"Generative Modeling by Estimating Gradients of the Data Distribution"</a>, 2019 &mdash; score matching with denoising and annealed Langevin sampling (SMLD).</li>
+      <li>Yang Song, Jascha Sohl-Dickstein and coauthors, <a href="https://arxiv.org/abs/2011.13456">"Score-Based Generative Modeling through Stochastic Differential Equations"</a>, 2020 &mdash; the VE/VP SDEs and the equivalence to DDPM.</li>
+      <li>Pascal Vincent, <a href="https://www.iro.umontreal.ca/~vincentp/Publications/denoising_autoencoders_icml_08.pdf">"Extracting and Composing Robust Features with Denoising Autoencoders"</a>, 2008 &mdash; the result that denoising learns the score.</li>
+      <li>Aapo Hyv&auml;rinen, <a href="https://www.cs.helsinki.fi/u/ahyvarin/papers/JMLR05.pdf">"Estimation of Non-Normalized Statistical Models by Score Matching"</a>, 2005 &mdash; the original score-matching objective.</li>
+      <li>Gareth Roberts and Richard Tweedie, <a href="https://projecteuclid.org/journals/bernoulli/volume-2/issue-4/Exponential-convergence-of-Langevin-distributions-and-their-discrete-approximations/10.2307/3318418.full">"Exponential Convergence of Langevin Distributions"</a>, 1996 &mdash; why the $\sqrt{2\delta}$ coefficient is the right one.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Score</td><td>$\nabla_x\log p(x)$; points uphill in log density, needs no normalising constant</td></tr>
+        <tr><td>Gaussian score</td><td>$-(x-\mu)/\sigma^2$</td></tr>
+        <tr><td>Langevin step</td><td>$x+\delta\,\nabla\log p+\sqrt{2\delta}\,z$; climbs with noise added</td></tr>
+        <tr><td>Denoiser identity</td><td>$\nabla\log p_t = -\varepsilon_\theta/\sqrt{1-\bar\alpha_t}$</td></tr>
+        <tr><td>VE SDE</td><td>Zero drift, exploding variance; $g=\sqrt{2\sigma\sigma'}$</td></tr>
+        <tr><td>VP SDE</td><td>Drift $-\tfrac12\beta x$, diffusion $\sqrt{\beta}$; variance stays one</td></tr>
+        <tr><td>Reverse SDE</td><td>Run the forward SDE backwards with the score as the correction term</td></tr>
+        <tr><td>Noise annealing</td><td>Use scores at many noise levels so the walk starts where the field is smooth</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the first arc of the guide: a distribution you draw, the noise that hides it, the network that undoes the noise, the loop that walks back, and the field underneath it all. The hub collects the next arc, where the same ideas are conditioned, compressed and scaled.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+  var CS = [[-1.7, -0.8], [1.6, 1.0], [0.0, -1.8]];
+  var SD = 0.5;
+  var pos = [2.6, 2.2];
+  var stepSize = 0.05;
+  var sdeMode = 'std';
+  var sigmaMax = 50;
+  var abValue = 0.8;
+  var vpSch = D.schedule('linear', 1000);
+
+  var fieldPlot = GM.plot(document.getElementById('sc-field-canvas'), {
+    W: 520, H: 420, xRange: [-4, 4], yRange: [-4, 4],
+    xLabel: 'x', yLabel: 'y', onResize: redrawField
+  });
+  var epsPlot = GM.plot(document.getElementById('sc-eps-canvas'), {
+    W: 520, H: 240, xRange: [0, 1], yRange: [0, 6],
+    xLabel: 'ᾱ_t', yLabel: '−1/√(1−ᾱ_t)', onResize: redrawEps
+  });
+  var sdePlot = GM.plot(document.getElementById('sc-sde-canvas'), {
+    W: 520, H: 280, xRange: [0, 1], yRange: [0, 1.05],
+    xLabel: 'fraction of the diffusion time', yLabel: 'normalised', onResize: redrawSde
+  });
+
+  var handle = null;
+
+  function responsibilities(x, y) {
+    var ls = [], i, maxL = -Infinity, tot = 0, w = [];
+    for (i = 0; i < CS.length; i++) {
+      var dx = x - CS[i][0], dy = y - CS[i][1];
+      var l = -(dx * dx + dy * dy) / (2 * SD * SD);
+      ls.push(l);
+      if (l > maxL) maxL = l;
+    }
+    for (i = 0; i < CS.length; i++) {
+      var e = Math.exp(ls[i] - maxL);
+      w.push(e);
+      tot += e;
+    }
+    for (i = 0; i < CS.length; i++) w[i] = w[i] / tot;
+    return w;
+  }
+
+  function scoreAt(x, y) {
+    var w = responsibilities(x, y), sx = 0, sy = 0, i;
+    for (i = 0; i < CS.length; i++) {
+      sx += w[i] * D.gaussScore(x, CS[i][0], SD);
+      sy += w[i] * D.gaussScore(y, CS[i][1], SD);
+    }
+    return [sx, sy];
+  }
+
+  function densityAt(x, y) {
+    var s = 0, i;
+    for (i = 0; i < CS.length; i++) {
+      var dx = x - CS[i][0], dy = y - CS[i][1];
+      s += Math.exp(-(dx * dx + dy * dy) / (2 * SD * SD));
+    }
+    return s;
+  }
+
+  function langevinPath() {
+    var r = GM.rng(777);
+    var x = pos[0], y = pos[1];
+    var path = [[x, y]], i;
+    for (i = 0; i < 220; i++) {
+      var s = scoreAt(x, y);
+      var nx = D.langevinStep(x, s[0], stepSize, r);
+      var ny = D.langevinStep(y, s[1], stepSize, r);
+      if (!isFinite(nx) || !isFinite(ny)) break;
+      x = nx; y = ny;
+      path.push([x, y]);
+    }
+    return path;
+  }
+
+  function redrawField() {
+    if (!fieldPlot) return;
+    fieldPlot.clear();
+    fieldPlot.raw(function (ctx) {
+      var cell = 7, X, Y;
+      for (X = 0; X + cell <= fieldPlot.plotW; X += cell) {
+        for (Y = 0; Y + cell <= fieldPlot.plotH; Y += cell) {
+          var wx = fieldPlot.wx(fieldPlot.padL + X + cell / 2);
+          var wy = fieldPlot.wy(fieldPlot.padT + Y + cell / 2);
+          var dd = densityAt(wx, wy);
+          if (dd < 0.02) continue;
+          ctx.fillStyle = 'rgba(43,95,255,' + Math.min(0.34, dd * 0.3) + ')';
+          ctx.fillRect(fieldPlot.padL + X, fieldPlot.padT + Y, cell, cell);
+        }
+      }
+    });
+    fieldPlot.axes({ xLabel: 'x', yLabel: 'y' });
+
+    var g = 13, i, j, xs = [], ys = [], grid = [], maxMag = 0;
+    for (i = 0; i <= g; i++) { xs.push(-3.6 + 7.2 * i / g); ys.push(-3.6 + 7.2 * i / g); }
+    for (i = 0; i < xs.length; i++) {
+      var row = [];
+      for (j = 0; j < ys.length; j++) {
+        var s = scoreAt(xs[i], ys[j]);
+        var mag = Math.hypot(s[0], s[1]);
+        row.push({ x: xs[i], y: ys[j], s: s, mag: mag });
+        if (mag > maxMag) maxMag = mag;
+      }
+      grid.push(row);
+    }
+    var scale = 0.42 / Math.max(maxMag, 1e-6);
+    fieldPlot.raw(function (ctx) {
+      for (var a = 0; a < grid.length; a++) {
+        for (var b = 0; b < grid[a].length; b++) {
+          var node = grid[a][b];
+          if (node.mag < 0.06) continue;
+          var x2 = node.x + node.s[0] * scale;
+          var y2 = node.y + node.s[1] * scale;
+          Guide.drawArrow(ctx, fieldPlot.px(node.x), fieldPlot.py(node.y), fieldPlot.px(x2), fieldPlot.py(y2),
+            { color: Guide.lerpColor('#c6c9cf', c.accent, Math.min(1, node.mag / maxMag)), width: 1.1, head: 4 });
+        }
+      }
+    });
+
+    var path = langevinPath();
+    fieldPlot.curve(path, { color: c.accent2, width: 2 });
+    if (handle) handle.draw();
+    fieldPlot.legend([
+      { label: 'density', color: '#9dbcff', fill: true },
+      { label: 'score ∇ log p', color: c.accent },
+      { label: 'Langevin walk', color: c.accent2 },
+      { label: 'draggable start', color: c.accent2 }
+    ], { dy: 6 });
+    redrawFieldReadout(path);
+  }
+
+  function redrawFieldReadout(path) {
+    var el = document.getElementById('sc-readout');
+    if (!el) return;
+    var end = path[path.length - 1];
+    var s = scoreAt(pos[0], pos[1]);
+    el.innerHTML =
+      '<div><span class="k">start</span> (' + pos[0].toFixed(2) + ', ' + pos[1].toFixed(2) + ')</div>' +
+      '<div><span class="k">score at start</span> (' + s[0].toFixed(2) + ', ' + s[1].toFixed(2) + ')</div>' +
+      '<div><span class="k">|score|</span> ' + Math.hypot(s[0], s[1]).toFixed(3) + '</div>' +
+      '<div><span class="k">step size δ</span> ' + stepSize.toFixed(3) + '</div>' +
+      '<div><span class="k">steps</span> ' + (path.length - 1) + '</div>' +
+      '<div><span class="k">final point</span> <span class="hi">(' + end[0].toFixed(2) + ', ' + end[1].toFixed(2) + ')</span></div>' +
+      '<div class="g-mini">' + nearestModeText(end) + '</div>';
+  }
+
+  function nearestModeText(p) {
+    var best = 0, bd = Infinity, i;
+    for (i = 0; i < CS.length; i++) {
+      var d = Math.hypot(p[0] - CS[i][0], p[1] - CS[i][1]);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return 'Ends near mode ' + (best + 1) + ' at (' + CS[best][0] + ', ' + CS[best][1] + ').';
+  }
+
+  function redrawEps() {
+    if (!epsPlot) return;
+    epsPlot.clear();
+    epsPlot.yRange[0] = 0;
+    epsPlot.yRange[1] = 6;
+    epsPlot.axes({ xLabel: 'ᾱ_t', yLabel: '−1/√(1−ᾱ_t)' });
+    epsPlot.curve(function (a) { return 1 / Math.sqrt(Math.max(1e-6, 1 - a)); }, { color: c.accent2, width: 2 });
+    epsPlot.vline(abValue, { color: c.text, dashed: true, width: 1.2 });
+    var sc = D.scoreFromEps(1, abValue);
+    epsPlot.text('score = ' + sc.toFixed(2), abValue, 5.3, { align: 'left', dx: 6, color: c.text });
+    epsPlot.legend([{ label: 'multiplier from ε = 1 to score', color: c.accent2 }], { dy: 6 });
+    var el = document.getElementById('sc-eps-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">ᾱ_t</span> ' + abValue.toFixed(2) + '</div>' +
+        '<div><span class="k">√(1−ᾱ_t)</span> ' + Math.sqrt(Math.max(0, 1 - abValue)).toFixed(4) + '</div>' +
+        '<div><span class="k">ε = 1 → score</span> <span class="hi">' + sc.toFixed(3) + '</span></div>' +
+        '<div class="g-mini">' + (abValue > 0.9 ? 'High signal: the score and the noise prediction nearly coincide.' : 'Lower signal: the same noise prediction means a much larger score.') + '</div>';
+    }
+  }
+
+  function normalise(arr) {
+    var m = 0, i;
+    for (i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i];
+    if (m < 1e-12) return arr.slice();
+    return arr.map(function (v) { return v / m; });
+  }
+
+  function redrawSde() {
+    if (!sdePlot) return;
+    sdePlot.clear();
+    sdePlot.yRange[0] = 0;
+    sdePlot.yRange[1] = 1.05;
+    sdePlot.axes({
+      xLabel: 'fraction of the diffusion time',
+      yLabel: sdeMode === 'std' ? 'marginal std (normalised)' : 'diffusion coefficient (normalised)'
+    });
+    var N = 140, i;
+    var sMin = 0.01, sMax = sigmaMax, lnr = Math.log(sMax / sMin);
+    var veStd = [], vpStd = [], veCoef = [], vpCoef = [];
+    for (i = 0; i <= N; i++) {
+      var u = i / N;
+      var sigma = sMin * Math.exp(lnr * u);
+      var sigmaDot = sigma * lnr;
+      var g = D.veDiffusion(sigma, sigmaDot);
+      var idx = Math.max(0, Math.min(999, Math.round(u * 1000) - 1));
+      var betaT = vpSch.betas[idx];
+      var vpMarg = Math.sqrt(Math.max(0, 1 - vpSch.alphaBar[idx]));
+      veStd.push(sigma);
+      vpStd.push(vpMarg);
+      veCoef.push(g);
+      vpCoef.push(D.vpDiffusion(betaT));
+    }
+    var veCurve = normalise(sdeMode === 'std' ? veStd : veCoef);
+    var vpCurve = normalise(sdeMode === 'std' ? vpStd : vpCoef);
+    var vePts = [], vpPts = [];
+    for (i = 0; i <= N; i++) {
+      vePts.push([i / N, veCurve[i]]);
+      vpPts.push([i / N, vpCurve[i]]);
+    }
+    sdePlot.curve(vpPts, { color: c.accent, width: 2 });
+    sdePlot.curve(vePts, { color: c.accent2, width: 2 });
+    sdePlot.legend([
+      { label: sdeMode === 'std' ? 'VE marginal std σ(t)' : 'VE diffusion g(t)', color: c.accent2 },
+      { label: sdeMode === 'std' ? 'VP marginal std' : 'VP diffusion √β(t)', color: c.accent }
+    ], { dy: 6 });
+    var mid = Math.round(N / 2);
+    var veVal = sdeMode === 'std' ? veStd[mid] : veCoef[mid];
+    var vpVal = sdeMode === 'std' ? vpStd[mid] : vpCoef[mid];
+    var el = document.getElementById('sc-sde-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">mode</span> ' + (sdeMode === 'std' ? 'marginal std' : 'diffusion coefficient') + '</div>' +
+        '<div><span class="k">σ_max</span> ' + sigmaMax + '</div>' +
+        '<div><span class="k">mid-time VE</span> ' + veVal.toFixed(4) + '</div>' +
+        '<div><span class="k">mid-time VP</span> ' + vpVal.toFixed(4) + '</div>' +
+        '<div class="g-mini">VE ends far from where it started; VP saturates at one because signal is removed as fast as noise is added.</div>';
+    }
+  }
+
+  function refresh() {
+    redrawField();
+    redrawEps();
+    redrawSde();
+  }
+
+  handle = fieldPlot ? fieldPlot.handles(
+    function () { return [{ id: 'start', x: pos[0], y: pos[1], r: 9, color: c.accent2, label: 'start' }]; },
+    function (id, wx, wy) {
+      if (!isFinite(wx) || !isFinite(wy)) return;
+      pos = [Math.max(-4, Math.min(4, wx)), Math.max(-4, Math.min(4, wy))];
+      redrawField();
+    },
+    { cursor: 'grab' }
+  ) : null;
+
+  var resetBtn = document.getElementById('sc-reset');
+  if (resetBtn) resetBtn.addEventListener('click', function () { pos = [2.6, 2.2]; redrawField(); });
+
+  function setMode(m) {
+    sdeMode = m;
+    var a = document.getElementById('sc-mode-std');
+    var b = document.getElementById('sc-mode-coef');
+    if (a) a.className = (m === 'std') ? 'active' : '';
+    if (b) b.className = (m === 'coef') ? 'active' : '';
+    redrawSde();
+  }
+  var modeStd = document.getElementById('sc-mode-std');
+  if (modeStd) modeStd.addEventListener('click', function () { setMode('std'); });
+  var modeCoef = document.getElementById('sc-mode-coef');
+  if (modeCoef) modeCoef.addEventListener('click', function () { setMode('coef'); });
+
+  Guide.bindSliders(document.querySelectorAll('#sc-step-size'), function (el) {
+    stepSize = parseFloat(el.value);
+    redrawField();
+  });
+  Guide.bindSliders(document.querySelectorAll('#sc-sigma'), function (el) {
+    sigmaMax = parseFloat(el.value);
+    redrawSde();
+  });
+  Guide.bindSliders(document.querySelectorAll('#sc-ab'), function (el) {
+    abValue = parseFloat(el.value);
+    redrawEps();
+  });
+
+  refresh();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'score-definition',
+      kind: 'choice',
+      prompt: 'Why is the score $\\nabla_x\\log p(x)$ often easier to work with than the density $p(x)$ itself?',
+      options: [
+        { label: 'The normalising constant divides out under the gradient, so it never has to be computed.', correct: true },
+        { label: 'Because the score is always bounded while the density can be zero.', correct: false },
+        { label: 'Because the score is a scalar and the density is a vector.', correct: false }
+      ],
+      explanation: 'Taking the gradient of $\\log p$ removes the intractable normaliser $Z$, since $\\nabla\\log Z = 0$. That is the whole motivation for score-based modelling: learn the field, never evaluate the density.'
+    },
+    {
+      id: 'score-gaussian',
+      kind: 'numeric',
+      prompt: 'For a Gaussian $\\mathcal{N}(\\mu=2,\\ \\sigma=0.5)$, what is the score at $x = 3$?',
+      answer: -4,
+      tolerance: 0.001,
+      explanation: 'The Gaussian score is $-(x-\\mu)/\\sigma^2 = -(3-2)/0.25 = -4$. The point lies above the mean, so the field pushes it back down, with magnitude growing linearly in distance and inversely in variance.'
+    },
+    {
+      id: 'score-langevin-noise',
+      kind: 'choice',
+      prompt: 'Why does the Langevin update add $\\sqrt{2\\delta}\\,z$ rather than some arbitrary noise?',
+      options: [
+        { label: 'With exactly that coefficient the stationary distribution of the walk is the target density p.', correct: true },
+        { label: 'Any noise works, and this one is just numerically convenient.', correct: false },
+        { label: 'The noise cancels the gradient step so the point stays put.', correct: false }
+      ],
+      explanation: 'The balance between the drift $\\delta\\nabla\\log p$ and the noise $\\sqrt{2\\delta}\\,z$ is what makes $p$ the stationary distribution. Change the noise coefficient and you sample from a different, temperature-scaled distribution.'
+    },
+    {
+      id: 'score-denoiser-identity',
+      kind: 'choice',
+      prompt: 'What is the exact relation between the trained noise network and the score of the noisy density?',
+      options: [
+        { label: '$\\nabla\\log p_t(x_t) = -\\varepsilon_\\theta(x_t,t)/\\sqrt{1-\\bar\\alpha_t}$', correct: true },
+        { label: '$\\nabla\\log p_t(x_t) = \\varepsilon_\\theta(x_t,t)\\,\\sqrt{\\bar\\alpha_t}$', correct: false },
+        { label: 'There is no exact relation; the two are trained separately.', correct: false }
+      ],
+      explanation: 'The two differ by the scalar $1/\\sqrt{1-\\bar\\alpha_t}$, which depends only on $t$. This identity is the SMLD-to-DDPM bridge: denoising and score matching are the same objective rescaled.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

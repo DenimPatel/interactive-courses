@@ -1,0 +1,659 @@
+---
+title: "LLM Serving, Interactively — Reference: Glossary & numbers to know"
+description: "Every term in the LLM Serving guide linked back to where it is introduced, plus the accelerator, model, quantization, engine and pricing tables."
+permalink: "/ai/llm-serving/glossary/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .glo-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .g-letter td {
+    font-family: var(--font-heading); font-weight: 600; font-size: 12px; letter-spacing: 0.08em;
+    text-transform: uppercase; opacity: 0.6; background: var(--color-surface);
+  }
+  .g-term td:first-child { font-weight: 600; white-space: nowrap; }
+  .g-term.g-hide, .g-letter.g-hide { display: none; }
+  #glo-filter { max-width: 460px; }
+  .glo-count { font-family: var(--font-mono); }
+  .glo-formula .g-math { margin-bottom: 6px; }
+  .glo-formula h3 { margin: 0 0 4px; font-size: 14px; }
+  .glo-formula p { margin: 0; font-size: 12.5px; opacity: 0.8; line-height: 1.55; }
+  .glo-num { font-family: var(--font-mono); }
+  .glo-kv-total { font-weight: 600; color: var(--color-accent-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Reference</span>
+    <h1>Glossary &amp; numbers to know</h1>
+    <p>This is the serving guide's back matter: one alphabetical index that links every term to the part that introduces it, the sourced tables the rest of the series cites, and a formula card for the back-of-envelope arithmetic. It is the serving-side counterpart to the <a href="{{ '/ai/llm-training/glossary/' | relative_url }}">training guide's glossary</a>, which defines the modelling ideas; here the emphasis is the number, the failure mode and the deployment shape.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="accelerators">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Accelerators: the bandwidth table</h2></div>
+    <p class="g-eyebrow">Capacity, bandwidth, FLOPs, fabric, power</p>
+    <p>A serving system is bounded below by the memory bandwidth of the chip it runs on. HBM capacity decides how many KV blocks fit and therefore how many sequences can be resident; bandwidth decides how fast a decode step can sweep the weights and the cache; peak FLOPs set the prefill ceiling; the interconnect decides whether you may shard at all. Read the table by asking which column is smallest for your workload. A single-stream decode job is almost always bandwidth-bound, so <span class="glo-num">bwTBs</span> is the number that predicts tokens per second; a long-prompt prefill job is compute-bound, so <span class="glo-num">bf16TFLOPs</span> and <span class="glo-num">fp8TFLOPs</span> matter more; a multi-node tensor-parallel deployment lives or dies on the fabric column.</p>
+    <p>The NVIDIA headline FLOPs in the upstream source include 2:4 sparsity, so the dense values rendered here are half the press-release number. AMD and Google publish dense figures directly. A dash means the format is not natively supported by that part, which is why FP4 is a Blackwell story and FP8 is a Hopper-and-later story.</p>
+    <div class="glo-table-wrap">
+      <table class="g-cheat" id="glo-acc-table">
+        <thead><tr><th>Accelerator</th><th>HBM</th><th>BW</th><th>BF16</th><th>FP8</th><th>FP4</th><th>Interconnect</th><th>TDP</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="glo-acc-source"></p>
+  </section>
+
+  <section class="g-step" id="models">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Models and their KV configurations</h2></div>
+    <p class="g-eyebrow">The two numbers that drive a capacity plan</p>
+    <p>Model parameters set the weight bytes a decode step must read; KV bytes per token set how many sequences fit beside those weights. Both are computed from public configs, not estimated. For an MHA or GQA model the per-token cache is <span class="glo-num">2 &times; layers &times; n_kv_heads &times; d_head &times; 2 bytes</span> &mdash; the leading 2 for K and V, the trailing 2 for FP16. <strong>MLA</strong> breaks the formula because it caches a single low-rank latent plus a decoupled RoPE key, and <strong>SWA-hybrid</strong> models bound the cache at the sliding-window length instead of letting it grow linearly, so read their rows as ceilings rather than rates. The KV bytes column is the one the concurrency calculators in the series use; multiply by context length and concurrency to see whether a model fits.</p>
+    <div class="glo-table-wrap">
+      <table class="g-cheat" id="glo-model-table">
+        <thead><tr><th>Model</th><th>Layers</th><th>Q heads</th><th>KV heads</th><th>d_head</th><th>Scheme</th><th>KV per token (FP16)</th><th>Params total / active</th><th>Context</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="glo-model-source"></p>
+  </section>
+
+  <section class="g-step" id="formulas">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Back-of-envelope formulas</h2></div>
+    <p class="g-eyebrow">Six expressions that explain most serving behaviour</p>
+    <p>Every interactive demo in the series is a version of one of these. Keep them in a notebook; they are accurate to a factor you can reason about, which is the point. Bytes per element is written <span class="glo-num">&beta;</span> and equals 2 for BF16/FP16, 1 for FP8/INT8 and 0.5 for INT4.</p>
+    <div class="g-grid2">
+      <div class="g-card glo-formula reveal">
+        <h3>KV bytes</h3>
+        <div class="g-math g-katex">$$\text{KV bytes} \;=\; 2\,L\,H_{kv}\,d_{head}\,T\,b\,\beta$$</div>
+        <p>L layers, H<sub>kv</sub> KV heads, head width d<sub>head</sub>, T cached tokens, batch b. For MLA replace <span class="glo-num">2 H<sub>kv</sub> d<sub>head</sub></span> with the cached latent width (576 for DeepSeek-V3).</p>
+      </div>
+      <div class="g-card glo-formula reveal">
+        <h3>Step time</h3>
+        <div class="g-math g-katex">$$T_{\text{step}} \;\approx\; \max\!\left(\frac{P\,b_p + \text{KV}_{\text{read}}}{\text{BW}},\; \frac{\text{FLOPs}}{\text{Peak}}\right) + T_{\text{overhead}}$$</div>
+        <p>The max of the memory-bound and compute-bound terms, plus launch and synchronization overhead. Decode at small batch is memory-bound; prefill is compute-bound.</p>
+      </div>
+      <div class="g-card glo-formula reveal">
+        <h3>Expected speculative tokens</h3>
+        <div class="g-math g-katex">$$\mathbb{E}[\text{tokens}] \;=\; \frac{1-\alpha^{\gamma+1}}{1-\alpha}$$</div>
+        <p>Per draft round with acceptance rate &alpha; and &gamma; draft tokens: 1 + &alpha; + &alpha;<sup>2</sup> + &hellip; + &alpha;<sup>&gamma;</sup>. At &alpha;=0.8 and &gamma;=4 the round yields about 3.36 tokens.</p>
+      </div>
+      <div class="g-card glo-formula reveal">
+        <h3>Pipeline bubble fraction</h3>
+        <div class="g-math g-katex">$$\text{bubble} \;=\; \frac{p-1}{m+p-1}$$</div>
+        <p>p pipeline stages and m microbatches. The fraction of stage-time spent idle while the pipe fills and drains; it vanishes only as m grows large.</p>
+      </div>
+      <div class="g-card glo-formula reveal">
+        <h3>All-reduce bytes</h3>
+        <div class="g-math g-katex">$$\text{bytes/GPU} \;=\; 2\cdot\frac{N-1}{N}\cdot S$$</div>
+        <p>Ring all-reduce moving message size S across N ranks. The factor 2 is the reduce-scatter plus all-gather; it is the per-step tax every TP group pays.</p>
+      </div>
+      <div class="g-card glo-formula reveal">
+        <h3>Goodput</h3>
+        <div class="g-math g-katex">$$G \;=\; \frac{1}{T}\sum_{r} \mathbb{1}\!\left[\text{TTFT}_r \le \text{SLO}_{\text{ttft}} \;\wedge\; \text{TPOT}_r \le \text{SLO}_{\text{tpot}}\right]$$</div>
+        <p>Requests per second that satisfy both latency limits. Raw throughput counts work you cannot bill for; goodput counts only the work that met its contract.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="glossary">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Glossary</h2></div>
+    <p class="g-eyebrow">Every term, linked to the part that introduces it</p>
+    <div class="g-goal">💡 <span><b>Filter the list.</b> Type any fragment &mdash; a term, a number, a technology &mdash; and the table hides non-matching rows and reports how many remain. Matching is case-insensitive and looks at both the term and its definition.</span></div>
+    <div class="g-field">
+      <label>Filter terms <span class="val glo-count" id="glo-count">—</span></label>
+      <input type="text" id="glo-filter" placeholder="e.g. cache, scheduler, FP8, all-reduce" autocomplete="off" spellcheck="false" aria-label="Filter glossary terms">
+    </div>
+    <div class="glo-table-wrap">
+      <table class="g-cheat" id="glo-table">
+        <thead><tr><th>Term</th><th>What it means</th><th>Introduced in</th></tr></thead>
+        <tbody>
+          <tr class="g-letter"><td colspan="3">A</td></tr>
+          <tr class="g-term"><td>Acceptance rate</td><td>Expected fraction of speculative draft tokens the target model accepts in a verification pass; the single number that decides whether speculation pays.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>Accelerator zoo</td><td>The GPU/TPU/Trainium landscape compared by HBM, bandwidth, FLOPs and interconnect rather than by brand.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>Activation outlier</td><td>A few input channels whose values dwarf the rest, setting a coarse step for every ordinary channel under per-tensor scaling.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>Active parameters</td><td>Parameters actually touched per token in a mixture-of-experts model (37B of 671B for DeepSeek-V3), as distinct from the total resident.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Admission control</td><td>Deciding whether to accept a request into the running set or shed it, based on KV headroom, capacity and the SLO.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Aging</td><td>Increasing a waiting request's effective priority over time so that long jobs cannot starve behind a stream of short ones.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>All-reduce</td><td>Summing a tensor across ranks and broadcasting the result; the synchronization every tensor-parallel step pays.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>All-to-all</td><td>Every rank exchanges a different slice with every other rank; the dispatch/combine primitive of expert parallelism.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Arithmetic intensity</td><td>FLOPs performed per byte moved; about 1&ndash;2 for a decode step and far higher for prefill, which is why the two live in different regimes of the roofline.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Attention sink</td><td>The first few tokens that absorb a disproportionate share of attention and must be kept for stability when the cache is trimmed.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">B</td></tr>
+          <tr class="g-term"><td>Backpressure</td><td>Returning a 429 or slowing the client instead of letting an unbounded queue convert overload into an SLO breach for everyone.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Batch invariance</td><td>Whether a request's output is bit-identical regardless of the other requests it was batched with; it is not, because floating-point addition is not associative.</td><td><a href="{{ '/ai/llm-serving/economics/' | relative_url }}">Part 20</a></td></tr>
+          <tr class="g-term"><td>Batch size (max_num_seqs)</td><td>How many sequences the engine runs per iteration; the knob that moves a step from memory-bound toward compute-bound.</td><td><a href="{{ '/ai/llm-serving/batching/' | relative_url }}">Part 6</a></td></tr>
+          <tr class="g-term"><td>Block manager</td><td>The allocator mapping a sequence's logical token positions to physical KV blocks, and the component preemption calls into.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Block size</td><td>Tokens per KV page, conventionally 16; the granularity at which internal fragmentation is paid.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Block table</td><td>The per-sequence array that translates logical block indices to physical block indices, so paged KV needs no contiguity.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Bottleneck (memory vs compute)</td><td>Which resource limits a step; decode is memory-bandwidth-bound, prefill is compute-bound, and batch size moves the crossing point.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">C</td></tr>
+          <tr class="g-term"><td>Cache hit rate</td><td>Fraction of prompt tokens whose KV was already resident; the statistic that turns prefix caching from an optimisation into a throughput multiplier.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Cache-aware routing</td><td>Sending a request to the replica that already holds its prefix instead of the least-loaded one.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Calibration</td><td>Running representative data through the model to measure activation ranges before quantizing; the ranges are data-dependent, so this is not really post-training.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>Capacity planning</td><td>Converting an RPS and latency target into GPUs and dollars, including the queueing headroom the mean hides.</td><td><a href="{{ '/ai/llm-serving/economics/' | relative_url }}">Part 20</a></td></tr>
+          <tr class="g-term"><td>Chunked prefill</td><td>Splitting a long prompt's prefill across iterations so decode requests are not stalled for the whole prompt's compute time.</td><td><a href="{{ '/ai/llm-serving/batching/' | relative_url }}">Part 6</a></td></tr>
+          <tr class="g-term"><td>Cold start</td><td>The 40&ndash;90 s from pod schedule to first token: image pull, process init, weight load, graph capture and warmup.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Compute-bound</td><td>Step time set by FLOPs rather than bytes; the high-batch and long-prefill regime.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Connector (KV)</td><td>The transport that ships a finished prefill's KV blocks to a decode worker, often over RDMA or NIXL.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>Context length</td><td>Tokens the model can attend to; KV memory and decode cost grow linearly with it while prefill cost grows quadratically.</td><td><a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a></td></tr>
+          <tr class="g-term"><td>Context parallelism (CP)</td><td>Splitting the sequence dimension across devices so a long context's attention and KV fit, with activations passed around the ring.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Continuous batching</td><td>Admitting and retiring sequences every iteration rather than per fixed batch, so a slow request never idles a whole batch.</td><td><a href="{{ '/ai/llm-serving/batching/' | relative_url }}">Part 6</a></td></tr>
+          <tr class="g-term"><td>Copy-on-write</td><td>Two sequences share a physical KV block until one writes, at which point the block is copied; how shared prefixes are stored once.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Cost per task</td><td>Dollars per completed task rather than per token; the number a budget actually sees once retries and thinking tokens are counted.</td><td><a href="{{ '/ai/llm-serving/economics/' | relative_url }}">Part 20</a></td></tr>
+          <tr class="g-term"><td>CUDA graph</td><td>A captured sequence of kernel launches replayed as a single operation to remove per-launch CPU overhead from a decode step.</td><td><a href="{{ '/ai/llm-serving/engine/' | relative_url }}">Part 9</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">D</td></tr>
+          <tr class="g-term"><td>Data parallelism (DP)</td><td>Replicating the model and splitting requests across copies; the default until weights no longer fit one device.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Decode</td><td>Generating one token at a time, memory-bandwidth-bound because every step sweeps the weights through HBM.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Decode worker</td><td>The pool in a disaggregated deployment that holds KV and generates tokens after prefill has produced it.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>DeepEP</td><td>DeepSeek's open-source MoE communication library implementing grouped all-to-all dispatch and combine.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Defragmentation</td><td>Reclaiming scattered free KV blocks, or moving pages so there is no need to; paging turns this from a stop-the-world op into an allocation detail.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Disaggregation (PD)</td><td>Running prefill and decode in separate pools, each sized for its own bottleneck, with KV transferred between them.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>Distributed KV cache</td><td>Partitioning a long context's KV across devices, for example with ring attention, so no single GPU holds all of it.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>DP-attention</td><td>Combining data parallelism with attention sharding so KV is not replicated across replicas, trading communication for capacity.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Draft model</td><td>The small model that proposes speculative tokens for the target model to verify; its agreement rate sets the speedup.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>Draft tree</td><td>Several candidate continuations explored in parallel and verified together, as in EAGLE and Medusa.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>DuoAttention</td><td>Keeping full KV for a small set of retrieval heads and constant-length KV for streaming heads; up to 2.18&times; decode speedup for MHA.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">E</td></tr>
+          <tr class="g-term"><td>EAGLE</td><td>Speculative decoding that drafts in the target model's feature space; EAGLE-2 reports 3.05&ndash;4.26&times; and EAGLE-3 up to 6.5&times;.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>End-to-end latency</td><td>Arrival to last token: queueing plus prefill plus decode, and the number a streaming UI hides behind TTFT.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Energy per token</td><td>Joules per generated token, roughly power &times; step time divided by tokens per step; the metric that makes rack power a serving variable.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>Engine</td><td>The serving software &mdash; vLLM, SGLang, TensorRT-LLM, llama.cpp &mdash; that schedules requests and runs the kernels.</td><td><a href="{{ '/ai/llm-serving/engine/' | relative_url }}">Part 9</a></td></tr>
+          <tr class="g-term"><td>EPLB</td><td>Expert-parallel load balancer: replicates hot experts onto less-loaded ranks to even out MoE traffic; roughly a 20% recovery is cited for DeepSeek-V3-class deployments.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Eviction (KV)</td><td>Dropping low-value KV entries to cap cache size, whether by attention score, recency or query relevance.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Expert</td><td>One of many parallel MLPs that a router selects per token; the unit sharded by expert parallelism.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Expert parallelism (EP)</td><td>Sharding experts across devices, one or more per rank, and paying an all-to-all to dispatch tokens and combine results.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Expert router</td><td>The gate that scores a token and picks the top-k experts to handle it; its load distribution is what makes hot experts a problem.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">F</td></tr>
+          <tr class="g-term"><td>Fair queueing</td><td>Scheduling that gives each tenant a bounded share under contention, so one workload cannot consume the fleet.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>FCFS</td><td>First-come-first-served ordering; simple and starvation-free, but one long request blocks everything behind it.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>First-token latency</td><td>Another name for TTFT, usefully split into queueing time and prefill time when diagnosing a regression.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>FlashAttention</td><td>IO-aware attention that tiles Q, K and V through SRAM instead of materializing the full attention matrix in HBM.</td><td><a href="{{ '/ai/llm-serving/engine/' | relative_url }}">Part 9</a></td></tr>
+          <tr class="g-term"><td>FP4</td><td>4-bit floating point, native on Blackwell at 0.5 bytes per parameter; the format that makes B200's FP4 peak a headline.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>FP8 (E4M3 / E5M2)</td><td>8-bit floating point, native on Hopper and Blackwell; E4M3 with per-block scaling is DeepSeek-V3's serving format.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>Fragmentation</td><td>Wasted KV memory from rounding a sequence up to a block boundary or from gaps between reserved regions.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>FSM (finite state machine)</td><td>The automaton a regular expression compiles to; its current state indexes the set of legal next tokens.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">G</td></tr>
+          <tr class="g-term"><td>Gateway</td><td>The front door that authenticates, rate-limits, observes and routes requests before any GPU sees them.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Goodput</td><td>Requests per second that meet their latency SLOs; raw throughput counts work you cannot bill for.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>GPU utilization</td><td>Fraction of time SMs are busy; routinely near 100% while goodput is poor, which is why it is a lie as a serving signal.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Graph capture</td><td>Recording a decode iteration's kernel launches into a CUDA graph so replay costs one launch instead of dozens.</td><td><a href="{{ '/ai/llm-serving/engine/' | relative_url }}">Part 9</a></td></tr>
+          <tr class="g-term"><td>Graph reuse</td><td>Caching captured CUDA graphs across process starts to remove graph-capture time from a cold start.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>GQA</td><td>Grouped-query attention: several query heads share one KV head, cutting KV by 8&times; at Llama-3-70B geometry with little quality loss.</td><td><a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">H</td></tr>
+          <tr class="g-term"><td>H2O</td><td>KV eviction that keeps a small set of heavy-hitter tokens plus recent ones; up to 29&times; throughput over naive baselines.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>HBM</td><td>High-bandwidth memory: its capacity caps concurrency, its bandwidth caps decode speed, and both are read from the accelerator table.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>Head dimension</td><td>Width of one attention head's vectors; it multiplies directly into KV bytes per token.</td><td><a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a></td></tr>
+          <tr class="g-term"><td>Head-of-line blocking</td><td>One long request delaying all the shorter ones queued behind it, the failure FCFS invites.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Heavy hitter</td><td>A token that receives disproportionate attention and is therefore worth keeping when the cache must shrink.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Hidden state</td><td>The residual-stream vector each layer reads and writes; the tensor whose size the weights matrix multiplies per token.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Hot expert</td><td>An expert that receives far more tokens than average; the top few percent of experts absorb a large share of traffic, which EPLB targets.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">I</td></tr>
+          <tr class="g-term"><td>ICI</td><td>The TPU interconnect; Google's analogue of NVLink and the fabric that decides whether a TPU shard communicates cheaply.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>Image tokens</td><td>Vision input expanded into context tokens; large, prefill-heavy and a reason multimodal workloads invert the prefill/decode ratio.</td><td><a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a></td></tr>
+          <tr class="g-term"><td>In-flight batching</td><td>TensorRT-LLM's name for continuous batching: sequences enter and leave the running set mid-flight.</td><td><a href="{{ '/ai/llm-serving/engine/' | relative_url }}">Part 9</a></td></tr>
+          <tr class="g-term"><td>Interconnect</td><td>The link (NVLink, NVSwitch, ICI, NeuronLink) that determines whether tensor and expert parallelism pay for themselves.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>Inter-token latency (ITL)</td><td>The gap between consecutive output tokens; the inverse of TPOT and the number a chat user actually perceives as speed.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">J</td></tr>
+          <tr class="g-term"><td>JSON schema</td><td>The grammar that constrains generation to a valid structure; the commonest reason structured decoding is deployed.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>Jump-forward decoding</td><td>Emitting a run of forced tokens at once when the grammar admits only one continuation, rather than one step at a time.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">K</td></tr>
+          <tr class="g-term"><td>Kernel</td><td>A compiled GPU routine; the unit whose launch overhead CUDA graphs remove and whose shape determines achieved efficiency.</td><td><a href="{{ '/ai/llm-serving/engine/' | relative_url }}">Part 9</a></td></tr>
+          <tr class="g-term"><td>Kubernetes (K8s)</td><td>The orchestrator that schedules serving pods, runs probes and drives autoscaling, and therefore sets the cold-start floor.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>KV block</td><td>A fixed-size chunk of KV cache, the unit PagedAttention allocates and the block table maps.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>KV cache</td><td>Cached keys and values so decode reuses attention state instead of recomputing it; the tensor that caps concurrency.</td><td><a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a></td></tr>
+          <tr class="g-term"><td>KV cache hit</td><td>A prefix whose KV was already computed and can be reused; a hit converts prefill work into a memory read.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>KV compression</td><td>Storing or summarizing fewer, cheaper KV entries, whether by quantization, eviction or low-rank projection.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>KV offload</td><td>Moving KV to a lower tier (DRAM or NVMe) and fetching it back when needed, trading latency for resident capacity.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>KV quantization</td><td>Storing KV in FP8, INT8 or INT4 to fit more sequences; every error is re-read on every decode step, so evaluate, do not assume.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>KV transfer</td><td>Shipping KV blocks over RDMA or NIXL from a prefill worker to a decode worker; the cost that bounds disaggregation.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>KV-aware routing</td><td>Load balancing by which replica holds the request's prefix, not merely by which has spare capacity.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">L</td></tr>
+          <tr class="g-term"><td>Latency SLO</td><td>The maximum TTFT or TPOT a request may have and still count as served; goodput is measured against it.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Length prediction</td><td>Guessing an output's length to schedule and admit better; wrong guesses either strand capacity or miss deadlines.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>LLGuidance</td><td>A constrained-decoding library that compiles grammars into token masks for fast structured generation.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>Load balancer</td><td>Distributes requests across replicas; a prefix-aware balancer turns a cache hit into a cheaper request.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Load shedding</td><td>Rejecting work deliberately to protect the requests already admitted; the honest alternative to an unbounded queue.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Logit</td><td>The raw pre-softmax score for each vocabulary entry; sampling turns the logit vector into one token.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Long-context</td><td>Serving very long prompts: quadratic prefill work, linear KV, and the eviction and routing machinery that makes it affordable.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>LoRA</td><td>A low-rank adapter over frozen base weights; serving many of them over one base is the multi-tenant pattern.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">M</td></tr>
+          <tr class="g-term"><td>Mask (logit)</td><td>Setting disallowed tokens to &minus;&infin; before sampling so the grammar is never violated.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>MBU</td><td>Memory-bandwidth utilization: achieved bytes per second over peak; the utilisation that actually predicts decode speed.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>Medusa</td><td>Adding decoding heads to a backbone so several future tokens are predicted and verified in parallel; 2.3&ndash;3.6&times; reported.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>Memory wall</td><td>The widening gap between compute growth and bandwidth growth that makes decode memory-bound rather than compute-bound.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>MFU</td><td>Model-FLOPs utilization: achieved FLOPs per second over the hardware peak; the prefill-side analogue of MBU.</td><td><a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a></td></tr>
+          <tr class="g-term"><td>MLA</td><td>Multi-head latent attention: DeepSeek's low-rank KV that caches one compressed latent plus a RoPE key, about 57&times; smaller than MHA at the same geometry.</td><td><a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a></td></tr>
+          <tr class="g-term"><td>Model Streamer</td><td>NVIDIA Run:ai's parallel weight loader; its benchmark drops a 15 GB model's load from 43.7 s to 7.5 s as concurrency rises.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>MoE</td><td>Mixture of experts: many parameters resident but only a few active per token, which decouples capacity from FLOPs.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Mooncake</td><td>Moonshot's KVCache-centric disaggregated store; its vLLM integration reports 3.8&times; throughput and 46&times; lower P50 TTFT on agentic traces.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>MQA</td><td>Multi-query attention: a single KV head, up to 64&times; less cache than MHA at the cost of quality headroom.</td><td><a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a></td></tr>
+          <tr class="g-term"><td>Multi-LoRA</td><td>Serving many adapters over one base model in a single batch, with adapters paged in and out like KV blocks.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>Multi-tenancy</td><td>Sharing serving capacity across independent workloads or customers, with fairness and isolation rather than one global queue.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>MXFP4</td><td>Microscaling 4-bit with a shared block exponent; the weight format named by gpt-oss-120b and accelerated natively on Blackwell.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">N</td></tr>
+          <tr class="g-term"><td>N-gram / prompt lookup</td><td>Speculating the continuation by copying matching n-grams from the prompt; no draft model, and the gain is entirely workload-dependent.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>NIXL</td><td>NVIDIA's inference transfer library for moving KV between disaggregated workers over RDMA and other fabrics.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>Noisy neighbour</td><td>A tenant whose load degrades the latency of others sharing the same replicas; the reason fair queueing is a serving feature.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>Node (prefill / decode)</td><td>The unit of disaggregated capacity; DeepSeek runs 32-GPU prefill units against 144-GPU decode units in its published split.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>NVFP4</td><td>Blackwell's 4-bit floating-point format adding a per-block FP8 scale on top of E2M1 values.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">O</td></tr>
+          <tr class="g-term"><td>OOM</td><td>Out-of-memory from KV growth; paging, preemption and admission control exist to prevent it from taking down a worker.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Open vs closed loop</td><td>Whether the client backs off when latency rises (closed) or pushes regardless (open); benchmarks must state which they use.</td><td><a href="{{ '/ai/llm-serving/economics/' | relative_url }}">Part 20</a></td></tr>
+          <tr class="g-term"><td>Outlines</td><td>The early FSM-indexing structured-generation library which introduced jump-forward decoding and near-zero masking overhead.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>Overload</td><td>The regime where arrivals exceed capacity; the regime admission control, load shedding and backpressure exist for.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">P</td></tr>
+          <tr class="g-term"><td>Page (KV)</td><td>A physical block of KV cache, the unit PagedAttention maps from a sequence's logical positions.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Paged KV cache</td><td>Non-contiguous, block-paged KV storage that removes the need to reserve a sequence's maximum length up front.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>PagedAttention</td><td>The vLLM mechanism that pages KV and translates logical to physical blocks with a block table.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Padding</td><td>Wasted batch slots from forcing variable-length sequences into a rectangle; packing and paging avoid it.</td><td><a href="{{ '/ai/llm-serving/batching/' | relative_url }}">Part 6</a></td></tr>
+          <tr class="g-term"><td>Parallelism</td><td>Splitting a model's compute across devices: tensor, pipeline, expert, data (attention) and context parallelism.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Percentile (P50 / P90 / P99)</td><td>The latency below which that fraction of requests fall; the mean hides the tail that actually breaks SLOs.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Pipeline bubble</td><td>Idle time while pipeline stages fill and drain, proportional to (p&minus;1)/(m+p&minus;1) for p stages and m microbatches.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Pipeline parallelism (PP)</td><td>Splitting model layers across stages and streaming microbatches through them; needs less bandwidth than TP but adds latency and bubbles.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Prefill</td><td>Processing the whole prompt in parallel; compute-bound, and the source of TTFT.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Prefill-decode ratio</td><td>The mix of prompt and output tokens in a workload; agentic and multimodal traffic invert the ratio that chat assumes.</td><td><a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a></td></tr>
+          <tr class="g-term"><td>Prefill worker</td><td>The pool in a disaggregated deployment that only computes prompt KV and hands it to decoders.</td><td><a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a></td></tr>
+          <tr class="g-term"><td>Preemption</td><td>Evicting a running sequence's KV to make room, then recomputing or swapping it back when capacity returns.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Prefix affinity</td><td>The routing preference for the replica that already holds a shared prefix, so a cache hit is not thrown away.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Prefix caching</td><td>Reusing KV for shared prompt prefixes across requests; a cache hit turns prefill time into a memory read.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Priority scheduling</td><td>Ordering the queue by request class rather than arrival, which needs aging or quotas to stay starvation-free.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Pushdown automaton</td><td>A stack machine needed for nested grammars such as balanced JSON, since a finite-state machine cannot count depth.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>PyramidKV</td><td>Layer-wise pyramidal KV budgets, more retention in low layers and less in high ones; near-full quality at roughly 12% of KV.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">Q</td></tr>
+          <tr class="g-term"><td>Quantization</td><td>Storing weights, activations or KV at lower precision to save bytes; in serving the win is bandwidth, not FLOPs.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>Query-aware eviction</td><td>Choosing KV entries to keep based on the current query rather than only recency or global attention mass.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Quest</td><td>Query-aware top-K KV page selection using per-page key ranges; up to 7.03&times; reported latency reduction.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">R</td></tr>
+          <tr class="g-term"><td>RadixAttention</td><td>SGLang's radix-tree prefix cache; reported around 6&times; higher throughput on structured workloads.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Radix tree</td><td>The prefix tree that indexes cached KV by shared token sequences and makes longest-prefix matching cheap.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Recompute</td><td>Rebuilding a preempted sequence's KV from its tokens instead of moving it; cheaper than a fetch below roughly 1,900 tokens.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+          <tr class="g-term"><td>Rejection sampling</td><td>The rule that accepts a draft token only when the target model's sample agrees, keeping the output distribution exact.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>Request routing</td><td>Choosing a replica for each request; the choice changes cache hit rate, queue depth and therefore latency.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Ring attention</td><td>Distributing a long sequence's attention across devices in a ring so each holds part of the KV and passes activations on.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Roofline</td><td>The model relating attainable FLOPs to arithmetic intensity, peak compute and peak bandwidth; it explains the memory wall.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>RPS</td><td>Requests per second; the input to capacity planning once each request's token profile is known.</td><td><a href="{{ '/ai/llm-serving/economics/' | relative_url }}">Part 20</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">S</td></tr>
+          <tr class="g-term"><td>Sampling</td><td>Turning logits into a token with greedy, temperature or top-p rules; it is the last step of every decode iteration.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>Scale-to-zero</td><td>Removing the last replica and paying a cold start to return; honest only when the traffic is genuinely bursty.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Scheduler</td><td>The component deciding what to admit, preempt and run each iteration, under KV and capacity limits.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Semantic caching</td><td>Reusing an answer when a new query is semantically equivalent to an old one; a workload-level cache above the KV cache.</td><td><a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a></td></tr>
+          <tr class="g-term"><td>Serving SLO</td><td>The latency and availability contract an API makes, expressed on TTFT, TPOT and error rate rather than on averages.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>SGMV</td><td>A batched LoRA kernel that applies many adapters in one pass by treating the batch as a segmented matrix-vector product.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>Sharding</td><td>Splitting weights, experts or KV across devices; every sharding choice trades memory for communication.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>SJF</td><td>Shortest-job-first ordering; improves mean latency but starves long jobs unless paired with aging or priority classes.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>S-LoRA</td><td>Serving thousands of LoRA adapters over one base with paged adapter memory and a unified batching kernel.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>Sliding window attention</td><td>Attending only to the last W tokens, which bounds KV memory instead of letting it grow with the sequence.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>SnapKV</td><td>Compressing the prefix by keeping the positions an observation window finds important; 3.6&times; decode at 16K with 8.2&times; memory efficiency.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Sparse attention</td><td>Attending to a selected subset of positions rather than all of them; the family that Quest and DuoAttention belong to.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Speculative decoding</td><td>Drafting several tokens cheaply and verifying them in one target-model pass, so more than one token emerges per step.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>SRPT</td><td>Shortest-remaining-processing-time: SJF with preemption, reordering as remaining work changes.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Starvation</td><td>A request that never gets served because it is always outranked; the failure mode every scheduling policy must answer for.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Step time</td><td>Wall time for one engine iteration; its reciprocal is the per-sequence token rate, and it is set by the slower of bandwidth and compute.</td><td><a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">Part 1</a></td></tr>
+          <tr class="g-term"><td>StreamingLLM</td><td>Keeping a few attention-sink tokens plus a recent window; stable to millions of tokens without fine-tuning.</td><td><a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a></td></tr>
+          <tr class="g-term"><td>Structured output</td><td>Constraining generation to a grammar, regex or schema so the output is valid by construction.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>Swap</td><td>Moving preempted KV to host DRAM instead of recomputing it; faster to restore, but it consumes host bandwidth and memory.</td><td><a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">T</td></tr>
+          <tr class="g-term"><td>Tail latency</td><td>The slow end of the distribution, P90 and P99; the part of latency that SLOs and users actually experience.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Tensor parallelism (TP)</td><td>Splitting weights and compute across devices within a fast interconnect, paying an all-reduce every layer.</td><td><a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a></td></tr>
+          <tr class="g-term"><td>Thinking tokens</td><td>Long reasoning traces that inflate output tokens and therefore cost; the workload shape that breaks per-token pricing intuitions.</td><td><a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a></td></tr>
+          <tr class="g-term"><td>Throughput</td><td>Tokens or requests per second across all users; not the same as goodput, and not the same as a good user experience.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Tiered KV cache</td><td>Storing KV across HBM, DRAM, NVMe and remote memory with promotion and demotion between tiers.</td><td><a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a></td></tr>
+          <tr class="g-term"><td>Time-to-first-token (TTFT)</td><td>Arrival to first token, dominated by queueing and prefill; the number a streaming user perceives as responsiveness.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Token bucket</td><td>A rate limiter that refills at a fixed rate and rejects overflow; the per-tenant admission valve.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>Token mask</td><td>The per-state vector of allowed next tokens; computing it cheaply is the whole game in structured decoding.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+          <tr class="g-term"><td>Tool call</td><td>A structured model output that invokes an external function, whose result returns to the context and extends the turn count.</td><td><a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a></td></tr>
+          <tr class="g-term"><td>TPOT</td><td>Time per output token after the first; the decode-speed metric that, with TTFT, defines a serving SLO.</td><td><a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a></td></tr>
+          <tr class="g-term"><td>Tree attention</td><td>Attention over a candidate tree that shares prefixes, letting all speculative branches be verified in one pass.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">U</td></tr>
+          <tr class="g-term"><td>Unconstrained decoding</td><td>Free generation with no grammar; the baseline that the constraint tax is measured against.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">V</td></tr>
+          <tr class="g-term"><td>Verifier</td><td>The target-model pass that accepts or rejects draft tokens and produces the accepted prefix.</td><td><a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Part 11</a></td></tr>
+          <tr class="g-term"><td>Virtual token counter</td><td>A fair-share accounting scheme that charges tenants by tokens actually consumed, so one cannot monopolise the fleet.</td><td><a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a></td></tr>
+          <tr class="g-term"><td>Vocab mask</td><td>The full-vocabulary boolean mask applied each constrained step; its width makes tiny per-token overheads measurable.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">W</td></tr>
+          <tr class="g-term"><td>Wait queue</td><td>Where admitted-but-not-running and preempted requests wait; its depth is the leading indicator of TTFT.</td><td><a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a></td></tr>
+          <tr class="g-term"><td>Warmup</td><td>Running throwaway inference passes to allocate memory and trigger kernel compilation before serving real traffic.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Weight load</td><td>Reading model weights from disk or network; the largest single term in the 40&ndash;90 s cold-start breakdown.</td><td><a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a></td></tr>
+          <tr class="g-term"><td>Weight-only quantization</td><td>Quantizing weights while leaving activations in FP16; the safest large win, and the one that fades above batch ~128.</td><td><a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">Part 10</a></td></tr>
+          <tr class="g-term"><td>Wide EP</td><td>Scaling expert parallelism across nodes and racks, as in DeepSeek's EP144 decode units, to spread hot experts.</td><td><a href="{{ '/ai/llm-serving/moe/' | relative_url }}">Part 14</a></td></tr>
+          <tr class="g-term"><td>Workload shape</td><td>The prompt, output and arrival mix that determines which bottleneck bites; chat, reasoning, agents and voice have different shapes.</td><td><a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a></td></tr>
+
+          <tr class="g-letter"><td colspan="3">X</td></tr>
+          <tr class="g-term"><td>XGrammar</td><td>Fast grammar-constrained decoding, reporting up to 100&times; faster mask generation than prior solutions with near-zero end-to-end overhead when overlapped.</td><td><a href="{{ '/ai/llm-serving/structured-output/' | relative_url }}">Part 16</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="quantization">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Quantization formats</h2></div>
+    <p class="g-eyebrow">Bytes per parameter and the accuracy bill</p>
+    <p>The table below is the series' shared reference for what each format buys and costs. The important column is not bits but bytes per parameter, because that is what a decode step reads; and the second important column is where the damage lands. Weight-only INT4 is usually benign; INT4 activations and INT4 KV need their own evaluation. The <span class="glo-num">bytesPerParam</span> column counts weights only and ignores scales, zero-points and KV, so treat it as a lower bound on the real footprint.</p>
+    <div class="glo-table-wrap">
+      <table class="g-cheat" id="glo-quant-table">
+        <thead><tr><th>Format</th><th>Bits</th><th>Bytes/param</th><th>Typical accuracy delta</th><th>Evaluation</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="glo-quant-source"></p>
+  </section>
+
+  <section class="g-step" id="engines">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Engine feature matrix</h2></div>
+    <p class="g-eyebrow">What each server actually supports first-class</p>
+    <p>These four engines dominate open serving, and the differences that matter in production are the ones that are not on the marketing page: whether KV is paged, whether prefill and decode can be split, and how speculative decoding is plumbed. A tick means documented first-class support, not that every combination is production-hardened. The notes column carries the caveat that matters for each.</p>
+    <div class="glo-table-wrap">
+      <table class="g-cheat" id="glo-engine-table">
+        <thead><tr><th>Engine</th><th>Paged attn</th><th>Cont. batching</th><th>Prefix cache</th><th>Speculative</th><th>LoRA</th><th>Disaggregation</th><th>Notes</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="glo-engine-source"></p>
+  </section>
+
+  <section class="g-step" id="pricing">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Pricing reference</h2></div>
+    <p class="g-eyebrow">Historical list prices, labelled as such</p>
+    <div class="g-warn">⚠️ <span><b>These prices are historical.</b> They are early-to-mid 2025 vendor list prices and several of these models are now superseded or repriced. They are here as clearly labelled reference points for the cost arithmetic in Part 20, not as current quotes. Verify against the live vendor pages before relying on any number.</span></div>
+    <p>The shape of the table is the lesson: cached input is roughly a tenth of fresh input, output is several times input, and the spread between a small and a frontier model is more than an order of magnitude. Any capacity plan that ignores the cache-hit column will overstate cost by roughly the hit rate.</p>
+    <div class="glo-table-wrap">
+      <table class="g-cheat" id="glo-price-table">
+        <thead><tr><th>Model</th><th>Input / 1M</th><th>Output / 1M</th><th>Cached input / 1M</th><th>Note</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="glo-price-source"></p>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Primary sources behind the numbers</p>
+    <ul class="g-refs">
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for Large Language Model Serving with PagedAttention</a>, SOSP 2023 &mdash; the vLLM paper behind Part 5.</li>
+      <li>Zheng et al., <a href="https://arxiv.org/abs/2312.07104">SGLang: Efficient Execution of Structured Language Model Programs</a>, 2023 &mdash; RadixAttention and prefix caching in Part 8.</li>
+      <li>Zhong et al., <a href="https://arxiv.org/abs/2401.09670">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving</a>, OSDI 2024 &mdash; the disaggregation result in Part 13.</li>
+      <li>Qin et al., <a href="https://arxiv.org/abs/2407.00079">Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</a>, 2024 &mdash; the KVCache store referenced in Part 8.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a>, 2024 &mdash; MLA, FP8 and the MoE configuration in Parts 4, 10 and 14.</li>
+      <li>Dong et al., <a href="https://arxiv.org/abs/2411.15100">XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models</a>, MLSys 2025 &mdash; constrained decoding in Part 16.</li>
+      <li>NVIDIA, <a href="https://developer.nvidia.com/blog/reducing-cold-start-latency-for-llm-inference-with-nvidia-runai-model-streamer/">Reducing Cold Start Latency with Model Streamer</a>, 2025 &mdash; the 43.7 s &rarr; 7.5 s weight-load benchmark in Part 19.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}This page is a reference. The series itself starts at the decode loop.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide;
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function boolCell(v) { return v ? '✓' : '—'; }
+  // KaTeX auto-render scans document.body for $...$ pairs. Runtime table/source
+  // text must therefore contain no dollar signs, or "$3/$15" renders as math.
+  function usdText(s) { return String(s == null ? '' : s).replace(/\$/g, 'USD '); }
+  function setSource(id, text) { var el = document.getElementById(id); if (el) el.textContent = usdText(text); }
+  function tflops(v) { return v == null ? '—' : G.fmtNum(v, 0); }
+  function gb(v) { return v == null ? '—' : v + ' GB'; }
+  function tb(v) { return v == null ? '—' : v + ' TB/s'; }
+  function gbs(v) { return v == null ? '—' : G.fmtNum(v, 0) + ' GB/s'; }
+  function w(v) { return v == null ? '—' : G.fmtNum(v, 0) + ' W'; }
+  function money(v) {
+    if (v == null) return '—';
+    var d = v < 0.1 ? 4 : 2;
+    return '$' + v.toFixed(d);
+  }
+  function kvPerToken(m) {
+    if (m.kvScheme === 'MLA') return m.layers * (512 + 64) * 2;
+    return 2 * m.layers * m.n_kv_heads * m.d_head * 2;
+  }
+
+  // Built-in offline snapshot. The live numbers file is fetched and replaces this
+  // without blocking first paint; the page is complete either way.
+  var FALLBACK = {
+    accelerators: {
+      source: 'Built-in offline snapshot (representative subset). Live source: vendor datasheets and architecture pages, retrieved 2026-09. NVIDIA headline FLOPs include 2:4 sparsity, so the dense figures shown are half the headline; AMD and Google quote dense directly; a dash means the format is not native.',
+      items: [
+        { name: 'NVIDIA A100 80GB SXM', hbmGB: 80, bwTBs: 2.0, bf16TFLOPs: 312, fp8TFLOPs: null, fp4TFLOPs: null, nvlinkGBs: 600, tdpW: 400 },
+        { name: 'NVIDIA H100 SXM', hbmGB: 80, bwTBs: 3.35, bf16TFLOPs: 989, fp8TFLOPs: 1979, fp4TFLOPs: null, nvlinkGBs: 900, tdpW: 700 },
+        { name: 'NVIDIA H200 SXM', hbmGB: 141, bwTBs: 4.8, bf16TFLOPs: 989, fp8TFLOPs: 1979, fp4TFLOPs: null, nvlinkGBs: 900, tdpW: 700 },
+        { name: 'NVIDIA B200', hbmGB: 192, bwTBs: 8.0, bf16TFLOPs: 2250, fp8TFLOPs: 4500, fp4TFLOPs: 9000, nvlinkGBs: 1800, tdpW: 1000 },
+        { name: 'NVIDIA GB200 NVL72 (per rack)', hbmGB: 13400, bwTBs: 8.0, bf16TFLOPs: 180000, fp8TFLOPs: 360000, fp4TFLOPs: 720000, nvlinkGBs: 1800, tdpW: 120000 },
+        { name: 'AMD Instinct MI300X', hbmGB: 192, bwTBs: 5.3, bf16TFLOPs: 1307, fp8TFLOPs: 2615, fp4TFLOPs: null, nvlinkGBs: 1024, tdpW: 750 },
+        { name: 'Google TPU v5e', hbmGB: 16, bwTBs: 0.8, bf16TFLOPs: 197, fp8TFLOPs: null, fp4TFLOPs: null, nvlinkGBs: 400, tdpW: null },
+        { name: 'Google TPU v5p', hbmGB: 95, bwTBs: 2.765, bf16TFLOPs: 459, fp8TFLOPs: 459, fp4TFLOPs: null, nvlinkGBs: 1200, tdpW: null },
+        { name: 'AWS Trainium2', hbmGB: 96, bwTBs: 2.9, bf16TFLOPs: 650, fp8TFLOPs: 1300, fp4TFLOPs: null, nvlinkGBs: null, tdpW: null }
+      ]
+    },
+    model_configs: {
+      source: 'Built-in offline snapshot (representative subset). Live source: official model configs and technical reports. KV per token is computed with ServingSim geometry: 2 x layers x n_kv_heads x d_head x 2 bytes, or layers x 576 x 2 for MLA; SWA-hybrid is a rate below its window.',
+      items: [
+        { name: 'Llama 3.1 8B', layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: 'GQA', totalParamsB: 8.03, activeParamsB: 8.03, contextLen: 131072 },
+        { name: 'Llama 3.1 70B', layers: 80, hidden: 8192, heads: 64, n_kv_heads: 8, d_head: 128, kvScheme: 'GQA', totalParamsB: 70.6, activeParamsB: 70.6, contextLen: 131072 },
+        { name: 'Llama 3.1 405B', layers: 126, hidden: 16384, heads: 128, n_kv_heads: 8, d_head: 128, kvScheme: 'GQA', totalParamsB: 405, activeParamsB: 405, contextLen: 131072 },
+        { name: 'DeepSeek-V3', layers: 61, hidden: 7168, heads: 128, n_kv_heads: 128, d_head: 128, kvScheme: 'MLA', totalParamsB: 671, activeParamsB: 37, contextLen: 163840 },
+        { name: 'Kimi K2', layers: 61, hidden: 7168, heads: 64, n_kv_heads: 64, d_head: 128, kvScheme: 'MLA', totalParamsB: 1000, activeParamsB: 32, contextLen: 131072 },
+        { name: 'Mistral 7B (sliding-window)', layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: 'SWA-hybrid', totalParamsB: 7.24, activeParamsB: 7.24, contextLen: 32768 },
+        { name: 'gpt-oss-120b', layers: 36, hidden: 2880, heads: 64, n_kv_heads: 8, d_head: 64, kvScheme: 'GQA', totalParamsB: 117, activeParamsB: 5.1, contextLen: 131072 }
+      ]
+    },
+    quantization: {
+      source: 'Built-in offline snapshot. Live source: GPTQ (arXiv:2210.17323), AWQ (arXiv:2306.00978), FP8/DeepSeek-V3 (arXiv:2412.19437), NVFP4/MXFP4 (NVIDIA Blackwell; gpt-oss-120b config). Deltas are typical reported ranges, not guarantees.',
+      items: [
+        { format: 'BF16', bits: 16, bytesPerParam: 2.0, accuracyDelta: '0 (reference)', eval: 'Baseline for all comparisons' },
+        { format: 'FP16', bits: 16, bytesPerParam: 2.0, accuracyDelta: '~0 vs BF16', eval: 'Baseline' },
+        { format: 'FP8 (E4M3)', bits: 8, bytesPerParam: 1.0, accuracyDelta: '~0 to 0.5%', eval: 'MMLU/GSM8K near-BF16 parity' },
+        { format: 'INT8 W8A8', bits: 8, bytesPerParam: 1.0, accuracyDelta: '~0.5-1%', eval: 'Near-lossless with SmoothQuant-style scaling' },
+        { format: 'INT4 weight-only (GPTQ/AWQ)', bits: 4, bytesPerParam: 0.5, accuracyDelta: '~1-3% (task-dependent)', eval: 'Perplexity and MMLU within a few points' },
+        { format: 'MXFP4 / NVFP4', bits: 4, bytesPerParam: 0.5, accuracyDelta: 'Measurable but often small with block scales', eval: 'Microscaling block formats (gpt-oss-120b, Blackwell)' }
+      ]
+    },
+    engines: {
+      source: 'Built-in offline snapshot. Live source: project documentation and papers, retrieved 2026-09 (vLLM/PagedAttention SOSP 2023; SGLang arXiv:2312.07104; TensorRT-LLM docs; llama.cpp server docs).',
+      items: [
+        { name: 'vLLM', pagedAttention: true, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: true, notes: 'PagedAttention origin; disaggregated prefill/decode via connectors; broad speculative decoding including n-gram and draft models.' },
+        { name: 'SGLang', pagedAttention: true, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: true, notes: 'RadixAttention prefix tree; strong EAGLE/EAGLE-3 speculation and XGrammar structured output.' },
+        { name: 'TensorRT-LLM', pagedAttention: true, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: true, notes: 'NVIDIA-optimized for Hopper/Blackwell; in-flight batching; FP8/FP4 and paged KV; disaggregated serving supported.' },
+        { name: 'llama.cpp', pagedAttention: false, continuousBatching: true, prefixCache: true, speculative: true, lora: true, disaggregation: false, notes: 'CPU/Metal/consumer focus; continuous batching via --cont-batching; no paged attention and no first-class PD disaggregation.' }
+      ]
+    },
+    pricing: {
+      source: 'Built-in offline snapshot. Live source: historical vendor list prices, early-to-mid 2025, per 1M tokens (USD, standard, non-batch). Clearly labelled historical reference points, not current quotes.',
+      as_of: '2025-02',
+      items: [
+        { model: 'GPT-4o', inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25, note: 'OpenAI list price introduced 2024. Historical.' },
+        { model: 'GPT-4o mini', inputPerMUSD: 0.15, outputPerMUSD: 0.6, cachedInputPerMUSD: 0.075, note: 'OpenAI list price from July 2024. Historical.' },
+        { model: 'Claude 3.5 Sonnet', inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3, note: 'Anthropic prompt-cache read price. Historical.' },
+        { model: 'Claude 3.7 Sonnet', inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3, note: 'Released Feb 2025 at the same $3/$15. Historical.' },
+        { model: 'Gemini 1.5 Flash', inputPerMUSD: 0.075, outputPerMUSD: 0.3, cachedInputPerMUSD: 0.01875, note: 'Google list price for <=128K context. Historical.' },
+        { model: 'Gemini 2.0 Flash', inputPerMUSD: 0.1, outputPerMUSD: 0.4, cachedInputPerMUSD: 0.025, note: 'Google list price, early 2025. Historical.' },
+        { model: 'DeepSeek-V3', inputPerMUSD: 0.27, outputPerMUSD: 1.1, cachedInputPerMUSD: 0.07, note: 'Cache-miss input / output / cache-hit input, Feb 2025. Historical.' }
+      ]
+    }
+  };
+
+  function renderAccelerators(data) {
+    var items = (data.accelerators && data.accelerators.items) || [];
+    document.querySelector('#glo-acc-table tbody').innerHTML = items.map(function (it) {
+      return '<tr>' +
+        '<td><b>' + esc(it.name) + '</b></td>' +
+        '<td>' + gb(it.hbmGB) + '</td>' +
+        '<td>' + tb(it.bwTBs) + '</td>' +
+        '<td>' + tflops(it.bf16TFLOPs) + '</td>' +
+        '<td>' + tflops(it.fp8TFLOPs) + '</td>' +
+        '<td>' + tflops(it.fp4TFLOPs) + '</td>' +
+        '<td>' + gbs(it.nvlinkGBs) + '</td>' +
+        '<td>' + w(it.tdpW) + '</td>' +
+        '</tr>';
+    }).join('');
+    setSource('glo-acc-source', data.accelerators && data.accelerators.source);
+  }
+
+  function renderModels(data) {
+    var items = (data.model_configs && data.model_configs.items) || [];
+    document.querySelector('#glo-model-table tbody').innerHTML = items.map(function (it) {
+      var kv = kvPerToken(it);
+      var kvLabel = it.kvScheme === 'MLA' ? 'latent 576' : String(it.n_kv_heads);
+      var active = it.activeParamsB === it.totalParamsB ? String(it.totalParamsB) : (it.totalParamsB + ' / ' + it.activeParamsB);
+      return '<tr>' +
+        '<td><b>' + esc(it.name) + '</b></td>' +
+        '<td>' + it.layers + '</td>' +
+        '<td>' + it.heads + '</td>' +
+        '<td>' + kvLabel + '</td>' +
+        '<td>' + it.d_head + '</td>' +
+        '<td>' + esc(it.kvScheme) + '</td>' +
+        '<td class="glo-kv-total">' + G.fmtBytes(kv) + '</td>' +
+        '<td>' + active + '</td>' +
+        '<td>' + G.fmtNum(it.contextLen, 0) + '</td>' +
+        '</tr>';
+    }).join('');
+    setSource('glo-model-source', data.model_configs && data.model_configs.source);
+  }
+
+  function renderQuant(data) {
+    var items = (data.quantization && data.quantization.items) || [];
+    document.querySelector('#glo-quant-table tbody').innerHTML = items.map(function (it) {
+      return '<tr>' +
+        '<td><b>' + esc(it.format) + '</b></td>' +
+        '<td>' + it.bits + '</td>' +
+        '<td>' + Number(it.bytesPerParam).toFixed(2) + '</td>' +
+        '<td>' + esc(it.accuracyDelta) + '</td>' +
+        '<td>' + esc(it.eval || it.note || '') + '</td>' +
+        '</tr>';
+    }).join('');
+    setSource('glo-quant-source', data.quantization && data.quantization.source);
+  }
+
+  function renderEngines(data) {
+    var items = (data.engines && data.engines.items) || [];
+    document.querySelector('#glo-engine-table tbody').innerHTML = items.map(function (it) {
+      return '<tr>' +
+        '<td><b>' + esc(it.name) + '</b></td>' +
+        '<td>' + boolCell(it.pagedAttention) + '</td>' +
+        '<td>' + boolCell(it.continuousBatching) + '</td>' +
+        '<td>' + boolCell(it.prefixCache) + '</td>' +
+        '<td>' + boolCell(it.speculative) + '</td>' +
+        '<td>' + boolCell(it.lora) + '</td>' +
+        '<td>' + boolCell(it.disaggregation) + '</td>' +
+        '<td>' + esc(it.notes || '') + '</td>' +
+        '</tr>';
+    }).join('');
+    setSource('glo-engine-source', data.engines && data.engines.source);
+  }
+
+  function renderPricing(data) {
+    var items = (data.pricing && data.pricing.items) || [];
+    document.querySelector('#glo-price-table tbody').innerHTML = items.map(function (it) {
+      return '<tr>' +
+        '<td><b>' + esc(it.model) + '</b></td>' +
+        '<td>' + money(it.inputPerMUSD) + '</td>' +
+        '<td>' + money(it.outputPerMUSD) + '</td>' +
+        '<td>' + money(it.cachedInputPerMUSD) + '</td>' +
+        '<td>' + esc(usdText(it.note || '')) + '</td>' +
+        '</tr>';
+    }).join('');
+    var src = (data.pricing && data.pricing.source) || '';
+    if (data.pricing && data.pricing.as_of) src = 'As of ' + data.pricing.as_of + '. ' + src;
+    setSource('glo-price-source', src);
+  }
+
+  function apply(data) {
+    if (!data) return;
+    renderAccelerators(data);
+    renderModels(data);
+    renderQuant(data);
+    renderEngines(data);
+    renderPricing(data);
+  }
+
+  // Paint the fallback immediately so first paint never waits on the network,
+  // then upgrade to the sourced numbers if the fetch succeeds.
+  apply(FALLBACK);
+  fetch(window.NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(apply)
+    .catch(function () { apply(FALLBACK); });
+
+  // ---- glossary filter -----------------------------------------------------
+  (function () {
+    var table = document.getElementById('glo-table');
+    if (!table) return;
+    var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr.g-term'));
+    var letters = Array.prototype.slice.call(table.querySelectorAll('tbody tr.g-letter'));
+    var hay = rows.map(function (r) { return r.textContent.toLowerCase(); });
+    var input = document.getElementById('glo-filter');
+    var countEl = document.getElementById('glo-count');
+
+    function applyFilter() {
+      var q = (input.value || '').trim().toLowerCase();
+      var visible = 0;
+      var i;
+      for (i = 0; i < rows.length; i++) {
+        var hit = !q || hay[i].indexOf(q) !== -1;
+        if (hit) visible++; else rows[i].classList.add('g-hide');
+        if (hit) rows[i].classList.remove('g-hide');
+      }
+      for (i = 0; i < letters.length; i++) {
+        var el = letters[i].nextElementSibling;
+        var any = false;
+        while (el && el.classList.contains('g-term')) {
+          if (!el.classList.contains('g-hide')) { any = true; break; }
+          el = el.nextElementSibling;
+        }
+        if (any) letters[i].classList.remove('g-hide');
+        else letters[i].classList.add('g-hide');
+      }
+      if (countEl) countEl.textContent = visible + (visible === 1 ? ' term' : ' terms');
+    }
+
+    if (input) input.addEventListener('input', applyFilter);
+    applyFilter();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

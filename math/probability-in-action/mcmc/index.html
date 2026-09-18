@@ -1,0 +1,695 @@
+---
+title: "Probability in Action, Interactively — Part 11: MCMC"
+description: "Sampling a posterior you can only evaluate pointwise: Metropolis–Hastings, the step size that makes or breaks mixing, Gibbs and Hamiltonian moves, and the trace plots that tell you when a chain can be trusted."
+permalink: "/math/probability-in-action/mcmc/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true plotly=true %}
+<style>
+  .g-plot-3d { width: 100%; height: 380px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; margin-bottom: 10px; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-canvas-stack canvas:last-child { margin-bottom: 0; }
+  .g-table-wrap { position: relative; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability in Action</span>
+    <h1>MCMC</h1>
+    <p>You have a posterior and it is written down completely &mdash; an unnormalised density you can evaluate at any point you name. What you cannot do is integrate it. The normalising constant is a high-dimensional integral with no closed form, and every summary you care about &mdash; a mean, a credible interval, a marginal, an expectation of some function &mdash; is another integral over the same intractable object. So you stop trying to compute and start trying to <em>visit</em>. If you can produce a stream of points whose long-run frequency matches the density, then averages over the stream estimate every expectation you wanted. Markov chain Monte Carlo is the machinery that turns "I can evaluate it" into "I can sample from it", and Metropolis&ndash;Hastings is the one idea underneath almost all of it.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">When the normaliser is the whole problem</p>
+    <p>Bayes' rule gives the posterior up to a constant. Write the data as <var>$\mathcal{D}$</var> and the parameter as <var>$\theta$</var>: the posterior is proportional to the likelihood times the prior, and the missing denominator is the evidence <var>$p(\mathcal{D})=\int p(\mathcal{D}\mid\theta)p(\theta)\,d\theta$</var>. In one dimension that integral is a quadrature problem. In fifty dimensions it is hopeless, because the number of evaluations needed grows exponentially with dimension. Yet the numerator is easy: hand me any <var>$\theta$</var> and I can tell you <var>$p(\mathcal{D}\mid\theta)p(\theta)$</var> in microseconds.</p>
+    <p>The previous part made this painless for a coin, where a Beta prior met a binomial likelihood and the posterior landed back in the Beta family. That is the exception. As soon as the model has a couple of layers &mdash; a hierarchical prior, a mixture, a neural likelihood &mdash; no conjugate family survives and the normaliser becomes an integral you cannot write down. The <a href="{{ '/math/probability-in-action/bayesian-inference/' | relative_url }}">conjugate case</a> taught us what a posterior <em>is</em>; this part is about what to do when you cannot compute one.</p>
+    <p>Here is the shift in viewpoint. I do not need the normalising constant if I can sample from the distribution. A cloud of points drawn from the posterior answers the same questions the density would. The mean is the average of the cloud; the 95% credible interval is its middle 95%; the marginal of one coordinate is its histogram along that axis; and an expectation <var>$\mathbb{E}[f(\theta)]$</var> is the plain average of <var>$f$</var> over the points. This is exactly the Monte Carlo principle of Part 8, applied to a distribution rather than a fixed region.</p>
+    <p>Ordinary sampling needs to know how to draw &mdash; inverse-CDF, rejection with an envelope, importance weights. All three need something more than pointwise evaluation: a quantile, an upper bound, a proposal you can sample. The posterior offers none of that. What it does offer is a <em>relative</em> weight between any two points, and that turns out to be enough, provided you are willing to give up independence. Markov chain Monte Carlo draws a correlated sequence whose stationary distribution is the target. The chain has memory, the samples are not independent, and every diagnostic in the subject exists to check that the memory is not lying to you.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> Metropolis&ndash;Hastings only ever needs a ratio of target densities, why the step size decides whether the chain explores or sticks, how Gibbs and Hamiltonian moves trade generality for better motion, and how a trace plot and an autocorrelation function tell you when to trust the chain.</span></div>
+    <div class="g-toc">
+      <a href="#metropolis">2 · Metropolis&ndash;Hastings</a>
+      <a href="#stepsize">3 · Step size, acceptance and mixing</a>
+      <a href="#gibbs-hmc">4 · Gibbs and Hamiltonian moves</a>
+      <a href="#diagnostics">5 · Trace plots and burn-in</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="metropolis">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Metropolis&ndash;Hastings</h2></div>
+    <p class="g-eyebrow">Propose a move; accept it with the right probability</p>
+    <p>The algorithm is a walk with a rule. You are standing at a point <var>$x$</var> and you want to know the target density there, but only up to a constant, so call the unnormalised value <var>$\pi(x)$</var>. Pick a proposal distribution <var>$q(x'\mid x)$</var> that you can sample from &mdash; a Gaussian centred on where you are is the standard choice &mdash; and draw a candidate <var>$x'$</var>. Then decide whether to move. The decision is not "move if the density is higher"; that would march uphill and pile every sample on the mode. It is a coin flip whose bias is the ratio of the densities, capped at one.</p>
+    <div class="g-math g-katex">$$\alpha(x,x')=\min\!\left(1,\;\frac{\pi(x')\,q(x\mid x')}{\pi(x)\,q(x'\mid x)}\right),\qquad x_{t+1}=\begin{cases}x' & \text{with probability }\alpha(x,x')\\ x & \text{otherwise.}\end{cases}$$</div>
+    <p>Look at what the formula asks for, and notice what it does not ask for. Both <var>$\pi$</var> values appear as a ratio, so any constant that multiplies the target cancels &mdash; the intractable evidence integral vanishes. That single observation is why MCMC works at all. If the proposal is symmetric, <var>$q(x\mid x')=q(x'\mid x)$</var>, the ratio simplifies to <var>$\pi(x')/\pi(x)$</var> and the algorithm is the plain Metropolis rule. When the target is flat at the mode and you propose a worse point, you still accept sometimes: a downhill step is how the chain escapes and how the histogram fills in the tails.</p>
+    <p>Why does this produce the right distribution? The acceptance rule is constructed to satisfy <strong>detailed balance</strong>, <var>$\pi(x)\,T(x\to x')=\pi(x')\,T(x'\to x)$</var>, where <var>$T$</var> is the full transition probability of proposing and accepting. Detailed balance makes <var>$\pi$</var> stationary, and if the chain is irreducible &mdash; it can reach any region with positive density &mdash; the stationary distribution is unique. Then a theorem from the Markov-chains part says the empirical distribution of the visited points converges to <var>$\pi$</var>. That is the whole justification, and it is short because it never touches the normaliser either.</p>
+    <p>The demo below runs one chain on a correlated two-dimensional Gaussian, so the target is a leaning ellipse you can see. Start where the chain starts, then move it a step at a time, or run a batch. The pink path is the chain, the dots are everywhere it has been, and the blue contours are the truth it is trying to fill in.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mh-canvas" width="560" height="460"></canvas>
+        <p class="g-canvas-hint">Blue ellipses are the one-, two- and three-sigma contours of the target. The pink path is the Metropolis chain; each dot is one accepted state. The bold dot is where the chain currently sits.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Step size <var>h</var> <span class="val">0.50</span></label><input type="range" id="mh-step" min="0.05" max="3" step="0.05" value="0.5"></div>
+        <div class="g-btnrow">
+          <button type="button" id="mh-one">Take one step</button>
+          <button type="button" id="mh-batch">&times;25 steps</button>
+          <button type="button" id="mh-reset">New chain</button>
+        </div>
+        <div class="g-readout" id="mh-readout"></div>
+      </div>
+    </div>
+    <p>The same walk can be lifted onto the density itself. The next panel draws the target as a surface &mdash; height is probability density &mdash; and drops the chain onto it. Every sample sits under the surface at its own density, so a chain that has found the mass shows up as a trail of markers on the flanks of the hill, and a chain that is still climbing shows up as a lonely thread in the low-density corner. Change the step size and watch both the scatter and the surface trail respond together.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div id="mh-plot" class="g-plot-3d"></div>
+        <p class="g-canvas-hint">Plotly surface of the target density with the chain overlaid as a scatter of markers, positioned at their own density height.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="surface-readout"></div>
+      </div>
+    </div>
+    <p>Notice that nothing here required an integral. To run any of it we needed exactly one function: given a point, return the unnormalised log density. That is the entire interface MCMC asks of a model, and it is why the technique reaches into places where closed-form posteriors do not exist &mdash; a hierarchical model with hundreds of parameters, a latent-variable model whose likelihood is itself an integral, a Bayesian neural network whose prior is over millions of weights.</p>
+  </section>
+
+  <section class="g-step" id="stepsize">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Step size, acceptance and mixing</h2></div>
+    <p class="g-eyebrow">The one knob that decides whether you learn anything</p>
+    <p>The proposal width <var>h</var> is the algorithm's only real tuning parameter, and it fails in opposite directions. Make <var>h</var> tiny and almost every proposal is accepted, because the density barely changes over a short hop &mdash; but the chain creeps. It explores the posterior at a snail's pace, neighbouring samples are nearly identical, and the effective number of independent samples is a fraction of the count. Make <var>h</var> huge and the chain proposes points far out in the tails, whose density ratio is minuscule, so almost everything is rejected and the chain sticks where it is for long stretches. The samples are then few in number and far apart in the way that matters least.</p>
+    <p>Between the extremes sits a sweet spot where the chain moves fast enough to traverse the distribution in a reasonable number of steps and still accepts often enough to make progress. The acceptance rate is the readout that tells you which regime you are in. A rate near one means sticky and slow; a rate near zero means jumpy and stuck; a rate somewhere in the middle means mixing. Drag the slider in the demo above from left to right and watch the trace flatten, then explode, then settle.</p>
+    <div class="g-math g-katex">$$\text{tune }h\text{ so that }\mathbb{E}[\alpha]\approx 0.234\ \text{in high dimension},\qquad \mathbb{E}[\alpha]\approx 0.5\ \text{in one or two dimensions},\qquad h\propto d^{-1/4}.$$</div>
+    <p>Those numbers are not folklore. In the late 1990s researchers worked out the scaling limit of random-walk Metropolis as dimension grows and found the proposal that optimises the diffusion speed of the chain accepts about 23.4% of the time. In one or two dimensions the optimum drifts up toward roughly one half. The <var>$d^{-1/4}$</var> rule for the step length is the same result read the other way: as the space grows you must shrink the jump, but only as the fourth root, so the algorithm degrades gracefully rather than catastrophically. The demo here is two-dimensional, so aim for a rate near one half.</p>
+    <p>The consequence of a bad step size is <strong>autocorrelation</strong>. Adjacent samples in the stream are correlated because the chain has memory, and the stronger the memory the more samples it takes to convey one fresh piece of information. The trace plot is the visual diagnostic: a healthy chain looks like a fuzzy caterpillar with no slow drifts and no long flat stretches; a sticky chain looks like a stepped line that barely moves; a jumpy chain looks like a spiky mess with the same value repeated. The histogram below is the payoff &mdash; only when the trace is healthy does the chain's own distribution line up with the target curve.</p>
+    <div class="g-demo">
+      <div class="g-canvas-stack">
+        <canvas id="mh-trace" width="640" height="200"></canvas>
+        <canvas id="mh-hist" width="640" height="220"></canvas>
+      </div>
+      <div class="g-canvas-hint">Top: the trace of <var>x</var> and <var>y</var> against iteration. Bottom: the running histogram of the chain's <var>x</var> values against the target marginal. Too small and the trace is a flat crawl with one towering bar; too large and it is spiky noise with a histogram that never settles.</p>
+      <div class="g-controls">
+        <div class="g-readout" id="trace-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="gibbs-hmc">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Gibbs and Hamiltonian moves</h2></div>
+    <p class="g-eyebrow">Two ways to move better than a random walk</p>
+    <p>Metropolis&ndash;Hastings is completely general, and generality is expensive: it wanders. A structured model usually hands you something a blind proposal cannot see &mdash; the conditional distribution of each coordinate given the others. <strong>Gibbs sampling</strong> takes that gift and updates one coordinate at a time, drawing each from its exact conditional. There is no accept/reject step at all. Every proposal is a draw from the correct conditional, so every move is accepted, and the chain updates the full vector once per sweep.</p>
+    <div class="g-math g-katex">$$x_1^{(t+1)}\sim p\!\left(x_1\mid x_2^{(t)},\dots\right),\qquad x_2^{(t+1)}\sim p\!\left(x_2\mid x_1^{(t+1)},x_3^{(t)},\dots\right),\qquad\dots$$</div>
+    <p>The gains come with a catch. Because each move is axis-aligned, Gibbs struggles when coordinates are strongly correlated: it takes a staircase of tiny horizontal and vertical steps to travel along a diagonal ridge, and the chain looks like it is shuffling sideways while barely advancing. The demo below makes the contrast literal. The same correlated Gaussian is walked by Metropolis, which can move diagonally but rejects moves, and by Gibbs, which never rejects but can only step along the axes.</p>
+    <div class="g-math g-katex">$$x_1\mid x_2\sim\mathcal{N}\!\left(\mu_1+\frac{\Sigma_{12}}{\Sigma_{22}}\left(x_2-\mu_2\right),\;\Sigma_{11}-\frac{\Sigma_{12}^2}{\Sigma_{22}}\right).$$</div>
+    <p>For the Gaussian the conditional is exact and cheap, which is why Gibbs is the natural sampler for the multivariate Gaussian and for every model built out of it &mdash; the block updates inside latent-variable models, the sweep in an Ising model, the alternating draws that make a Bayesian mixture tractable. When the conditional is not available in closed form you can still use a Metropolis step inside a Gibbs sweep, which is the hybrid that most real samplers are.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gibbs-canvas" width="560" height="460"></canvas>
+        <p class="g-canvas-hint">Grey: the Metropolis chain. Pink: the Gibbs chain, drawn through its two half-steps per sweep so the axis-aligned staircase is visible.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="gibbs-readout"></div>
+      </div>
+    </div>
+    <p><strong>Hamiltonian Monte Carlo</strong> attacks the random walk itself. Instead of proposing a blind jump, give the chain a simulated physical momentum and let it glide along the gradient of the log density for several small leapfrog steps. Positions and momenta update in an alternating pattern that conserves energy almost exactly, so a proposal can travel a long way along a level set of the density while still being a plausible draw. The gradient buys large, well-directed moves; the length of the trajectory is the product of the step size <var>$\epsilon$</var> and the number of leapfrog steps <var>$L$</var>.</p>
+    <div class="g-math g-katex">$$p\leftarrow p+\tfrac{\epsilon}{2}\nabla\log\pi(x),\qquad x\leftarrow x+\epsilon\,p,\qquad p\leftarrow p+\tfrac{\epsilon}{2}\nabla\log\pi(x).$$</div>
+    <p>The three lines are the leapfrog integrator, applied <var>$L$</var> times and followed by a Metropolis accept/reject on the total energy. In the correlated Gaussian below, the gradient points along the lean of the ellipse, so HMC shoots across the ridge in a handful of moves where Metropolis has to blunder into it. The price is that HMC needs a gradient &mdash; cheap for a Gaussian, available by backpropagation for a neural likelihood, and the reason Hamiltonian methods swept through Bayesian statistics once autodiff matured. This is the same gradient calculus that drives <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization</a>, repurposed from finding a minimum to exploring a distribution.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hmc-canvas" width="560" height="460"></canvas>
+        <p class="g-canvas-hint">Grey: random-walk Metropolis. Pink: Hamiltonian trajectories. The HMC chain crosses the correlated ridge in long, directed arcs instead of blind hops.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="hmc-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="diagnostics">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Trace plots and burn-in</h2></div>
+    <p class="g-eyebrow">Reading a chain honestly</p>
+    <p>A Markov chain started at an arbitrary point has not yet forgotten where it began. The early samples are a transient, drifting from the starting value toward the region of high probability, and during that drift they are not draws from the target at all. Discarding that warm-up is called <strong>burn-in</strong>, and the trace plot is how you decide how much to throw away. Start the chain far out in a low-density corner and you will see the first hundred iterations of the trace climb steadily; only after it starts wiggling around a stable level is the chain sampling.</p>
+    <p>Burn-in is necessary but not sufficient, and it is easy to overstate its importance. Throwing away the first <var>$B$</var> samples cannot create information; it removes a bias at the cost of a few samples. The bigger issue is autocorrelation, which persists after warm-up. Samples that sit near each other in time are correlated, so the <var>$N$</var> samples you kept may carry only <var>$N_{\text{eff}}$</var> samples' worth of independent information. The leftmost panel below starts the chain in a corner; move the burn-in slider and watch the histogram fill in. The autocorrelation panel shows the memory directly.</p>
+    <div class="g-math g-katex">$$\rho_k=\frac{\dfrac{1}{N}\sum_{t=1}^{N-k}\left(x_t-\bar x\right)\left(x_{t+k}-\bar x\right)}{\dfrac{1}{N}\sum_{t=1}^{N}\left(x_t-\bar x\right)^2},\qquad N_{\text{eff}}\approx\frac{N}{1+2\sum_{k\ge1}\rho_k}.$$</div>
+    <p>Read the trace for three diseases. A slow drift with no return means the chain is still converging &mdash; run longer and burn more, or the estimate is biased. Long flat stretches mean the chain is stuck, a proposal or a multimodality problem. A jagged line that hugs a narrow band means the chain is mixing well and the effective sample count is close to the raw count. None of these is visible in a single summary number; the trace is the honest view, which is why every serious sampler prints one.</p>
+    <p>The autocorrelation function should decay to near zero within a few lags for a well-tuned chain. If it lingers &mdash; heavy tails out to tens or hundreds of lags &mdash; you are not getting the sample size you paid for. The cure is a better proposal, a reparameterisation that breaks the correlation between coordinates, or a different algorithm entirely. The diagnostic is the same in every case: plot the trace, plot the autocorrelation, and reduce the effective sample size accordingly before you quote an error bar.</p>
+    <div class="g-demo">
+      <div class="g-canvas-stack">
+        <canvas id="burn-trace" width="640" height="220"></canvas>
+        <canvas id="burn-hist" width="640" height="220"></canvas>
+        <canvas id="acf-canvas" width="640" height="200"></canvas>
+      </div>
+      <p class="g-canvas-hint">A chain started in a low-density corner. The shaded region is discarded burn-in <var>B</var>; the histogram on the right uses only the kept samples. The bottom panel is the autocorrelation of the kept <var>x</var> sequence.</p>
+      <div class="g-controls">
+        <div class="g-field"><label>Burn-in <var>B</var> <span class="val">120</span></label><input type="range" id="burn-b" min="0" max="320" step="10" value="120"></div>
+        <div class="g-readout" id="burn-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">When the posterior has no formula</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">The posterior you cannot integrate</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/math/probability-in-action/bayesian-inference/' | relative_url }}">conjugate part</a> left the posterior as a closed-form Beta; the moment the model has a hierarchy or a non-conjugate likelihood, that closed form is gone and MCMC is the default way to get samples from it anyway.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Conditionals and Gaussians</h3>
+        <p style="margin-bottom:0;">Gibbs sampling lives off the closed-form conditionals of the <a href="{{ '/math/probability/multivariate-gaussian/' | relative_url }}">multivariate Gaussian</a>: block updates, marginal slices and the precision matrix all become moves on the chain rather than integrals.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision / Robotics</div>
+        <h3 style="margin:6px 0;">Gradients for better proposals</h3>
+        <p style="margin-bottom:0;">Hamiltonian moves need <var>$\nabla\log\pi$</var>, the same gradient machinery that powers <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization</a>. Where a map or a pose graph has an analytic gradient, HMC turns it into directed exploration instead of a blind walk.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / ML</div>
+        <h3 style="margin:6px 0;">Uncertainty over model parameters</h3>
+        <p style="margin-bottom:0;">When a model's weights are given a posterior rather than a point estimate, that posterior is sampled, not solved. The scoring of such distributions is what <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">model evaluation</a> measures, and the same diagnostics decide whether to believe the uncertainty it reports.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Target</td><td><var>$\pi(\theta)\propto p(\mathcal{D}\mid\theta)\,p(\theta)$</var></td><td>Known up to a constant; that constant is never computed.</td></tr>
+        <tr><td>MH acceptance</td><td><var>$\alpha=\min\!\left(1,\dfrac{\pi(x')\,q(x\mid x')}{\pi(x)\,q(x'\mid x)}\right)$</var></td><td>Accept the downhill move sometimes; the ratio cancels the evidence.</td></tr>
+        <tr><td>Symmetric proposal</td><td><var>$\alpha=\min\!\left(1,\pi(x')/\pi(x)\right)$</var></td><td>Plain Metropolis: only the density ratio matters.</td></tr>
+        <tr><td>Detailed balance</td><td><var>$\pi(x)\,T(x\to x')=\pi(x')\,T(x'\to x)$</var></td><td>Makes <var>$\pi$</var> stationary; with irreducibility, unique.</td></tr>
+        <tr><td>Gibbs update</td><td><var>$x_i^{(t+1)}\sim p\!\left(x_i\mid x_{-i}^{(t)}\right)$</var></td><td>Exact conditionals; every move accepted.</td></tr>
+        <tr><td>Gaussian conditional</td><td><var>$x_1\mid x_2\sim\mathcal{N}\!\left(\mu_1+\tfrac{\Sigma_{12}}{\Sigma_{22}}(x_2-\mu_2),\;\Sigma_{11}-\tfrac{\Sigma_{12}^2}{\Sigma_{22}}\right)$</var></td><td>The workhorse Gibbs step for correlated clouds.</td></tr>
+        <tr><td>HMC leapfrog</td><td><var>$p\!+\!=\!\tfrac{\epsilon}{2}\nabla\log\pi(x);\;x\!+\!=\!\epsilon p;\;p\!+\!=\!\tfrac{\epsilon}{2}\nabla\log\pi(x)$</var></td><td>Gradient-guided moves; trajectory length <var>$\epsilon L$</var>.</td></tr>
+        <tr><td>Step-size rule</td><td><var>$\mathbb{E}[\alpha]\approx0.234$</var> (high <var>$d$</var>), <var>$\approx0.5$</var> (1&ndash;2D), <var>$h\propto d^{-1/4}$</var></td><td>Tune acceptance to the middle; too high is sticky, too low is stuck.</td></tr>
+        <tr><td>Burn-in</td><td>discard first <var>$B$</var> samples</td><td>Remove the transient from the starting point; watch the trace.</td></tr>
+        <tr><td>Autocorrelation</td><td><var>$\rho_k$</var>; <var>$N_{\text{eff}}\approx N/(1+2\sum\rho_k)$</var></td><td>Decay fast or you have fewer samples than you counted.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Metropolis, Rosenbluth, Rosenbluth, Teller and Teller, <a href="https://doi.org/10.1063/1.1699114">"Equation of state calculations by fast computing machines"</a>, <em>Journal of Chemical Physics</em>, 1953 &mdash; the original algorithm, from statistical physics.</li>
+      <li>W. K. Hastings, <a href="https://doi.org/10.1093/biomet/57.1.97">"Monte Carlo sampling methods using Markov chains and their applications"</a>, <em>Biometrika</em>, 1970 &mdash; the general, asymmetric-proposal form and the detailed-balance argument.</li>
+      <li>Radford Neal, <a href="https://arxiv.org/abs/1206.1901">"MCMC using Hamiltonian dynamics"</a>, 2011 &mdash; the definitive chapter on leapfrog, energy and tuning.</li>
+      <li>Christian Robert and George Casella, <em>Monte Carlo Statistical Methods</em>, 2004 &mdash; the textbook treatment of Metropolis&ndash;Hastings and Gibbs, with the convergence theorems.</li>
+      <li>Andrew Gelman et al., <em>Bayesian Data Analysis</em>, chapter 11 &mdash; convergence diagnostics, trace plots, <var>$\hat R$</var> and effective sample size in practice.</li>
+      <li>David MacKay, <em>Information Theory, Inference, and Learning Algorithms</em>, chapter 29 &mdash; the same ideas written for exactly this audience.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Latent structure turns one hard integral into a lower bound you can climb, and the sampler you just built becomes the E-step.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-plot3d.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var LA = LinAlg;
+  var PLOT_OPTS = { responsive: true, displayModeBar: false };
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; return x.toFixed(d); }
+  // ------------------------------------------------------------------
+  // Shared target: a correlated 2-D Gaussian posterior, known only up to
+  // a constant, evaluated through its log density.
+  // ------------------------------------------------------------------
+  var MU = [0, 0];
+  var SIG = [[1.0, 0.72], [0.72, 1.0]];
+  var TARGET = Prob.mvn(MU, SIG);
+  var INV = LA.mat.inverse(SIG);
+  var XR = [-3.8, 3.8], YR = [-3.8, 3.8];
+  var X0 = [-2.7, 2.3];
+
+  function logp(x) { return Math.log(Math.max(TARGET.pdf(x), 1e-300)); }
+  function gradLogp(x) {
+    var dx = x[0] - MU[0], dy = x[1] - MU[1];
+    return [-(INV[0][0] * dx + INV[0][1] * dy), -(INV[1][0] * dx + INV[1][1] * dy)];
+  }
+  function normalPdf(x, mu, s2) {
+    return Math.exp(-0.5 * (x - mu) * (x - mu) / s2) / Math.sqrt(2 * Math.PI * s2);
+  }
+  function chainToPts(samples) { return samples.map(function (s) { return [s[0], s[1]]; }); }
+  function meanJump(samples) {
+    if (samples.length < 2) return 0;
+    var d = 0;
+    for (var i = 1; i < samples.length; i++) {
+      var dx = samples[i][0] - samples[i - 1][0], dy = samples[i][1] - samples[i - 1][1];
+      d += Math.sqrt(dx * dx + dy * dy);
+    }
+    return d / (samples.length - 1);
+  }
+
+  function strokeEllipse(pl, S, mu, nSig, opts) {
+    var pts = Prob.confEllipse(S, mu, nSig), ctx = pl.ctx;
+    ctx.save();
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var X = pl.px(pts[i][0]), Y = pl.py(pts[i][1]);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.closePath();
+    if (opts.fill) { ctx.fillStyle = opts.fill; ctx.fill(); }
+    if (opts.color) { ctx.strokeStyle = opts.color; ctx.lineWidth = opts.width || 1.5; ctx.stroke(); }
+    ctx.restore();
+  }
+  function targetBackdrop(pl) {
+    strokeEllipse(pl, SIG, MU, 3, { fill: 'rgba(43,95,255,0.06)' });
+    strokeEllipse(pl, SIG, MU, 2, { fill: 'rgba(43,95,255,0.10)' });
+    strokeEllipse(pl, SIG, MU, 1, { fill: 'rgba(43,95,255,0.14)', color: c.accent, width: 1.8 });
+    strokeEllipse(pl, SIG, MU, 2, { color: 'rgba(43,95,255,0.45)', width: 1.1 });
+    strokeEllipse(pl, SIG, MU, 3, { color: 'rgba(43,95,255,0.25)', width: 1 });
+  }
+  function polyline(pl, pts, color, width, dash) {
+    var ctx = pl.ctx;
+    ctx.save();
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var X = pl.px(pts[i][0]), Y = pl.py(pts[i][1]);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = width || 2;
+    if (dash) ctx.setLineDash(dash);
+    ctx.stroke();
+    ctx.restore();
+  }
+  // ------------------------------------------------------------------
+  // Demo A — Metropolis-Hastings walking the 2-D posterior
+  // ------------------------------------------------------------------
+  var MH = { step: 0.5, seed: 20261111, n: 260, x0: X0.slice() };
+  var mhApi = null, mhPl = null, mhTrace = null, mhHist = null;
+
+  function rebuildMH() {
+    var r = Prob.rng(MH.seed);
+    mhApi = Prob.mcmc.metropolis(logp, { x0: MH.x0.slice(), step: MH.step, rng: r });
+    for (var i = 0; i < MH.n; i++) mhApi.step();
+  }
+
+  function drawMH() {
+    if (!mhPl || !mhApi) return;
+    var pl = mhPl, s = mhApi.samples;
+    pl.clear();
+    pl.grid({ step: 1 });
+    targetBackdrop(pl);
+    polyline(pl, chainToPts(s), 'rgba(214,0,108,0.35)', 1.2);
+    pl.points(chainToPts(s), { color: 'rgba(214,0,108,0.30)', r: 1.8 });
+    pl.points([s[s.length - 1]], { color: c.accent2, r: 4.5 });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'y' });
+    pl.legend([{ label: 'target 1-sigma', color: c.accent }, { label: 'chain', color: c.accent2 }]);
+
+    var tp = mhTrace;
+    tp.clear();
+    tp.grid({ step: 1 });
+    tp.hline(0, { color: 'rgba(32,30,29,0.25)', dash: [3, 3] });
+    function pick(t, comp) {
+      var j = Math.max(0, Math.min(s.length - 1, Math.round(t - 0.5)));
+      return s[j][comp];
+    }
+    tp.curve(function (t) { return pick(t, 0); }, { from: 0.5, to: s.length + 0.5, samples: Math.min(s.length, 300), color: c.accent, width: 1.6, label: 'x' });
+    tp.curve(function (t) { return pick(t, 1); }, { from: 0.5, to: s.length + 0.5, samples: Math.min(s.length, 300), color: c.accent2, width: 1.6, label: 'y' });
+    tp.axes({ step: 1, xLabel: 'iteration', yLabel: 'value' });
+    tp.legend();
+
+    var hp = mhHist;
+    var xs = s.map(function (p) { return p[0]; });
+    var h = Prob.hist(xs, { bins: 24, range: [-4, 4], density: true });
+    hp.clear();
+    hp.grid({ step: 0.1 });
+    hp.bars(h.bins, { color: 'rgba(214,0,108,0.35)', baseline: 0 });
+    var m0 = TARGET.marginal(0);
+    hp.curve(function (x) { return normalPdf(x, m0.mu, m0.sigma2); }, { color: c.accent, width: 2, label: 'target p(x)' });
+    hp.axes({ step: 0.1, xLabel: 'x', yLabel: 'density' });
+    hp.legend();
+    var ymax = 0.5;
+    h.bins.forEach(function (b) { if (b.y > ymax) ymax = b.y; });
+    hp.yRange[1] = Math.max(0.5, ymax * 1.15);
+
+    var rate = mhApi.rate;
+    var verdict = rate > 0.75 ? 'sticky - step too small' : rate < 0.15 ? 'jumpy - step too large' : 'mixing well';
+    el('mh-readout').innerHTML =
+      '<div><span class="k">step size h</span> <span class="hi">' + fmt(MH.step, 2) + '</span></div>' +
+      '<div><span class="k">samples</span> ' + s.length + '</div>' +
+      '<div><span class="k">acceptance rate</span> <span class="hi">' + fmt(rate, 2) + '</span></div>' +
+      '<div><span class="k">verdict</span> ' + verdict + '</div>' +
+      '<div style="margin-top:6px;">Acceptance alone is not quality: a tiny step accepts almost always and still crawls.</div>';
+    el('trace-readout').innerHTML =
+      '<div><span class="k">acceptance</span> <span class="hi">' + fmt(rate, 2) + '</span></div>' +
+      '<div><span class="k">mean jump per step</span> ' + fmt(meanJump(s), 3) + '</div>' +
+      '<div><span class="k">target rate (2-D)</span> ~0.50</div>';
+    drawSurface();
+  }
+  mhPl = Prob.plot(el('mh-canvas'), { W: 560, H: 460, xRange: XR, yRange: YR, onResize: drawMH });
+  mhTrace = Prob.plot(el('mh-trace'), { W: 640, H: 200, xRange: [0, MH.n + 1], yRange: [-4, 4], onResize: drawMH });
+  mhHist = Prob.plot(el('mh-hist'), { W: 640, H: 220, xRange: [-4, 4], yRange: [0, 0.5], onResize: drawMH });
+  // ------------------------------------------------------------------
+  // Demo A (continued) — Plotly surface with the chain overlaid
+  // ------------------------------------------------------------------
+  var sdiv = el('mh-plot');
+  function render3d(div, traces, layout) {
+    if (!div || !window.Plotly) return;
+    if (!div.__plotlyInit) { Plotly.newPlot(div, traces, layout, PLOT_OPTS); div.__plotlyInit = true; }
+    else { Plotly.react(div, traces, layout, PLOT_OPTS); }
+  }
+  function drawSurface() {
+    if (!sdiv || !window.Plotly || !mhApi) return;
+    var N = 41, lo = -3.6, hi = 3.6, xs = [], zz = [], zmax = 1e-9, i, j;
+    for (i = 0; i < N; i++) xs.push(lo + (hi - lo) * i / (N - 1));
+    for (i = 0; i < N; i++) {
+      var row = [];
+      for (j = 0; j < N; j++) {
+        var z = TARGET.pdf([xs[i], xs[j]]);
+        if (z > zmax) zmax = z;
+        row.push(z);
+      }
+      zz.push(row);
+    }
+    var cx = [], cy = [], cz = [];
+    mhApi.samples.forEach(function (p) {
+      cx.push(p[0]); cy.push(p[1]); cz.push(TARGET.pdf(p) + zmax * 0.02);
+    });
+    var traces = [
+      { type: 'surface', x: xs, y: xs, z: zz, showscale: false, opacity: 1, hoverinfo: 'skip',
+        colorscale: [[0, '#eaf0ff'], [1, '#2b5fff']] },
+      { type: 'scatter3d', mode: 'markers', x: cx, y: cy, z: cz, name: 'chain',
+        marker: { size: 2.6, color: '#d6006c' }, hoverinfo: 'skip' }
+    ];
+    render3d(sdiv, traces, GuidePlot3D.baseLayout({
+      range: { x: [lo, hi], y: [lo, hi], z: [0, zmax * 1.08] },
+      aspectmode: 'data', xTitle: 'x', yTitle: 'y', zTitle: 'density'
+    }));
+    el('surface-readout').innerHTML =
+      '<div><span class="k">peak density</span> <span class="hi">' + fmt(zmax, 3) + '</span></div>' +
+      '<div><span class="k">chain points</span> ' + mhApi.samples.length + '</div>' +
+      '<div style="margin-top:6px;">The chain only ever evaluated the density, never integrated it.</div>';
+  }
+  window.addEventListener('resize', function () {
+    if (sdiv && sdiv.__plotlyInit && window.Plotly) Plotly.Plots.resize(sdiv);
+  });
+  // ------------------------------------------------------------------
+  // Demo B — Gibbs sampling: axis-aligned moves on the same target
+  // ------------------------------------------------------------------
+  var GIB = { n: 220, seed: 20261112, x0: X0.slice() };
+  var gibbsApi = null, gibbsHalf = [], gibbsPl = null;
+
+  function rebuildGibbs() {
+    gibbsHalf = [];
+    var r = Prob.rng(GIB.seed);
+    var conditionals = [
+      function (x, rg) {
+        var C = TARGET.conditional([1], [x[1]]);
+        var v = C.mu[0] + Math.sqrt(Math.max(C.Sigma[0][0], 1e-12)) * rg.normal();
+        gibbsHalf.push([v, x[1]]);
+        return v;
+      },
+      function (x, rg) {
+        var C = TARGET.conditional([0], [x[0]]);
+        var v = C.mu[0] + Math.sqrt(Math.max(C.Sigma[0][0], 1e-12)) * rg.normal();
+        gibbsHalf.push([x[0], v]);
+        return v;
+      }
+    ];
+    gibbsApi = Prob.mcmc.gibbs(conditionals, { x0: GIB.x0.slice(), rng: r });
+    for (var i = 0; i < GIB.n; i++) gibbsApi.step();
+  }
+
+  function drawGibbs() {
+    if (!gibbsPl || !gibbsApi || !mhApi) return;
+    var pl = gibbsPl;
+    pl.clear();
+    pl.grid({ step: 1 });
+    targetBackdrop(pl);
+    polyline(pl, chainToPts(mhApi.samples), 'rgba(32,30,29,0.30)', 1.4);
+    pl.points(chainToPts(mhApi.samples), { color: 'rgba(32,30,29,0.30)', r: 1.6 });
+    polyline(pl, gibbsHalf, c.accent2, 1.4);
+    pl.points(chainToPts(gibbsApi.samples), { color: 'rgba(214,0,108,0.5)', r: 1.8 });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'y' });
+    pl.legend([{ label: 'Metropolis (h = 0.5)', color: 'rgba(32,30,29,0.6)' }, { label: 'Gibbs (axis-aligned)', color: c.accent2 }]);
+    var cstd = Math.sqrt(Math.max(SIG[0][0] - SIG[0][1] * SIG[0][1] / SIG[1][1], 0));
+    el('gibbs-readout').innerHTML =
+      '<div><span class="k">Gibbs acceptance</span> <span class="hi">1.00</span> - every move is accepted</div>' +
+      '<div><span class="k">MH acceptance</span> ' + fmt(mhApi.rate, 2) + '</div>' +
+      '<div><span class="k">conditional std (x | y)</span> ' + fmt(cstd, 3) + ' vs marginal 1.000</div>' +
+      '<div><span class="k">moves per sweep</span> 2 (one per coordinate)</div>' +
+      '<div style="margin-top:6px;">Exact conditionals, no rejections - but the staircase struggles along a diagonal ridge.</div>';
+  }
+  gibbsPl = Prob.plot(el('gibbs-canvas'), { W: 560, H: 460, xRange: XR, yRange: YR, onResize: drawGibbs });
+  // ------------------------------------------------------------------
+  // Demo C — Hamiltonian Monte Carlo for contrast
+  // ------------------------------------------------------------------
+  var HMC = { n: 220, seed: 20261113, x0: X0.slice(), eps: 0.2, L: 10 };
+  var hmcApi = null, hmcPl = null;
+
+  function rebuildHMC() {
+    var r = Prob.rng(HMC.seed);
+    hmcApi = Prob.mcmc.hmc(logp, gradLogp, { x0: HMC.x0.slice(), epsilon: HMC.eps, L: HMC.L, rng: r });
+    for (var i = 0; i < HMC.n; i++) hmcApi.step();
+  }
+
+  function drawHMC() {
+    if (!hmcPl || !hmcApi || !mhApi) return;
+    var pl = hmcPl;
+    pl.clear();
+    pl.grid({ step: 1 });
+    targetBackdrop(pl);
+    polyline(pl, chainToPts(mhApi.samples), 'rgba(32,30,29,0.30)', 1.4);
+    pl.points(chainToPts(mhApi.samples), { color: 'rgba(32,30,29,0.30)', r: 1.6 });
+    polyline(pl, chainToPts(hmcApi.samples), c.accent2, 1.6);
+    pl.points(chainToPts(hmcApi.samples), { color: 'rgba(214,0,108,0.55)', r: 1.9 });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'y' });
+    pl.legend([{ label: 'Metropolis (h = 0.5)', color: 'rgba(32,30,29,0.6)' }, { label: 'HMC (eps = 0.2, L = 10)', color: c.accent2 }]);
+    el('hmc-readout').innerHTML =
+      '<div><span class="k">HMC acceptance</span> <span class="hi">' + fmt(hmcApi.rate, 2) + '</span></div>' +
+      '<div><span class="k">trajectory length</span> eps * L = ' + fmt(HMC.eps * HMC.L, 2) + '</div>' +
+      '<div><span class="k">mean jump</span> HMC ' + fmt(meanJump(hmcApi.samples), 3) + ' vs MH ' + fmt(meanJump(mhApi.samples), 3) + '</div>' +
+      '<div style="margin-top:6px;">Gradients turn blind hops into directed glides along the correlation.</div>';
+  }
+  hmcPl = Prob.plot(el('hmc-canvas'), { W: 560, H: 460, xRange: XR, yRange: YR, onResize: drawHMC });
+  // ------------------------------------------------------------------
+  // Demo D — burn-in, trace plots and autocorrelation
+  // ------------------------------------------------------------------
+  var BURN = { n: 420, seed: 20261114, x0: [3.5, -3.4], b: 120 };
+  var burnApi = null, burnXs = [];
+  var burnPl = null, burnHist = null, acfPl = null;
+
+  function rebuildBurn() {
+    var r = Prob.rng(BURN.seed);
+    burnApi = Prob.mcmc.metropolis(logp, { x0: BURN.x0.slice(), step: 0.62, rng: r });
+    for (var i = 0; i < BURN.n; i++) burnApi.step();
+    burnXs = burnApi.samples.map(function (p) { return p[0]; });
+  }
+
+  function autocorr(xs, maxLag) {
+    var n = xs.length, i, k, mx = 0;
+    if (n === 0) return [1];
+    for (i = 0; i < n; i++) mx += xs[i];
+    mx /= n;
+    var v = 0;
+    for (i = 0; i < n; i++) v += (xs[i] - mx) * (xs[i] - mx);
+    var out = [];
+    for (k = 0; k <= maxLag; k++) {
+      var s = 0;
+      for (i = 0; i + k < n; i++) s += (xs[i] - mx) * (xs[i + k] - mx);
+      out.push(v > 1e-300 ? s / v : 0);
+    }
+    return out;
+  }
+
+  function drawBurn() {
+    if (!burnPl || !burnApi) return;
+    var b = BURN.b, n = burnXs.length, i;
+    var kept = burnXs.slice(b);
+
+    var tp = burnPl;
+    tp.clear();
+    tp.grid({ step: 1 });
+    tp.band(0, b, { color: 'rgba(214,0,108,0.09)' });
+    tp.vline(b, { color: c.accent2, dash: [6, 4], labelText: 'B' });
+    tp.hline(0, { color: 'rgba(32,30,29,0.25)', dash: [3, 3] });
+    tp.curve(function (t) { var j = Math.max(0, Math.min(n - 1, Math.round(t - 0.5))); return burnXs[j]; },
+      { from: 0.5, to: n + 0.5, samples: n, color: c.accent, width: 1.5, label: 'x trace' });
+    tp.axes({ step: 1, xLabel: 'iteration', yLabel: 'x' });
+    tp.legend();
+
+    var hp = burnHist;
+    var h = Prob.hist(kept, { bins: 24, range: [-4, 4], density: true });
+    hp.clear();
+    hp.grid({ step: 0.1 });
+    hp.bars(h.bins, { color: 'rgba(214,0,108,0.35)', baseline: 0 });
+    var m0 = TARGET.marginal(0);
+    hp.curve(function (x) { return normalPdf(x, m0.mu, m0.sigma2); }, { color: c.accent, width: 2, label: 'target p(x)' });
+    hp.axes({ step: 0.1, xLabel: 'x (kept samples)', yLabel: 'density' });
+    hp.legend();
+    var ymax = 0.5;
+    h.bins.forEach(function (bb) { if (bb.y > ymax) ymax = bb.y; });
+    hp.yRange[1] = Math.max(0.5, ymax * 1.15);
+
+    var ap = acfPl;
+    var ac = autocorr(kept, 30), items = [];
+    for (i = 0; i < ac.length; i++) items.push({ x: i, y: ac[i] });
+    ap.clear();
+    ap.grid({ step: 0.2 });
+    ap.hline(0, { color: 'rgba(32,30,29,0.35)', dash: [3, 3] });
+    ap.bars(items, { color: 'rgba(43,95,255,0.55)', width: 0.7, baseline: 0 });
+    ap.axes({ step: 0.2, xLabel: 'lag k', yLabel: 'autocorrelation' });
+
+    var meanAll = 0, meanKept = 0;
+    for (i = 0; i < n; i++) meanAll += burnXs[i];
+    meanAll /= Math.max(n, 1);
+    for (i = 0; i < kept.length; i++) meanKept += kept[i];
+    meanKept /= Math.max(kept.length, 1);
+    var sumRho = 0;
+    for (i = 1; i < ac.length; i++) sumRho += ac[i];
+    var ess = kept.length / (1 + 2 * Math.max(sumRho, 0));
+    el('burn-readout').innerHTML =
+      '<div><span class="k">burn-in B</span> <span class="hi">' + b + '</span> of ' + n + '</div>' +
+      '<div><span class="k">kept samples</span> ' + kept.length + '</div>' +
+      '<div><span class="k">mean, all vs kept</span> ' + fmt(meanAll, 3) + ' vs ' + fmt(meanKept, 3) + '</div>' +
+      '<div><span class="k">autocorr lag 1</span> ' + fmt(ac[1] || 0, 3) + '</div>' +
+      '<div><span class="k">approx. ESS</span> ' + fmt(ess, 1) + ' of ' + kept.length + '</div>' +
+      '<div style="margin-top:6px;">Discarding the transient removes the pull of the starting corner; correlational honesty is what remains.</div>';
+  }
+  burnPl = Prob.plot(el('burn-trace'), { W: 640, H: 220, xRange: [0, BURN.n + 1], yRange: [-4.5, 4.5], onResize: drawBurn });
+  burnHist = Prob.plot(el('burn-hist'), { W: 640, H: 220, xRange: [-4, 4], yRange: [0, 0.5], onResize: drawBurn });
+  acfPl = Prob.plot(el('acf-canvas'), { W: 640, H: 200, xRange: [0, 31], yRange: [-0.6, 1.05], onResize: drawBurn });
+  // ------------------------------------------------------------------
+  // Build state, wire controls, draw everything once
+  // ------------------------------------------------------------------
+  rebuildMH();
+  rebuildGibbs();
+  rebuildHMC();
+  rebuildBurn();
+
+  Guide.bindSliders([el('mh-step')], function (s) {
+    MH.step = parseFloat(s.value);
+    rebuildMH();
+    drawMH();
+  });
+  Guide.bindSliders([el('burn-b')], function (s) {
+    BURN.b = parseInt(s.value, 10);
+    drawBurn();
+  });
+  el('mh-one').addEventListener('click', function () {
+    if (mhApi) { mhApi.step(); drawMH(); }
+  });
+  el('mh-batch').addEventListener('click', function () {
+    if (!mhApi) return;
+    for (var i = 0; i < 25; i++) mhApi.step();
+    drawMH();
+  });
+  el('mh-reset').addEventListener('click', function () {
+    rebuildMH();
+    drawMH();
+  });
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'mcmc-why',
+      kind: 'choice',
+      prompt: 'Why is MCMC needed for a Bayesian posterior in more than a couple of dimensions?',
+      options: [
+        { label: 'The posterior is easy to evaluate up to a constant, but the constant (the evidence integral) cannot be computed.', correct: true },
+        { label: 'The likelihood cannot be evaluated without knowing the posterior first.', correct: false },
+        { label: 'Priors are only defined in one dimension.', correct: false }
+      ],
+      explanation: 'The likelihood times the prior is a pointwise-evaluable unnormalised density. What is intractable is the normalising integral, and a ratio-based sampler never needs it.'
+    },
+    {
+      id: 'mcmc-acceptance-number',
+      kind: 'numeric',
+      prompt: 'A Metropolis chain with a <em>symmetric</em> proposal has <var>$\\pi(x)=0.8$</var> at the current point and <var>$\\pi(x\')=0.24$</var> at the candidate. What is the acceptance probability?',
+      answer: 0.3,
+      tolerance: 0.01,
+      explanation: 'For a symmetric proposal the ratio is π(x′)/π(x) = 0.24/0.8 = 0.3, and the move is accepted with that probability. It is not rejected outright: accepting some downhill moves is what fills in the distribution.'
+    },
+    {
+      id: 'mcmc-step-small',
+      kind: 'choice',
+      prompt: 'You set the proposal step size extremely small. What do you observe?',
+      options: [
+        { label: 'A very high acceptance rate with a trace that barely moves — sticky and slow to explore.', correct: true },
+        { label: 'A very low acceptance rate because short jumps are usually rejected.', correct: false },
+        { label: 'Perfect mixing, because acceptance is what matters most.', correct: false }
+      ],
+      explanation: 'Short proposals change the density very little, so they are almost always accepted, but the chain crawls and neighbouring samples are nearly identical. High acceptance alone is not a sign of good exploration.'
+    },
+    {
+      id: 'mcmc-gibbs-step',
+      kind: 'choice',
+      prompt: 'What is the acceptance rate of a Gibbs sampler that draws each coordinate from its exact conditional?',
+      options: [
+        { label: 'One — every move is accepted, because each draw already comes from the correct conditional.', correct: true },
+        { label: 'About 0.234, as for any Metropolis sampler.', correct: false },
+        { label: 'It depends on the step size, which must be tuned.', correct: false }
+      ],
+      explanation: 'Gibbs has no proposal to reject: each coordinate is drawn from its exact conditional distribution, so the sweep is accepted by construction. Its weakness is different — axis-aligned moves mix poorly under strong correlation.'
+    },
+    {
+      id: 'mcmc-hmc-length',
+      kind: 'numeric',
+      prompt: 'An HMC sampler uses leapfrog step size <var>$\\epsilon=0.1$</var> and <var>$L=12$</var> leapfrog steps per proposal. What is the trajectory length <var>$\\epsilon L$</var>?',
+      answer: 1.2,
+      tolerance: 0.001,
+      explanation: 'The trajectory length is ε × L = 0.1 × 12 = 1.2. Longer trajectories travel farther along the density but cost more gradient evaluations and eventually overshoot.'
+    },
+    {
+      id: 'mcmc-burnin',
+      kind: 'choice',
+      prompt: 'A trace plot starts high, slides down over 150 iterations, and then wiggles around a stable level. What should you do?',
+      options: [
+        { label: 'Discard the first ≈150 samples as burn-in and analyse the stationary part.', correct: true },
+        { label: 'Keep everything — burn-in is only a convention and removing samples never helps.', correct: false },
+        { label: 'Increase the step size until the drift disappears.', correct: false }
+      ],
+      explanation: 'The initial slide is the transient from the starting point: those samples are not draws from the target. Burn-in removes that bias; the stable wiggle afterwards is the chain sampling.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+
+  drawMH();
+  drawGibbs();
+  drawHMC();
+  drawBurn();
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

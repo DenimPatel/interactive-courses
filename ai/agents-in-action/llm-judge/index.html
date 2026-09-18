@@ -1,0 +1,583 @@
+---
+title: "Agents in Action, Interactively — Part 10: LLM-as-judge and its biases"
+description: "Pointwise versus pairwise grading, rubrics built from the failure taxonomy, the three named biases and their mitigations, and why you must measure inter-annotator agreement before you trust a judge."
+permalink: "/ai/agents-in-action/llm-judge/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>LLM-as-judge and its biases</h1>
+    <p>Once you have a task set, something has to grade it, and for open-ended answers a second model is the only affordable grader. That makes the judge a component of your system, with its own failure modes. This part builds the judge deliberately: pointwise versus pairwise, a rubric drawn from the failure taxonomy, the three biases that reliably bend verdicts, and the human-agreement measurement that has to happen before any of it counts for anything.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="playground">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A judge is a model, and models are biased</h2></div>
+    <p class="g-eyebrow">Watch a wrong answer win, then fix the judge</p>
+    <p>An LLM judge is asked a question so simple it seems to need no engineering: which of these two answers is better? That is exactly the kind of short, context-light comparison where systematic preferences do the most damage, because there is no reasoning depth to average them out. Three biases are documented well enough to have names. <strong>Position bias</strong> — the answer presented first wins more often than it should; swap the order and the verdict flips. <strong>Verbosity bias</strong> — a longer answer wins more often than it should, whether or not the extra words carry information. <strong>Self-preference bias</strong> — a judge scores text in its own family's style higher, including text it produced itself.</p>
+    <p>The playground below pairs a short correct answer (A) with a long, confident, wrong one (B) drawn from the judge's own family. The sliders are the three biases; the verdicts are computed with the same mock judge the rest of this volume uses. Start at the authored defaults: B wins, and B is wrong.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="judge-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Three verdicts for one pair: as shown, with the order swapped, and order-averaged. The wrong answer is winning because it is long and self-authored, not because it is right.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Position bias <span class="val">0.6</span></label><input type="range" id="judge-position" min="0" max="1" step="0.05" value="0.6"></div>
+        <div class="g-field"><label>Verbosity bias <span class="val">1.2</span></label><input type="range" id="judge-verbosity" min="0" max="2" step="0.05" value="1.2"></div>
+        <div class="g-field"><label>Self-preference bias <span class="val">0.5</span></label><input type="range" id="judge-self" min="0" max="1" step="0.05" value="0.5"></div>
+        <div class="g-btnrow">
+          <button id="judge-swap">Order-swap averaging: off</button>
+        </div>
+        <div class="g-readout" id="judge-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="judge-evals-source"></p>
+    <div class="g-goal">💡 <span><b>The fix is mechanical, not moral.</b> Position bias dies when you grade both orders and average. Verbosity bias dies when the rubric constrains length. Self-preference dies when the judge is a different model family, or a human. None of them dies by asking the judge to be fair.</span></div>
+  </section>
+
+  <section class="g-step" id="pointwise-pairwise">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Pointwise and pairwise are different instruments</h2></div>
+    <p class="g-eyebrow">Absolute scores drift; relative comparisons do not</p>
+    <p><strong>Pointwise</strong> asks for a score: "rate this answer 1–10 against the rubric." It is the natural shape for regression testing and for tracking a single output over time, and it is the only shape that works when there is no second candidate to compare against. Its weakness is calibration: absolute scores drift with the prompt, the day and the model version, so a threshold that passed last week fails this week even though the answers did not change. <strong>Pairwise</strong> asks for a choice: "which of these two is better?" It is far more stable, because the comparison is local, and it is the right instrument for ranking two candidate systems on the same inputs. Its weakness is scale: pairwise tells you A beats B, not by how much, and it needs a candidate to compare against.</p>
+    <p>The rule of thumb: use pairwise to compare two systems or two prompts on a fixed set, use pointwise (with a tight rubric) to detect regressions on a single system, and never mix the two when you report a number. The demo shows why. The pair never changes, but the pointwise scores wander across re-runs and cross the pass threshold; the pairwise verdict does not.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pv-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Sixteen re-runs of the same pair. Dashed line = the pass threshold. Pointwise scores drift across it; the pairwise winner is the same every run.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Scoring noise (σ) <span class="val">1.2</span></label><input type="range" id="pv-noise" min="0" max="3" step="0.1" value="1.2"></div>
+        <div class="g-readout" id="pv-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> a pointwise harness that reports "the average score went from 6.4 to 6.1" invites you to ship a fix for noise. Report the pairwise win rate on a fixed set, or report pointwise with a confidence interval and a stated threshold — never a bare mean.</span></div>
+  </section>
+
+  <section class="g-step" id="rubric">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Rubrics come from the failure taxonomy</h2></div>
+    <p class="g-eyebrow">Grade the failure modes you actually have</p>
+    <p>A rubric is not a list of virtues. It is a list of the specific ways your answers fail, written as checkable criteria and weighted by the cost of the failure. The source of that list is the error-analysis step: you read real outputs, name the failure modes, count them, and then turn the top ones into rubric lines. If your taxonomy says the dominant failure is answers that are fluent but not grounded in the retrieved context, then a rubric without a groundedness criterion is measuring something else.</p>
+    <p>Below, the rubric criteria are the five failure modes from the retrieval taxonomy. Each case in the human-labelled set is tagged with the mode it exhibits. Toggle the criteria on and watch agreement with the human labels climb — not because the judge got smarter, but because the rubric started asking the right question.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rubric-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Left: the rubric, as criteria you can switch on. Right: judge–human agreement on a labelled set, against the 50% chance line.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="rubric-buttons"></div>
+        <div class="g-btnrow">
+          <button id="rubric-all" class="g-primary">Cover all modes</button>
+          <button id="rubric-none">Clear rubric</button>
+        </div>
+        <div class="g-readout" id="rubric-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>A rubric is a hypothesis about failure.</b> If agreement with humans does not rise when you add the criterion, the criterion is either wrong or the labels disagree — and that second possibility is the next section.</span></div>
+  </section>
+
+  <section class="g-step" id="iaa">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Inter-annotator agreement comes first</h2></div>
+    <p class="g-eyebrow">If two humans cannot agree, no judge can be validated</p>
+    <p>Before you can ask whether a judge agrees with humans, you have to ask whether humans agree with each other. Label a sample twice — two annotators, or one annotator on two days — and measure the agreement. If it is low, the task is underspecified, the labels are ambiguous, or the rubric is unusable; a judge cannot beat the ceiling the humans set, so a low ceiling means the problem is upstream of the judge.</p>
+    <p>The right statistic is not raw agreement, because raw agreement is inflated by class imbalance: two annotators who both say "pass" almost every time agree often by accident. <strong>Cohen's κ</strong> corrects for that chance agreement. It runs up to 1 for perfect agreement and is 0 when the annotators are no better than chance; negative values are worse than chance. A widely used reading is that below 0.4 is weak, 0.4–0.6 moderate, 0.6–0.8 substantial and above 0.8 strong — a convention, not a law. Move the disagreement slider and watch κ fall, dragging the judge's achievable ceiling down with it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="iaa-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Left: the confusion matrix between the two annotators. Right: κ as a bar on a 0–1 scale, with the 0.6 "substantial" marker.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Annotator disagreement <span class="val">15</span>%</label><input type="range" id="iaa-disagree" min="0" max="50" step="1" value="15"></div>
+        <div class="g-readout" id="iaa-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Never trust a judge you have not calibrated.</b> A judge that looks reasonable is not evidence. Report the confusion matrix against human labels, the κ, and the human κ it is bounded by — and re-run the calibration whenever the judge model or the rubric changes.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the harness</th></tr></thead>
+      <tbody>
+        <tr><td>Pointwise or pairwise?</td><td>Pairwise to compare two systems on fixed inputs; pointwise to detect regressions on one system.</td></tr>
+        <tr><td>Why not a bare mean score?</td><td>Absolute scores drift with prompt, day and model version; a trend may be calibration, not quality.</td></tr>
+        <tr><td>Where does the rubric come from?</td><td>The error-analysis failure taxonomy, weighted by the cost of each failure — not a list of virtues.</td></tr>
+        <tr><td>Position bias</td><td>The first answer wins. Mitigation: grade both orders and average.</td></tr>
+        <tr><td>Verbosity bias</td><td>The longer answer wins. Mitigation: a length-controlled rubric, or explicit conciseness criteria.</td></tr>
+        <tr><td>Self-preference bias</td><td>The judge favours its own family's style. Mitigation: a different judge model, or humans.</td></tr>
+        <tr><td>What must you measure first?</td><td>Inter-annotator agreement. The humans' κ is the judge's ceiling.</td></tr>
+        <tr><td>What validates the judge?</td><td>A confusion matrix against human labels and Cohen's κ — reported, not assumed.</td></tr>
+        <tr><td>What invalidates it?</td><td>Raw agreement alone, a drifting pointwise score, or an uncalibrated judge on a new model version.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Zheng et al., <a href="https://arxiv.org/abs/2306.05685">"Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"</a>, NeurIPS 2023 — the paper that named position, verbosity and self-enhancement bias and measured judge–human agreement.</li>
+      <li>Wang et al., <a href="https://arxiv.org/abs/2305.17926">"Large Language Models are not Fair Evaluators"</a>, 2023 — the order-swap calibration that removes position bias, and evidence of how large the effect is.</li>
+      <li>Panickssery et al., <a href="https://arxiv.org/abs/2404.13076">"LLM Evaluators Recognize and Favor Their Own Generations"</a>, 2024 — self-preference measured directly, and its link to self-recognition.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2303.16634">"G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment"</a>, EMNLP 2023 — rubric-driven grading with chain of thought, and the agreement gains it buys.</li>
+      <li>Cohen, <a href="https://doi.org/10.1177/001316446002000104">"A Coefficient of Agreement for Nominal Scales"</a>, Educational and Psychological Measurement, 1960 — the κ statistic the calibration readout uses.</li>
+      <li>Es et al., <a href="https://arxiv.org/abs/2309.15217">"RAGAS: Automated Evaluation of Retrieval Augmented Generation"</a>, EACL 2024 — faithfulness and context metrics as judge-scored rubric lines.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A calibrated judge grades one answer. The harder job is evaluating a pipeline and an agent — localising a failure to a stage, and separating a good end state from a good trajectory. Next: evaluating RAG and agents.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench (2025); GAIA (Mialon et al., arXiv:2311.12983, 2023); OSWorld (Xie et al., arXiv:2404.07972, 2024). Judge bias and calibration: Zheng et al., arXiv:2306.05685 (NeurIPS 2023); Wang et al., arXiv:2305.17926 (2023); Panickssery et al., arXiv:2404.13076 (2024). Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — the judge bias playground (load-bearing)
+  // ------------------------------------------------------------------
+  var PAIR = {
+    a: { correct: true, length: 120, selfAuthored: false },
+    b: { correct: false, length: 900, selfAuthored: true }
+  };
+  // A labelled comparison set. Each case has an unambiguous human label:
+  // 1 means the human prefers A; 0 means the human prefers B. Where the judge
+  // scores a tie, our standing rubric breaks it toward the shorter answer.
+  var CASES = [
+    { a: { correct: true, length: 300, selfAuthored: false }, b: { correct: false, length: 300, selfAuthored: false }, label: 1 },
+    { a: { correct: false, length: 300, selfAuthored: false }, b: { correct: true, length: 300, selfAuthored: false }, label: 0 },
+    { a: { correct: true, length: 150, selfAuthored: false }, b: { correct: true, length: 700, selfAuthored: false }, label: 1 },
+    { a: { correct: true, length: 700, selfAuthored: false }, b: { correct: true, length: 150, selfAuthored: false }, label: 0 },
+    { a: { correct: false, length: 150, selfAuthored: false }, b: { correct: false, length: 700, selfAuthored: false }, label: 1 },
+    { a: { correct: false, length: 700, selfAuthored: false }, b: { correct: false, length: 150, selfAuthored: false }, label: 0 },
+    { a: { correct: true, length: 260, selfAuthored: false }, b: { correct: false, length: 900, selfAuthored: true }, label: 1 },
+    { a: { correct: false, length: 900, selfAuthored: true }, b: { correct: true, length: 260, selfAuthored: false }, label: 0 },
+    { a: { correct: true, length: 400, selfAuthored: false }, b: { correct: true, length: 400, selfAuthored: false }, label: 1 },
+    { a: { correct: false, length: 250, selfAuthored: false }, b: { correct: false, length: 250, selfAuthored: true }, label: 1 },
+    { a: { correct: true, length: 180, selfAuthored: false }, b: { correct: true, length: 180, selfAuthored: true }, label: 1 },
+    { a: { correct: true, length: 500, selfAuthored: true }, b: { correct: true, length: 120, selfAuthored: false }, label: 0 }
+  ];
+  var state = { swap: false };
+  var setupA = Guide.setupCanvas(el('judge-canvas'), 640, 340, drawA);
+
+  function biases() {
+    return {
+      position: +el('judge-position').value,
+      verbosity: +el('judge-verbosity').value,
+      self: +el('judge-self').value,
+      lengthScale: 400
+    };
+  }
+  function predFor(cs, b, averaged) {
+    var j = AppSim.judge(cs.a, cs.b, b);
+    var v = averaged ? j.averaged : j.shown;
+    var w = v.winner;
+    if (w === 'tie') w = (cs.a.length <= cs.b.length) ? 'a' : 'b';
+    return w === 'a' ? 1 : 0;
+  }
+  function kappaFor(b, averaged) {
+    var pred = CASES.map(function (cs) { return predFor(cs, b, averaged); });
+    var labels = CASES.map(function (cs) { return cs.label; });
+    return AppSim.cohenKappa(pred, labels);
+  }
+  function winnerText(w) { return w === 'a' ? 'A wins' : (w === 'b' ? 'B wins' : 'tie'); }
+
+  function drawCandidate(ctx, x, y, w, h, tag, cand) {
+    ctx.fillStyle = 'rgba(43,95,255,0.06)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(tag, x + 10, y + 18);
+    ctx.font = '11px ' + c.font;
+    ctx.fillStyle = cand.correct ? c.accent700 : c.accent2;
+    ctx.fillText(cand.correct ? 'correct' : 'wrong — but confident', x + 10, y + 34);
+    ctx.fillStyle = cand.correct ? c.accent : c.accent2;
+    ctx.fillRect(x + 10, y + 44, (w - 20) * (cand.length / 900), 8);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText(cand.length + ' words', x + 12, y + 66);
+    if (cand.selfAuthored) {
+      ctx.fillStyle = c.accent2;
+      ctx.fillText('from the judge\u2019s own family', x + 10, y + 80);
+    }
+  }
+  function drawVerdict(ctx, y, title, v, active, maxScore) {
+    ctx.font = (active ? '600 ' : '') + '12px ' + c.font;
+    ctx.fillStyle = active ? c.accent700 : c.text; ctx.textAlign = 'left';
+    ctx.fillText(title, 24, y + 11);
+    ctx.fillStyle = active ? c.accent700 : c.text; ctx.font = '12px ' + c.font;
+    ctx.fillText(winnerText(v.winner), 176, y + 11);
+    var bx = 268, bw = 300;
+    ctx.fillStyle = v.winner === 'a' ? c.accent : c.accent400;
+    ctx.fillRect(bx, y, bw * Math.max(0, v.a) / maxScore, 11);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('A ' + v.a.toFixed(2), bx + 4, y + 9);
+    ctx.fillStyle = v.winner === 'b' ? c.accent2 : c.accent400;
+    ctx.fillRect(bx, y + 17, bw * Math.max(0, v.b) / maxScore, 11);
+    ctx.fillStyle = c.text;
+    ctx.fillText('B ' + v.b.toFixed(2), bx + 4, y + 26);
+  }
+
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var b = biases();
+    var j = AppSim.judge(PAIR.a, PAIR.b, b);
+    var ks = kappaFor(b, false);
+    var ka = kappaFor(b, true);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('one pair, three ways of reading the verdict', 24, 18);
+    drawCandidate(ctx, 24, 28, 280, 92, 'A — first / short', PAIR.a);
+    drawCandidate(ctx, 336, 28, 280, 92, 'B — second / long', PAIR.b);
+    var maxScore = Math.max(1, j.shown.a, j.shown.b, j.swapped.a, j.swapped.b, j.averaged.a, j.averaged.b);
+    drawVerdict(ctx, 146, 'as shown    (A first)', j.shown, !state.swap, maxScore);
+    drawVerdict(ctx, 204, 'order swapped (B first)', j.swapped, false, maxScore);
+    drawVerdict(ctx, 262, 'order-averaged', j.averaged, state.swap, maxScore);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('scores are the judge\u2019s own units; order-averaging cancels the position term', 24, 322);
+    var active = state.swap ? j.averaged.winner : j.shown.winner;
+    el('judge-readout').innerHTML =
+      '<div><span class="k">verdict as shown</span> <span class="hi">' + winnerText(j.shown.winner) + '</span></div>' +
+      '<div><span class="k">with the order swapped</span> ' + winnerText(j.swapped.winner) + '</div>' +
+      '<div><span class="k">order-averaged</span> ' + winnerText(j.averaged.winner) + '</div>' +
+      '<div><span class="k">judge in force</span> ' + (state.swap ? 'order-averaged' : 'as shown') + '</div>' +
+      '<div><span class="k">agreement \u03ba (as shown)</span> ' + ks.toFixed(2) + ' \u00b7 <span class="k">averaged</span> ' + ka.toFixed(2) + '</div>' +
+      (active === 'b'
+        ? '<div class="bad">the wrong answer is winning \u2014 this judge is not calibrated</div>'
+        : '<div class="k">the correct answer wins</div>');
+  }
+  Guide.bindSliders([el('judge-position'), el('judge-verbosity'), el('judge-self')], drawA);
+  el('judge-swap').addEventListener('click', function () {
+    state.swap = !state.swap;
+    this.className = state.swap ? 'g-primary' : '';
+    this.textContent = 'Order-swap averaging: ' + (state.swap ? 'on' : 'off');
+    drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — pointwise drift versus pairwise stability
+  // ------------------------------------------------------------------
+  var setupB = Guide.setupCanvas(el('pv-canvas'), 640, 320, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 320;
+    var sigma = +el('pv-noise').value;
+    var j = AppSim.judge({ correct: true, length: 150 }, { correct: false, length: 700 }, {});
+    var pairWin = j.averaged.winner === 'b' ? 'B' : 'A';
+    var aPts = [], bPts = [], aPass = 0, bPass = 0;
+    for (var k = 0; k < 16; k++) {
+      var r = AppSim.rng(1000 + k * 13);
+      var sa = 6.6 + sigma * AppSim.gaussian(r);
+      var sb = 5.0 + sigma * AppSim.gaussian(r);
+      if (sa >= 6) aPass++;
+      if (sb >= 6) bPass++;
+      aPts.push({ x: k + 1, y: sa });
+      bPts.push({ x: k + 1, y: sb });
+    }
+    var axes = Guide.drawLines(ctx, W, H,
+      [
+        { points: aPts, color: c.accent, width: 2.2 },
+        { points: bPts, color: c.accent2, width: 2.2 }
+      ],
+      [1, 16], [3, 9],
+      { xLabel: 'independent scoring run', yLabel: 'pointwise score (1\u201310)', padL: 52, padB: 30 });
+    var ty = axes.py(6);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(axes.padL, ty); ctx.lineTo(axes.padL + axes.plotW, ty); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('pass threshold 6.0', axes.padL + 6, ty - 4);
+    ctx.fillStyle = c.accent; ctx.fillText('candidate A (correct)', axes.padL + 6, axes.padT + 12);
+    ctx.fillStyle = c.accent2; ctx.fillText('candidate B (wrong)', axes.padL + 6, axes.padT + 26);
+    el('pv-readout').innerHTML =
+      '<div><span class="k">pairwise winner</span> <span class="hi">' + pairWin + '</span> \u00b7 same on all 16 runs</div>' +
+      '<div><span class="k">pointwise passes (score \u2265 6)</span> A ' + aPass + '/16 \u00b7 B ' + bPass + '/16</div>' +
+      '<div class="k">the pair never changed \u2014 only the absolute scores did</div>';
+  }
+  Guide.bindSliders([el('pv-noise')], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — rubric from the failure taxonomy
+  // ------------------------------------------------------------------
+  var MODES = [
+    'Missing evidence',
+    'Wrong chunk retrieved',
+    'Answer not grounded in the context',
+    'Retrieved but not used (middle of long context)',
+    'Agent answers without retrieving'
+  ];
+  var RUBRIC_CASES = [
+    'Missing evidence', 'Wrong chunk retrieved', 'Answer not grounded in the context',
+    'Retrieved but not used (middle of long context)', 'Agent answers without retrieving',
+    'Missing evidence', 'Wrong chunk retrieved', 'Answer not grounded in the context',
+    'Retrieved but not used (middle of long context)', 'Agent answers without retrieving',
+    'Wrong chunk retrieved', 'Agent answers without retrieving'
+  ];
+  var covered = {};
+  var setupC = Guide.setupCanvas(el('rubric-canvas'), 640, 320, drawC);
+  function buildRubricButtons() {
+    var host = el('rubric-buttons');
+    MODES.forEach(function (m, i) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = m.length > 26 ? m.slice(0, 24) + '\u2026' : m;
+      b.addEventListener('click', function () {
+        covered[i] = !covered[i];
+        b.className = covered[i] ? 'g-primary' : '';
+        drawC();
+      });
+      host.appendChild(b);
+    });
+  }
+  function agreement() {
+    var right = 0;
+    RUBRIC_CASES.forEach(function (m, i) {
+      var isCovered = covered[MODES.indexOf(m)];
+      if (isCovered || i % 2 === 0) right++;
+    });
+    return right / RUBRIC_CASES.length;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var n = MODES.filter(function (m, i) { return covered[i]; }).length;
+    var agree = agreement();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('rubric criteria', 24, 18);
+    MODES.forEach(function (m, i) {
+      var y = 40 + i * 34;
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.strokeRect(24, y, 14, 14);
+      if (covered[i]) { ctx.fillStyle = c.accent700; ctx.fillRect(26, y + 2, 10, 10); }
+      ctx.fillStyle = covered[i] ? c.text : c.accent700;
+      ctx.font = '11px ' + c.font;
+      ctx.fillText(m, 48, y + 11);
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.fillText('judge\u2013human agreement', 430, 18);
+    var bx = 430, bw = 150, baseY = 280, topY = 44;
+    var lineY = baseY - (baseY - topY) * 0.5;
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(bx, lineY); ctx.lineTo(bx + bw, lineY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('50% chance', bx + bw + 6, lineY + 3);
+    ctx.fillStyle = agree >= 0.8 ? c.accent : c.accent2;
+    ctx.fillRect(bx, baseY - (baseY - topY) * agree, bw, (baseY - topY) * agree);
+    ctx.fillStyle = c.text; ctx.font = '600 13px ' + c.font;
+    ctx.textAlign = 'center';
+    ctx.fillText(Guide.fmtPct(agree, 0), bx + bw / 2, baseY - (baseY - topY) * agree - 8);
+    ctx.textAlign = 'left';
+    ctx.font = '10px ' + c.font;
+    ctx.fillText('0%', bx - 2, baseY + 14); ctx.fillText('100%', bx + bw - 10, baseY + 14);
+    el('rubric-readout').innerHTML =
+      '<div><span class="k">criteria covering the taxonomy</span> <span class="hi">' + n + '/5</span></div>' +
+      '<div><span class="k">agreement with human labels</span> <span class="hi">' + Guide.fmtPct(agree, 0) + '</span> \u00b7 chance is 50%</div>' +
+      (n === 0 ? '<div class="bad">the rubric asks no question about the failures the set exhibits</div>'
+               : '<div class="k">each added criterion is a hypothesis \u2014 agreement is the test</div>');
+  }
+  buildRubricButtons();
+  el('rubric-all').addEventListener('click', function () {
+    MODES.forEach(function (m, i) { covered[i] = true; });
+    Array.prototype.forEach.call(el('rubric-buttons').children, function (b) { b.className = 'g-primary'; });
+    drawC();
+  });
+  el('rubric-none').addEventListener('click', function () {
+    MODES.forEach(function (m, i) { covered[i] = false; });
+    Array.prototype.forEach.call(el('rubric-buttons').children, function (b) { b.className = ''; });
+    drawC();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — inter-annotator agreement sets the ceiling
+  // ------------------------------------------------------------------
+  var setupD = Guide.setupCanvas(el('iaa-canvas'), 640, 320, drawD);
+  function iaaData(pct) {
+    var r = AppSim.rng(99);
+    var a1 = [], a2 = [], counts = [[0, 0], [0, 0]];
+    for (var i = 0; i < 40; i++) {
+      var gold = r() < 0.5 ? 1 : 0;
+      var other = r() < (pct / 100) ? (gold ? 0 : 1) : gold;
+      a1.push(gold); a2.push(other);
+      counts[gold][other]++;
+    }
+    return { k: AppSim.cohenKappa(a1, a2), counts: counts };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var pct = +el('iaa-disagree').value;
+    var d = iaaData(pct);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('confusion matrix: annotator 1 (rows) \u00d7 annotator 2 (columns)', 24, 18);
+    var x0 = 70, y0 = 44, cw = 120, ch = 84;
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center';
+    ctx.fillText('ann. 2: fail', x0 + cw / 2, y0 - 8);
+    ctx.fillText('ann. 2: pass', x0 + cw + cw / 2, y0 - 8);
+    ctx.textAlign = 'right';
+    ctx.fillText('ann. 1: fail', x0 - 8, y0 + ch / 2);
+    ctx.fillText('ann. 1: pass', x0 - 8, y0 + ch + ch / 2);
+    for (var i = 0; i < 2; i++) {
+      for (var j = 0; j < 2; j++) {
+        var x = x0 + j * cw, y = y0 + i * ch;
+        var v = d.counts[i][j];
+        ctx.fillStyle = i === j ? 'rgba(43,95,255,0.18)' : 'rgba(214,0,108,0.16)';
+        ctx.fillRect(x, y, cw, ch);
+        ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(x, y, cw, ch);
+        ctx.fillStyle = c.text; ctx.font = '600 20px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText(String(v), x + cw / 2, y + ch / 2 + 7);
+      }
+    }
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText("Cohen\u2019s \u03ba", 386, 18);
+    var bx = 386, bw = 226, by = 150;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + bw, by); ctx.stroke();
+    for (var t = 1; t <= 10; t++) {
+      var tx = bx + bw * (t / 10);
+      ctx.beginPath(); ctx.moveTo(tx, by - 4); ctx.lineTo(tx, by + 4); ctx.stroke();
+    }
+    var k = Math.max(0, Math.min(1, d.k));
+    ctx.fillStyle = k >= 0.6 ? c.accent : c.accent2;
+    ctx.fillRect(bx, by - 34, bw * k, 26);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('0.6 substantial', bx + bw * 0.6 - 18, by + 18);
+    ctx.fillStyle = c.text; ctx.font = '600 13px ' + c.font; ctx.textAlign = 'right';
+    ctx.fillText('\u03ba = ' + d.k.toFixed(2), bx + bw, by - 44);
+    ctx.textAlign = 'left';
+    var ceiling = Math.max(0, d.k);
+    el('iaa-readout').innerHTML =
+      '<div><span class="k">annotator disagreement</span> ' + pct + '%</div>' +
+      '<div><span class="k">human \u03ba</span> <span class="hi">' + d.k.toFixed(2) + '</span> (' + (d.k >= 0.6 ? 'substantial' : d.k >= 0.4 ? 'moderate' : 'weak') + ')</div>' +
+      '<div><span class="k">judge\u2013human \u03ba ceiling</span> ' + ceiling.toFixed(2) + ' \u2014 a judge cannot beat the humans</div>' +
+      (d.k < 0.4 ? '<div class="bad">fix the labels before you build the judge</div>' : '<div class="k">the labels are usable; now calibrate the judge against them</div>');
+  }
+  Guide.bindSliders([el('iaa-disagree')], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    el('judge-evals-source') && (el('judge-evals-source').textContent =
+      (data && data.evals && data.evals.source) || FALLBACK.evals.source);
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'llm-judge-position-mitigation',
+      kind: 'choice',
+      prompt: 'Your judge reliably prefers whichever answer is listed first. What removes that specific bias?',
+      options: [
+        { label: 'Grade both orders of the same pair and average the two verdicts.' },
+        { label: 'Tell the judge in the system prompt to ignore order.' },
+        { label: 'Increase the temperature so the verdicts vary.' },
+        { label: 'Only ever grade one answer at a time.' }
+      ],
+      explanation: 'Position bias is cancelled by symmetry: present A-then-B and B-then-A and average. Instruction alone does not reliably remove it, and higher temperature adds noise rather than removing bias.'
+    },
+    {
+      id: 'llm-judge-kappa',
+      kind: 'numeric',
+      prompt: 'Two annotators label 100 answers pass/fail. They agree on 80 of them. Each annotator says "pass" on exactly 50 answers. What is Cohen\'s κ?',
+      answer: 0.6,
+      unit: 'κ',
+      tolerance: 0.02,
+      explanation: 'Observed agreement is 0.80. Expected chance agreement is 0.5·0.5 + 0.5·0.5 = 0.50. So κ = (0.80 − 0.50) / (1 − 0.50) = 0.60.'
+    },
+    {
+      id: 'llm-judge-verbosity-mitigation',
+      kind: 'choice',
+      prompt: 'The judge keeps picking the longer answer regardless of content. Which mitigation targets verbosity bias?',
+      options: [
+        { label: 'A length-controlled rubric with explicit conciseness criteria.' },
+        { label: 'Swapping the order of the candidates.' },
+        { label: 'Using a different model family as the judge.' },
+        { label: 'Averaging ten repeated judgments of the same pair.' }
+      ],
+      explanation: 'Order swapping fixes position bias, a different family fixes self-preference, and repetition reduces variance but not a systematic preference. Length control is the verbosity-specific fix.'
+    },
+    {
+      id: 'llm-judge-iaa-first',
+      kind: 'choice',
+      prompt: 'Before trusting a judge on a new task, what should you measure first?',
+      options: [
+        { label: 'Inter-annotator agreement between humans on the same labels.' },
+        { label: 'The judge\'s agreement with itself over ten runs.' },
+        { label: 'The judge\'s score distribution for signs of skew.' },
+        { label: 'The correlation between judge scores and answer length.' }
+      ],
+      explanation: 'The humans\' κ is the ceiling on any judge. If two humans cannot agree, a judge cannot be validated against those labels, so the labels must be fixed before the judge is built.'
+    },
+    {
+      id: 'llm-judge-averaged-score',
+      kind: 'numeric',
+      prompt: 'Two answers are tied at 1.0 on merit. The judge adds +0.4 to whichever answer is listed first. What is the first-listed answer\'s order-averaged score?',
+      answer: 1.2,
+      tolerance: 0.01,
+      explanation: 'Shown first it scores 1.0 + 0.4 = 1.4; shown second it scores 1.0. The order average is (1.4 + 1.0) / 2 = 1.2 — the position term cancels and the true merit is recovered.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

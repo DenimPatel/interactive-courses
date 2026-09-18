@@ -1,0 +1,515 @@
+---
+title: "Agents in Action, Interactively — Part 2: Tool use: the loop, and tool design as the craft"
+description: "Schemas, tool_use and tool_result, parallel calls and errors as data: a few non-overlapping tools, token-efficient returns, and error messages written for the model rather than for a stack trace."
+permalink: "/ai/agents-in-action/tool-use/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Tool use: the loop, and tool design as the craft</h1>
+    <p>Last part ended with a decision: the task genuinely has no writable path, so the model owns the control flow. For the model to act on anything, it needs tools, and tools are not a prompt trick — they are an interface you design. This part walks the loop turn by turn, then treats tool design as the lever it is: names, descriptions and typed parameters are what the model chooses between; overlapping tools split the probability mass; errors are data you write <em>for the model</em>, not for a stack trace; and everything a tool returns is spent from the context budget, forever.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="loop">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The loop is two message types</h2></div>
+    <p class="g-eyebrow">Reason, tool_use, tool_result, repeat</p>
+    <p>An agent turn has exactly two new message shapes. The model emits a <strong><code>tool_use</code></strong> block: a typed request naming a tool and an argument object. Your code reads it, executes the corresponding function — or refuses to — and appends a <strong><code>tool_result</code></strong> block keyed to the same call id. The model then runs again with that result in context. That is the whole loop. There is no hidden channel: the tool's output reaches the model only because your code put it back into the messages.</p>
+    <p>Two things follow, and both are easy to get wrong. First, the model never runs anything. It proposes a call; the decision to execute it is a policy your code owns, which is where permissions, idempotency and rate limits live. Second, a failing tool is not an exception that ends the loop — it is a <code>tool_result</code> like any other, and the loop continues. What the model does next depends entirely on how you phrased that result.</p>
+    <div class="g-code"><span class="k">// the loop, in the shape your code actually writes it</span>
+messages = [system, user]
+<span class="k">while</span> <span class="s">True</span>:
+    reply = llm(messages, tools=TOOLS)
+    <span class="k">if</span> reply.stop_reason == "tool_use":
+        results = [run(c) <span class="k">for</span> c <span class="k">in</span> reply.tool_calls]   <span class="s"># your policy, your side effects</span>
+        messages += [reply, tool_results(results)]
+    <span class="k">else</span>:
+        <span class="k">return</span> reply.text</div>
+    <p>Step through the loop below. Each node is one message; the JSON panel shows the actual block that would be appended at that point.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tu-loop-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">The track is one task. The highlighted node is the message currently being produced; the panel shows its block.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="tu-loop-step" class="g-primary">Step</button>
+          <button id="tu-loop-play">Play loop</button>
+          <button id="tu-loop-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="tu-loop-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> the loop is not magic, it is a <code>while</code> that appends two message types. Everything you can control about an agent — what it can do, what it sees, when it stops — is a decision in that <code>while</code>, not a property of the model.</span></div>
+  </section>
+
+  <section class="g-step" id="schemas">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Schemas are the interface, and descriptions are prompts</h2></div>
+    <p class="g-eyebrow">The model chooses from what you describe, not from what you built</p>
+    <p>A tool definition has three parts: a <strong>name</strong>, a <strong>description</strong>, and a typed <strong>input schema</strong>. The model never sees your implementation — it sees only those three strings. A description is therefore a prompt in the strictest sense: it is the text the model conditions on when it decides which tool to call and how to fill the arguments. “Search” is a prompt. “Search the documentation corpus by keyword and return the top passages; use this for facts that appear verbatim in the docs, and use <code>ask_user</code> when the request is ambiguous” is a better one.</p>
+    <p>The schema does two jobs at once. It documents the argument types for the model, and it is a contract your code validates before executing anything. A well-typed schema with an enum where the choices are finite removes a whole class of malformed calls before they reach your function.</p>
+    <p>Then there is the design principle that matters most and is least intuitive: keep the tool set <strong>few</strong> and <strong>non-overlapping</strong>. Two tools that plausibly answer the same request split the probability mass between them, and the model's error rate rises with the overlap, not with the raw count. Drag the controls below — with no overlap, a larger set is survivable; with high overlap, even a handful of tools becomes a coin flip.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tu-overlap-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Selection accuracy against the overlap coefficient. The marker is your current setting; the dashed line is the analytic curve for the chosen tool count.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Tools exposed <span class="val">8</span></label><input type="range" id="tu-tools" min="2" max="24" step="1" value="8"></div>
+        <div class="g-field"><label>Overlap coefficient <span class="val">0.20</span></label><input type="range" id="tu-overlap" min="0" max="1" step="0.05" value="0.20"></div>
+        <div class="g-readout" id="tu-overlap-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="tu-src-mcp"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> adding a tool is free to write and expensive to own. Every definition is tokens in every request, and every near-duplicate is a permanent chance to pick wrong. If two tools overlap, merge them or delete one — that is a cheaper fix than any amount of prompt tuning.</span></div>
+  </section>
+
+  <section class="g-step" id="parallel">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Parallel calls, partial failure, and errors as data</h2></div>
+    <p class="g-eyebrow">The model may batch; your code must survive it</p>
+    <p>When the calls are independent, the model will often emit several <code>tool_use</code> blocks in a single turn — a search and two reads, say, rather than a search, then a read, then a read. That is a latency win: the calls can run concurrently and the results return together. It is also a failure-handling problem, because a batch can fail <em>partially</em>. One tool succeeds, one times out, one is rejected by a permission check. The loop must still return a result for every call id in the turn, or the next model request is malformed.</p>
+    <p>How you describe those failures is the highest-leverage text you write all day. A raw stack trace tells the model nothing it can act on: it does not know whether the failure was transient, whether the argument was invalid, or whether retrying would help. A <strong>structured error</strong> — a type, the offending field, the constraint, and a suggested next action — is content the model can reason about, and it turns a dead end into a branch.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tu-error-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The same failure, returned two ways. Bars are seeded recovery rates over 800 trials with the chosen number of retries.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Retries allowed after a failure <span class="val">1</span></label><input type="range" id="tu-retries" min="1" max="3" step="1" value="1"></div>
+        <div class="g-readout" id="tu-error-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="tu-src-evals"></p>
+    <p>Two habits make the difference. Make side-effecting tools <strong>idempotent</strong> where you can — pass an idempotency key so a retried write is a no-op rather than a duplicate — and separate reads from writes so the model can explore freely and commit deliberately. And return errors in the same structured shape every time, so the model learns the contract rather than guessing at prose.</p>
+    <p class="g-source" id="tu-src-agents"></p>
+    <div class="g-goal">💡 <span><b>Write the error message for its reader.</b> The reader is a model that will decide the next action from your text alone. Type, field, constraint, fix — four lines of JSON beat forty lines of traceback, every time.</span></div>
+  </section>
+
+  <section class="g-step" id="returns">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Tool returns are spent forever</h2></div>
+    <p class="g-eyebrow">The context window is not a data bus</p>
+    <p>A tool result appended to the transcript does not just cost tokens once. Because the model is stateless, that result is re-sent on every subsequent turn, so a fat return is paid for again at every step of the loop. Ten steps that each stuff four thousand tokens of raw rows into context are not a ten-thousand-token problem — they are a growing-transcript problem, and the bill compounds exactly the way the whole volume has warned.</p>
+    <p>The fix is the same as everywhere else in context engineering: return less, on purpose. Paginate and let the model ask for the next page. Trim to the fields the model needs, not the fields the database has. Summarise a large result behind a smaller handle the model can expand. Crucially, the model's own note about a result survives better than the result itself: “searched <code>eval harness</code>, found five passages, the relevant one says the harness runs five cases” costs a fraction of the five passages.</p>
+    <p>Below, each tool return is counted for real, and each step's context is checked against the window. Watch the overflow appear — it is a property of the return size, not the task.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tu-return-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Context composition per step. The dashed line is the usable budget (window minus the output reserve); a marked column has overflowed.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Returned tokens per call <span class="val">1200</span></label><input type="range" id="tu-return" min="200" max="8000" step="200" value="1200"></div>
+        <div class="g-field"><label>Steps in the run <span class="val">10</span></label><input type="range" id="tu-steps" min="4" max="24" step="1" value="10"></div>
+        <div class="g-readout" id="tu-return-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Foreshadowing Part 4:</b> “the context window is not a data bus” is the rule that motivates code execution and skills. If a step would move ten thousand tokens through the window just to compute one number, let code compute the number and put only the number in context.</span></div>
+    <p>The training-side counterpart — why a model is taught to emit structured calls at all, and how function-calling is evaluated — is owned by <a href="{{ '/ai/llm-training/tools-agents/' | relative_url }}">Part 14 of the training guide</a>. This page assumes the capability and concerns itself with the interface you hand it.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that keeps the loop alive</th></tr></thead>
+      <tbody>
+        <tr><td>What does the model actually do for a tool call?</td><td>It emits a typed <code>tool_use</code> block. Your code decides whether and how to execute it.</td></tr>
+        <tr><td>How does the result get back to the model?</td><td>Your code appends a <code>tool_result</code> keyed to the call id and calls the model again.</td></tr>
+        <tr><td>What is a tool description, really?</td><td>A prompt. It is the only thing the model sees when choosing between tools.</td></tr>
+        <tr><td>How many tools should I expose?</td><td>As few as the task needs, and none that overlap. Overlap splits the probability mass.</td></tr>
+        <tr><td>What does the model get when a tool fails?</td><td>Whatever you put in the <code>tool_result</code>. Make it a structured error, not a stack trace.</td></tr>
+        <tr><td>What is a good error shape?</td><td>Type, field, constraint, suggested fix — written for the model to branch on.</td></tr>
+        <tr><td>How do I handle a batch of calls?</td><td>Return a result for every call id, even the failed ones. Run independent calls concurrently.</td></tr>
+        <tr><td>What does a big return cost?</td><td>Every subsequent turn of the loop, because the transcript is re-sent. Paginate, trim, summarise.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/writing-tools-for-agents">“Writing effective tools for AI agents — using AI agents”</a>, September 2025 — tool descriptions as prompts, consolidation, and returning token-efficient results.</li>
+      <li>Anthropic, <a href="https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview">Tool use overview</a>, docs — the <code>tool_use</code>/<code>tool_result</code> message contract and parallel tool use.</li>
+      <li>Schick et al., <a href="https://arxiv.org/abs/2302.04761">“Toolformer: Language Models Can Teach Themselves to Use Tools”</a>, arXiv:2302.04761, 2023 — the origin story of learned tool invocation.</li>
+      <li>Patil et al., <a href="https://arxiv.org/abs/2305.15334">“Gorilla: Large Language Model Connected with Massive APIs”</a>, arXiv:2305.15334, 2023 — why API documentation quality is a first-class variable.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2210.03629">“ReAct: Synergizing Reasoning and Acting in Language Models”</a>, arXiv:2210.03629, 2022 — the interleaved reason/act loop this part implements.</li>
+      <li>Berkeley Function Calling Leaderboard, <a href="https://gorilla.cs.berkeley.edu/leaderboard.html">gorilla.cs.berkeley.edu</a> — function-selection and argument-correctness scores, and the failure modes behind them.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The loop and its tools are in place. Next: the algorithms that tried to plan it all up front — ReAct, Plan-and-Execute, Reflexion, Tree of Thoughts, LATS — and which of their ideas actually survived into production.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    agents: {
+      source: "Anthropic, “Effective context engineering for AI agents” (2025-09-29) and “Building effective agents” (2024-12); reliability compounding is arithmetic: 0.95^20 ≈ 0.36. Offline fallback constants.",
+      workflowPatterns: ["prompt chaining", "routing", "parallelisation", "orchestrator-worker", "evaluator-optimiser"],
+      reliabilityExample: { perStep: 0.95, steps: 20, endToEnd: 0.358 }
+    },
+    mcp: {
+      source: "Model Context Protocol, introduced by Anthropic 2024-11-25 and donated to the Linux Foundation; spec revisions 2024-11-05, 2025-03-26, 2025-06-18, and a 2026 revision streamlining the core toward a stateless request/response model. Offline fallback constants.",
+      specRevisions: ["2024-11-05", "2025-03-26", "2025-06-18", "2026 (stateless core)"],
+      skillStages: ["metadata (name + description, always in context)", "instructions (SKILL.md body, loaded when the skill is invoked)", "resources (scripts and files, loaded on demand)"]
+    },
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench (2025) for tool-agent-user interaction, which introduced pass^k; GAIA (Mialon et al., arXiv:2311.12983, 2023). Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts — the reliability counterpart to pass@k's capability measure.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable end state", caveat: "scores move with the user simulator" }
+      ]
+    }
+  };
+  var NUM = FALLBACK;
+
+  // ------------------------------------------------------------------
+  // Demo A — the loop player
+  // ------------------------------------------------------------------
+  var LOOP_STEPS = [
+    { label: "reason", kind: "reason",
+      json: '{"role":"assistant","content":[{"type":"text","text":"I should search the docs for the eval harness."}]}',
+      note: "The model thinks in text. At this point nothing has been executed and no external state has changed." },
+    { label: "tool_use", kind: "tool_use",
+      json: '{"type":"tool_use","id":"tu_1","name":"search_docs","input":{"query":"eval harness","k":5}}',
+      note: "The model emits a typed call. Your code — not the model — decides whether, and how, to run it." },
+    { label: "tool_result", kind: "tool_result",
+      json: '{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"text","text":"… 5 passages, 640 tokens …"}]}',
+      note: "Your code executes the call and appends the result keyed to tu_1. The loop turns." },
+    { label: "reason", kind: "reason",
+      json: '{"role":"assistant","content":[{"type":"text","text":"The harness runs five cases. That answers the question."}]}',
+      note: "The model reasons again, now with the tool output in context. It may call another tool, or stop." },
+    { label: "answer", kind: "answer",
+      json: '{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"An eval harness is a labelled set of cases…"}]}',
+      note: "No tool call this turn, so the loop exits and this message is the answer." }
+  ];
+  var A = { step: 0 };
+  var setupA = Guide.setupCanvas(el("tu-loop-canvas"), 640, 320, drawA);
+  function wrapText(ctx, str, maxW) {
+    str = String(str);
+    var lines = [], cur = "";
+    for (var i = 0; i < str.length; i++) {
+      var ch = str.charAt(i);
+      if (ch === "\n") { lines.push(cur); cur = ""; continue; }
+      if (cur && ctx.measureText(cur + ch).width > maxW) { lines.push(cur); cur = ""; }
+      cur += ch;
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 320;
+    var steps = LOOP_STEPS.map(function (s, i) {
+      return { label: s.label, state: i < A.step ? "done" : (i === A.step ? "active" : "pending") };
+    });
+    Guide.drawTraceTrack(ctx, W, H, steps, { active: A.step, nodeR: 10, padT: 30, padB: 176, labelColor: c.text });
+    var cur = LOOP_STEPS[A.step];
+    ctx.fillStyle = c.accent700; ctx.font = "600 11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("message " + (A.step + 1) + " of " + LOOP_STEPS.length + " · " + cur.kind, 16, 152);
+    ctx.fillStyle = c.text; ctx.font = "10.5px " + c.mono;
+    var lines = wrapText(ctx, cur.json, 600).slice(0, 5);
+    lines.forEach(function (L, i) { ctx.fillText(L, 16, 170 + i * 15); });
+    var ran = A.step >= 2;
+    el("tu-loop-readout").innerHTML =
+      '<div><span class="k">current message</span> <span class="hi">' + cur.kind + '</span></div>' +
+      '<div><span class="k">executed by</span> ' + (cur.kind === "tool_use" ? "the model proposes; your code will run it" : (cur.kind === "tool_result" ? "your code" : "the model")) + '</div>' +
+      '<div class="k">' + cur.note + '</div>' +
+      (ran ? '<div class="k">appended messages so far: ' + (A.step + 1) + ' · each re-sent on the next turn</div>' : '');
+  }
+  el("tu-loop-step").addEventListener("click", function () { A.step = (A.step + 1) % LOOP_STEPS.length; drawA(); });
+  el("tu-loop-reset").addEventListener("click", function () { A.step = 0; drawA(); });
+  Guide.loop({
+    onStep: function () { A.step = (A.step + 1) % LOOP_STEPS.length; drawA(); },
+    button: el("tu-loop-play"), interval: 700, playLabel: "Play loop", pauseLabel: "Pause"
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — tool count and overlap
+  // ------------------------------------------------------------------
+  var B = { n: el("tu-tools"), ov: el("tu-overlap") };
+  var setupB = Guide.setupCanvas(el("tu-overlap-canvas"), 640, 340, drawB);
+  function accuracy(n, o) {
+    var cluster = 1 / (1 + o * Math.pow(Math.max(1, n - 1), 0.65));
+    var many = 0.85 + 0.15 * (1 - Math.log(Math.max(2, n)) / Math.log(24));
+    return Math.max(0.02, cluster * many);
+  }
+  function simulateAccuracy(n, o, trials, seed) {
+    var p = accuracy(n, o), r = AppSim.rng(seed), hits = 0;
+    for (var t = 0; t < trials; t++) { if (r() < p) hits++; }
+    return hits / trials;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var n = +B.n.value, o = +B.ov.value;
+    var pts = [];
+    for (var i = 0; i <= 20; i++) {
+      var x = i / 20;
+      pts.push({ x: x, y: accuracy(n, x) * 100 });
+    }
+    var geo = Guide.drawLines(setupB.ctx, 640, 340,
+      [{ points: pts, color: c.accent, width: 2.4 }],
+      [0, 1], [0, 105],
+      { xLabel: "overlap coefficient", yLabel: "selection accuracy (%)", padL: 56, padB: 30 });
+    var ctx = setupB.ctx;
+    var px = geo.px(o), py = geo.py(accuracy(n, o) * 100);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px, geo.padT); ctx.lineTo(px, geo.padT + geo.plotH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2;
+    ctx.beginPath(); ctx.arc(px, py, 6, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = "10.5px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("perfect separation: overlap = 0 keeps accuracy high even with many tools", geo.padL + 8, geo.padT + 14);
+    var analytic = accuracy(n, o);
+    var empirical = simulateAccuracy(n, o, 4000, 13);
+    el("tu-overlap-readout").innerHTML =
+      '<div><span class="k">tools exposed</span> <span class="hi">' + n + '</span> · overlap ' + o.toFixed(2) + '</div>' +
+      '<div><span class="k">selection accuracy (model)</span> <span class="hi">' + (analytic * 100).toFixed(1) + '%</span></div>' +
+      '<div><span class="k">seeded check, 4,000 trials</span> ' + (empirical * 100).toFixed(1) + '%</div>' +
+      '<div class="k">' + (o === 0
+        ? "no overlap: the count costs tokens, but not much accuracy. Every definition is still re-sent on every turn."
+        : (analytic < 0.7
+          ? "overlap dominates: the model is choosing between tools that look the same, and the choice is close to a coin flip. Merge or delete the duplicates."
+          : "mild overlap: still correct most of the time, but the errors concentrate in exactly the confusable pair.")) + '</div>';
+  }
+  Guide.bindSliders([B.n, B.ov], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — errors as data
+  // ------------------------------------------------------------------
+  var RAW_ERROR = {
+    label: "raw stack trace",
+    base: 0.14,
+    text: 'Traceback (most recent call last):\n  File "agent/tools.py", line 88, in search_docs\n    hits = index.search(query, k)\nValueError: k must be <= 20'
+  };
+  var STRUCTURED_ERROR = {
+    label: "structured error",
+    base: 0.82,
+    text: '{"error":{"type":"invalid_argument","field":"k","value":50,"constraint":"k <= 20","message":"k is too large; the index returns at most 20","suggested_fix":"retry search_docs with k=10"}}'
+  };
+  var C = { retries: el("tu-retries") };
+  var setupC = Guide.setupCanvas(el("tu-error-canvas"), 640, 340, drawC);
+  function recovery(base, retries) { return 1 - Math.pow(1 - base, retries); }
+  function simulateRecovery(base, retries, trials, seed) {
+    var r = AppSim.rng(seed), hits = 0;
+    for (var t = 0; t < trials; t++) {
+      var ok = false;
+      for (var a = 0; a < retries; a++) { if (r() < base) { ok = true; } }
+      if (ok) hits++;
+    }
+    return hits / trials;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var retries = +C.retries.value;
+    var variants = [RAW_ERROR, STRUCTURED_ERROR];
+    var rates = [simulateRecovery(RAW_ERROR.base, retries, 800, 23), simulateRecovery(STRUCTURED_ERROR.base, retries, 800, 29)];
+    variants.forEach(function (v, i) {
+      var x = 16 + i * 320, w = 288;
+      ctx.fillStyle = i === 0 ? c.accent400 : c.accent700;
+      ctx.globalAlpha = 0.10; ctx.fillRect(x, 20, w, 250); ctx.globalAlpha = 1;
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(x, 20, w, 250);
+      ctx.fillStyle = i === 0 ? c.accent700 : c.accent2;
+      ctx.font = "600 12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText(v.label, x + 12, 40);
+      ctx.fillStyle = c.text; ctx.font = "10px " + c.mono;
+      wrapText(ctx, v.text, w - 24).slice(0, 8).forEach(function (L, j) {
+        ctx.fillText(L, x + 12, 60 + j * 14);
+      });
+      // recovery bar
+      var by = 210, bw = w - 24;
+      ctx.fillStyle = c.divider; ctx.fillRect(x + 12, by, bw, 18);
+      ctx.fillStyle = i === 0 ? c.accent400 : c.accent2;
+      ctx.fillRect(x + 12, by, bw * rates[i], 18);
+      ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("recovery " + (rates[i] * 100).toFixed(1) + "%", x + 12, by + 34);
+      ctx.fillStyle = c.accent700;
+      ctx.fillText("analytic " + (recovery(v.base, retries) * 100).toFixed(1) + "% · " + retries + " retr" + (retries === 1 ? "y" : "ies"), x + 12, by + 48);
+    });
+    el("tu-error-readout").innerHTML =
+      '<div><span class="k">same failure, same model</span> raw <span class="hi">' + (rates[0] * 100).toFixed(1) + '%</span> · structured <span class="hi">' + (rates[1] * 100).toFixed(1) + '%</span></div>' +
+      '<div><span class="k">difference</span> ' + ((rates[1] - rates[0]) * 100).toFixed(1) + ' points of recovery, from the text of one message</div>' +
+      '<div class="k">retries help both, but only one of them tells the model what to do differently. A raw traceback is content the model cannot branch on.</div>';
+  }
+  Guide.bindSliders([C.retries], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — tool-return bloat
+  // ------------------------------------------------------------------
+  var VOCAB = ["row", "passage", "score", "title", "docs", "text", "id", "rank", "file", "line"];
+  function buildReturn(target) {
+    var out = [];
+    for (var i = 0; i < target; i++) out.push(VOCAB[i % VOCAB.length]);
+    var text = out.join(" ");
+    return { text: text, tokens: AppSim.countTokens(text) };
+  }
+  var D = { per: el("tu-return"), steps: el("tu-steps") };
+  var setupD = Guide.setupCanvas(el("tu-return-canvas"), 640, 340, drawD);
+  var WINDOW = 128000, RESERVE = 8000;
+  function drawD() {
+    if (!setupD) return;
+    var target = +D.per.value, stepsN = +D.steps.value;
+    var returnsPerStep = buildReturn(target).tokens;
+    var budget = WINDOW - RESERVE;
+    var columns = [], peak = 0, overflowSteps = 0, lastTotal = 0;
+    for (var i = 1; i <= stepsN; i++) {
+      var priorReturns = (i - 1) * returnsPerStep;
+      var priorReasoning = (i - 1) * 180;
+      var segments = [
+        { name: "system", value: 900, color: c.accent700 },
+        { name: "tools", value: 1400, color: c.accent },
+        { name: "task", value: 260, color: "#c9a227" },
+        { name: "history", value: priorReturns + priorReasoning, color: c.accent400 },
+        { name: "returns", value: returnsPerStep, color: c.accent2 }
+      ];
+      var b = AppSim.ctxBudget({ window: WINDOW, reserveOutput: RESERVE, segments: segments.map(function (s) { return { name: s.name, tokens: s.value }; }) });
+      var total = b.used;
+      peak = Math.max(peak, total);
+      if (b.over) overflowSteps++;
+      if (i === stepsN) lastTotal = total;
+      columns.push({
+        label: String(i), segments: segments,
+        marker: b.over ? { color: c.accent2 } : null
+      });
+    }
+    var maxTotal = Math.max(peak, budget * 1.04);
+    var geo = Guide.drawStackedColumns(setupD.ctx, 640, 340, columns, {
+      maxTotal: maxTotal, padL: 54, padR: 16, padT: 26, padB: 30, gap: 3
+    });
+    var ctx = setupD.ctx;
+    var cy = geo.py(budget);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(geo.padL, cy); ctx.lineTo(624, cy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("usable budget " + Guide.fmtNum(budget) + " tok", geo.padL + 2, cy - 4);
+    el("tu-return-readout").innerHTML =
+      '<div><span class="k">per tool result</span> <span class="hi">' + Guide.fmtNum(returnsPerStep) + '</span> tokens (counted by <code>AppSim.countTokens</code>)</div>' +
+      '<div><span class="k">final context</span> ' + Guide.fmtNum(lastTotal) + ' tok · peak ' + Guide.fmtNum(peak) + ' tok</div>' +
+      '<div><span class="k">overflowing steps</span> <span class="' + (overflowSteps ? "bad" : "hi") + '">' + overflowSteps + ' / ' + stepsN + '</span></div>' +
+      '<div class="k">' + (overflowSteps
+        ? "the return size, not the task, blew the budget. Paginate, trim to the fields the model needs, or summarise behind a handle."
+        : "within budget — but every result is re-sent on every later turn, so the cost is already compounding.") + '</div>';
+  }
+  Guide.bindSliders([D.per, D.steps], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var sm = el("tu-src-mcp"), se = el("tu-src-evals"), sg = el("tu-src-agents");
+    if (sm) sm.textContent = (NUM.mcp && NUM.mcp.source) || FALLBACK.mcp.source;
+    if (se) se.textContent = (NUM.evals && NUM.evals.source) || FALLBACK.evals.source;
+    if (sg) sg.textContent = (NUM.agents && NUM.agents.source) || FALLBACK.agents.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: "tool-use-loop",
+      kind: "choice",
+      prompt: "The model emits a tool_use block. What does your code do with it?",
+      options: [
+        { label: "Decide whether to execute it, run the tool if allowed, and append a tool_result keyed to the call id.", correct: true },
+        { label: "Nothing — the model executes the tool itself and returns the result." },
+        { label: "Append the block and stop; the next request reads the tool state from the server." },
+        { label: "Replace it with a plain-text description of the tool." }
+      ],
+      explanation: "The model only proposes a call. Execution is a policy your code owns, and the result reaches the model only because you append a tool_result for that call id and call the model again."
+    },
+    {
+      id: "tool-use-errors",
+      kind: "choice",
+      prompt: "A tool fails with an invalid argument. What should the tool_result contain?",
+      options: [
+        { label: "A structured error naming the type, the offending field, the constraint and a suggested fix.", correct: true },
+        { label: "The raw stack trace, so the model has the full context." },
+        { label: "An empty string, to save tokens." },
+        { label: "A generic 'tool failed' message and a re-run of the same call." }
+      ],
+      explanation: "The error is read by a model that must choose the next action. Type, field, constraint and fix are text it can branch on; a stack trace is text it cannot."
+    },
+    {
+      id: "tool-use-probability",
+      kind: "numeric",
+      prompt: "Eight tool descriptions overlap so heavily that a query is equally likely to match any of them. If the model's choice is spread evenly across the eight, what is the probability it selects the correct one? Give three decimals.",
+      answer: 0.125,
+      unit: "probability",
+      tolerance: 0.002,
+      explanation: "Probability mass is split over the confusable set: 1/8 = 0.125. The count alone is not the problem — the overlap is. Merging or deleting duplicates restores the mass to one tool."
+    },
+    {
+      id: "tool-use-returns",
+      kind: "choice",
+      prompt: "Why does a large tool result cost more than its own token count?",
+      options: [
+        { label: "Because it is appended to the transcript and re-sent on every subsequent turn of the loop.", correct: true },
+        { label: "Because output tokens are billed at a higher rate than input tokens." },
+        { label: "Because the provider caches tool results and charges for the write." },
+        { label: "It does not; a result is billed once when it is returned." }
+      ],
+      explanation: "The model is stateless, so the growing transcript is re-sent every turn. A fat return is paid at every later step, which is why you paginate, trim or summarise."
+    },
+    {
+      id: "tool-use-budget",
+      kind: "numeric",
+      prompt: "A run's context holds 900 system tokens, 1,400 tool-definition tokens and a 260-token task, plus three tool calls that each returned 2,500 tokens. The window is 128,000 and 4,000 are reserved for the output. How many tokens remain?",
+      answer: 113940,
+      unit: "tokens",
+      tolerance: 1,
+      explanation: "Usable budget = 128,000 − 4,000 = 124,000. Used = 900 + 1,400 + 260 + 3×2,500 = 10,060. Remaining = 124,000 − 10,060 = 113,940."
+    }
+  ];
+  GuideQuiz.init(document.getElementById("quiz-root"), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

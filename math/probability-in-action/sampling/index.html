@@ -1,0 +1,642 @@
+---
+title: "Probability in Action, Interactively — Part 7: How to draw a sample"
+description: "Turning uniform draws into any distribution you like: inverse-CDF sampling, rejection sampling behind a draggable envelope, and importance sampling with its weight cloud."
+permalink: "/math/probability-in-action/sampling/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #inv-cdf-canvas, #inv-hist-canvas, #rej-canvas, #is-curves-canvas, #is-weight-canvas {
+    background: var(--color-neutral-100); border-radius: var(--radius-sm); display: block;
+  }
+  .g-meter { height: 10px; background: var(--color-neutral-100); border: 1px solid var(--color-divider); border-radius: 5px; overflow: hidden; margin: 5px 0; }
+  .g-meter > span { display: block; height: 100%; background: var(--color-accent); }
+  .g-readout .hi { font-weight: 600; color: var(--color-accent-800); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>How to draw a sample</h1>
+    <p>Every simulation in this volume rests on one humble ability: producing a number whose distribution is exactly the one you named. Computers give you a uniform stream and nothing else, so the gap between "a random number in [0,1]" and "a draw from a posterior over ten thousand parameters" has to be bridged by an algorithm. There are three bridges worth knowing. The first inverts the CDF, so a uniform becomes a draw from any distribution whose quantile function you can write down. The second builds an envelope over the target and throws darts at it, trading waste for universality. The third changes the measure instead of the sample, reweighting draws from an easy proposal so that a weighted average equals an average under the hard target. Together they are the machinery under Monte Carlo, Markov chain Monte Carlo, particle filters and the policy-gradient estimators of modern machine learning, and this part builds each one on the screen.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">You have uniforms; you need this distribution</p>
+    <p>Imagine you are handed a black box that returned <var>0.3719</var>, then <var>0.0288</var>, then <var>0.9144</var>, each an independent uniform draw on the unit interval. That is all the randomness a computer can honestly manufacture. Now suppose the task is to simulate the waiting time between two radioactive decays, the height of a person drawn from a population, or the next token in a sentence. Those are not uniform, and the whole usefulness of simulation depends on converting one into the other without bias. The sample you produce must have the right distribution, not merely the right range.</p>
+    <p>The classical framing is this. You are given a target distribution <var>F</var> — maybe only through its density <var>f</var> up to an unknown constant, which is the normal state of affairs in Bayesian inference. You are given an unlimited supply of independent uniform variables, and often a second distribution <var>g</var> that you <em>can</em> sample. The question is how to turn draws from the uniform, or from <var>g</var>, into draws from <var>F</var>. Different answers give different costs. Inversion is exact and uses one uniform per sample but needs the quantile function. Rejection is exact and needs almost nothing but wastes draws. Importance sampling does not even return a sample from <var>F</var>; it returns a weighted collection from which expectations under <var>F</var> can still be estimated.</p>
+    <p>It is worth saying why we care about exactness at all. A simulator that draws from slightly the wrong distribution produces slightly wrong answers, and the error is invisible because it never averages out — more samples shrink the Monte Carlo noise around the wrong value. In a filter tracking a robot, a biased sampler means a drifting estimate; in a reinforcement-learning gradient, it means the policy improves toward the wrong objective. The three methods below are the standard ways to keep the distribution honest while keeping the arithmetic simple.</p>
+    <p>The plan for this part follows the three bridges. First inverse-CDF sampling, the cleanest of the three, with a live conversion of uniforms into samples from a normal, an exponential or a beta, checked against the target density. Then rejection sampling with an envelope you can drag, an acceptance meter, and a visible pile of rejected points. Then importance sampling, where the object of study is the weight histogram and the effective sample size, and where a deliberately bad proposal makes the method collapse on command. The last sections collect the formulas and send you on to Monte Carlo integration, which consumes exactly these samplers.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a uniform pushed through a quantile function becomes a draw from any target, how an envelope turns "sample the hard thing" into "sample the easy thing and reject some", and how reweighting draws lets an expectation under one distribution be estimated from samples of another — plus how to tell when the last trick is quietly failing.</span></div>
+    <div class="g-toc">
+      <a href="#inverse-cdf">2 · Inverse-CDF sampling</a>
+      <a href="#rejection">3 · Rejection sampling</a>
+      <a href="#importance">4 · Importance sampling</a>
+      <a href="#shows">5 · Where this shows up</a>
+      <a href="#cheat">6 · Cheat sheet</a>
+      <a href="#reading">7 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="inverse-cdf">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Inverse-CDF sampling</h2></div>
+    <p class="g-eyebrow">Push a uniform through the quantile function</p>
+    <p>Start with the target CDF <var>$F(x)=P(X\le x)$</var>. It is non-decreasing and runs from zero to one, so it can be inverted: for a number <var>u</var> in the unit interval, define <var>F^{-1}(u)</var> to be the smallest <var>x</var> with <var>$F(x)\ge u$</var>. Feed a uniform variable <var>U</var> into that inverse and you get a variable with CDF <var>F</var>. The proof is one line. Because <var>F</var> is monotone, the event <var>$F^{-1}(U)\le x$</var> is the same as the event <var>$U\le F(x)$</var>; and since <var>U</var> is uniform on <var>[0,1]</var>, the probability of <var>$U\le F(x)$</var> is exactly <var>F(x)</var>. That is what it means for the new variable to have distribution <var>F</var>.</p>
+    <div class="g-math g-katex">$$U\sim\mathrm{Uniform}(0,1),\qquad X=F^{-1}(U)\ \Longrightarrow\ P(X\le x)=P\bigl(U\le F(x)\bigr)=F(x).$$</div>
+    <p>This is the <strong>probability integral transform</strong>, and it is a two-way street. Run the argument backwards and a variable with continuous CDF <var>F</var>, pushed through <var>F</var> itself, becomes uniform — the fact that makes probability plots and copulas work. The forward direction is what we use for sampling. The picture in the demo is the geometry: a uniform on the vertical axis, a horizontal line to the CDF curve, and a vertical drop to the horizontal axis. Uniformly spaced levels on the y-axis, once mapped through the curve, land densely where the CDF rises steeply, which is exactly where the density is large.</p>
+    <p>What does it cost? One uniform per sample, no rejections, no tuning. The catch is the quantile function. For a normal distribution there is no elementary closed form for <var>F^{-1}</var>, so a library either inverts the CDF numerically — a bisection or Newton search, as the <var>Prob</var> distributions here do — or falls back on a special-purpose construction such as Box–Muller. For the exponential, <var>$F^{-1}(u)=-\log(1-u)/\lambda$</var>, and for the uniform it is a linear map, both essentially free. Discrete targets are even easier: ordering the outcomes and comparing the uniform against the running cumulative probabilities is inversion, and it is precisely the algorithm a language model uses to sample a token from a softmax.</p>
+    <div class="g-math g-katex">$$F_{\text{exp}}^{-1}(u)=-\frac{\log(1-u)}{\lambda},\qquad F_{\text{uniform}(a,b)}^{-1}(u)=a+(b-a)u,\qquad F_{\text{normal}}^{-1}\ \text{has no elementary form.}$$</div>
+    <p>Two practical cautions. First, the inversion must be numerically stable near the ends: <var>F^{-1}</var> blows up or saturates as <var>u</var> approaches zero or one, and a quantile routine that bisects a CDF with flat tails can return garbage if the bracket is wrong. Second, inversion delivers independent samples only because the uniforms were independent. Push a single uniform through many different quantile functions and you get a perfectly dependent vector — the basis of copulas, but a trap if you expected a random sample. In the demo below, switch between the three families and draw: the histogram of the mapped uniforms sits under the target density, because that is what the theorem promises.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="inv-cdf-canvas" width="640" height="280"></canvas>
+        <p class="g-canvas-hint">The target CDF <var>F(x)</var> with nine uniform levels on the vertical axis. Each level is carried across to the curve and dropped down, so the points on the horizontal axis are <var>x=F^{-1}(u)</var>.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="inv-hist-canvas" width="640" height="280"></canvas>
+        <p class="g-canvas-hint">The histogram of 400 draws made by mapping independent uniforms through the quantile function, with the target density overlaid.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="inv-normal" class="active">Normal</button>
+          <button type="button" id="inv-exp">Exponential</button>
+          <button type="button" id="inv-beta">Beta(2, 5)</button>
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="inv-draw">Draw 400</button>
+          <button type="button" id="inv-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="inv-readout"></div>
+      </div>
+    </div>
+    <p>Notice that the two panels tell the same story from opposite ends. The upper panel is the algorithm, mechanical and deterministic once the uniforms are chosen; the lower panel is the certificate, statistical and noisy. If the quantile function were wrong by even a little, the upper panel would look fine and the lower would be tilted, too heavy in one tail or shifted off centre. That is why simulation code is tested against moments and quantiles rather than eyeballed: a sampler is correct exactly when its output density matches the target.</p>
+  </section>
+
+  <section class="g-step" id="rejection">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Rejection sampling</h2></div>
+    <p class="g-eyebrow">Enclose the target, throw darts, keep what lands inside</p>
+    <p>Inversion needs the quantile function. Rejection sampling needs only the density, and it needs it only up to a constant — no integral, no inversion, no normalising constant. Pick a <strong>proposal</strong> distribution <var>g</var> that you already know how to sample and that is positive wherever the target <var>f</var> is. Choose a constant <var>M</var> large enough that <var>$M\,g(x)\ge f(x)$</var> for every <var>x</var>. That curve <var>$M\,g$</var> is the <strong>envelope</strong>: the proposal, scaled up until it sits above the target everywhere. Then repeat the same two steps. Draw <var>$X\sim g$</var> and an independent <var>$U\sim\mathrm{Uniform}(0,1)$</var>; accept <var>X</var> if <var>$U\le f(X)/\bigl(M\,g(X)\bigr)$</var>, otherwise throw it away.</p>
+    <div class="g-math g-katex">$$\text{draw }X\sim g,\quad U\sim\mathrm{Uniform}(0,1),\qquad \text{accept }X\ \text{if}\quad U\le\frac{f(X)}{M\,g(X)},\qquad \text{accept probability}=\frac{1}{M}.$$</div>
+    <p>Why is the accepted point distributed as <var>f</var>? A proposed point at location <var>x</var> is accepted with probability <var>f(x)/(M g(x))</var>, and the chance of proposing near <var>x</var> is proportional to <var>g(x)</var>. Multiply the two: the density of accepted points is proportional to <var>$g(x)\cdot f(x)/(M g(x))=f(x)/M$</var>. The proposal cancels, leaving the target. Normalising over all <var>x</var> gives <var>f</var> exactly. The same computation gives the acceptance probability: integrating the acceptance probability against <var>g</var> yields <var>$\frac{1}{M}\int f=\frac{1}{M}$</var>, so the method keeps an average of one draw in <var>M</var>.</p>
+    <div class="g-math g-katex">$$\text{density of accepted }x\ \propto\ g(x)\cdot\frac{f(x)}{M\,g(x)}=\frac{f(x)}{M}\ \propto\ f(x).$$</div>
+    <p>The envelope constant is therefore the entire efficiency budget. Make <var>M</var> as small as the constraint allows — the tightest envelope is <var>$M^*=\sup_x f(x)/g(x)$</var> — and the rejection rate is <var>1-1/M^*</var>. A proposal shaped like the target wastes almost nothing; a proposal that is far too wide, or centred in the wrong place, wastes almost everything. Rejection sampling is also unforgiving about the support: if <var>g</var> is zero somewhere <var>f</var> is not, that region of the target is unreachable and the result is silently biased. The demo flags this directly — an envelope that dips below the target draws a warning, because then the accept rule no longer produces the target.</p>
+    <p>There is a hard limitation hiding in the constant. In one dimension, fitting an envelope is easy. In ten dimensions, the volume between a decent proposal and a target is enormous, and <var>M^*</var> grows roughly exponentially with the dimension; the acceptance probability collapses to nothing. This is the <strong>curse of dimensionality</strong>, and it is the reason rejection sampling is used in low dimensions and replaced by Markov chain Monte Carlo — the subject of a later part — in high ones. A related cousin, adaptive rejection sampling, rebuilds the envelope on the fly when <var>f</var> is log-concave, squeezing <var>M</var> down automatically.</p>
+    <p>Drag the envelope handle on the canvas to scale <var>M</var>, and use the sliders to shift and widen the Gaussian proposal. Watch three things move together: the envelope height, the fraction of points that land under the target (accepted, in blue) rather than in the gap above it (rejected, in grey), and the resulting histogram. Tighten the envelope until it just grazes the target and the acceptance meter climbs toward its theoretical ceiling of <var>1/M</var>. Pull it up into a tall, flat lid and almost every draw is wasted.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rej-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Blue points were accepted, grey points rejected. The dashed curve is the envelope <var>$M\cdot g(x)$</var>; drag its peak handle vertically to resize <var>M</var>. The shaded region is the bimodal target density.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Proposal centre <span class="val">0.0</span></label><input type="range" id="rej-mu" min="-3" max="3" step="0.1" value="0"></div>
+        <div class="g-field"><label>Proposal width <span class="val">1.8</span></label><input type="range" id="rej-sigma" min="0.3" max="3" step="0.1" value="1.8"></div>
+        <div class="g-field"><label>Envelope scale <span class="val">2.20</span></label><input type="range" id="rej-M" min="0.4" max="15" step="0.1" value="2.2"></div>
+        <div class="g-btnrow">
+          <button type="button" id="rej-play">Animate draws</button>
+          <button type="button" id="rej-add">Add 300</button>
+          <button type="button" id="rej-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="rej-readout"></div>
+      </div>
+    </div>
+    <p>Rejection sampling is the honest workhorse of low-dimensional simulation, and its logic reappears elsewhere under other names. Deciding whether a proposal is acceptable is a coin flip whose bias is the likelihood ratio, and the same ratio governs acceptance in Metropolis–Hastings. The practical skill it teaches is the one that carries over: to sample something hard, sample something easy and correct the answer for the difference. When the correction is a hard accept/reject decision, you get this method; when it is a weight, you get the next one.</p>
+  </section>
+
+  <section class="g-step" id="importance">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Importance sampling</h2></div>
+    <p class="g-eyebrow">Keep every draw, but weight it</p>
+    <p>Rejection throws away the points it does not want. Importance sampling keeps them all and records how much each one should count. The change is small in code and large in effect: instead of producing a sample from <var>f</var>, it produces a sample from a proposal <var>g</var> together with a <strong>weight</strong> <var>w(x)=f(x)/g(x)</var>, and every expectation is then taken as a weighted average. The identity that makes it work is a one-line change of measure. For any function <var>h</var> whose expectation under <var>f</var> exists, write the integral against <var>f</var>, multiply and divide by <var>g</var>, and read the result as an integral against <var>g</var>.</p>
+    <div class="g-math g-katex">$$w(x)=\frac{f(x)}{g(x)},\qquad \mathbb{E}_f[h(X)]=\int h(x)f(x)\,dx=\int h(x)\frac{f(x)}{g(x)}\,g(x)\,dx=\mathbb{E}_g\bigl[h(X)\,w(X)\bigr].$$</div>
+    <p>So draw <var>$x_1,\dots,x_n\sim g$</var> and estimate <var>$\mathbb{E}_f[h]$</var> by the average of <var>h(x_i)w(x_i)</var>. That estimator is unbiased, provided <var>g</var> is positive wherever <var>h f</var> is not zero — the same support condition as rejection, with the same silent bias if violated. Its variance is <var>$\frac{1}{n}\bigl(\mathbb{E}_g[h^2w^2]-\mathbb{E}_f[h]^2\bigr)$</var>, and now the proposal has real leverage. The variance is small when <var>g</var> is large exactly where <var>|h|f</var> is large. In the ideal case <var>$g^*\propto|h|f$</var> the variance is zero: every weight is identical and the estimate is exact before any noise.</p>
+    <div class="g-math g-katex">$$g^*\propto |h|\,f\ \text{ minimises variance},\qquad \widehat{I}=\frac{1}{n}\sum_{i=1}^{n} h(x_i)\,w(x_i),\qquad \mathrm{Var}(\widehat I)=\frac{1}{n}\Bigl(\mathbb{E}_g[h^2w^2]-\mathbb{E}_f[h]^2\Bigr).$$</div>
+    <p>In practice the target density is usually known only up to a constant, so the plain average cannot be formed and one uses the <strong>self-normalised</strong> estimator <var>$\widehat I_{\mathrm{SN}}=\sum_i w_i h(x_i)/\sum_i w_i$</var>. It is slightly biased for finite <var>n</var> but consistent, never needs the normalising constants, and is what the demo computes. The quality of that estimator is governed not by <var>n</var> but by how evenly the weight is spread. Define the <strong>effective sample size</strong> as <var>$\mathrm{ESS}=(\sum_i w_i)^2/\sum_i w_i^2$</var>, the number of equally weighted draws that would carry the same information. When the weights are all equal, <var>$\mathrm{ESS}=n$</var>; when one draw holds all the weight, <var>$\mathrm{ESS}=1$</var>, no matter how many samples you drew.</p>
+    <div class="g-math g-katex">$$\mathrm{ESS}=\frac{\bigl(\sum_{i=1}^{n} w_i\bigr)^2}{\sum_{i=1}^{n} w_i^2},\qquad \mathrm{ESS}=n\ \text{for equal weights},\qquad \mathrm{ESS}\to 1\ \text{as the weights degenerate}.$$</div>
+    <p>Degeneracy is the characteristic failure. If <var>g</var> rarely lands where <var>f</var> has mass, then a few lucky draws fall in the target's core, acquire enormous weights, and dominate the average; the rest contribute nothing. The estimate then depends on whether those lucky draws happened, which is a variance problem that no amount of extra sampling fixes — adding more draws from the same bad proposal adds more negligible-weight points, not more information. The diagnostic is exactly the weight histogram below: a healthy run puts almost all weight near the same value, while a bad proposal produces a long tail with a spike near zero and a handful of giants.</p>
+    <p>The demo samples from a Gaussian proposal and estimates the mean of a standard normal target using <var>h(x)=x</var>. Move the proposal centre away from the target or shrink its width and the weight cloud stretches out, the largest weight swallows the total, and the ESS meter drains even though the sample count never changes. Move it back and the weights flatten. This is the picture to keep in mind whenever you see an importance weight: it is a correction factor, and corrections that vary by orders of magnitude are a warning that the two distributions barely overlap.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="is-curves-canvas" width="640" height="250"></canvas>
+        <p class="g-canvas-hint">The target density <var>f(x)</var> and the proposal <var>g(x)</var> you sample from. Overlap is what keeps the weights small.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="is-weight-canvas" width="640" height="260"></canvas>
+        <p class="g-canvas-hint">Histogram of the importance weights <var>w=f(x)/g(x)</var> from 800 draws. A healthy proposal piles up at <var>$w\approx 1$</var>; a mismatched one develops a long tail.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Proposal centre <span class="val">0.0</span></label><input type="range" id="is-mu" min="-3" max="3" step="0.1" value="0"></div>
+        <div class="g-field"><label>Proposal width <span class="val">1.0</span></label><input type="range" id="is-sigma" min="0.3" max="4" step="0.1" value="1"></div>
+        <div class="g-btnrow">
+          <button type="button" id="is-good">Good proposal</button>
+          <button type="button" id="is-break">Break it</button>
+        </div>
+        <div class="g-readout" id="is-readout"></div>
+      </div>
+    </div>
+    <p>Importance sampling is not a sampler in the sense of the first two sections — it never yields an unweighted draw from <var>f</var>. What it yields is a consistent estimator of any expectation under <var>f</var>, and that is often all that was wanted. The weighted cloud of particles is the seed of sequential importance sampling and the particle filter, where the proposal is built one observation at a time and the weights are multiplied by each likelihood. The ratio <var>f/g</var> is also the likelihood ratio that appears in off-policy policy gradients and in the clipped objective of proximal policy optimisation, where it is the same correction repurposed as a training signal.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every simulator is one of these three in disguise</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / ML</div>
+        <h3 style="margin:6px 0;">Sampling the next token</h3>
+        <p style="margin-bottom:0;">A language model outputs a probability for every token, and the <a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">decode loop</a> turns those probabilities into an actual token. That is inverse-CDF sampling on a discrete support: form the running cumulative sum, draw one uniform, and pick the token whose cumulative interval contains it. Temperature reshapes the distribution first, and top-p truncation restricts the support before the same inversion runs.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / ML</div>
+        <h3 style="margin:6px 0;">Off-policy correction</h3>
+        <p style="margin-bottom:0;">Policy-gradient methods in <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">RLHF</a> learn from data collected by an older policy, so the gradient has to correct for the mismatch. The correction is the importance weight <var>$p_{\text{new}}/p_{\text{old}}$</var>, exactly the ratio <var>f/g</var> here, and its variance is why algorithms clip it instead of trusting it — the same degeneracy the ESS meter warns about.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Change of variables</h3>
+        <p style="margin-bottom:0;">The proof that <var>F^{-1}(U)</var> has the right distribution, and the derivation of the importance weight, are both statements about how densities transform under a map. That machinery is developed as calculus in <a href="{{ '/math/calculus-in-motion/probability/' | relative_url }}">Calculus of probability</a>, where the Jacobian is the whole story.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Monte Carlo integration</h3>
+        <p style="margin-bottom:0;">The next part, <a href="{{ '/math/probability-in-action/monte-carlo/' | relative_url }}">Monte Carlo integration</a>, takes these samplers as given and uses them to compute integrals. Every variance-reduction trick there — antithetic variates, control variates, stratification — is judged by how much it shrinks the error of an average built from exactly the draws this part taught you to produce.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Inverse transform</td><td><var>$x=F^{-1}(u),\;u\sim\mathrm{Uniform}(0,1)$</var></td><td>Push a uniform through the quantile function; one draw, no waste.</td></tr>
+        <tr><td>Integral transform</td><td><var>$F^{-1}(U)\sim F$</var></td><td>Why it works: the mapped variable has CDF <var>F</var>.</td></tr>
+        <tr><td>Discrete inversion</td><td>walk the cumulative probabilities</td><td>One uniform picks an interval; the algorithm behind token sampling.</td></tr>
+        <tr><td>Rejection accept rule</td><td><var>$U\le f(X)/(M\,g(X)),\;X\sim g$</var></td><td>Keep the point if the dart lands under the target.</td></tr>
+        <tr><td>Envelope</td><td><var>$M\,g(x)\ge f(x)$</var> on the support of <var>f</var></td><td>Must hold everywhere; tightest <var>M</var> is the efficient choice.</td></tr>
+        <tr><td>Acceptance probability</td><td><var>1/M</var></td><td>Efficiency <var>=1/M</var>; reject rate <var>=1-1/M</var>.</td></tr>
+        <tr><td>Importance weight</td><td><var>w(x)=f(x)/g(x)</var></td><td>The correction factor for sampling from the wrong distribution.</td></tr>
+        <tr><td>Importance identity</td><td><var>$\mathbb{E}_f[h]=\mathbb{E}_g[h\,w]$</var></td><td>Change of measure; unbiased if <var>g>0</var> wherever <var>$hf\ne0$</var>.</td></tr>
+        <tr><td>Optimal proposal</td><td><var>$g^*\propto|h|f$</var></td><td>Zero variance in the ideal case; guides the choice of <var>g</var>.</td></tr>
+        <tr><td>Effective sample size</td><td><var>$\mathrm{ESS}=(\sum w)^2/\sum w^2$</var></td><td><var>n</var> when weights are equal, <var>1</var> when they degenerate.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Sheldon Ross, <em>Simulation</em>, 5th edition &mdash; the clearest textbook treatment of the inverse-transform and acceptance-rejection methods, with the algorithms written out fully.</li>
+      <li>Jun S. Liu, <em>Monte Carlo Strategies in Scientific Computing</em>, 2001 &mdash; the standard reference on importance sampling, sequential importance sampling and the theory of effective sample size.</li>
+      <li>Art B. Owen, <em>Monte Carlo Theory, Methods and Examples</em>, 2013 &mdash; an accessible and rigorous chapter on importance sampling with variance analysis and the ESS diagnostic.</li>
+      <li>Christian P. Robert and George Casella, <em>Monte Carlo Statistical Methods</em>, 2nd edition &mdash; rejection and importance sampling placed in the larger arc toward MCMC.</li>
+      <li>Reuven Y. Rubinstein and Dirk P. Kroese, <em>Simulation and the Monte Carlo Method</em>, 3rd edition &mdash; the crossover and change-of-measure view of importance sampling, useful when the proposal is chosen for variance reduction.</li>
+      <li>The <a href="{{ '/math/probability-in-action/glossary/' | relative_url }}">volume glossary</a> &mdash; a routing table from each of these ideas into the AI, vision and robotics pages that depend on them.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Once you can draw from any distribution, the next question is what to do with the draws.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; if (!isFinite(x)) { return '&mdash;'; } return x.toFixed(d); }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function setActive(ids, on) {
+    for (var i = 0; i < ids.length; i++) { el(ids[i]).className = (ids[i] === on) ? 'active' : ''; }
+  }
+  function syncSlider(id, v) {
+    var s = el(id);
+    if (!s) { return; }
+    s.value = String(v);
+    var vEl = s.parentElement ? s.parentElement.querySelector('.val') : null;
+    if (vEl) { vEl.textContent = (Math.round(v * 100) / 100).toFixed(2); }
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — inverse-CDF sampling from a uniform stream
+  // ------------------------------------------------------------------
+  var inv = { family: 'normal', samples: [], seed: 7701 };
+  var invCdfPlot = null, invHistPlot = null;
+
+  function invDist() {
+    if (inv.family === 'exponential') { return Prob.dist.exponential(1); }
+    if (inv.family === 'beta') { return Prob.dist.beta(2, 5); }
+    return Prob.dist.normal(0, 1);
+  }
+  function invRange() {
+    if (inv.family === 'exponential') { return [0, 6]; }
+    if (inv.family === 'beta') { return [0, 1]; }
+    return [-4, 4];
+  }
+  function invLabel() {
+    if (inv.family === 'exponential') { return 'Exponential(1)'; }
+    if (inv.family === 'beta') { return 'Beta(2, 5)'; }
+    return 'Normal(0, 1)';
+  }
+  function invResample(n) {
+    var d = invDist(), r = Prob.rng(inv.seed + n), i;
+    inv.samples = [];
+    for (i = 0; i < n; i++) {
+      var u = clamp(r.uniform(), 1e-6, 1 - 1e-6);
+      inv.samples.push(d.quantile(u));
+    }
+  }
+  function drawInvCdf() {
+    if (!invCdfPlot) { return; }
+    var d = invDist(), R = invRange(), pl = invCdfPlot, i;
+    pl.xRange[0] = R[0]; pl.xRange[1] = R[1];
+    pl.yRange[0] = 0; pl.yRange[1] = 1;
+    pl.clear();
+    pl.grid({ step: 0.25 });
+    pl.curve(function (x) { return d.cdf(x); }, { color: c.accent2, width: 2, label: 'F(x)' });
+    var us = [];
+    for (i = 0; i < 9; i++) { us.push(0.06 + 0.88 * (i + 0.5) / 9); }
+    var ctx = pl.ctx, pts = [];
+    ctx.save();
+    ctx.strokeStyle = 'rgba(214,0,108,0.5)'; ctx.lineWidth = 1.1; ctx.setLineDash([4, 3]);
+    for (i = 0; i < us.length; i++) {
+      var u = us[i], x = d.quantile(u);
+      ctx.beginPath();
+      ctx.moveTo(pl.px(R[0]), pl.py(u));
+      ctx.lineTo(pl.px(x), pl.py(u));
+      ctx.lineTo(pl.px(x), pl.py(0));
+      ctx.stroke();
+      pts.push({ x: x, y: u });
+    }
+    ctx.setLineDash([]); ctx.restore();
+    pl.points(pts, { color: c.accent, r: 3.5, label: 'x = F\u207B\u00B9(u)' });
+    pl.axes({ step: 0.25, xLabel: 'x', yLabel: 'u (uniform)' });
+    pl.legend();
+  }
+  function drawInvHist() {
+    if (!invHistPlot) { return; }
+    var d = invDist(), R = invRange(), pl = invHistPlot, i;
+    var h = Prob.hist(inv.samples, { bins: 40, range: R, density: true });
+    var maxPdf = 0;
+    for (i = 0; i <= 120; i++) {
+      var y = d.pdf(R[0] + (R[1] - R[0]) * i / 120);
+      if (isFinite(y) && y > maxPdf) { maxPdf = y; }
+    }
+    if (!(maxPdf > 0)) { maxPdf = 1; }
+    pl.xRange[0] = R[0]; pl.xRange[1] = R[1];
+    pl.yRange[0] = 0; pl.yRange[1] = maxPdf * 1.18;
+    pl.clear();
+    pl.grid({ step: 0.25 });
+    pl.bars(h.bins, { color: 'rgba(43,95,255,0.55)', label: 'draws' });
+    pl.curve(function (x) { return d.pdf(x); }, { color: c.accent2, width: 2.2, label: 'target pdf' });
+    pl.axes({ xLabel: 'x', yLabel: 'density' });
+    pl.legend();
+    renderInvReadout();
+  }
+  function renderInvReadout() {
+    var d = invDist(), n = inv.samples.length, s = 0, i;
+    for (i = 0; i < n; i++) { s += inv.samples[i]; }
+    var m = n ? s / n : 0;
+    el('inv-readout').innerHTML =
+      '<div><span class="k">target</span> <span class="hi">' + invLabel() + '</span></div>' +
+      '<div><span class="k">draws</span> ' + n + '</div>' +
+      '<div><span class="k">sample mean</span> ' + fmt(m, 3) + ' &nbsp; <span class="k">target mean</span> ' + fmt(d.mean, 3) + '</div>' +
+      '<div style="margin-top:6px;">Each uniform is pushed through the quantile function: <var>x = F\u207B\u00B9(u)</var>.</div>';
+  }
+
+  invCdfPlot = Prob.plot(el('inv-cdf-canvas'), {
+    W: 640, H: 280, xRange: [-4, 4], yRange: [0, 1], onResize: drawInvCdf
+  });
+  invHistPlot = Prob.plot(el('inv-hist-canvas'), {
+    W: 640, H: 280, xRange: [-4, 4], yRange: [0, 1], onResize: drawInvHist
+  });
+  function setInvFamily(f) {
+    if (inv.family === f) { return; }
+    inv.family = f; inv.samples = [];
+    setActive(['inv-normal', 'inv-exp', 'inv-beta'],
+      f === 'normal' ? 'inv-normal' : (f === 'exponential' ? 'inv-exp' : 'inv-beta'));
+    drawInvCdf(); drawInvHist();
+  }
+  el('inv-normal').addEventListener('click', function () { setInvFamily('normal'); });
+  el('inv-exp').addEventListener('click', function () { setInvFamily('exponential'); });
+  el('inv-beta').addEventListener('click', function () { setInvFamily('beta'); });
+  el('inv-draw').addEventListener('click', function () { invResample(400); drawInvHist(); });
+  el('inv-reset').addEventListener('click', function () { inv.samples = []; drawInvHist(); });
+  invResample(400);
+  drawInvCdf(); drawInvHist();
+
+  // ------------------------------------------------------------------
+  // Demo B — rejection sampling behind a draggable envelope
+  // ------------------------------------------------------------------
+  var MIX = [{ w: 0.5, mu: -1.4, s: 0.7 }, { w: 0.5, mu: 1.4, s: 0.7 }];
+  function targetPdf(x) {
+    var p = 0, i;
+    for (i = 0; i < MIX.length; i++) {
+      var z = (x - MIX[i].mu) / MIX[i].s;
+      p += MIX[i].w * Math.exp(-0.5 * z * z) / (MIX[i].s * Math.sqrt(2 * Math.PI));
+    }
+    return p;
+  }
+  var REJ_RANGE = [-5, 5];
+  var rej = { mu: 0, sigma: 1.8, M: 2.2, accepted: [], rejected: [], n: 0, nAcc: 0, seed: 9091, rng: null };
+  var rejPlot = null, rejHandles = null, rejLoop = null;
+
+  function rejProposal() { return Prob.dist.normal(rej.mu, rej.sigma); }
+  function rejReset() {
+    rej.accepted = []; rej.rejected = []; rej.n = 0; rej.nAcc = 0;
+    rej.rng = Prob.rng(rej.seed);
+  }
+  function rejGenerate(k) {
+    var g = rejProposal(), i;
+    for (i = 0; i < k; i++) {
+      var x = g.sample(rej.rng);
+      if (x < REJ_RANGE[0] - 0.5 || x > REJ_RANGE[1] + 0.5) { i--; continue; }
+      var u = rej.rng.uniform();
+      var y = u * rej.M * g.pdf(x);
+      rej.n++;
+      if (y <= targetPdf(x)) { rej.nAcc++; rej.accepted.push({ x: x, y: y }); }
+      else { rej.rejected.push({ x: x, y: y }); }
+    }
+  }
+  function rejMaxRatio() {
+    var g = rejProposal(), best = 0, i;
+    for (i = 0; i <= 200; i++) {
+      var x = REJ_RANGE[0] + (REJ_RANGE[1] - REJ_RANGE[0]) * i / 200;
+      var r = targetPdf(x) / g.pdf(x);
+      if (r > best) { best = r; }
+    }
+    return best;
+  }
+  function renderRejReadout() {
+    var mr = rejMaxRatio();
+    var rate = rej.n ? rej.nAcc / rej.n : 0;
+    var target = 1 / rej.M;
+    var lowEnv = rej.M < mr - 1e-3;
+    var pct = Math.round(clamp(rate, 0, 1) * 100);
+    el('rej-readout').innerHTML =
+      '<div><span class="k">proposal</span> Normal(' + fmt(rej.mu, 1) + ', ' + fmt(rej.sigma, 1) + ')</div>' +
+      '<div><span class="k">envelope scale M</span> <span class="hi">' + fmt(rej.M, 2) + '</span></div>' +
+      '<div><span class="k">accepted</span> ' + rej.nAcc + ' / ' + rej.n + '</div>' +
+      '<div class="g-meter"><span style="width:' + pct + '%"></span></div>' +
+      '<div><span class="k">empirical rate</span> ' + fmt(rate, 3) + ' &nbsp; <span class="k">target 1/M</span> ' + fmt(target, 3) + '</div>' +
+      (lowEnv
+        ? '<div style="margin-top:6px;color:#b00020;">Envelope dips below the target: M must be at least ' + fmt(mr, 2) + ' before the accept rule is valid.</div>'
+        : '<div style="margin-top:6px;">The tightest valid envelope has M about ' + fmt(mr, 2) + '; every unit above that is wasted draws.</div>');
+  }
+  function drawRej() {
+    if (!rejPlot) { return; }
+    var pl = rejPlot, g = rejProposal(), i, yTop = 0;
+    for (i = 0; i <= 200; i++) {
+      var x = REJ_RANGE[0] + (REJ_RANGE[1] - REJ_RANGE[0]) * i / 200;
+      yTop = Math.max(yTop, targetPdf(x), rej.M * g.pdf(x));
+    }
+    yTop = yTop * 1.12;
+    if (!(yTop > 0)) { yTop = 1; }
+    pl.xRange[0] = REJ_RANGE[0]; pl.xRange[1] = REJ_RANGE[1];
+    pl.yRange[0] = 0; pl.yRange[1] = yTop;
+    pl.clear();
+    pl.grid({ step: 1 });
+    pl.area(targetPdf, REJ_RANGE[0], REJ_RANGE[1], { color: 'rgba(43,95,255,0.10)' });
+    pl.points(rej.rejected, { color: 'rgba(32,30,29,0.22)', r: 2 });
+    pl.points(rej.accepted, { color: 'rgba(43,95,255,0.85)', r: 2 });
+    pl.curve(function (x) { return targetPdf(x); }, { color: c.accent, width: 2.4, label: 'target f(x)' });
+    pl.curve(function (x) { return rej.M * g.pdf(x); }, { color: c.accent2, width: 2, dash: [6, 4], label: 'envelope M\u00B7g(x)' });
+    if (rejHandles) { rejHandles.draw(); }
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'density' });
+    pl.legend();
+    renderRejReadout();
+  }
+
+  rejReset();
+  rejGenerate(300);
+  rejPlot = Prob.plot(el('rej-canvas'), {
+    W: 640, H: 340, xRange: REJ_RANGE, yRange: [0, 1], onResize: drawRej
+  });
+  rejHandles = rejPlot.handles(function () {
+    var g = rejProposal();
+    return [{ id: 'env', x: rej.mu, y: rej.M * g.pdf(rej.mu), r: 8, color: c.accent2, label: 'drag to resize M' }];
+  }, function (id, x, y) {
+    if (id !== 'env') { return; }
+    var g = rejProposal();
+    rej.M = clamp(y / g.pdf(rej.mu), 0.4, 15);
+    syncSlider('rej-M', rej.M);
+    drawRej();
+  });
+  Guide.bindSliders([el('rej-mu')], function (s) { rej.mu = parseFloat(s.value); drawRej(); });
+  Guide.bindSliders([el('rej-sigma')], function (s) { rej.sigma = parseFloat(s.value); drawRej(); });
+  Guide.bindSliders([el('rej-M')], function (s) { rej.M = parseFloat(s.value); drawRej(); });
+  el('rej-add').addEventListener('click', function () { rejGenerate(300); drawRej(); });
+  el('rej-reset').addEventListener('click', function () { rejReset(); rejGenerate(300); drawRej(); });
+  rejLoop = Guide.loop({
+    onStep: function () {
+      rejGenerate(4);
+      drawRej();
+      if (rej.n > 6000) { rejLoop.stop(); }
+    },
+    button: el('rej-play'),
+    interval: 40,
+    playLabel: 'Animate draws',
+    pauseLabel: 'Pause'
+  });
+  drawRej();
+
+  // ------------------------------------------------------------------
+  // Demo C — importance sampling: weights, degeneracy, ESS
+  // ------------------------------------------------------------------
+  var fTarget = Prob.dist.normal(0, 1);
+  var ism = { mu: 0, sigma: 1, N: 800, seed: 31337, weights: [] };
+  var isStats = { est: 0, ess: 0 };
+  var isCurvePlot = null, isWeightPlot = null;
+
+  function isProposal() { return Prob.dist.normal(ism.mu, ism.sigma); }
+  function ismWeights() {
+    var r = Prob.rng(ism.seed), g = isProposal(), out = [], i;
+    var sw = 0, sw2 = 0, swx = 0;
+    for (i = 0; i < ism.N; i++) {
+      var x = g.sample(r);
+      var w = fTarget.pdf(x) / g.pdf(x);
+      if (!isFinite(w) || w < 0) { w = 0; }
+      out.push(w);
+      sw += w; sw2 += w * w; swx += w * x;
+    }
+    isStats.est = sw > 0 ? swx / sw : 0;
+    isStats.ess = sw2 > 0 ? (sw * sw) / sw2 : 0;
+    return out;
+  }
+  function drawIsCurves() {
+    if (!isCurvePlot) { return; }
+    var pl = isCurvePlot, g = isProposal(), i, yTop = 0;
+    for (i = -60; i <= 60; i++) {
+      var x = i / 10;
+      yTop = Math.max(yTop, fTarget.pdf(x), g.pdf(x));
+    }
+    yTop = yTop * 1.15;
+    if (!(yTop > 0)) { yTop = 1; }
+    pl.xRange[0] = -6; pl.xRange[1] = 6;
+    pl.yRange[0] = 0; pl.yRange[1] = yTop;
+    pl.clear();
+    pl.grid({ step: 1 });
+    pl.curve(function (x) { return g.pdf(x); }, { color: c.accent2, width: 2, dash: [6, 4], label: 'proposal g(x)' });
+    pl.curve(function (x) { return fTarget.pdf(x); }, { color: c.accent, width: 2.4, label: 'target f(x)' });
+    pl.axes({ step: 1, xLabel: 'x', yLabel: 'density' });
+    pl.legend();
+  }
+  function renderIsReadout() {
+    var w = ism.weights, n = w.length, i, sw = 0, sw2 = 0, maxW = 0;
+    for (i = 0; i < n; i++) { sw += w[i]; sw2 += w[i] * w[i]; if (w[i] > maxW) { maxW = w[i]; } }
+    var ess = sw2 > 0 ? (sw * sw) / sw2 : 0;
+    var fracTop = sw > 0 ? maxW / sw : 0;
+    var pct = Math.round(clamp(ess / Math.max(1, n), 0, 1) * 100);
+    el('is-readout').innerHTML =
+      '<div><span class="k">proposal</span> Normal(' + fmt(ism.mu, 1) + ', ' + fmt(ism.sigma, 1) + ')</div>' +
+      '<div><span class="k">draws</span> ' + n + ' &nbsp; <span class="k">ESS</span> <span class="hi">' + fmt(ess, 1) + '</span></div>' +
+      '<div class="g-meter"><span style="width:' + pct + '%"></span></div>' +
+      '<div><span class="k">weighted mean</span> ' + fmt(isStats.est, 3) + ' &nbsp; <span class="k">true mean</span> 0.000</div>' +
+      '<div><span class="k">largest weight holds</span> ' + fmt(fracTop * 100, 1) + '% of the total</div>' +
+      (ess < 0.1 * n
+        ? '<div style="margin-top:6px;color:#b00020;">Weights are degenerate: a handful of draws carry almost all the mass, so the estimate is dominated by luck.</div>'
+        : '<div style="margin-top:6px;">Weights are spread out, so the proposal overlaps the target where it matters.</div>');
+  }
+  function drawIsWeights() {
+    if (!isWeightPlot) { return; }
+    var w = ism.weights, i;
+    var sorted = w.slice().sort(function (a, b) { return a - b; });
+    var hi = sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(0.98 * sorted.length))] : 1;
+    if (!(hi > 0)) { hi = 1; }
+    var h = Prob.hist(w, { bins: 40, range: [0, hi] });
+    var maxY = 1;
+    for (i = 0; i < h.bins.length; i++) { maxY = Math.max(maxY, h.bins[i].count); }
+    isWeightPlot.xRange[0] = 0; isWeightPlot.xRange[1] = hi;
+    isWeightPlot.yRange[0] = 0; isWeightPlot.yRange[1] = maxY * 1.15;
+    isWeightPlot.clear();
+    isWeightPlot.grid({ step: hi / 5 });
+    isWeightPlot.bars(h.bins, { color: 'rgba(43,95,255,0.6)', label: 'weight w' });
+    isWeightPlot.vline(1, { color: c.accent2, dash: [6, 4], labelText: 'w = 1' });
+    isWeightPlot.axes({ xLabel: 'importance weight', yLabel: 'count' });
+    isWeightPlot.legend();
+    renderIsReadout();
+  }
+  function ismRegen() {
+    ism.weights = ismWeights();
+    drawIsCurves(); drawIsWeights();
+  }
+
+  isCurvePlot = Prob.plot(el('is-curves-canvas'), {
+    W: 640, H: 250, xRange: [-6, 6], yRange: [0, 1], onResize: drawIsCurves
+  });
+  isWeightPlot = Prob.plot(el('is-weight-canvas'), {
+    W: 640, H: 260, xRange: [0, 1], yRange: [0, 1], onResize: drawIsWeights
+  });
+  Guide.bindSliders([el('is-mu')], function (s) { ism.mu = parseFloat(s.value); ismRegen(); });
+  Guide.bindSliders([el('is-sigma')], function (s) { ism.sigma = parseFloat(s.value); ismRegen(); });
+  el('is-good').addEventListener('click', function () {
+    ism.mu = 0; ism.sigma = 1;
+    syncSlider('is-mu', 0); syncSlider('is-sigma', 1);
+    ismRegen();
+  });
+  el('is-break').addEventListener('click', function () {
+    ism.mu = 2.6; ism.sigma = 0.6;
+    syncSlider('is-mu', 2.6); syncSlider('is-sigma', 0.6);
+    ismRegen();
+  });
+  ismRegen();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'sampling-inverse-transform',
+      kind: 'choice',
+      prompt: 'If <var>U</var> is uniform on the unit interval and <var>F</var> is the target CDF, what is the distribution of <var>F^{-1}(U)</var>?',
+      options: [
+        { label: 'It has CDF <var>F</var>, because the event <var>F^{-1}(U) &le; x</var> is the event <var>U &le; F(x)</var>.', correct: true },
+        { label: 'It is uniform, like <var>U</var>, for every target <var>F</var>.', correct: false },
+        { label: 'It exists only when <var>F</var> is the standard normal CDF.', correct: false }
+      ],
+      explanation: 'Inversion is monotone, so <var>F^{-1}(U) &le; x</var> exactly when <var>U &le; F(x)</var>, and a uniform variable is below <var>F(x)</var> with probability <var>F(x)</var>. That is the defining property of a draw from <var>F</var>.'
+    },
+    {
+      id: 'sampling-rejection-rate',
+      kind: 'numeric',
+      prompt: 'A rejection sampler uses an envelope <var>M g(x)</var> with <var>M = 4</var>. What is the probability that a proposed point is accepted?',
+      answer: 0.25,
+      tolerance: 0.001,
+      explanation: 'The acceptance probability is <var>1/M</var>, so with <var>M = 4</var> three of every four proposals are rejected: the acceptance rate is 0.25.'
+    },
+    {
+      id: 'sampling-rejection-envelope',
+      kind: 'choice',
+      prompt: 'What does a large envelope constant <var>M</var> cost you?',
+      options: [
+        { label: 'Efficiency: only about <var>1/M</var> of proposals survive, so almost all the work is thrown away.', correct: true },
+        { label: 'Correctness: the accepted points are no longer distributed as the target.', correct: false },
+        { label: 'Nothing, as long as <var>M g(x) &ge; f(x)</var> holds.', correct: false }
+      ],
+      explanation: 'Any valid <var>M</var> gives exactly the target distribution, so correctness is not at stake. But the acceptance probability is <var>1/M</var>, so a loose envelope wastes almost every draw — the classic curse of dimensionality.'
+    },
+    {
+      id: 'sampling-importance-weight',
+      kind: 'numeric',
+      prompt: 'For a draw <var>x</var> the target density is <var>f(x) = 0.2</var> and the proposal density is <var>g(x) = 0.5</var>. What is the importance weight <var>w = f(x)/g(x)</var>?',
+      answer: 0.4,
+      tolerance: 0.001,
+      explanation: 'The weight is the ratio of densities, 0.2 / 0.5 = 0.4. A draw that <var>g</var> produces more readily than <var>f</var> would gets discounted.'
+    },
+    {
+      id: 'sampling-ess-degenerate',
+      kind: 'choice',
+      prompt: 'A proposal barely overlaps the target. What happens to the importance weights and the effective sample size?',
+      options: [
+        { label: 'A few draws land in the target core, get enormous weights and dominate the average; the ESS collapses toward 1.', correct: true },
+        { label: 'The weights become perfectly uniform and the ESS climbs toward the number of draws.', correct: false },
+        { label: 'The estimator becomes biased low but the ESS stays equal to the number of draws.', correct: false }
+      ],
+      explanation: 'The ratio <var>f/g</var> is huge wherever <var>g</var> is small and <var>f</var> is not, so a handful of samples carry nearly all the weight. The effective sample size <var>(&sum;w)&sup2;/&sum;w&sup2;</var> then approaches 1 no matter how many draws you take.'
+    },
+    {
+      id: 'sampling-importance-identity',
+      kind: 'choice',
+      prompt: 'Which is the correct importance-sampling identity for estimating <var>E_f[h(X)]</var> from draws of a proposal <var>g</var>?',
+      options: [
+        { label: '<var>E_f[h] = E_g[h w]</var> with <var>w(x) = f(x)/g(x)</var>, valid whenever <var>g &gt; 0</var> wherever <var>h f</var> is nonzero.', correct: true },
+        { label: '<var>E_f[h] = E_g[h] g/f</var>, so each draw is divided by its weight.', correct: false },
+        { label: 'It requires <var>f</var> and <var>g</var> to be the same distribution, or the estimator is undefined.', correct: false }
+      ],
+      explanation: 'The change of measure multiplies and divides the integrand by <var>g</var>: <var>&int;h f = &int;(h f/g) g = E_g[h w]</var>. The one requirement is support: if <var>g</var> is zero where <var>h f</var> is not, that region is unreachable and the estimator is biased.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

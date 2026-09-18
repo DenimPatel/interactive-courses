@@ -1,0 +1,667 @@
+---
+title: "Probability in Action, Interactively — Part 17: The Kalman filter and EKF"
+description: "The Bayes filter specialised to Gaussians: a tunable constant-velocity tracker with its ±1σ and ±2σ bands, then a 2D extended Kalman filter whose linearisation error you can watch grow."
+permalink: "/math/probability-in-action/kalman/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true plotly=true %}
+<style>
+  .g-plot-ekf { width: 100%; height: 360px; }
+  .g-kal-sub { margin-top: 10px; font-size: 13px; color: var(--color-text-muted, var(--color-text)); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability in Action</span>
+    <h1>The Kalman filter and EKF</h1>
+    <p>The Bayes filter is a loop: predict the state forward with a motion model, then reweight the prediction with a measurement. In Part 16 that loop lived on a histogram, a grid of little bins that blur and sharpen. If the belief and both noise sources are Gaussian, the loop collapses into five lines of matrix algebra and never leaves the family. That collapse is the Kalman filter, and it is the single most-used estimation algorithm in engineering &mdash; it flies spacecraft, fuses inertial and GPS, and tracks everything a robot can see. When the motion or measurement model is curved rather than linear, the same recursion runs on a local straight-line approximation, and that approximation has an error you can measure. This part derives both, then draws them: a tracker whose confidence bands you can tighten with a slider, and an extended filter whose linearisation error spikes exactly where the geometry gets most curved.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">What is a belief, if it is always a bell?</p>
+    <p>Part 16 built the Bayes filter without assuming anything about the shape of the belief. You keep a distribution over the state, you push it through the motion model, and you multiply it by the likelihood of the measurement. For a robot on a line that belief might be a row of bins; for a pose in a building it might be a cloud of particles. The update is exact in principle and expensive in practice, because a general distribution has no finite description. You approximate it with a grid, or sample it, and pay for the resolution.</p>
+    <p>The Kalman filter is what happens when you refuse to approximate. Suppose the belief at every step is Gaussian: a mean <var>x</var> and a covariance <var>P</var>. Suppose the motion model is linear in the state and corrupted by Gaussian noise, and the measurement is likewise a linear function plus Gaussian noise. Then the prediction is Gaussian, the product of two Gaussians is Gaussian, and the belief at every future step is Gaussian too. The whole distribution is carried by a vector and a matrix, and the update is finite, closed-form, and optimal &mdash; not approximately optimal, but the exact conditional mean and covariance.</p>
+    <p>That is a startling amount of structure to get for free, and it is bought with two strong assumptions: linearity and Gaussian noise. The first is the one that breaks. A range-and-bearing sensor does not report a linear function of position; it reports a distance and an angle, and the angle is <var>$\arctan$</var> of a ratio. A robot that rotates has a motion model full of sines and cosines. The extended Kalman filter keeps the Gaussian belief and the two-step recursion but linearises the models at the current estimate, turning the curve into its tangent line. It works beautifully while the belief is small relative to the curvature, and fails when the belief is broad enough that the tangent is a poor stand-in for the curve.</p>
+    <p>So the question of this part is concrete. If the belief is a bell, what exactly are the predict and update steps, where do the matrices <var>Q</var> and <var>R</var> come from, how do we choose them, and how badly does the tangent-line trick hurt when the world curves? We answer with a tracker you can tune on the left and an extended filter on the right, and we measure the linearisation error rather than hand-waving about it.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the Kalman filter is just the Bayes filter with Gaussians, why <var>$K=P^-H^\top(HP^-H^\top+R)^{-1}$</var> interpolates between trusting the model and trusting the sensor, how <var>Q</var> and <var>R</var> set that balance, and how the EKF's first-order linearisation fails when the belief subtends a wide angle.</span></div>
+    <div class="g-toc">
+      <a href="#model">2 · The linear-Gaussian model</a>
+      <a href="#equations">3 · Predict, then update</a>
+      <a href="#tuning">4 · Tuning Q and R</a>
+      <a href="#ekf">5 · The EKF and linearisation</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="model">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The linear-Gaussian model</h2></div>
+    <p class="g-eyebrow">Three sentences that buy you the whole algorithm</p>
+    <p>Write the state at time <var>k</var> as a vector <var>x_k</var>. For a moving object on a line the natural state is position and velocity, <var>$x=(p,v)^\top$</var>, because a model that predicts position from position alone cannot know that the object was already moving. Given the state and a control input <var>u_k</var>, the motion model says how the state evolves: multiply by a matrix <var>F</var>, add the effect of the control through a matrix <var>B</var>, and add noise. The measurement model says what the sensor reports: multiply the state by an observation matrix <var>H</var> and add noise.</p>
+    <div class="g-math g-katex">$$x_k = F\,x_{k-1} + B\,u_k + w_k,\qquad w_k\sim\mathcal{N}(0,Q),\qquad z_k = H\,x_k + v_k,\qquad v_k\sim\mathcal{N}(0,R).$$</div>
+    <p>Every symbol earns its place. <var>F</var> is the deterministic dynamics: for the constant-velocity model with time step <var>$\Delta t$</var> it is <var>$\begin{pmatrix}1 &amp; \Delta t\\ 0 &amp; 1\end{pmatrix}$</var>, which says position advances by velocity times time and velocity is unchanged. <var>B</var> lets an external command push the state, for instance an acceleration that adds <var>$\tfrac12\Delta t^2$</var> to position and <var>$\Delta t$</var> to velocity. <var>H</var> is the sensor's view of the state: if the sensor measures position only, <var>$H=\begin{pmatrix}1 &amp; 0\end{pmatrix}$</var> and the velocity is never seen directly, only inferred from how position changes.</p>
+    <p>The two noise covariances are the honest part of the model. <var>Q</var> is the process noise: everything the dynamics failed to predict &mdash; gusts, friction changes, a driver who did not hold a constant velocity. <var>R</var> is the measurement noise: sensor error, quantisation, the fact that two readings of the same true position differ. Neither is a nuisance parameter to be swept under the rug. They are the numbers that decide how much the filter believes the model against the sensors, and the next two sections show exactly how.</p>
+    <p>One more object is needed: the belief itself. Before any data, the state is unknown; we summarise that ignorance as a Gaussian prior with mean <var>x_0</var> and covariance <var>P_0</var>. A large diagonal in <var>P_0</var> means "I have almost no idea where this thing is". The filter's job is to shrink that matrix with evidence. Because every operation it performs &mdash; a linear map, an addition of independent Gaussians, a product of Gaussians &mdash; preserves Gaussianity, the belief stays a bell described by a mean and a covariance forever.</p>
+  </section>
+
+  <section class="g-step" id="equations">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Predict, then update</h2></div>
+    <p class="g-eyebrow">Five lines, and the gain that decides everything</p>
+    <p>The prediction step pushes the belief through the motion model. A linear map sends a mean through <var>F</var> and a covariance through <var>$F(\cdot)F^\top$</var>, and adding independent Gaussian noise adds its covariance. That gives the prior for the new time step, written with a minus superscript.</p>
+    <div class="g-math g-katex">$$x^- = F\,x + B\,u,\qquad P^- = F\,P\,F^\top + Q.$$</div>
+    <p>Prediction always widens the belief: the covariance is pushed through <var>F</var> and then inflated by <var>Q</var>. Uncertainty can never decrease without data. The update step is where information arrives. The sensor predicts a measurement <var>Hx^-</var>; the actual reading <var>z</var> differs by the innovation <var>z-Hx^-</var>; and the Kalman gain <var>K</var> decides how much of that surprise to fold into the state.</p>
+    <div class="g-math g-katex">$$K = P^- H^\top\left(H P^- H^\top + R\right)^{-1},\qquad x = x^- + K\,(z - H\,x^-),\qquad P = (I - K H)\,P^-.$$</div>
+    <p>Read the gain as a ratio of uncertainties. The matrix <var>$H P^- H^\top$</var> is the uncertainty the model has about the measurement it expects; <var>R</var> is the uncertainty the sensor adds. Their sum <var>$S=HP^-H^\top+R$</var> is the total innovation covariance. When <var>R</var> is tiny next to the model's own uncertainty, <var>K</var> is close to a pseudo-inverse of <var>H</var>: the filter snaps the estimate onto the measurement and ignores the prediction. When <var>R</var> is large, the inverse shrinks, <var>K</var> goes to zero, and the filter barely moves from <var>x^-</var>. The update is a weighted average of two noisy opinions, weighted by how much each is trusted &mdash; and the weights are inverse variances. That is the entire content of the algorithm.</p>
+    <p>Notice that the covariance update never looks at the data. <var>P=(I-KH)P^-</var> is a function of <var>P^-</var>, <var>H</var> and <var>R</var> alone. The uncertainty about how well you know the state evolves deterministically, whether the measurements agree with the prediction or not. This is why you can pre-compute the gain schedule for a fixed measurement pattern before a mission, and why the filter is so cheap: no sampling, no integrals, just a handful of matrix products per step.</p>
+    <p>The state is jointly Gaussian throughout, so the filter is not just a plausible heuristic; it is the exact Bayes posterior under the linear-Gaussian assumptions. The mean it produces minimises the mean-squared error among all estimators, not merely among linear ones. It is also a least-squares solution to a weighted problem: the estimate is the smallest set of state changes that reconciles the motion model with the measurements, each residual weighted by its inverse covariance. That reading is the one that generalises to the extended filter, and to the smoother and the bundle adjuster.</p>
+  </section>
+
+  <section class="g-step" id="tuning">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Tuning Q and R</h2></div>
+    <p class="g-eyebrow">A tracker you can lean on the model or the sensor</p>
+    <p>Here is a constant-velocity tracker following a target on a line. The true trajectory is drawn faintly, the position measurements are pink dots, and the filter's estimate is the heavy blue line with two shaded bands: <var>$\pm1\sigma$</var> and <var>$\pm2\sigma$</var> from the diagonal of <var>P</var>. The measurements are fixed; the sliders change only what the filter <em>believes</em> about the noise, not the data. Start the run and watch the band narrow as evidence accumulates, then pump the process-noise slider up and watch the estimate start chasing the dots.</p>
+    <p>The two sliders are the two dials that matter. <var>Q</var> is the assumed process noise, added to <var>P^-</var> every step: turn it up and the filter thinks the model is unreliable, so <var>P^-</var> grows fast, the gain rises, and each measurement pulls the estimate hard. The estimate becomes jumpy and tracks the noisy dots. Turn <var>Q</var> down and the filter trusts its dynamics; the gain falls, the line smooths out, and when the true trajectory actually changes direction the estimate lags behind. <var>R</var> is the assumed measurement noise: raise it and the filter treats each reading as untrustworthy, the gain drops, and the estimate coasts on the model. Lower it and the band contracts around the dots, sharp but twitchy.</p>
+    <div class="g-math g-katex">$$\text{gain} \uparrow \text{ with } Q,\qquad \text{gain} \downarrow \text{ with } R,\qquad K_1 = \frac{P^-_{11}}{P^-_{11}+R}.$$</div>
+    <p>The readout shows the gain at the current step. At the very first update it is close to one, because <var>P_0</var> is large and the first measurement genuinely dominates. As the run proceeds the position gain falls toward a steady-state value determined entirely by the ratio of <var>Q</var> to <var>R</var>. There is no "correct" setting in the abstract. The right question is whether the assumed noises match the real ones; if they do, the filter is optimal, and if they do not, the bands lie about the actual error. A useful sanity check is to compare the innovation magnitudes to <var>S</var>: if measurements routinely land outside the <var>$\pm3\sigma$</var> band, one of the two sliders is wrong.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="kal-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Blue line is the estimate, shaded for <var>$\pm1\sigma$</var> and <var>$\pm2\sigma$</var>; pink dots are position measurements; the dashed line is the truth. Use <b>Step</b> to advance one reading or <b>Run</b> to play.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Process noise Q <span class="val">0.08</span></label><input type="range" id="kal-q" min="0.01" max="2" step="0.01" value="0.08"></div>
+        <div class="g-field"><label>Measurement noise R <span class="val">4</span></label><input type="range" id="kal-r" min="0.25" max="16" step="0.25" value="4"></div>
+        <div class="g-btnrow">
+          <button type="button" id="kal-step">Step</button>
+          <button type="button" id="kal-run">Run</button>
+          <button type="button" id="kal-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="kal-readout"></div>
+      </div>
+    </div>
+    <p>Two details are worth noticing in the readout. First, the velocity gain <var>K_2</var> is not zero even though the sensor never measures velocity: the filter infers velocity from the trend of the position readings, which is why the state contains velocity at all. Second, the bands are not confidence intervals for the truth in the frequentist sense; they are the filter's own posterior standard deviations under its assumptions. That is precisely the Bayesian object, and it is what makes this recursive filter the linear-Gaussian special case of Part 16's loop.</p>
+  </section>
+
+  <section class="g-step" id="ekf">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The EKF and linearisation</h2></div>
+    <p class="g-eyebrow">When the tangent line is not the curve</p>
+    <p>Most real sensors are not linear. A range-and-bearing sensor reports <var>$r=\sqrt{(x_l-x_r)^2+(y_l-y_r)^2}$</var> and <var>$\phi=\arctan\!\big((y_l-y_r)/(x_l-x_r)\big)$</var>, both nonlinear functions of the landmark position and the robot pose. A rotating vehicle's motion model is full of sines and cosines. The extended Kalman filter keeps the Gaussian belief and the same predict-update skeleton, but replaces the true models with their first-order Taylor expansions at the current estimate. Matrices become Jacobians:</p>
+    <div class="g-math g-katex">$$F_k = \left.\frac{\partial f}{\partial x}\right|_{\hat x},\qquad H_k = \left.\frac{\partial h}{\partial x}\right|_{\hat x},\qquad x_k = f(x_{k-1},u_k),\qquad z_k \approx h(\hat x) + H_k (x_k - \hat x).$$</div>
+    <p>Here the robot moves along a known path in the plane and observes a single fixed landmark, so the state to estimate is the landmark's position, <var>$x=(l_x,l_y)^\top$</var>. The motion model of the landmark is the identity &mdash; it does not move &mdash; while the measurement model is the range and bearing from the current robot pose. The canvas below shows the path, the noisy bearing rays, the true landmark in pink, and the estimate in blue with its <var>$1\sigma$</var> and <var>$2\sigma$</var> covariance ellipses from <var>$\mathrm{Prob.confEllipse}$</var>.</p>
+    <p>The price of linearisation is the error between the true curved measurement prediction and the straight-line stand-in. The smaller the belief, the closer the two agree; the wider the angular extent the belief subtends at the robot, the worse the tangent fits. The second canvas plots that bearing error against the angular spread of the belief as the robot travels. Both rise and fall together, and both spike when the robot passes close to the landmark, where the bearing function bends hardest and a small position error swings the predicted angle the most.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ekf-canvas" width="640" height="400"></canvas>
+        <p class="g-canvas-hint">Dark dots are the robot path, thin pink rays are bearing observations, pink is the true landmark, blue is the estimate. The ellipse is the landmark belief, from <var>$\mathrm{Prob.confEllipse}(P,x,k)$</var>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="ekf-step">Step</button>
+          <button type="button" id="ekf-run">Run</button>
+          <button type="button" id="ekf-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="ekf-readout"></div>
+      </div>
+    </div>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ekf-err-canvas" width="640" height="180"></canvas>
+        <p class="g-canvas-hint">Bearing linearisation error (pink) and the angular spread of the belief, <var>$\arctan(\sigma_{\max}/r)$</var> (blue dashed), both in degrees. They track: the tangent is a poor substitute exactly when the belief covers a wide angle.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="ekf-err-readout"></div>
+      </div>
+    </div>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div id="ekf-plot" class="g-plot-ekf"></div>
+        <p class="g-canvas-hint">Plotly surface of the landmark belief <var>$\mathcal{N}(x,P)$</var> at the current step. The peak is the estimate, the spread is the covariance, and the hill sharpens as measurements arrive.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="ekf-surface-readout"></div>
+      </div>
+    </div>
+    <p>The EKF is not the only remedy, and it is worth knowing what the alternatives buy. The unscented Kalman filter propagates a deterministic set of sigma points through the true nonlinear function and re-fits a Gaussian to the result, capturing curvature to second order without ever forming a Jacobian. Iterated EKFs re-linearise around the updated estimate instead of the predicted one. Full nonlinear least squares, the subject of the <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM</a> and bundle-adjustment machinery, abandons the recursion and optimises the whole trajectory at once. Each is a different answer to the same question: how much of the Gaussian shortcut can you keep once the world stops being linear?</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The default filter of engineered systems</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Sensor fusion on a moving base</h3>
+        <p style="margin-bottom:0;">A mobile robot fuses wheel <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry</a> with an IMU and range readings in a Kalman filter whose state is pose and velocity. The same predict-update split lets it drop a wheel tick while keeping a coherent belief, and the covariance is what tells the planner how much to trust its own location.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Landmarks and bundle adjustment</h3>
+        <p style="margin-bottom:0;">The range-bearing update here is the front end of visual <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM</a>. A camera observes a landmark, the Jacobian <var>H</var> is the derivative of the projection, and the EKF maintains the landmark and camera uncertainty jointly. Large-scale systems replace the recursion with nonlinear least squares, but the linearisation step is the same idea.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Products of Gaussians</h3>
+        <p style="margin-bottom:0;">The update is a product of two Gaussian densities, renormalised. When the two are written as quadratics, the mean of the product is a precision-weighted average and its covariance is the sum of precisions inverted. That is the engine behind <a href="{{ '/math/probability/multivariate-gaussian/' | relative_url }}">conditioning</a> a multivariate Gaussian, and it explains why the gain is an inverse-variance ratio.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Estimation</div>
+        <h3 style="margin:6px 0;">The recursive Bayes filter</h3>
+        <p style="margin-bottom:0;">This is the Gaussian case of the general <a href="{{ '/math/probability-in-action/bayes-filter/' | relative_url }}">Bayes filter</a>: predict convolves the belief with motion noise, update multiplies it by the measurement likelihood. Swap the Gaussian for a grid and you get Part 16's histogram filter; swap it for a particle cloud and you get Part 18's particle filter. Same loop, different representation.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Motion model</td><td><var>$x_k=Fx_{k-1}+Bu_k+w_k,\;w_k\sim\mathcal{N}(0,Q)$</var></td><td>Linear dynamics plus process noise.</td></tr>
+        <tr><td>Measurement model</td><td><var>$z_k=Hx_k+v_k,\;v_k\sim\mathcal{N}(0,R)$</var></td><td>Linear sensor plus measurement noise.</td></tr>
+        <tr><td>Predict mean</td><td><var>x^-=Fx+Bu</var></td><td>Push the mean through the dynamics.</td></tr>
+        <tr><td>Predict covariance</td><td><var>$P^-=FPF^\top+Q$</var></td><td>Uncertainty grows without data.</td></tr>
+        <tr><td>Innovation</td><td><var>y=z-Hx^-</var></td><td>The part of the reading the model did not expect.</td></tr>
+        <tr><td>Innovation covariance</td><td><var>$S=HP^-H^\top+R$</var></td><td>Model uncertainty plus sensor noise.</td></tr>
+        <tr><td>Kalman gain</td><td><var>$K=P^-H^\top S^{-1}$</var></td><td>Inverse-variance weighting of model against sensor.</td></tr>
+        <tr><td>Update mean</td><td><var>x=x^-+Ky</var></td><td>Move the prediction by a fraction of the surprise.</td></tr>
+        <tr><td>Update covariance</td><td><var>P=(I-KH)P^-</var></td><td>Shrinks deterministically; data-independent.</td></tr>
+        <tr><td>EKF Jacobians</td><td><var>$F=\partial f/\partial x,\;H=\partial h/\partial x$</var></td><td>Linearise the curved models at the estimate.</td></tr>
+        <tr><td>Linearisation error</td><td><var>$h(x)-\big[h(\hat x)+H(x-\hat x)\big]$</var></td><td>Grows with curvature and with the belief's angular spread.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>R. E. Kalman, <em>"A New Approach to Linear Filtering and Prediction Problems"</em>, Journal of Basic Engineering, 1960 &mdash; the original paper, shockingly readable.</li>
+      <li>Sebastian Thrun, Wolfram Burgard and Dieter Fox, <em>Probabilistic Robotics</em>, chapters 3 and 7 &mdash; the Bayesian framing and the EKF, with the range-bearing example this part draws.</li>
+      <li>Yaakov Bar-Shalom, X.-Rong Li and Thiagalingam Kirubarajan, <em>Estimation with Applications to Tracking and Navigation</em> &mdash; the reference for tuning <var>Q</var> and <var>R</var> and for the consistency checks.</li>
+      <li>Simo Särkkä, <em>Bayesian Filtering and Smoothing</em>, chapters 4&ndash;5 &mdash; a clean derivation of the Kalman filter as the Gaussian special case, and the unscented extension.</li>
+      <li>Greg Welch and Gary Bishop, <a href="https://www.cs.unc.edu/~welch/media/pdf/kalman_intro.pdf">"An Introduction to the Kalman Filter"</a> &mdash; the short tutorial most people actually learned it from.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The Gaussian shortcut runs out when the belief has more than one hill &mdash; then you need a cloud of samples instead of a mean and a covariance.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-plot3d.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var LA = LinAlg;
+  var PLOT_OPTS = { responsive: true, displayModeBar: false };
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; return x.toFixed(d); }
+  function deg(rad) { return rad * 180 / Math.PI; }
+
+  function fillBetween(pl, xs, lo, hi, fill) {
+    var ctx = pl.ctx, i, X, Y;
+    ctx.save();
+    ctx.beginPath();
+    for (i = 0; i < xs.length; i++) {
+      X = pl.px(xs[i]); Y = pl.py(hi[i]);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    for (i = xs.length - 1; i >= 0; i--) ctx.lineTo(pl.px(xs[i]), pl.py(lo[i]));
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — 1D constant-velocity tracker driven by Q and R
+  // ------------------------------------------------------------------
+  var N = 50, TRUE_V = 0.40, MEAS_SD = 2.0;
+  var truthP = [], meas = [];
+  (function () {
+    var r = Prob.rng(20260914), x = 0, v = TRUE_V;
+    for (var t = 0; t < N; t++) {
+      if (t > 0) { v += r.normal(0, 0.25); x += v; }
+      truthP.push(x);
+      meas.push(x + r.normal(0, MEAS_SD));
+    }
+  })();
+
+  var tracker = { q: 0.08, r: 4.0, cur: 0, run: null };
+  var kalPl = null;
+
+  function rebuildTracker() {
+    var q = tracker.q, r = tracker.r;
+    var F = [[1, 1], [0, 1]], H = [[1, 0]];
+    var Q = [[q / 4, q / 2], [q / 2, q]], R = [[r]];
+    var kf = Prob.filters.kalman({
+      F: F, H: H, Q: Q, R: R, x0: [meas[0], 0.2], P0: [[9, 0], [0, 4]]
+    });
+    var est = [], sd = [], gain = [], i;
+    for (i = 0; i < N; i++) {
+      if (i > 0) kf.predict();
+      var Pm = kf.P;
+      var S = Pm[0][0] + r;
+      gain.push([Pm[0][0] / S, Pm[1][0] / S]);
+      kf.update(meas[i]);
+      est.push(kf.x[0]);
+      sd.push(Math.sqrt(Math.max(kf.P[0][0], 0)));
+    }
+    tracker.run = { est: est, sd: sd, gain: gain };
+  }
+
+  function drawTracker() {
+    if (!kalPl) return;
+    var pl = kalPl, cur = tracker.cur, run = tracker.run;
+    var lo = Infinity, hi = -Infinity, i, v;
+    for (i = 0; i <= cur; i++) {
+      v = Math.min(truthP[i], meas[i], run.est[i] - 2 * run.sd[i]);
+      if (v < lo) lo = v;
+      v = Math.max(truthP[i], meas[i], run.est[i] + 2 * run.sd[i]);
+      if (v > hi) hi = v;
+    }
+    if (!isFinite(lo) || !(hi > lo)) { lo = 0; hi = 1; }
+    var pad = (hi - lo) * 0.08 || 1;
+    pl.yRange[0] = lo - pad;
+    pl.yRange[1] = hi + pad;
+    pl.clear();
+    var xs = [], lo1 = [], hi1 = [], lo2 = [], hi2 = [], measPts = [];
+    for (i = 0; i <= cur; i++) {
+      xs.push(i);
+      lo1.push(run.est[i] - run.sd[i]); hi1.push(run.est[i] + run.sd[i]);
+      lo2.push(run.est[i] - 2 * run.sd[i]); hi2.push(run.est[i] + 2 * run.sd[i]);
+      measPts.push({ x: i, y: meas[i] });
+    }
+    fillBetween(pl, xs, lo2, hi2, 'rgba(43,95,255,0.10)');
+    fillBetween(pl, xs, lo1, hi1, 'rgba(43,95,255,0.20)');
+    pl.grid({ step: 5 });
+    pl.axes({ step: 5, xLabel: 'time step', yLabel: 'position' });
+    pl.curve(function (x) {
+      var k = Math.max(0, Math.min(cur, Math.round(x)));
+      return truthP[k];
+    }, { from: 0, to: cur, samples: cur + 1, color: c.text, width: 1.4, dash: [5, 4] });
+    pl.points(measPts, { color: c.accent2, r: 2.2 });
+    pl.curve(function (x) {
+      var k = Math.max(0, Math.min(cur, Math.round(x)));
+      return run.est[k];
+    }, { from: 0, to: cur, samples: cur + 1, color: c.accent, width: 2.4 });
+    pl.vline(cur, { color: c.divider });
+    pl.legend([
+      { label: '±2σ', color: 'rgba(43,95,255,0.10)', fill: true },
+      { label: '±1σ', color: 'rgba(43,95,255,0.20)', fill: true },
+      { label: 'estimate', color: c.accent },
+      { label: 'measurements', color: c.accent2 },
+      { label: 'truth', color: c.text, dash: [5, 4] }
+    ]);
+    var rmse = 0, k = run.gain[cur];
+    for (i = 0; i <= cur; i++) { var d = run.est[i] - truthP[i]; rmse += d * d; }
+    rmse = Math.sqrt(rmse / (cur + 1));
+    var trust = k[0] > 0.55 ? 'the measurements dominate this update'
+      : k[0] > 0.25 ? 'model and measurements share the update'
+      : 'the model dominates this update';
+    el('kal-readout').innerHTML =
+      '<div><span class="k">Q (assumed)</span> <span class="hi">' + fmt(tracker.q, 2) + '</span>' +
+      ' <span class="k">R (assumed)</span> <span class="hi">' + fmt(tracker.r, 2) + '</span></div>' +
+      '<div><span class="k">gain K (position, velocity)</span> ' + fmt(k[0], 3) + ', ' + fmt(k[1], 3) + '</div>' +
+      '<div><span class="k">position σ at this step</span> ' + fmt(run.sd[cur], 3) + '</div>' +
+      '<div><span class="k">RMSE over shown steps</span> ' + fmt(rmse, 3) + '</div>' +
+      '<div style="margin-top:6px;">K = ' + fmt(k[0], 2) + ': ' + trust + '.</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo B — 2D EKF on a range-bearing landmark
+  // ------------------------------------------------------------------
+  var M = 40, RANGE_SD = 0.5, BEAR_SD = 0.10;
+  var TRUE_LM = [2.6, 0.1];
+  var poses = [], zAll = [];
+  (function () {
+    var r = Prob.rng(20260217);
+    for (var i = 0; i < M; i++) {
+      var t = i / (M - 1);
+      var px = -6 + 12 * t;
+      var py = -0.6 + 0.35 * Math.sin(6.0 * t);
+      poses.push([px, py]);
+      var dx = TRUE_LM[0] - px, dy = TRUE_LM[1] - py;
+      var rr = Math.sqrt(dx * dx + dy * dy);
+      var bb = Math.atan2(dy, dx);
+      zAll.push([rr + r.normal(0, RANGE_SD), bb + r.normal(0, BEAR_SD)]);
+    }
+  })();
+
+  var ekfPose = poses[0];
+  function ekfDyn(x) { return [x[0], x[1]]; }
+  function ekfF() { return [[1, 0], [0, 1]]; }
+  function ekfH(x) {
+    var dx = x[0] - ekfPose[0], dy = x[1] - ekfPose[1];
+    return [Math.sqrt(dx * dx + dy * dy), Math.atan2(dy, dx)];
+  }
+  function ekfHjac(x) {
+    var dx = x[0] - ekfPose[0], dy = x[1] - ekfPose[1];
+    var r2 = Math.max(1e-9, dx * dx + dy * dy), rr = Math.sqrt(r2);
+    return [[dx / rr, dy / rr], [-dy / r2, dx / r2]];
+  }
+
+  var ekfState = { t: 0, est: [], estP: [], errDeg: [], spreadDeg: [] };
+  var ekfPl = null, errPl = null, ekfDiv = null;
+  var EKF_XR = [-8, 8], EKF_YR = [-5, 5];
+
+  function rebuildEKF() {
+    ekfPose = poses[0];
+    var x0 = [poses[0][0] + zAll[0][0] * Math.cos(zAll[0][1]),
+              poses[0][1] + zAll[0][0] * Math.sin(zAll[0][1])];
+    var R = [[RANGE_SD * RANGE_SD, 0], [0, BEAR_SD * BEAR_SD]];
+    var Q = [[5e-4, 0], [0, 5e-4]];
+    var kf = Prob.filters.ekf({
+      f: ekfDyn, h: ekfH, F: ekfF, H: ekfHjac, Q: Q, R: R, x0: x0, P0: [[3, 0], [0, 3]]
+    });
+    var est = [], estP = [], errDeg = [], spreadDeg = [], t;
+    for (t = 0; t < M; t++) {
+      ekfPose = poses[t];
+      kf.predict();
+      var xe = kf.x.slice();
+      var HJ = ekfHjac(xe);
+      var hT = ekfH(TRUE_LM), hE = ekfH(xe);
+      var lr = hE[0] + HJ[0][0] * (TRUE_LM[0] - xe[0]) + HJ[0][1] * (TRUE_LM[1] - xe[1]);
+      var lb = hE[1] + HJ[1][0] * (TRUE_LM[0] - xe[0]) + HJ[1][1] * (TRUE_LM[1] - xe[1]);
+      errDeg.push(Math.abs(hT[1] - lb) * 180 / Math.PI);
+      var eg = LA.mat.eigSym(kf.P);
+      var smax = Math.sqrt(Math.max(eg.values[0], eg.values[1], 0));
+      spreadDeg.push(deg(Math.atan2(smax, Math.max(1e-3, hE[0]))));
+      kf.update(zAll[t]);
+      est.push([kf.x[0], kf.x[1]]);
+      estP.push([[kf.P[0][0], kf.P[0][1]], [kf.P[1][0], kf.P[1][1]]]);
+    }
+    ekfState.est = est;
+    ekfState.estP = estP;
+    ekfState.errDeg = errDeg;
+    ekfState.spreadDeg = spreadDeg;
+  }
+
+  function drawEKF() {
+    if (!ekfPl) return;
+    var pl = ekfPl, cur = ekfState.t, i;
+    pl.clear();
+    pl.grid(null, { step: 1 });
+    pl.axes(null, { step: 1 });
+    var ctx = pl.ctx;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(214,0,108,0.22)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (i = 0; i <= cur; i++) {
+      var zz = zAll[i];
+      var ex = poses[i][0] + zz[0] * Math.cos(zz[1]);
+      var ey = poses[i][1] + zz[0] * Math.sin(zz[1]);
+      ctx.moveTo(pl.px(poses[i][0]), pl.py(poses[i][1]));
+      ctx.lineTo(pl.px(ex), pl.py(ey));
+    }
+    ctx.stroke();
+    ctx.restore();
+    pl.points(poses.slice(0, cur + 1), { color: 'rgba(32,30,29,0.28)', r: 2 });
+    pl.points(ekfState.est.slice(0, cur + 1), { color: 'rgba(43,95,255,0.55)', r: 2 });
+    pl.polygon(Prob.confEllipse(ekfState.estP[cur], ekfState.est[cur], 2),
+      { fill: 'rgba(43,95,255,0.10)', stroke: 'rgba(43,95,255,0.35)', width: 1.2 });
+    pl.polygon(Prob.confEllipse(ekfState.estP[cur], ekfState.est[cur], 1),
+      { stroke: c.accent, width: 2 });
+    pl.points([TRUE_LM], { color: c.accent2, r: 4.5 });
+    pl.points([ekfState.est[cur]], { color: c.accent, r: 4 });
+    pl.points([poses[cur]], { color: c.text, r: 3.5 });
+    var e = ekfState.est[cur], Pc = ekfState.estP[cur];
+    var perr = Math.sqrt((e[0] - TRUE_LM[0]) * (e[0] - TRUE_LM[0]) + (e[1] - TRUE_LM[1]) * (e[1] - TRUE_LM[1]));
+    var eg = LA.mat.eigSym(Pc);
+    var s1 = Math.sqrt(Math.max(eg.values[0], eg.values[1], 0));
+    var s2 = Math.sqrt(Math.min(eg.values[0], eg.values[1], 0));
+    el('ekf-readout').innerHTML =
+      '<div><span class="k">step</span> <span class="hi">' + cur + ' / ' + (M - 1) + '</span>' +
+      ' <span class="k">robot range to landmark</span> ' + fmt(ekfH(e)[0], 2) + '</div>' +
+      '<div><span class="k">estimate (l<sub>x</sub>, l<sub>y</sub>)</span> ' + fmt(e[0], 2) + ', ' + fmt(e[1], 2) + '</div>' +
+      '<div><span class="k">position error</span> ' + fmt(perr, 3) + '</div>' +
+      '<div><span class="k">1σ semi-axes</span> ' + fmt(s1, 3) + ', ' + fmt(s2, 3) + '</div>' +
+      '<div><span class="k">bearing linearisation error</span> ' + fmt(ekfState.errDeg[cur], 3) + '&deg;</div>' +
+      '<div><span class="k">angular spread of belief</span> ' + fmt(ekfState.spreadDeg[cur], 3) + '&deg;</div>';
+  }
+
+  function drawErr() {
+    if (!errPl) return;
+    var pl = errPl, cur = ekfState.t, maxY = 1e-6, i;
+    for (i = 0; i < M; i++) maxY = Math.max(maxY, ekfState.errDeg[i], ekfState.spreadDeg[i]);
+    maxY *= 1.15;
+    pl.yRange[0] = 0;
+    pl.yRange[1] = maxY;
+    pl.clear();
+    var step = Math.max(1, Math.ceil(maxY / 4));
+    pl.grid({ step: step });
+    pl.axes({ step: step, xLabel: 'path step', yLabel: 'degrees' });
+    pl.curve(function (x) {
+      var k = Math.max(0, Math.min(M - 1, Math.round(x)));
+      return ekfState.spreadDeg[k];
+    }, { from: 0, to: M - 1, samples: M, color: c.accent, width: 1.6, dash: [5, 4], label: 'angular spread' });
+    pl.curve(function (x) {
+      var k = Math.max(0, Math.min(M - 1, Math.round(x)));
+      return ekfState.errDeg[k];
+    }, { from: 0, to: M - 1, samples: M, color: c.accent2, width: 2, label: 'linearisation error' });
+    pl.vline(cur, { color: c.divider });
+    pl.legend();
+    el('ekf-err-readout').innerHTML =
+      '<div><span class="k">peak bearing error</span> ' + fmt(Math.max.apply(null, ekfState.errDeg), 3) + '&deg;</div>' +
+      '<div><span class="k">error at current step</span> ' + fmt(ekfState.errDeg[cur], 3) + '&deg;' +
+      ' <span class="k">spread</span> ' + fmt(ekfState.spreadDeg[cur], 3) + '&deg;</div>' +
+      '<div style="margin-top:6px;">The two curves move together: the tangent line fits badly exactly where the belief subtends a wide angle.</div>';
+  }
+
+  function render3d(div, traces, layout) {
+    if (!div || !window.Plotly) return;
+    if (!div.__plotlyInit) { Plotly.newPlot(div, traces, layout, PLOT_OPTS); div.__plotlyInit = true; }
+    else { Plotly.react(div, traces, layout, PLOT_OPTS); }
+  }
+
+  function drawSurface() {
+    if (!window.Plotly || !ekfDiv) return;
+    var x = ekfState.est[ekfState.t], P = ekfState.estP[ekfState.t];
+    var m = Prob.mvn(x, P);
+    var eg = LA.mat.eigSym(P);
+    var smax = Math.sqrt(Math.max(eg.values[0], eg.values[1], 0));
+    var ext = Math.max(0.4, 3 * smax);
+    var lo0 = x[0] - ext, hi0 = x[0] + ext, lo1 = x[1] - ext, hi1 = x[1] + ext;
+    var G = 25, xs = [], ys = [], zz = [], zmax = 1e-12, i, j;
+    for (i = 0; i < G; i++) {
+      xs.push(lo0 + (hi0 - lo0) * i / (G - 1));
+      ys.push(lo1 + (hi1 - lo1) * i / (G - 1));
+    }
+    for (i = 0; i < G; i++) {
+      var row = [];
+      for (j = 0; j < G; j++) {
+        var z = m.pdf([xs[i], ys[j]]);
+        if (!isFinite(z) || z < 0) z = 0;
+        if (z > zmax) zmax = z;
+        row.push(z);
+      }
+      zz.push(row);
+    }
+    render3d(ekfDiv, [{
+      type: 'surface', x: xs, y: ys, z: zz, showscale: false, opacity: 1, hoverinfo: 'skip',
+      colorscale: [[0, '#eaf0ff'], [1, '#2b5fff']]
+    }], GuidePlot3D.baseLayout({
+      range: { x: [lo0, hi0], y: [lo1, hi1], z: [0, zmax * 1.05] },
+      aspectmode: 'data', xTitle: 'x (m)', yTitle: 'y (m)', zTitle: 'belief'
+    }));
+    el('ekf-surface-readout').innerHTML =
+      '<div><span class="k">peak belief density</span> <span class="hi">' + fmt(zmax, 3) + '</span></div>' +
+      '<div><span class="k">1σ semi-axes</span> ' + fmt(Math.sqrt(Math.max(eg.values[0], eg.values[1], 0)), 3) +
+      ', ' + fmt(Math.sqrt(Math.min(eg.values[0], eg.values[1], 0)), 3) + '</div>' +
+      '<div style="margin-top:6px;">The hill sharpens as range-bearing updates tighten <var>P</var>.</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Wiring
+  // ------------------------------------------------------------------
+  rebuildTracker();
+  rebuildEKF();
+
+  kalPl = Prob.plot(el('kal-canvas'), {
+    W: 640, H: 360, xRange: [0, N - 1], yRange: [0, 1], onResize: drawTracker
+  });
+  ekfPl = LinAlg.plane(el('ekf-canvas'), {
+    W: 640, H: 400, xRange: EKF_XR, yRange: EKF_YR, onResize: drawEKF
+  });
+  errPl = Prob.plot(el('ekf-err-canvas'), {
+    W: 640, H: 180, xRange: [0, M - 1], yRange: [0, 1], onResize: drawErr
+  });
+  ekfDiv = el('ekf-plot');
+
+  Guide.bindSliders([el('kal-q')], function (s) {
+    tracker.q = parseFloat(s.value);
+    rebuildTracker();
+    drawTracker();
+  });
+  Guide.bindSliders([el('kal-r')], function (s) {
+    tracker.r = parseFloat(s.value);
+    rebuildTracker();
+    drawTracker();
+  });
+
+  el('kal-step').addEventListener('click', function () {
+    if (tracker.cur < N - 1) tracker.cur++;
+    drawTracker();
+  });
+  var kalLoop = Guide.loop({
+    onStep: function () {
+      if (tracker.cur < N - 1) { tracker.cur++; drawTracker(); }
+      else kalLoop.stop();
+    },
+    button: el('kal-run'), interval: 180
+  });
+  el('kal-reset').addEventListener('click', function () {
+    tracker.cur = 0;
+    kalLoop.stop();
+    drawTracker();
+  });
+
+  function ekfAdvance() {
+    if (ekfState.t < M - 1) ekfState.t++;
+    drawEKF(); drawErr(); drawSurface();
+  }
+  el('ekf-step').addEventListener('click', ekfAdvance);
+  var ekfLoop = Guide.loop({
+    onStep: function () {
+      if (ekfState.t < M - 1) ekfAdvance();
+      else ekfLoop.stop();
+    },
+    button: el('ekf-run'), interval: 220
+  });
+  el('ekf-reset').addEventListener('click', function () {
+    ekfState.t = 0;
+    ekfLoop.stop();
+    drawEKF(); drawErr(); drawSurface();
+  });
+
+  window.addEventListener('resize', function () {
+    if (ekfDiv && ekfDiv.__plotlyInit && window.Plotly) Plotly.Plots.resize(ekfDiv);
+  });
+
+  drawTracker();
+  drawEKF();
+  drawErr();
+  drawSurface();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'kalman-gain-tradeoff',
+      kind: 'choice',
+      prompt: 'What is the Kalman gain <var>K</var> trading off?',
+      options: [
+        { label: 'How much to move the estimate toward the measurement versus keep the prediction, weighted by the inverse of each uncertainty.', correct: true },
+        { label: 'The speed of the filter against its numerical stability.', correct: false },
+        { label: 'The dimension of the state against the number of sensors.', correct: false }
+      ],
+      explanation: 'K = P⁻Hᵀ(HP⁻Hᵀ + R)⁻¹ is an inverse-variance weight. A small R makes K large and the update snaps to the measurement; a large R makes K small and the prediction survives.'
+    },
+    {
+      id: 'kalman-predict-position',
+      kind: 'numeric',
+      prompt: 'A constant-velocity model has <var>F = [[1, 1], [0, 1]]</var>. With no control input, if the state is <var>x = (p, v) = (2, 3)</var>, what is the predicted position <var>p&#8315;</var>?',
+      answer: 5,
+      tolerance: 0.001,
+      explanation: 'p⁻ = 1·p + 1·v = 2 + 3 = 5. The velocity column adds one step of motion to the position; velocity itself is unchanged by this F.'
+    },
+    {
+      id: 'kalman-large-r',
+      kind: 'choice',
+      prompt: 'As the assumed measurement noise <var>R</var> grows very large, what does the update do?',
+      options: [
+        { label: 'The gain falls toward zero, so the filter trusts the model and barely moves from the prediction.', correct: true },
+        { label: 'The gain rises toward one, so the filter follows every measurement.', correct: false },
+        { label: 'The covariance grows without bound regardless of the data.', correct: false }
+      ],
+      explanation: 'Large R inflates the innovation covariance S = HP⁻Hᵀ + R, so K = P⁻HᵀS⁻¹ shrinks and x ≈ x⁻. This is why a noisy sensor should be assigned a large R.'
+    },
+    {
+      id: 'kalman-covariance-update',
+      kind: 'choice',
+      prompt: 'Why does the covariance update <var>P=(I-KH)P^-</var> not depend on the measurement values?',
+      options: [
+        { label: 'Because the uncertainty reduction is determined by the model, sensor geometry and noise, not by the numerical readings.', correct: true },
+        { label: 'Because the covariance is reset to Q at every step.', correct: false },
+        { label: 'Because P is constant once the filter reaches steady state from the first update on.', correct: false }
+      ],
+      explanation: 'The gain and the covariance recursion are functions of P⁻, H and R alone. Measurements affect the mean x, not how much uncertainty each update removes — which is why a gain schedule can be precomputed.'
+    },
+    {
+      id: 'kalman-ekf-error',
+      kind: 'choice',
+      prompt: 'When is the EKF’s first-order linearisation a poor approximation?',
+      options: [
+        { label: 'When the belief is broad enough that the curved measurement function bends appreciably across it.', correct: true },
+        { label: 'When the covariance matrices are exactly diagonal.', correct: false },
+        { label: 'Whenever the state dimension exceeds one.', correct: false }
+      ],
+      explanation: 'Linearisation replaces h by its tangent at the estimate. If the belief spans a wide angle, points a standard deviation away sit where the tangent departs from the curve, and the error grows with the curvature times the spread squared.'
+    },
+    {
+      id: 'kalman-ekf-jacobian',
+      kind: 'numeric',
+      prompt: 'For the bearing measurement <var>&phi; = arctan((y<sub>l</sub> &minus; y<sub>r</sub>) / (x<sub>l</sub> &minus; x<sub>r</sub>))</var>, the Jacobian entry <var>&part;&phi;/&part;y<sub>l</sub></var> equals <var>&Delta;x / r&sup2;</var>, where <var>&Delta;x = x<sub>l</sub> &minus; x<sub>r</sub></var> and <var>r&sup2; = &Delta;x&sup2; + &Delta;y&sup2;</var>. With <var>&Delta;x = 3</var> and <var>&Delta;y = 4</var>, what is <var>&part;&phi;/&part;y<sub>l</sub></var>?',
+      answer: 0.12,
+      tolerance: 0.005,
+      explanation: 'r² = 9 + 16 = 25, so ∂φ/∂y_l = Δx/r² = 3/25 = 0.12. The Jacobian is how the EKF turns the curved bearing into a local linear map: H = [[Δx/r, Δy/r], [−Δy/r², Δx/r²]].'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

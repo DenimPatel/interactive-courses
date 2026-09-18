@@ -1,0 +1,530 @@
+---
+title: "Statistics, Interactively — Part 28: The Kalman filter and the EKF"
+description: "Track in 2D with a live covariance ellipse, tune Q and R until it diverges, then linearise a range-bearing model and watch the EKF's error."
+permalink: "/math/statistics/kalman-filter/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-big { font-family: var(--font-mono); font-size: 16px; font-weight: 600; }
+  .g-mode-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>The Kalman filter and the EKF</h1>
+    <p>The Kalman filter is what Bayes' rule becomes when every belief is Gaussian and every model is linear. It is exact, recursive, and cheap, which is why it has ridden on spacecraft and inside phones for sixty years. This part makes it visible: a target tracked in two dimensions with its uncertainty drawn as a live covariance ellipse, Q and R turned into sliders you can mis-set until the filter lies to you, and then a range-bearing sensor that forces the linear machinery to bend around a nonlinear measurement. That bend is the extended Kalman filter, and watching it fail when the uncertainty grows is the point.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">How do you keep a belief about a moving state?</p>
+    <p>The Bayes filter of Part 27 represented a belief as a histogram over a grid: it blurred the belief when the robot moved and multiplied it when a sensor spoke. That picture is exact for any motion and any sensor, but it scales terribly, because the number of grid cells grows exponentially with the number of state variables. A robot that tracks position and velocity in two dimensions already has four numbers to describe, and a histogram over four dimensions is a nightmare of bookkeeping.</p>
+    <p>The Kalman filter buys tractability with one restriction. If the belief is a Gaussian and the motion and measurement models are linear, then the belief stays Gaussian forever, and the entire distribution is summarised by a mean vector and a covariance matrix. Instead of a grid, the filter carries a single point around the state space together with a shape that says how uncertain it is about every direction. Predict with the motion model, correct with the measurement, repeat. That is the whole algorithm.</p>
+    <p>The state here is a vector: position and velocity in the plane, $x = [x,\; y,\; v_x,\; v_y]$. The position part is what the sensor sees; the velocity part is inferred, never measured directly. The covariance matrix tells the filter, and you, how confident it is about each, and about how they trade off: fast in one direction but unsure of a heading is a long, thin ellipse, not a blurry circle.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the predict step inflates the covariance and the update step fuses information, why Q and R are beliefs about the world rather than measurements of it, why the EKF is a Taylor expansion that breaks when uncertainty is large, and why the covariance ellipse is the filter's honest self-report of how much it should be trusted.</span></div>
+    <div class="g-toc">
+      <a href="#linear">2 · Exact inference for a linear-Gaussian state</a>
+      <a href="#track">3 · Track in 2D</a>
+      <a href="#trust">4 · Q and R are beliefs</a>
+      <a href="#ekf">5 · The EKF and linearisation</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="linear">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Exact inference for a linear-Gaussian state</h2></div>
+    <p class="g-eyebrow">Predict, then fuse — the precision sum from Part 17</p>
+    <p>Write the two models the filter assumes. The state evolves by a linear map $A$ plus Gaussian noise with covariance $Q$: $x_k = A x_{k-1} + w$, $w \sim \mathcal{N}(0, Q)$. The sensor returns a linear projection $H$ of the state plus Gaussian noise with covariance $R$: $z_k = H x_k + v$, $v \sim \mathcal{N}(0, R)$. Both noises are zero-mean, and $Q$ and $R$ are the only places the filter's humility enters.</p>
+    <p>The <em>predict</em> step pushes the belief through the motion model. The mean is carried by the dynamics, and the covariance is carried by the dynamics and then inflated by the process noise:</p>
+    <div class="g-math g-katex">$$\mu^- = A\mu, \qquad \Sigma^- = A\Sigma A^\top + Q$$</div>
+    <p>Read the second expression as the filter admitting that it does not believe its own model. A perfect prediction would leave the covariance unchanged; $Q$ adds uncertainty because the true motion has accelerations, wobbles and turns that the constant matrix $A$ cannot know. This is the <em>covariance inflation</em> the whole page is about.</p>
+    <p>The <em>update</em> step folds in the measurement. Form the innovation — the part of the reading the prediction failed to explain — and its covariance, then the Kalman gain, and finally the corrected belief:</p>
+    <div class="g-math g-katex">$$\nu = z - H\mu^-, \qquad S = H\Sigma^- H^\top + R, \qquad K = \Sigma^- H^\top S^{-1}$$</div>
+    <div class="g-math g-katex">$$\mu = \mu^- + K\nu, \qquad \Sigma = (I - KH)\,\Sigma^-$$</div>
+    <p>The gain decides how far to move toward the measurement, and it is a precision-weighted compromise. In one dimension with $H=1$ it reduces to $K = \sigma^2/(\sigma^2+r)$, the fraction of the total precision carried by the prior — which is precisely the scalar update of <a href="{{ '/math/statistics/conjugacy-fusion/' | relative_url }}">Part 17</a>, where the posterior precision was the sum of the prior and observation precisions and the mean was the weight-average. Nothing has changed but the vocabulary: a reciprocal became a matrix inverse, a sum became a matrix sum, and the fusion is still exact. The same weighted-average algebra appears whenever independent Gaussian errors combine, as in the <a href="{{ '/math/calculus-in-motion/probability/' | relative_url }}">probability guide</a>.</p>
+    <p>There is no approximation anywhere in these five equations. Given the linear-Gaussian model, they are the exact posterior. That is also their weakness: the moment either model curves, exactness is gone, and the extended Kalman filter in Step 5 is the honest repair.</p>
+  </section>
+
+  <section class="g-step" id="track">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Track in 2D</h2></div>
+    <p class="g-eyebrow">The signature interaction: a live covariance ellipse</p>
+    <p>The demo runs the filter on a target whose true motion is a constant-velocity drift interrupted by small accelerations and one sustained turn. The noisy pink dots are position measurements with a fixed, true sensor noise of $0.55$; the dark path is the filter's estimate; the pale dashed line is the truth. The ellipse is the filter's $2\sigma$ covariance <em>projected onto the $x$–$y$ block</em> of the full $4\times4$ matrix — the filter's own picture of where it might be. Step forward one measurement at a time, or press Play to watch the belief converge from a wide initial ellipse to something tight that follows the target.</p>
+    <p>Watch the ellipse and the point tell different stories. Early on the ellipse is large and round, because almost nothing is known; after a few measurements it shrinks, and once the velocity is inferred it becomes an elongated shape that anticipates where the target is heading. That elongation is the covariance earning its keep: position is known well, velocity a little less so, and the two are correlated, so the uncertainty leans along the direction of travel rather than spreading evenly.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="track-canvas" width="660" height="420"></canvas>
+        <canvas id="err-canvas" width="660" height="210"></canvas>
+        <p class="g-canvas-hint">Top: truth, measurements, estimate and its $2\sigma$ covariance ellipse. Bottom: the NIS — the squared innovation measured in units of its own covariance — against the value it should average.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-mode-row">
+          <button type="button" id="mode-kf" class="active">Position sensor (KF)</button>
+          <button type="button" id="mode-ekf">Range-bearing (EKF)</button>
+        </div>
+        <div class="g-field"><label><span id="q-label-text">Q · process noise (assumed accel σ)</span> <span class="val" id="q-val">0.055</span></label><input type="range" id="q-slider" min="-2.5" max="0.5" step="0.02" value="-1.26"></div>
+        <div class="g-field"><label><span id="r-label-text">R · position measurement σ</span> <span class="val" id="r-val">0.55</span></label><input type="range" id="r-slider" min="0.05" max="3" step="0.01" value="0.55"></div>
+        <div class="g-field" id="bear-field" style="display:none;"><label>bearing measurement σ (assumed) <span class="val" id="bear-val">0.07</span></label><input type="range" id="bear-slider" min="0.01" max="0.5" step="0.005" value="0.07"></div>
+        <div class="g-btnrow">
+          <button type="button" id="play-btn" class="g-primary">Play</button>
+          <button type="button" id="step-btn">Step</button>
+          <button type="button" id="reset-btn">Reset</button>
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="preset-balanced">Balanced</button>
+          <button type="button" id="preset-tinyr">Tiny R</button>
+          <button type="button" id="preset-hugeq">Huge Q</button>
+          <button type="button" id="preset-detune">Detune</button>
+          <button type="button" id="preset-widebear">Wide bearing</button>
+        </div>
+        <div class="g-readout" id="track-readout"></div>
+      </div>
+    </div>
+    <p>The bottom canvas is the honesty check. The normalised innovation squared, $\mathrm{NIS} = \nu^\top S^{-1}\nu$, is what statisticians call a consistency statistic: if the filter's model and covariances are right, it should behave like a $\chi^2$ variable with as many degrees of freedom as the measurement has numbers — two here — so its mean should hover near $2$, and most of the time it should sit under the $95\%$ threshold. When the NIS lives far above that line, the filter is not merely wrong; it is confidently wrong, and its covariance no longer describes its error.</p>
+  </section>
+
+  <section class="g-step" id="trust">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Q and R are beliefs</h2></div>
+    <p class="g-eyebrow">Trust is a parameter you can get wrong</p>
+    <p>The sensor in the demo is fixed: its true noise never moves. The sliders change only what the filter <em>believes</em> about the sensor and about its own motion. That gap between belief and reality is where every practical Kalman failure lives, and turning the knobs is the fastest way to feel it.</p>
+    <p>Turn R far below the truth and the filter believes the sensor is exquisite. It chases each noisy reading and forgets the smooth constant-velocity prediction, so the estimate becomes a jagged copy of the noise. That is the sense in which too small an R makes the filter <em>ignore the motion model</em>: the measurement is trusted so completely that the dynamics stop mattering. Turn Q far above the truth and the opposite happens — every prediction is treated as wildly unreliable, the ellipse balloons at every step, and the estimate jitters because it is constantly re-learning a state it should already know.</p>
+    <p>The extreme setting is the instructive one. Press <em>Detune</em>: Q is driven to almost nothing while R is left large, so the filter is certain its motion model is perfect and convinced the sensor is poor. Its covariance shrinks to a sliver, the Kalman gain goes to zero, and it stops listening to the measurements entirely — free-running on a straight line while the truth curves away. The estimate sails off, but the ellipse stays small. That is <em>divergence</em>, and it is worse than being lost: the filter is lost and reports high confidence. An error that grows while the ellipse stays tight is the signature, and the readout calls it out.</p>
+    <div class="g-warn">⚠ <span><b>Tuning is a statement about the world.</b> Q and R are not free parameters to be minimised until the picture looks calm. They assert how much the model and the sensor can be trusted, and a filter tuned to look good on one trajectory will be overconfident on the next. Run the same scenario with the Balanced preset, then Detune, and watch consistency — not smoothness — be what the covariance was promising.</span></div>
+  </section>
+
+  <section class="g-step" id="ekf">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The EKF and linearisation</h2></div>
+    <p class="g-eyebrow">Bending the linear machinery around a curve</p>
+    <p>Switch the demo to <em>Range-bearing</em>. The sensor no longer reports $x$ and $y$; it reports a range $r$ and a bearing $\theta$ to a fixed landmark, and those two numbers are a nonlinear function of the state: $r = \sqrt{(x-x_L)^2 + (y-y_L)^2}$ and $\theta = \operatorname{atan2}(y-y_L,\, x-x_L)$. There is no matrix $H$ that produces $r$ and $\theta$ from $[x,y,v_x,v_y]$, so the exact update has no closed form.</p>
+    <p>The extended Kalman filter handles this by lying locally and honestly. At the current estimate it evaluates the Jacobian $H_k = \partial h/\partial x$, the matrix of first derivatives of the measurement model, using <code>Stats.filter.jacobian</code> — the same object the <a href="{{ '/math/calculus/jacobian-hessian/' | relative_url }}">Jacobian and Hessian guide</a> develops. It then replaces the true curved map with its tangent plane at the estimate and runs the ordinary Kalman update with that tangent in place of $H$. The prediction step can be linearised the same way when the motion model curves, but here the motion stays linear, so only the sensor bends.</p>
+    <p>Linearisation is a bargain with geometry, and the bill arrives when the belief is wide. The tangent drawn at the estimate is a straight stand-in for a curve that sweeps over the whole arc of the belief; when that arc is broad, the update pushes the estimate in a slightly wrong direction and the error accumulates. Press <em>Wide bearing</em> to set the assumed bearing σ to $0.5$: the estimate lags the truth along the tangential direction the ellipse has stretched into, and the position error climbs into the several-unit range while range itself still tracks. Push the slider the other way, toward a confident bearing, and the filter trusts the tangent so completely that a small linearisation error is amplified into a large position error — the NIS climbs into the hundreds as the filter grows certain in a direction it has mis-modelled. Only while the bearing uncertainty is small enough that the tangent nearly matches the curve is the EKF effectively exact, and locating that threshold is the single most important thing to know before trusting an EKF in a real system. The same question reappears in the optimisation guides as a conditioning problem.</p>
+    <p>The NIS canvas is just as useful here. An EKF whose linearisation is poor tends to be overconfident in exactly the directions it got wrong, so its NIS climbs even as the estimate looks plausible. Comparing the dark estimate path against the pale truth path, with the error and RMSE printed below, is the direct measurement of the linearisation error the ellipse is hiding.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One recursion, two worlds</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">The robot state being estimated</h3>
+        <p style="margin-bottom:0;">A mobile robot's state is exactly the vector on this page — position, heading, and velocity — predicted from wheel or inertial motion and corrected by an absolute sensor. The <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry chapter</a> shows the raw prediction that feeds the predict step; the filter is what stops that prediction from drifting once a measurement arrives. Every localization stack is this recursion, run for as long as the robot is switched on.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision &amp; Geometry</div>
+        <h3 style="margin:6px 0;">The Jacobian inside a SLAM backend</h3>
+        <p style="margin-bottom:0;">A SLAM system holds a Gaussian belief over poses and landmarks and folds in camera observations through a curved projection model. The <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM chapter</a> is the EKF's update written for a huge state, and the Jacobian of the projection is the same linearisation that makes the range-bearing update possible here. When the linearisation breaks down, the backend is the place it shows up as drift.</p>
+      </div>
+    </div>
+    <p>The pattern is not particular to robots. Inertial navigation, satellite positioning, radar tracking and camera calibration all maintain a running Gaussian estimate and fold in noisy measurements with these same two steps. What changes is the size of the state and the shape of the models; what stays fixed is the picture — a point, an ellipse, and a rule for shrinking it with each honest measurement while inflation undoes some of that progress with each step of motion.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below treat the filter as recursive Bayesian inference rather than a bag of matrix formulas. If you take away one thing, take away the picture of an ellipse that grows with motion, shrinks with information, and tells you how far to trust the point inside it.</p>
+    <ul class="g-refs">
+      <li>Sebastian Thrun, Wolfram Burgard, and Dieter Fox, <em>Probabilistic Robotics</em>, MIT Press, chapter 3 &mdash; Gaussian filters, the Kalman and extended Kalman filters, and the origin of the prediction/update split used here.</li>
+      <li>Greg Welch and Gary Bishop, <a href="https://www.cs.unc.edu/~welch/kalman/kalmanIntro.html">"An Introduction to the Kalman Filter"</a>, UNC-Chapel Hill TR 95-041 &mdash; the standard short derivation, with the discrete update written out step by step.</li>
+      <li>Rudolf E. K&aacute;lm&aacute;n, "A New Approach to Linear Filtering and Prediction Problems", <em>Journal of Basic Engineering</em>, 1960 &mdash; the original paper, worth a look for how little the core idea has changed.</li>
+      <li>Christopher Bishop, <em>Pattern Recognition and Machine Learning</em>, &sect;13.3 &mdash; the linear dynamical system as the probabilistic model the filter solves exactly.</li>
+      <li>Simo S&auml;rkk&auml;, <em>Bayesian Filtering and Smoothing</em>, Cambridge University Press &mdash; a modern, careful treatment of the EKF and its consistency, including the failure modes this part dramatises.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Predict</td><td>$\mu^- = A\mu$, $\Sigma^- = A\Sigma A^\top + Q$; the mean follows the model, the covariance inflates</td></tr>
+        <tr><td>Innovation</td><td>$\nu = z - H\mu^-$; the part of the measurement the prediction did not explain</td></tr>
+        <tr><td>Innovation covariance</td><td>$S = H\Sigma^- H^\top + R$; uncertainty of that surprise</td></tr>
+        <tr><td>Kalman gain</td><td>$K = \Sigma^- H^\top S^{-1}$; a precision-weighted compromise, exactly Part 17's fusion in matrix form</td></tr>
+        <tr><td>Update</td><td>$\mu = \mu^- + K\nu$, $\Sigma = (I-KH)\Sigma^-$; the belief fuses toward the measurement</td></tr>
+        <tr><td>Q</td><td>Process noise: how much you distrust the motion model; too small and the filter stops listening</td></tr>
+        <tr><td>R</td><td>Measurement noise: how much you distrust the sensor; too small and the filter chases noise</td></tr>
+        <tr><td>NIS</td><td>$\nu^\top S^{-1}\nu$; should average the measurement dimension when the filter is consistent</td></tr>
+        <tr><td>EKF</td><td>Replace the curved model with its first-order Taylor tangent (the Jacobian) at the current estimate</td></tr>
+        <tr><td>Divergence</td><td>The estimate is wrong while the covariance stays small: confidence without correctness</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A single Gaussian cannot survive a room with two doors. The next part replaces the ellipse with a cloud of particles that can be in two places at once.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) {
+    d = d == null ? 2 : d;
+    if (x == null || !isFinite(x)) return '\u2014';
+    var s = x.toFixed(d);
+    if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s === '-0' ? '0' : s;
+  }
+  function wrapPi(a) {
+    while (a > Math.PI) a -= 2 * Math.PI;
+    while (a < -Math.PI) a += 2 * Math.PI;
+    return a;
+  }
+
+  // Fixed scenario constants. The truth and the true sensor noise never change;
+  // only the filter's beliefs (the sliders) do, which is the whole lesson.
+  var SEED = 20260914;
+  var T = 80, TURN = 26, ARC = 24, CURVE_ACC = 0.04;
+  var LX = 6.4, LY = 7.4;
+  var POS_SD_TRUE = 0.55, RB_SD_TRUE = 0.55, BR_SD_TRUE = 0.07;
+  var ACC_TRUE = 0.055;
+
+  var A = [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]];
+  var Hpos = [[1, 0, 0, 0], [0, 1, 0, 0]];
+
+  function fAffine(x) { return S.mat.mulVec(A, x); }
+  function hRB(x) {
+    var dx = x[0] - LX, dy = x[1] - LY;
+    return [Math.sqrt(dx * dx + dy * dy), Math.atan2(dy, dx)];
+  }
+  function rbToXY(z) { return [LX + z[0] * Math.cos(z[1]), LY + z[0] * Math.sin(z[1])]; }
+  function buildQ(qAcc) {
+    return [
+      [qAcc / 4, 0, qAcc / 2, 0],
+      [0, qAcc / 4, 0, qAcc / 2],
+      [qAcc / 2, 0, qAcc, 0],
+      [0, qAcc / 2, 0, qAcc]
+    ];
+  }
+  function computeNIS(nu, Sm) {
+    var Si = S.mat.inverse(Sm);
+    if (!Si) return NaN;
+    var v = S.mat.mulVec(Si, nu), s = 0;
+    for (var i = 0; i < nu.length; i++) s += nu[i] * v[i];
+    return s;
+  }
+
+  var truth = [], measPos = [], measRB = [];
+  function buildSim() {
+    truth = []; measPos = []; measRB = [];
+    var r = S.rng(SEED);
+    var px = 2.0, py = 1.7, vx = 0.30, vy = 0.22;
+    for (var t = 0; t < T; t++) {
+      if (t >= TURN && t < TURN + ARC) {
+        var sp = Math.sqrt(vx * vx + vy * vy) || 1;
+        var ax = -vy / sp * CURVE_ACC, ay = vx / sp * CURVE_ACC;
+        vx += ax; vy += ay;
+      }
+      vx += ACC_TRUE * S.gauss(r);
+      vy += ACC_TRUE * S.gauss(r);
+      px += vx; py += vy;
+      truth.push([px, py]);
+      measPos.push([px + POS_SD_TRUE * S.gauss(r), py + POS_SD_TRUE * S.gauss(r)]);
+      var dx = px - LX, dy = py - LY;
+      var rr = Math.sqrt(dx * dx + dy * dy), th = Math.atan2(dy, dx);
+      measRB.push([rr + RB_SD_TRUE * S.gauss(r), th + BR_SD_TRUE * S.gauss(r)]);
+    }
+  }
+
+  var mode = 'kf';
+  var mu = null, Sigma = null, step = 0;
+  var estPts = [], nisArr = [], errArr = [];
+  var lastInnov = [0, 0], lastNIS = NaN;
+
+  var plot = S.plot(el('track-canvas'), {
+    W: 660, H: 420, xRange: [0, 8], yRange: [0, 8],
+    xLabel: 'x position', yLabel: 'y position', onResize: draw
+  });
+  var nisPlot = S.plot(el('err-canvas'), {
+    W: 660, H: 210, xRange: [0, T], yRange: [0, 10],
+    xLabel: 'timestep', yLabel: 'NIS', onResize: drawErr
+  });
+
+  function setBounds() {
+    var minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
+    function inc(x, y) {
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (y < miny) miny = y; if (y > maxy) maxy = y;
+    }
+    truth.forEach(function (p) { inc(p[0], p[1]); });
+    measPos.forEach(function (p) { inc(p[0], p[1]); });
+    inc(LX, LY);
+    var m = 1.2;
+    minx -= m; maxx += m; miny -= m; maxy += m;
+    var cx = 0.5 * (minx + maxx), cy = 0.5 * (miny + maxy);
+    var sx = maxx - minx, sy = maxy - miny;
+    var ar = plot.plotW / plot.plotH;
+    if (sx < sy * ar) sx = sy * ar; else sy = sx / ar;
+    plot.xRange[0] = cx - sx / 2; plot.xRange[1] = cx + sx / 2;
+    plot.yRange[0] = cy - sy / 2; plot.yRange[1] = cy + sy / 2;
+  }
+
+  function assumptions() {
+    var accSd = Math.pow(10, parseFloat(el('q-slider').value));
+    var rSd = parseFloat(el('r-slider').value);
+    var bearSd = parseFloat(el('bear-slider').value);
+    return { accSd: accSd, qAcc: accSd * accSd, rSd: rSd, bearSd: bearSd };
+  }
+  function syncLabels() {
+    var a = assumptions();
+    el('q-val').textContent = fmt(a.accSd, 3);
+    el('r-val').textContent = fmt(a.rSd, 2);
+    el('bear-val').textContent = fmt(a.bearSd, 3);
+  }
+
+  function initFilter() {
+    estPts = []; nisArr = []; errArr = [];
+    lastInnov = [0, 0]; lastNIS = NaN;
+    step = 0;
+    var x0, y0;
+    if (mode === 'kf') { x0 = measPos[0][0]; y0 = measPos[0][1]; }
+    else { var p0 = rbToXY(measRB[0]); x0 = p0[0]; y0 = p0[1]; }
+    mu = [x0, y0, 0.2, 0.15];
+    Sigma = [[4, 0, 0, 0], [0, 4, 0, 0], [0, 0, 4, 0], [0, 0, 0, 4]];
+  }
+
+  function draw() {
+    if (!plot) return;
+    plot.clear();
+    plot.axes({ xLabel: 'x position', yLabel: 'y position' });
+    plot.curve(truth, { color: 'rgba(32,30,29,0.32)', width: 1.5, dashed: true });
+
+    var mpts = [];
+    for (var i = 0; i < step; i++) mpts.push(mode === 'kf' ? measPos[i] : rbToXY(measRB[i]));
+    plot.points(mpts, { color: c.accent2, r: 2.2 });
+
+    if (mode === 'ekf') {
+      plot.points([[LX, LY]], { color: c.accent, r: 5, stroke: '#ffffff', width: 2 });
+      plot.text('landmark', LX, LY, { color: c.accent, dx: 8, dy: -8, size: 11 });
+    }
+
+    if (estPts.length) plot.curve(estPts, { color: c.accent700, width: 2.2 });
+
+    if (mu) {
+      var Sxy = [[Sigma[0][0], Sigma[0][1]], [Sigma[1][0], Sigma[1][1]]];
+      plot.ellipse(Sxy, [mu[0], mu[1]], 2, { color: c.accent700, width: 2, fill: 'rgba(11,60,208,0.14)' });
+      plot.points([[mu[0], mu[1]]], { color: c.accent700, r: 4, stroke: '#ffffff', width: 1.5 });
+    }
+
+    plot.legend([
+      { label: 'truth', color: c.text, dashed: true },
+      { label: mode === 'kf' ? 'measurements' : 'range-bearing (converted)', color: c.accent2 },
+      { label: 'filter estimate', color: c.accent700 },
+      { label: '2\u03C3 covariance (x\u2013y block)', color: c.accent700, fill: 'rgba(11,60,208,0.3)' }
+    ], { dy: 8 });
+
+    updateReadout();
+  }
+
+  function drawErr() {
+    if (!nisPlot) return;
+    nisPlot.clear();
+    var chi95 = S.dist.chi2.quantile(0.95, 2);
+    var maxV = 4, i;
+    for (i = 0; i < nisArr.length; i++) if (isFinite(nisArr[i].v)) maxV = Math.max(maxV, nisArr[i].v);
+    var cap = Math.min(200, Math.max(chi95 * 1.5, maxV * 1.1));
+    nisPlot.yRange[0] = 0; nisPlot.yRange[1] = cap;
+    nisPlot.axes({ xLabel: 'timestep', yLabel: 'NIS' });
+    nisPlot.hline(2, { color: c.text, dashed: true, width: 1.2 });
+    nisPlot.hline(chi95, { color: c.accent2, dashed: true, width: 1.4 });
+    var pts = [];
+    for (i = 0; i < nisArr.length; i++) pts.push([nisArr[i].t + 1, nisArr[i].v]);
+    nisPlot.curve(pts, { color: c.accent700, width: 2 });
+    nisPlot.legend([
+      { label: 'NIS', color: c.accent700 },
+      { label: 'expected 2', color: c.text, dashed: true },
+      { label: '\u03C7\u00B2\u2082 95% = ' + fmt(chi95, 2), color: c.accent2, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function updateReadout() {
+    var a = assumptions();
+    var i, n = errArr.length;
+    var e = n ? errArr[n - 1] : NaN;
+    var ss = 0;
+    for (i = 0; i < n; i++) ss += errArr[i] * errArr[i];
+    var rmse = n ? Math.sqrt(ss / n) : NaN;
+    var sum = 0, m = 0;
+    for (i = 0; i < nisArr.length; i++) if (isFinite(nisArr[i].v)) { sum += nisArr[i].v; m++; }
+    var meanNIS = m ? sum / m : NaN;
+    var diverge = (mu && (!isFinite(mu[0]) || !isFinite(mu[1]))) || (n > 0 && errArr[n - 1] > 3);
+
+    var qLabel = a.accSd < 0.7 * ACC_TRUE ? 'too small \u2014 ignores manoeuvres' : (a.accSd > 1.6 * ACC_TRUE ? 'too large \u2014 jittery' : 'near the truth');
+    var rLabel = a.rSd < 0.6 * POS_SD_TRUE ? 'too small \u2014 chases noise' : (a.rSd > 1.8 * POS_SD_TRUE ? 'too large \u2014 ignores the sensor' : 'near the truth');
+
+    var html = '';
+    html += '<div><span class="k">mode</span> ' + (mode === 'kf' ? 'linear Kalman (position)' : 'EKF (range-bearing)') + ' &middot; <span class="k">step</span> ' + step + ' / ' + T + '</div>';
+    html += '<div><span class="k">Q assumed</span> accel \u03C3 = ' + fmt(a.accSd, 3) + ' <span class="k">(truth ' + fmt(ACC_TRUE, 3) + ')</span> \u2014 ' + qLabel + '</div>';
+    html += '<div><span class="k">R assumed</span> ' + (mode === 'kf' ? 'position' : 'range') + ' \u03C3 = ' + fmt(a.rSd, 2) + ' <span class="k">(truth ' + fmt(POS_SD_TRUE, 2) + ')</span> \u2014 ' + rLabel + '</div>';
+    if (mode === 'ekf') html += '<div><span class="k">bearing \u03C3 assumed</span> ' + fmt(a.bearSd, 3) + ' <span class="k">(truth ' + fmt(BR_SD_TRUE, 3) + ')</span></div>';
+    html += '<div><span class="k">innovation</span> [' + fmt(lastInnov[0], 2) + ', ' + fmt(lastInnov[1], 3) + '] &middot; norm ' + fmt(Math.sqrt(lastInnov[0] * lastInnov[0] + lastInnov[1] * lastInnov[1]), 2) + '</div>';
+    html += '<div><span class="k">NIS</span> last ' + fmt(lastNIS, 2) + ' &middot; mean ' + fmt(meanNIS, 2) + ' <span class="k">(expected 2)</span></div>';
+    html += '<div><span class="k">error vs truth</span> ' + fmt(e, 2) + ' &middot; RMSE ' + fmt(rmse, 2) + '</div>';
+    if (diverge) html += '<div class="bad">diverging: the covariance no longer describes the true error</div>';
+    else if (isFinite(meanNIS) && meanNIS > 6 && step > 8) html += '<div class="bad">inconsistent: NIS is well above its expected value</div>';
+    else html += '<div class="g-mini">consistency check: NIS should hover near 2 &mdash; larger means overconfident.</div>';
+    el('track-readout').innerHTML = html;
+  }
+
+  function advance() {
+    if (step >= T) { resetRun(); loop.stop(); return; }
+    var a = assumptions();
+    var pred = (mode === 'kf')
+      ? S.filter.kalman.predict(mu, Sigma, A, buildQ(a.qAcc))
+      : S.filter.ekf.predict(mu, Sigma, fAffine, buildQ(a.qAcc));
+    mu = pred.mu; Sigma = pred.Sigma;
+
+    var res;
+    if (mode === 'kf') {
+      res = S.filter.kalman.update(mu, Sigma, measPos[step], Hpos, [[a.rSd * a.rSd, 0], [0, a.rSd * a.rSd]]);
+    } else {
+      var zr = measRB[step], hm = hRB(mu);
+      var z = [zr[0], hm[1] + wrapPi(zr[1] - hm[1])];
+      res = S.filter.ekf.update(mu, Sigma, z, hRB, [[a.rSd * a.rSd, 0], [0, a.bearSd * a.bearSd]]);
+    }
+    mu = res.mu; Sigma = res.Sigma;
+    lastInnov = res.innovation;
+    lastNIS = computeNIS(res.innovation, res.S);
+    estPts.push([mu[0], mu[1]]);
+    var t = truth[step];
+    errArr.push(Math.sqrt((mu[0] - t[0]) * (mu[0] - t[0]) + (mu[1] - t[1]) * (mu[1] - t[1])));
+    nisArr.push({ t: step, v: lastNIS });
+    step++;
+    draw(); drawErr();
+  }
+
+  function resetRun() {
+    if (loop && loop.running()) loop.stop();
+    buildSim();
+    setBounds();
+    initFilter();
+    draw(); drawErr();
+  }
+
+  function setMode(m) {
+    mode = m;
+    el('mode-kf').classList.toggle('active', m === 'kf');
+    el('mode-ekf').classList.toggle('active', m === 'ekf');
+    el('r-label-text').textContent = (m === 'kf' ? 'R \u00B7 position measurement \u03C3' : 'R \u00B7 range measurement \u03C3');
+    el('bear-field').style.display = (m === 'ekf') ? '' : 'none';
+    resetRun();
+  }
+
+  var loop;
+
+  Guide.bindSliders([el('q-slider'), el('r-slider'), el('bear-slider')], function () {
+    syncLabels();
+    draw(); drawErr();
+  });
+
+  el('mode-kf').addEventListener('click', function () { setMode('kf'); });
+  el('mode-ekf').addEventListener('click', function () { setMode('ekf'); });
+  el('step-btn').addEventListener('click', function () { advance(); });
+  el('reset-btn').addEventListener('click', function () { resetRun(); });
+
+  function applyPreset(name) {
+    if (name === 'balanced') { el('q-slider').value = -1.26; el('r-slider').value = 0.55; el('bear-slider').value = 0.07; }
+    else if (name === 'tinyr') { el('q-slider').value = -1.26; el('r-slider').value = 0.06; el('bear-slider').value = 0.07; }
+    else if (name === 'hugeq') { el('q-slider').value = 0.30; el('r-slider').value = 0.55; el('bear-slider').value = 0.07; }
+    else if (name === 'detune') { el('q-slider').value = -2.70; el('r-slider').value = 2.0; el('bear-slider').value = 0.07; }
+    else if (name === 'widebear') { el('q-slider').value = -1.26; el('r-slider').value = 0.55; el('bear-slider').value = 0.5; }
+    syncLabels();
+    resetRun();
+  }
+  el('preset-balanced').addEventListener('click', function () { applyPreset('balanced'); });
+  el('preset-tinyr').addEventListener('click', function () { applyPreset('tinyr'); });
+  el('preset-hugeq').addEventListener('click', function () { applyPreset('hugeq'); });
+  el('preset-detune').addEventListener('click', function () { applyPreset('detune'); });
+  el('preset-widebear').addEventListener('click', function () {
+    if (mode !== 'ekf') setMode('ekf');
+    applyPreset('widebear');
+  });
+
+  loop = Guide.loop({
+    interval: 95,
+    button: el('play-btn'),
+    playLabel: 'Play',
+    pauseLabel: 'Pause',
+    onStep: function () { advance(); }
+  });
+
+  syncLabels();
+  resetRun();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'kalman-filter-predict',
+      kind: 'choice',
+      prompt: 'What does the predict step do to the covariance, and why?',
+      options: [
+        { label: 'It inflates it by Q, because the motion model cannot know the accelerations and turns the true state will take.', correct: true },
+        { label: 'It shrinks it, because moving toward the future makes the state more certain.', correct: false },
+        { label: 'It leaves it unchanged; only the update step ever changes the covariance.', correct: false }
+      ],
+      explanation: 'Predict propagates the covariance through the dynamics, \u03A3\u207B = A\u03A3A^T + Q. The A\u03A3A^T part is how the model moves uncertainty around; the + Q is the filter admitting the model is imperfect. Motion therefore always adds uncertainty before a measurement can remove it.'
+    },
+    {
+      id: 'kalman-filter-gain',
+      kind: 'numeric',
+      prompt: 'In one dimension the prior variance is 4 and the measurement variance is 1. What is the Kalman gain K = \u03C3\u00B2/(\u03C3\u00B2 + r)?',
+      answer: 0.8,
+      tolerance: 0.001,
+      explanation: 'K = 4/(4 + 1) = 0.8. The gain is the prior precision\u2019s share of the total precision, which is exactly the scalar fusion of Part 17: the posterior mean is the prior mean plus 0.8 times the innovation.'
+    },
+    {
+      id: 'kalman-filter-qr',
+      kind: 'choice',
+      prompt: 'You set R far below the sensor\u2019s true noise. What does the filter do?',
+      options: [
+        { label: 'It over-trusts the measurement, chasing the noise and effectively ignoring the motion model, so the estimate becomes jittery.', correct: true },
+        { label: 'It ignores the measurement and drifts on the motion model alone.', correct: false },
+        { label: 'It becomes more accurate, because a smaller R always means less uncertainty.', correct: false }
+      ],
+      explanation: 'R is the filter\u2019s belief about the sensor, not the sensor\u2019s reality. A too-small R makes each reading look far more precise than it is, so the gain grows and the estimate copies the noise. Ignoring the measurement is what a too-large R produces, and it is equally wrong.'
+    },
+    {
+      id: 'kalman-filter-ekf',
+      kind: 'choice',
+      prompt: 'Why does the extended Kalman filter fail when the bearing uncertainty is large?',
+      options: [
+        { label: 'It replaces the curved measurement model with its tangent at the estimate, and that tangent is a poor fit when the belief spans a wide arc.', correct: true },
+        { label: 'It cannot represent range and bearing at the same time, so one of the two must be discarded.', correct: false },
+        { label: 'It uses a smaller covariance than the Kalman filter, so it always under-corrects.', correct: false }
+      ],
+      explanation: 'The EKF linearises h about the current estimate with its Jacobian and then treats the map as straight. When the belief is narrow the tangent is nearly exact; when it is wide the curve bends away from the tangent, the update points in a slightly wrong direction, and the error accumulates \u2014 which is why the tangential drift grows as bearing \u03C3 is raised.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

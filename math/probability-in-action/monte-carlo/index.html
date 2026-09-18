@@ -1,0 +1,518 @@
+---
+title: "Probability in Action, Interactively — Part 8: Monte Carlo integration"
+description: "Throw random points at an integral, watch the estimate wobble inside a shrinking error band, then race antithetic variates, control variates and stratification to see which one buys the most accuracy per sample."
+permalink: "/math/probability-in-action/monte-carlo/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #pi-canvas, #pi-converge, #race-canvas {
+    background: var(--color-neutral-100); border-radius: var(--radius-sm); display: block;
+  }
+  #pi-readout .hi, #race-readout .hi { font-weight: 600; color: var(--color-accent-800); }
+  .g-btnrow button.active { background: var(--color-accent-700); color: #fff; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>Monte Carlo integration</h1>
+    <p>Here is an idea that sounds like a practical joke: to measure the area of a shape, or the value of an integral, throw darts at it at random and count how many land inside. That is the whole method. It ignores the smoothness of the function, does not care how many dimensions you are integrating over, and returns an answer whose error you can read off the back of an envelope as <var>&sigma;/&radic;N</var>. The catch is the same back-of-envelope: halving the error costs four times the work, and no amount of cleverness removes that square-root wall. So the real subject of this part is not how to estimate an integral with randomness &mdash; that is four lines of arithmetic &mdash; but how to shrink the constant in front of <var>1/&radic;N</var>. Antithetic pairs, a control variate with a known mean, and stratification each buy extra accuracy for the same number of function evaluations, often a lot of it, and they are the difference between a simulation that finishes and one that does not.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">An integral you cannot do by hand, and a handful of darts</p>
+    <p>Plenty of integrals have no closed form. The normalising constant of a posterior, the expected loss of a policy over a high-dimensional action space, the average brightness of a scene seen from every possible camera pose &mdash; each is an integral or an expectation, and each is one you cannot evaluate with a clever substitution. Classical quadrature fixes a grid of points and weights, and it works beautifully in one dimension. In ten dimensions a grid with only ten points per axis already needs ten billion evaluations, and the cost explodes from there. Randomness sidesteps the grid entirely.</p>
+    <p>The move is to rewrite the integral as an expectation. For a function <var>h</var> on the unit interval, the average value of <var>h</var> over the interval is its integral, and the average value of <var>h</var> at a uniformly random point is the same number. So draw a point <var>U</var> from the uniform distribution on <var>[0,1]</var> and look at <var>h(U)</var>. Its expectation is the integral. One random point is a terrible estimate; a million independent points average out. This is the <strong>Monte Carlo estimator</strong>, and the remarkable thing is that its accuracy depends on the variance of <var>h</var>, not on the dimension of the space you are sampling.</p>
+    <p>The price is visible in the error. Because the samples are independent, the variance of the average is the variance of one sample divided by <var>N</var>, so the typical error falls like <var>1/&radic;N</var>. That is slow. To gain one more correct digit you need a hundred times as many samples. Deterministic quadrature does far better in low dimensions &mdash; it can be exponentially accurate on smooth functions &mdash; but it cannot survive the curse of dimensionality, and Monte Carlo can. That trade &mdash; slower convergence, but indifferent to dimension &mdash; is why simulation is the default tool in statistics, physics, finance and machine learning.</p>
+    <p>The demo below is the oldest picture in the subject. Take the unit square, inscribe a quarter circle of radius one, and throw points uniformly at the square. The fraction that land inside the quarter circle estimates its area, <var>&pi;/4</var>, so four times that fraction estimates <var>&pi;</var>. As the points accumulate, the estimate wanders but its error band narrows like <var>1/&radic;N</var>. Watch both things at once: the estimate really does converge, and it really does keep moving.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> sampling random points estimates an integral, why the error is <var>&sigma;/&radic;N</var> and no better, and how antithetic variates, control variates and stratification cut the variance &mdash; the same answer from the same number of samples, with a fraction of the noise.</span></div>
+    <div class="g-toc">
+      <a href="#estimator">2 · The estimator and its error</a>
+      <a href="#variance">3 · Racing the variance reducers</a>
+      <a href="#shows">4 · Where this shows up</a>
+      <a href="#cheat">5 · Cheat sheet</a>
+      <a href="#reading">6 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="estimator">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The estimator and its error</h2></div>
+    <p class="g-eyebrow">Unbiased, and noisy by exactly the amount the variance says</p>
+    <p>Write the target as an expectation. If <var>X</var> is uniform on <var>[0,1]</var> and <var>h</var> is whatever you want to integrate, then <var>$I=\int_0^1 h(x)\,dx=\mathbb{E}[h(X)]$</var>. Draw <var>N</var> independent uniforms <var>$x_1,\dots,x_N$</var>, evaluate <var>h</var> at each, and average. The result <var>$\hat I_N$</var> is unbiased: its expectation is the true integral, because expectation is linear and each sample has the right mean. Unbiasedness is the guarantee that the method points at the right answer.</p>
+    <div class="g-math g-katex">$$I=\int_0^1 h(x)\,dx=\mathbb{E}[h(X)],\qquad \hat I_N=\frac{1}{N}\sum_{i=1}^{N}h(x_i),\qquad \mathbb{E}[\hat I_N]=I,\qquad \operatorname{Var}(\hat I_N)=\frac{\sigma^2}{N}.$$</div>
+    <p>The noise is the other half of the story. Independent samples make the variance of the average exactly <var>&sigma;^2/N</var>, where <var>$\sigma^2=\operatorname{Var}(h(X))$</var> is the variance of a single evaluation. Taking square roots gives the <strong>standard error</strong> <var>&sigma;/&radic;N</var>, which is the typical size of the gap between <var>$\hat I_N$</var> and <var>I</var>. In practice you never know <var>&sigma;</var>, so you estimate it from the same samples &mdash; the sample standard deviation of the <var>h(x_i)</var> divided by <var>&radic;N</var> &mdash; and that estimated error is what turns the point estimate into an error bar.</p>
+    <p>That <var>1/&radic;N</var> is the whole economics of simulation. Four times the work halves the error; a hundred times the work removes one digit. It is called the square-root wall, and it cannot be demolished by better hardware, because more samples is exactly what hardware buys and the wall is made of samples. What <em>can</em> be moved is the constant <var>&sigma;</var>: if two estimators are both unbiased for <var>I</var>, the one with smaller <var>&sigma;</var> is the one you should run. The rest of this part is about making <var>&sigma;</var> small without changing the answer.</p>
+    <p>Pi by darts is this estimator in disguise, and it is a good first test because the truth is known to ten digits. Sample a point <var>(x_i,y_i)</var> uniformly in the unit square and let <var>h</var> be the indicator that the point lies in the quarter disc <var>$x^2+y^2\le 1$</var>. The expectation of that indicator is the area of the quarter disc, <var>&pi;/4</var>, so <var>4</var> times the sample mean estimates <var>&pi;</var>. The per-sample variance is <var>p(1-p)</var> with <var>p=&pi;/4</var>, giving a standard error near <var>1.64/&radic;N</var> &mdash; a constant times <var>1/&radic;N</var>, as promised.</p>
+    <div class="g-math g-katex">$$\hat\pi_N=\frac{4}{N}\sum_{i=1}^{N}\mathbf{1}\{x_i^2+y_i^2\le 1\},\qquad \operatorname{se}(\hat\pi_N)\approx\frac{1.64}{\sqrt{N}}.$$</div>
+    <p>Drag the number of darts and watch the running estimate on the right. The shaded band is centred on the true <var>&pi;</var> and narrows like <var>1/&radic;N</var>; the curve should spend most of its time inside. Notice how slowly the band closes &mdash; at ten thousand darts it is still about a hundredth of a unit wide &mdash; and notice that a different seed redraws a completely different path inside the same band. The randomness is real, but its <em>size</em> is predictable, which is what makes a Monte Carlo answer reportable.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pi-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Blue darts land inside the quarter circle, grey darts outside. Each throw is a sample; the fraction inside estimates the area <var>&pi;/4</var>.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="pi-converge" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The heavy line is <var>$4\cdot(\text{inside}/N)$</var> as the darts accumulate; the dashed line is <var>&pi;</var>; the shaded band is the <var>$\pm 1/\sqrt{N}$</var>-scaled error band.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Darts thrown <span class="val">1000</span></label><input type="range" id="pi-n" min="50" max="6000" step="50" value="1000"></div>
+        <div class="g-btnrow"><button type="button" id="pi-reseed">New run</button></div>
+        <div class="g-readout" id="pi-readout"></div>
+      </div>
+    </div>
+    <p>One habit is worth forming here. Every random draw in this volume comes from a seeded stream, so the same seed always replays the same run. That is not a limitation; it is what makes a simulation a reproducible experiment rather than an anecdote. When you compare two estimators, you compare them on the <em>same</em> underlying randomness, which removes the luck of the draw from the comparison. The next section does exactly that, holding the target integral fixed and letting four estimators race.</p>
+  </section>
+
+  <section class="g-step" id="variance">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Racing the variance reducers</h2></div>
+    <p class="g-eyebrow">Same answer, less noise, no extra samples</p>
+    <p>Take the target to be concrete: <var>$I=\int_0^1 e^x\,dx=e-1\approx 1.71828$</var>. The naive Monte Carlo estimate averages <var>e^{x_i}</var> over uniform points and carries a standard error of about <var>0.49/&radic;N</var>. Three classical tricks beat that constant while leaving the expectation untouched. None of them is exotic; all of them exploit a piece of structure in the integrand that the naive sampler refuses to look at.</p>
+    <p><strong>Antithetic variates</strong> use the fact that a uniform sample can be reflected. For every point <var>x</var>, also evaluate at <var>1-x</var>, and average the pair. Each point is still marginally uniform, so the estimate stays unbiased, but the two evaluations are negatively correlated whenever <var>h</var> is monotone &mdash; if <var>e^x</var> is unusually small at <var>x</var>, it is unusually large at <var>1-x</var>. Averaging a negatively correlated pair cancels much of the noise, and since the estimator averages <var>N/2</var> such pairs, its variance drops to <var>$\tfrac12\sigma^2(1+\rho)$</var> per pair, with <var>$\rho$</var> the correlation between <var>h(X)</var> and <var>h(1-X)</var>. For a monotone integrand <var>$\rho&lt;0$</var>, and the reflection is essentially free.</p>
+    <div class="g-math g-katex">$$\tilde h_i=\tfrac12\bigl[h(x_i)+h(1-x_i)\bigr],\qquad \operatorname{Var}(\tilde h)=\tfrac12\sigma^2(1+\rho),\qquad \rho=\operatorname{Corr}\bigl(h(X),h(1-X)\bigr)&lt;0.$$</div>
+    <p><strong>Control variates</strong> use a function whose mean you already know. Pick <var>g</var> with <var>$\mathbb{E}[g(X)]=\mu_g$</var> known exactly &mdash; for the unit interval the natural choice is <var>g(x)=x</var> with <var>$\mu_g=\tfrac12$</var>. Estimate the integrand minus a multiple of how far <var>g</var> strays from its mean. The correction has zero mean, so the estimator is still unbiased, but subtracting the correlated part of <var>g</var> removes its contribution to the variance. The best coefficient is the regression slope <var>$\beta^*=\operatorname{Cov}(h,g)/\operatorname{Var}(g)$</var>, and the residual variance is the familiar <var>$\sigma_h^2(1-\rho_{hg}^2)$</var>: the fraction of the variance that <var>g</var> cannot explain is what remains. Here <var>x</var> and <var>e^x</var> are strongly related, so almost all of the noise is removed.</p>
+    <div class="g-math g-katex">$$\hat I_{\text{cv}}=\frac1N\sum_{i=1}^{N}\bigl[h(x_i)-\beta\,(g(x_i)-\mu_g)\bigr],\qquad \beta^*=\frac{\operatorname{Cov}(h,g)}{\operatorname{Var}(g)},\qquad \operatorname{Var}\bigl(\hat I_{\text{cv}}\bigr)=\frac{\sigma_h^2(1-\rho_{hg}^2)}{N}.$$</div>
+    <p><strong>Stratification</strong> attacks the variance by dividing the problem instead of correlating samples. Split <var>[0,1]</var> into <var>L</var> slices, draw a proportionate number of points in each, and average the per-slice averages with weights <var>w_l</var>. Because the slice means are computed separately, none of the variation <em>between</em> slices leaks into the error; only the variation <em>within</em> a slice survives. Since <var>e^x</var> changes little across a narrow slice, the within-slice variances are tiny and the total variance, <var>$\sum_l w_l^2\sigma_l^2/n_l$</var>, is a small fraction of the naive <var>$\sigma^2/N$</var>. More strata means a stronger effect, and in the limit of infinitely many strata with one sample each the error can fall faster than <var>1/&radic;N</var> because the integrand's smoothness is finally being used.</p>
+    <div class="g-math g-katex">$$\hat I_{\text{st}}=\sum_{l=1}^{L}w_l\,\frac{1}{n_l}\sum_{i=1}^{n_l}h(x_{li}),\qquad \operatorname{Var}\bigl(\hat I_{\text{st}}\bigr)=\sum_{l=1}^{L}\frac{w_l^2\,\sigma_l^2}{n_l}.$$</div>
+    <p>The demo races all four estimators on the same integral. Each curve is the root-mean-square error of the estimator over many independent replications, plotted against the number of samples on log axes, so a straight line of slope <var>-1/2</var> means exactly <var>1/&radic;N</var> convergence. Every method shows that slope: variance reduction moves the line down, it does not bend it. What changes is the vertical offset, and the offset is precisely the reduction in <var>&sigma;</var>. The naive estimator sits on top; antithetic pairs pull it down sharply because the reflection cancels so much; the control variate and stratification each do better still, because they use more of the structure of <var>e^x</var>. The reference dashed line is the naive slope, drawn to make the constant visible.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="race-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">RMS error against sample count for four unbiased estimators of <var>$\int_0^1 e^x\,dx$</var>, on log&ndash;log axes. Lower is better; the dashed guide has slope <var>-1/2</var>, the signature of <var>$1/\sqrt{N}$</var>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Report at N <span class="val">512</span></label><input type="range" id="race-n" min="0" max="8" step="1" value="5"></div>
+        <div class="g-btnrow"><button type="button" id="race-reseed">New seed</button></div>
+        <div class="g-legend">
+          <span class="g-legend-item"><span class="g-swatch" style="background:#d6006c"></span> naive</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#e09000"></span> antithetic</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#2b5fff"></span> control variates</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#1a7f37"></span> stratified</span>
+        </div>
+        <div class="g-readout" id="race-readout"></div>
+      </div>
+    </div>
+    <p>Two warnings keep this honest. First, variance reduction must preserve unbiasedness, and the control variate only does so because <var>$\mu_g$</var> is known exactly; estimating it from the same samples introduces a bias that is usually tiny but always there. Second, a badly chosen control variate is worse than none: if <var>h</var> and <var>g</var> are uncorrelated, the correction adds variance instead of removing it, and the optimal <var>$\beta$</var> is simply zero. The same care applies to stratification, whose gains evaporate if the slices are chosen so that the integrand varies wildly inside them. Variance reduction is not free magic; it is a way of feeding known structure back into the sampler, and it rewards knowing your integrand.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every expectation you cannot compute directly</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / ML</div>
+        <h3 style="margin:6px 0;">Policy gradients and baselines</h3>
+        <p style="margin-bottom:0;">Reinforcement learning from human feedback estimates an expected reward by sampling trajectories, and the estimator is a Monte Carlo average with all the noise that implies. The standard fix in <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">RLHF</a> &mdash; subtracting a baseline from the reward &mdash; is a control variate whose known mean is zero for a centred advantage, and it is the reason policy-gradient training converges at all.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Integrals past three dimensions</h3>
+        <p style="margin-bottom:0;">The Riemann sums of <a href="{{ '/math/calculus-in-motion/multiple-integrals/' | relative_url }}">multiple integrals</a> become hopeless once the dimension climbs, while the Monte Carlo error stays <var>&sigma;/&radic;N</var> regardless of dimension. That dimension-independence is why simulation replaces quadrature in statistical physics, rendering, and Bayesian computation.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Stochastic objectives in optimization</h3>
+        <p style="margin-bottom:0;">Robust fitting and pose estimation optimise expectations over noise and outliers, and stochastic methods in <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization</a> replace the exact objective with a sampled one. Variance reduction is what keeps those sampled gradients from drowning the descent direction in noise.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">The samplers it depends on</h3>
+        <p style="margin-bottom:0;">Every estimator here assumes you can draw the right points, and in high dimensions that is its own problem. The inverse-CDF, rejection and importance-sampling machines of <a href="{{ '/math/probability-in-action/sampling/' | relative_url }}">How to draw a sample</a> are what turn a target distribution into the stream of <var>x_i</var> this part averages; importance sampling is itself a variance-reduction technique, aimed at a different representation of the same integral.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Integral as expectation</td><td><var>$\int_0^1 h(x)\,dx=\mathbb{E}[h(U)]$</var>, <var>$U\sim\mathrm{Unif}(0,1)$</var></td><td>The average value of the integrand is the integral.</td></tr>
+        <tr><td>Basic estimator</td><td><var>$\hat I_N=\frac1N\sum_i h(x_i)$</var></td><td>Average the evaluations of independent samples; unbiased.</td></tr>
+        <tr><td>Variance and error</td><td><var>$\operatorname{Var}=\sigma^2/N$</var>, error <var>$\approx\sigma/\sqrt N$</var></td><td>The square-root wall: 4&times; the samples halves the error.</td></tr>
+        <tr><td>Estimated error</td><td><var>$s/\sqrt N$</var>, <var>$s^2=\frac{1}{N-1}\sum_i(h(x_i)-\hat I_N)^2$</var></td><td>Replace the unknown <var>$\sigma$</var> with the sample spread.</td></tr>
+        <tr><td>Pi by darts</td><td><var>$\hat\pi_N=\frac4N\sum_i\mathbf 1\{x_i^2+y_i^2\le1\}$</var></td><td>Area of the quarter disc is <var>$\pi/4$</var>; se <var>$\approx1.64/\sqrt N$</var>.</td></tr>
+        <tr><td>Antithetic variates</td><td><var>$\tfrac12[h(x)+h(1-x)]$</var>, var <var>$\tfrac12\sigma^2(1+\rho)$</var></td><td>Reflected pairs are negatively correlated for monotone <var>h</var>.</td></tr>
+        <tr><td>Control variate</td><td><var>$h-\beta(g-\mu_g)$</var>, <var>$\beta^*=\operatorname{Cov}(h,g)/\operatorname{Var}(g)$</var></td><td>Subtract the correlated part of a function with known mean <var>$\mu_g$</var>.</td></tr>
+        <tr><td>Residual variance</td><td><var>$\sigma_h^2(1-\rho_{hg}^2)/N$</var></td><td>Only the part of <var>h</var> that <var>g</var> cannot explain remains.</td></tr>
+        <tr><td>Stratified estimator</td><td><var>$\sum_l w_l\,\bar h_l$</var>, var <var>$\sum_l w_l^2\sigma_l^2/n_l$</var></td><td>Between-slice variation is removed; only within-slice noise survives.</td></tr>
+        <tr><td>What does not change</td><td>the expectation <var>I</var></td><td>Variance reduction moves the constant, never the slope or the answer.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>J. M. Hammersley and D. C. Handscomb, <em>Monte Carlo Methods</em>, 1964 &mdash; the classic treatment of the basic estimator, error bars and variance reduction, written before the field had a name for itself.</li>
+      <li>Christian P. Robert and George Casella, <em>Monte Carlo Statistical Methods</em>, 2004 &mdash; the estimator in the context of inference, with careful chapters on antithetic and control variates.</li>
+      <li>Art B. Owen, <em>Monte Carlo Theory, Methods and Examples</em>, 2013 &mdash; freely available and unusually readable, especially on stratification and the quasi-Monte Carlo limit.</li>
+      <li>Paul Glasserman, <em>Monte Carlo Methods in Financial Engineering</em>, 2003 &mdash; variance reduction as a practical discipline, where every basis point of error is money.</li>
+      <li>Sheldon M. Ross, <em>Simulation</em>, 2012 &mdash; an elementary account of antithetic, control and stratified sampling with worked examples you can reproduce by hand.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Randomness also accumulates over time &mdash; next, walks that drift, jump and diffuse.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var P = Prob;
+  var PI = Math.PI;
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; if (!isFinite(x)) { return '&mdash;'; } return x.toFixed(d); }
+  function log10(x) { return Math.log(x) / Math.LN10; }
+
+  // ------------------------------------------------------------------
+  // Demo A — pi by darts, with a 1/sqrt(N) error band
+  // ------------------------------------------------------------------
+  var PI_MAXN = 6000;
+  var pi = { n: 1000, seed: 20260914, xs: null, ys: null, cum: null, est: null };
+  var piScatter = null, piPlot = null;
+
+  function regenPi() {
+    var r = P.rng(pi.seed);
+    var xs = new Array(PI_MAXN), ys = new Array(PI_MAXN);
+    var cum = new Array(PI_MAXN + 1), est = new Array(PI_MAXN + 1);
+    var inside = 0, i, x, y;
+    cum[0] = 0; est[0] = 0;
+    for (i = 1; i <= PI_MAXN; i++) {
+      x = r.uniform(); y = r.uniform();
+      xs[i - 1] = x; ys[i - 1] = y;
+      if (x * x + y * y <= 1) { inside++; }
+      cum[i] = inside;
+      est[i] = 4 * inside / i;
+    }
+    pi.xs = xs; pi.ys = ys; pi.cum = cum; pi.est = est;
+  }
+
+  function drawPiScatter() {
+    if (!piScatter) { return; }
+    var ctx = piScatter.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 44, padR = 20, padT = 20, padB = 40;
+    var size = Math.min(W - padL - padR, H - padT - padB);
+    function X(u) { return padL + u * size; }
+    function Y(v) { return padT + (1 - v) * size; }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(padL, padT, size, size);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(X(0), Y(0), size, -Math.PI / 2, 0); ctx.stroke();
+    var n = pi.n, i, x, y;
+    for (i = 0; i < n; i++) {
+      x = pi.xs[i]; y = pi.ys[i];
+      ctx.fillStyle = (x * x + y * y <= 1) ? 'rgba(43,95,255,0.80)' : 'rgba(32,30,29,0.26)';
+      ctx.fillRect(X(x) - 1, Y(y) - 1, 2.2, 2.2);
+    }
+    ctx.fillStyle = c.accent2; ctx.font = '12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('x\u00b2 + y\u00b2 = 1', X(0.52), Y(0.86));
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.fillText('unit square', padL, padT + size + 24);
+  }
+
+  function drawPi() {
+    if (!piPlot) { return; }
+    var pl = piPlot, n = pi.n, i, x, X, Y;
+    if (n < 2) { n = 2; }
+    piPlot.xRange[0] = 1; piPlot.xRange[1] = PI_MAXN;
+    piPlot.yRange[0] = 2.4; piPlot.yRange[1] = 3.9;
+    pl.clear();
+    pl.grid({ step: 0.5 });
+    var top = pl.py(pl.yRange[1]), bot = pl.py(pl.yRange[0]);
+    function clampY(v) { return Math.max(top, Math.min(bot, v)); }
+    var steps = 120;
+    var ctx = pl.ctx;
+    ctx.save();
+    ctx.beginPath();
+    for (i = 0; i <= steps; i++) {
+      x = 1 + (n - 1) * i / steps;
+      X = pl.px(x); Y = clampY(pl.py(PI + 1.64 / Math.sqrt(x)));
+      if (i === 0) { ctx.moveTo(X, Y); } else { ctx.lineTo(X, Y); }
+    }
+    for (i = steps; i >= 0; i--) {
+      x = 1 + (n - 1) * i / steps;
+      X = pl.px(x); Y = clampY(pl.py(PI - 1.64 / Math.sqrt(x)));
+      ctx.lineTo(X, Y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(43,95,255,0.10)';
+    ctx.fill();
+    ctx.restore();
+    pl.hline(PI, { color: c.accent2, dash: [6, 4], labelText: '\u03c0 = 3.14159\u2026' });
+    pl.curve(function (t) {
+      var k = Math.max(1, Math.min(n, Math.round(t)));
+      return pi.est[k];
+    }, { from: 1, to: n, samples: Math.min(n, 1200), color: c.accent, width: 2, label: 'running estimate' });
+    pl.axes({ step: 0.5, xLabel: 'N (darts thrown)', yLabel: '4 \u00b7 (inside / N)' });
+    pl.legend([
+      { label: 'running estimate', color: c.accent },
+      { label: '\u03c0 (truth)', color: c.accent2, dash: [6, 4] },
+      { label: '\u00b11.64/\u221aN error band', color: 'rgba(43,95,255,0.10)', fill: true }
+    ]);
+    var est = pi.est[n], ins = pi.cum[n];
+    el('pi-readout').innerHTML =
+      '<div><span class="k">darts</span> ' + n + ' &nbsp;|&nbsp; <span class="k">inside</span> ' + ins + '</div>' +
+      '<div><span class="k">estimate 4\u00b7inside/N</span> <span class="hi">' + fmt(est, 5) + '</span></div>' +
+      '<div><span class="k">true \u03c0</span> ' + fmt(PI, 5) + '</div>' +
+      '<div><span class="k">|error|</span> ' + fmt(Math.abs(est - PI), 5) + '</div>' +
+      '<div><span class="k">band half-width 1.64/\u221aN</span> ' + fmt(1.64 / Math.sqrt(n), 5) + '</div>' +
+      '<div style="margin-top:6px;">The band narrows like 1/\u221aN; the estimate keeps moving inside it.</div>';
+  }
+
+  function redrawPi() { drawPiScatter(); drawPi(); }
+
+  regenPi();
+  piScatter = Guide.setupCanvas(el('pi-canvas'), 640, 360, drawPiScatter);
+  piPlot = P.plot(el('pi-converge'), { W: 640, H: 340, xRange: [1, PI_MAXN], yRange: [2.4, 3.9], onResize: drawPi });
+  Guide.bindSliders([el('pi-n')], function (s) {
+    pi.n = parseInt(s.value, 10);
+    redrawPi();
+  });
+  el('pi-reseed').addEventListener('click', function () {
+    pi.seed = (pi.seed * 1103515245 + 12345) % 2147483647;
+    regenPi();
+    redrawPi();
+  });
+  redrawPi();
+
+  // ------------------------------------------------------------------
+  // Demo B — four unbiased estimators raced on the same integral
+  // ------------------------------------------------------------------
+  var TARGET = Math.E - 1;
+  var BETA = 6 * (3 - Math.E);
+  var NGRID = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+  var REPS = 80;
+  var race = { seed: 20260914, xs: null, curves: null, xlo: 0, xhi: 1, ylo: -3, yhi: 0, idx: 5 };
+  var racePlot = null;
+
+  function estNaive(r, N) {
+    var s = 0, i;
+    for (i = 0; i < N; i++) { s += Math.exp(r.uniform()); }
+    return s / N;
+  }
+  function estAnti(r, N) {
+    var pairs = Math.floor(N / 2), s = 0, i, u;
+    for (i = 0; i < pairs; i++) { u = r.uniform(); s += Math.exp(u) + Math.exp(1 - u); }
+    return s / (2 * pairs);
+  }
+  function estControl(r, N) {
+    var s = 0, i, u;
+    for (i = 0; i < N; i++) { u = r.uniform(); s += Math.exp(u) - BETA * (u - 0.5); }
+    return s / N;
+  }
+  function estStrat(r, N) {
+    var S = 10, per = Math.max(1, Math.round(N / S)), s = 0, l, i, u;
+    for (l = 0; l < S; l++) {
+      for (i = 0; i < per; i++) { u = (l + r.uniform()) / S; s += Math.exp(u); }
+    }
+    return s / (S * per);
+  }
+
+  function rmsError(method, N, rng) {
+    var acc = 0, i, d;
+    for (i = 0; i < REPS; i++) { d = method(rng, N) - TARGET; acc += d * d; }
+    return Math.sqrt(acc / REPS);
+  }
+
+  function computeRace() {
+    var methods = [
+      { name: 'naive', fn: estNaive, color: '#d6006c', ys: [] },
+      { name: 'antithetic', fn: estAnti, color: '#e09000', ys: [] },
+      { name: 'control variates', fn: estControl, color: '#2b5fff', ys: [] },
+      { name: 'stratified', fn: estStrat, color: '#1a7f37', ys: [] }
+    ];
+    var xs = [], i, j, lo = Infinity, hi = -Infinity, e, y;
+    for (i = 0; i < NGRID.length; i++) { xs.push(log10(NGRID[i])); }
+    for (j = 0; j < methods.length; j++) {
+      var rng = P.rng(race.seed + 101 * (j + 1));
+      for (i = 0; i < NGRID.length; i++) {
+        e = rmsError(methods[j].fn, NGRID[i], rng);
+        y = log10(e);
+        methods[j].ys.push(y);
+        if (y < lo) { lo = y; }
+        if (y > hi) { hi = y; }
+      }
+    }
+    race.xs = xs;
+    race.curves = methods;
+    race.xlo = xs[0] - 0.12;
+    race.xhi = xs[xs.length - 1] + 0.12;
+    race.ylo = lo - 0.25;
+    race.yhi = hi + 0.25;
+    if (race.xhi - race.xlo < 0.5) { race.xhi = race.xlo + 0.5; }
+    if (race.yhi - race.ylo < 1) { race.yhi = race.ylo + 1; }
+  }
+
+  function lineFn(xs, ys) {
+    return function (x) {
+      if (x <= xs[0]) { return ys[0]; }
+      if (x >= xs[xs.length - 1]) { return ys[ys.length - 1]; }
+      for (var i = 1; i < xs.length; i++) {
+        if (x <= xs[i]) {
+          var t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+          return ys[i - 1] + (ys[i] - ys[i - 1]) * t;
+        }
+      }
+      return ys[ys.length - 1];
+    };
+  }
+
+  function renderRaceReadout() {
+    var sel = NGRID[race.idx], x = log10(sel);
+    var errs = [], j, base;
+    for (j = 0; j < race.curves.length; j++) {
+      errs.push(Math.pow(10, lineFn(race.xs, race.curves[j].ys)(x)));
+    }
+    base = errs[0];
+    var rows = ['<div><span class="k">reported at N</span> ' + sel + ' &nbsp;|&nbsp; <span class="k">replications</span> ' + REPS + '</div>'];
+    for (j = 0; j < race.curves.length; j++) {
+      rows.push('<div><span class="k">' + race.curves[j].name + '</span> RMS error <span class="hi">' + fmt(errs[j], 4) + '</span>' +
+        (j > 0 ? ' &nbsp;<span class="k">(' + fmt(base / errs[j], 1) + '\u00d7 smaller than naive)</span>' : '') + '</div>');
+    }
+    rows.push('<div style="margin-top:6px;">All four are unbiased for I = e \u2212 1 \u2248 1.71828. They share the 1/\u221aN slope and differ only in the constant, so lower means more accuracy per evaluation.</div>');
+    el('race-readout').innerHTML = rows.join('');
+  }
+
+  function drawRace() {
+    if (!racePlot) { return; }
+    var pl = racePlot, j, i, m, pts;
+    pl.xRange[0] = race.xlo; pl.xRange[1] = race.xhi;
+    pl.yRange[0] = race.ylo; pl.yRange[1] = race.yhi;
+    pl.clear();
+    pl.grid({ step: 0.5 });
+    var naive = race.curves[0];
+    var x0 = race.xs[0], y0 = naive.ys[0];
+    pl.curve(function (t) { return y0 - 0.5 * (t - x0); },
+      { from: x0, to: race.xhi, samples: 4, color: 'rgba(32,30,29,0.35)', width: 1.2, dash: [5, 4] });
+    for (j = 0; j < race.curves.length; j++) {
+      m = race.curves[j];
+      pl.curve(lineFn(race.xs, m.ys),
+        { from: race.xs[0], to: race.xs[race.xs.length - 1], samples: 40, color: m.color, width: 2.2, label: m.name });
+      pts = [];
+      for (i = 0; i < race.xs.length; i++) { pts.push({ x: race.xs[i], y: m.ys[i] }); }
+      pl.points(pts, { color: m.color, r: 3 });
+    }
+    pl.vline(log10(NGRID[race.idx]), { color: c.text, dash: [4, 3], labelText: 'N = ' + NGRID[race.idx] });
+    pl.axes({ step: 0.5, xLabel: 'log\u2081\u2080 N (samples per estimate)', yLabel: 'log\u2081\u2080 RMS error' });
+    pl.legend();
+    renderRaceReadout();
+  }
+
+  computeRace();
+  racePlot = P.plot(el('race-canvas'), {
+    W: 640, H: 360, xRange: [race.xlo, race.xhi], yRange: [race.ylo, race.yhi], onResize: drawRace
+  });
+  Guide.bindSliders([el('race-n')], function (s) {
+    race.idx = parseInt(s.value, 10);
+    drawRace();
+  });
+  el('race-reseed').addEventListener('click', function () {
+    race.seed = (race.seed * 1103515245 + 12345) % 2147483647;
+    computeRace();
+    drawRace();
+  });
+  drawRace();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'monte-carlo-error-scaling',
+      kind: 'choice',
+      prompt: 'If you quadruple the number of independent samples in a Monte Carlo estimate, what happens to the expected error?',
+      options: [
+        { label: 'It roughly halves, because the error falls like 1/&radic;N.', correct: true },
+        { label: 'It falls to a quarter, because the variance falls like 1/N.', correct: false },
+        { label: 'It stays the same; only the bias changes.', correct: false }
+      ],
+      explanation: 'The variance falls like 1/N, so the standard error falls like 1/&radic;N. Quadrupling N halves the error — the square-root wall. Reducing the variance constant instead is what variance reduction buys.'
+    },
+    {
+      id: 'monte-carlo-pi-numeric',
+      kind: 'numeric',
+      prompt: 'Of 2000 darts thrown uniformly at the unit square, 1571 land inside the quarter circle. What does the estimator <var>4 &middot; inside / N</var> give for <var>&pi;</var>?',
+      answer: 3.142,
+      tolerance: 0.01,
+      unit: '',
+      explanation: '4 × 1571 / 2000 = 3.142. The true value is 3.14159…, and the error here is consistent with the ~1.64/√N standard error of the dart estimator.'
+    },
+    {
+      id: 'monte-carlo-antithetic',
+      kind: 'choice',
+      prompt: 'Why does averaging <var>h(x)</var> with <var>h(1&minus;x)</var> reduce the variance of a Monte Carlo estimate?',
+      options: [
+        { label: 'The two evaluations are negatively correlated for a monotone integrand, so their average is less variable than two independent draws.', correct: true },
+        { label: 'It reuses the same random number, so no extra samples are needed at all.', correct: false },
+        { label: 'It makes the estimator biased toward the midpoint, which lowers the variance.', correct: false }
+      ],
+      explanation: 'Reflected points are marginally uniform, so the estimator remains unbiased. For monotone h the covariance between h(X) and h(1−X) is negative, and averaging a negatively correlated pair cancels noise. Bias is never the mechanism.'
+    },
+    {
+      id: 'monte-carlo-control-numeric',
+      kind: 'numeric',
+      prompt: 'A sample gives <var>mean(h) = 1.80</var>, <var>mean(g) = 0.55</var>, with known <var>E[g] = 0.50</var> and <var>&beta; = 1.7</var>. What is the control-variate estimate <var>mean(h) &minus; &beta;(mean(g) &minus; E[g])</var>?',
+      answer: 1.715,
+      tolerance: 0.005,
+      explanation: 'mean(h) − β(mean(g) − E[g]) = 1.80 − 1.7(0.55 − 0.50) = 1.80 − 0.085 = 1.715. The correction has zero mean, so it removes noise without changing the target.'
+    },
+    {
+      id: 'monte-carlo-stratified',
+      kind: 'choice',
+      prompt: 'What is the source of the variance reduction in stratified sampling?',
+      options: [
+        { label: 'Sampling separately within slices removes the variation between slices, leaving only the smaller within-slice variance.', correct: true },
+        { label: 'It draws more samples than the naive method for the same budget.', correct: false },
+        { label: 'It assumes the integrand is constant inside each slice, which introduces a helpful bias.', correct: false }
+      ],
+      explanation: 'Stratification reallocates the same total number of samples so that each slice is estimated on its own. The between-slice differences — which the naive sampler would treat as noise — never enter the error, and smooth integrands vary little inside a narrow slice.'
+    },
+    {
+      id: 'monte-carlo-samples-for-target',
+      kind: 'numeric',
+      prompt: 'With 1000 samples an estimate has error 0.10. Roughly how many samples are needed to bring the error down to 0.05, using the same estimator?',
+      answer: 4000,
+      tolerance: 1,
+      unit: '',
+      explanation: 'Error falls like 1/&radic;N, so halving it needs four times the samples: 4 × 1000 = 4000. Reaching 0.025 would need 16 000, which is the square-root wall in numbers.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

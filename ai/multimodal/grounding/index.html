@@ -1,0 +1,517 @@
+---
+title: "Grounding"
+description: "Detection and segmentation as coordinate tokens, promptable segmentation, referring expressions, and grounding a computer interface."
+permalink: "/ai/multimodal/grounding/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-legend { font-size: 11.5px; opacity: 0.72; margin-top: 8px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Grounding</h1>
+    <p>Describing a picture is easy to check: the words either match the scene or they do not. Pointing at one is harder, because a pointer is a pair of numbers and the model has to place those numbers exactly where the thing is. Grounding is the discipline of making a language model emit spatial coordinates &mdash; a box, a point, a mask &mdash; as tokens it already knows how to produce, so that "the red mug on the left" resolves to a rectangle a downstream system can act on. It is what turns a captioner into something that can be pointed at a robot, a document, or a button. The clearest way to hold the idea is as the difference between writing an answer and circling the answer on the page: a captioner writes, and a grounded model circles. Both say what is in the picture, but only the second says exactly where, and only a location is something another program can act on. That is what turns a captioner into something that can be pointed at a robot, a document, or a button. It is worth being precise about the word, because it is used loosely elsewhere: here <em>grounding</em> means tying a piece of language to a place in an image, nothing more mystical. This part follows the coordinate from a continuous number to a discrete token, then out to boxes, masks, referring expressions and a computer screen.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="coords">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Coordinates as tokens</h2></div>
+    <p class="g-eyebrow">Clip a continuous pair onto a grid of ids</p>
+    <p>A language model emits tokens from a fixed vocabulary: a token is one symbol drawn from a finite list, and that list is the vocabulary, so everything the model can output is one of a known, countable set. A coordinate, by contrast, is a real number, a value on a continuous line with infinitely many possibilities between any two points. The standard reconciliation is to bin the image into a grid and let each coordinate be the index of a bin, where a bin is one cell of the grid and its index is the integer that names that cell. A box becomes four integers &mdash; two corners, each a row and a column &mdash; written as ordinary tokens like <code>&lt;bin_13&gt;</code>. A tiny example makes the snapping concrete: on a 32-by-32 grid, a corner a fraction 0.62 of the way across falls into column 19, and the model emits the token for that column rather than the exact value. The model then does what it is good at: it predicts the sequence of coordinate tokens that follows the referring phrase, exactly as it would predict the next word. The cost is resolution. A grid with $N$ bins per side places a corner within $1/N$ of its true position and no better, so an object smaller than a bin cannot be pointed at precisely, and a box's edges jitter by half a bin. The error is half a bin rather than a whole one because a token stands for the centre of its cell, so the worst a corner can be off is half the cell's width.</p>
+    <p>The number of bins is therefore a real budget decision, not a detail. More bins localise better but lengthen the vocabulary and give the model more ways to be wrong, because every extra column is another symbol for the softmax to spread probability over and another distinction the model has to learn from data. Fewer bins are easy to predict but coarser than the objects that matter, so a small mug and a distant bird can end up in the same cell. The trade cuts both ways, and neither end is free: precision costs vocabulary size, and vocabulary size costs statistical efficiency, since a model that must tell 256 columns apart needs more examples than one that must tell 8 apart. The demo quantises a point onto an $N \times N$ grid; the error arrow is the distance thrown away by the snap, and the readout names the coordinate token the model would emit.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gr-coords-canvas" width="470" height="280"></canvas>
+        <p class="g-canvas-hint">A continuous point and its snapped cell centre on an $N \times N$ coordinate grid. The arrow is the quantisation error; each bin index is one coordinate token the model predicts.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Grid bins N <span class="val">64</span></label><input type="range" id="gr-bins" min="0" max="5" step="1" value="3"></div>
+        <div class="g-field"><label>Point x <span class="val">0.62</span></label><input type="range" id="gr-ptx" min="0" max="100" step="1" value="62"></div>
+        <div class="g-field"><label>Point y <span class="val">0.34</span></label><input type="range" id="gr-pty" min="0" max="100" step="1" value="34"></div>
+        <div class="g-readout" id="gr-coords-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> explain how a box becomes four coordinate tokens, describe what a promptable segmentation model does with a point or a box (promptable meaning one trained model answers many prompts without being retrained, and segmentation meaning deciding which pixels belong to an object), quantise a referring expression into a box, and say why grounding a GUI &mdash; a graphical user interface, the buttons and fields on a screen &mdash; is the same problem with buttons instead of mugs.</span></div>
+    <div class="g-toc">
+      <a href="#boxes">2 · Boxes and masks</a>
+      <a href="#referring">3 · Referring expressions and promptable segmentation</a>
+      <a href="#computer">4 · Grounding a computer interface</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="boxes">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Boxes and masks</h2></div>
+    <p class="g-eyebrow">A box is four tokens; a mask is many</p>
+    <p>Once a coordinate is a token, detection is a language task. Detection means finding objects in an image and returning a rectangle around each one, a bounding box, together with a label saying what it is; the name survives from the older computer-vision pipeline that did this with purpose-built heads, and the point here is that a language model can do it by emitting tokens instead. A grounded model is trained on text that interleaves an object's name with its normalised corner coordinates, so "<code>mug</code>" is followed by four bins and a score. Normalised means the coordinates are written as fractions of the image's width and height, running from 0 to 1, so that a token means the same relative place whatever the image's pixel size. Concretely, a training string might read the word <code>mug</code>, then the four bin indices for left, top, right and bottom, then a confidence value, and the loss is the ordinary next-token loss on that whole string. At inference &mdash; after training, when the model is answering rather than learning &mdash; it reads the phrase, emits the bins, and the bins are decoded back into a rectangle. Segmentation adds a third representation: rather than a box around the object, the model emits a polygon or a run of mask tokens that traces its outline. A polygon is a closed shape named by a short list of corner points, so it can follow a boundary that a rectangle cannot, while a mask is a dense per-pixel map saying, pixel by pixel, whether that pixel belongs to the object. The polygon is compact and the boundary is exact; the mask is dense and can represent a shape a box cannot, such as a ring or a curved handle. Both are still token sequences, which is the only property that matters to the trunk.</p>
+    <p>Confidence is the other half of the problem. A grounded model does not emit one box; it emits a ranked set, each box carrying a score, and a downstream system has to choose a threshold above which a box is trusted. That threshold is a single cut on the score: predictions above it are reported and predictions below it are thrown away. Set it low and the model reports everything that looks a little like a mug, so a fold of cloth or a patch of shadow becomes a false positive; set it high and it misses the one that is half-occluded, meaning partly hidden behind something else so only a fraction of it shows. The two failure modes pull in opposite directions, and the right cut depends on what each mistake costs: extra boxes are tolerable when a person reads the output, while they are not when a machine acts on it. The slider moves the threshold on a fixed set of predictions so the trade between recall and noise is visible, where recall is the fraction of the objects actually present that the model managed to report.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gr-boxes-canvas" width="320" height="320"></canvas>
+        <p class="g-canvas-hint">A procedural scene from <code>GenMedia.img.circles</code> with a fixed set of predicted boxes, thresholded by the slider. Colour runs from the least to the most confident prediction.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Confidence threshold <span class="val">0.50</span></label><input type="range" id="gr-conf" min="0" max="100" step="1" value="50"></div>
+        <div class="g-readout" id="gr-boxes-readout"></div>
+        <p class="g-mini">A high threshold keeps only the confident boxes and misses occluded objects; a low one keeps the recall and reports shapes that were never there. There is no threshold that is right for every image.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>A box is a lossy answer.</b> Four coordinates cannot say that the mug is behind the book, or that only its handle is visible; two different shapes can share one rectangle, and one rectangle can hide several objects. That is why segmentation exists, and why a box prompt and a mask output are often used together: the box localises crudely and the mask refines what the box enclosed.</span></div>
+  </section>
+
+  <section class="g-step" id="referring">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Referring expressions and promptable segmentation</h2></div>
+    <p class="g-eyebrow">A phrase in, a region out; a click in, a mask out</p>
+    <p>A <em>referring expression</em> is a phrase that picks out one object by describing it &mdash; "the plant in the corner", "the cup behind the book". The phrase does two jobs at once: it names a kind of thing, and it uses a spatial or relational word to choose one instance of that kind. Resolving one requires both language and space, because the model has to identify the candidate objects, use the relation to break the tie, and return the one box the phrase names. If a scene holds three mugs, the word "mug" alone does not single one out; "the mug on the left" does, and only if the model can compare positions. A referring benchmark is harder than a detection benchmark for exactly that reason, where a benchmark is a fixed test set with known right answers: the answer is not any mug, it is the mug the sentence chose, and a model that only detects objects has no way to respect the choice.</p>
+    <p>Promptable segmentation takes the complementary approach. Instead of a phrase, it accepts a prompt &mdash; a point inside an object, a box around it, or a rough mask &mdash; and returns a mask for whatever the prompt touches. A click is the simplest kind of prompt, an implicit statement that the point belongs to the thing being chosen. The prompt encoder turns the click into a vector, mapping raw coordinates and a little context into the same numeric form the image side already uses; a small mask decoder combines it with the image embeddings, the per-patch vectors the vision encoder produced, and the result is a region. The power is that one model answers many prompts without retraining: point at the handle and it segments the mug; box the page and it segments the text. The weights are identical across those two calls, which is what makes the interaction feel like one tool rather than a series of separate models. Click anywhere on the scene below and the nearest object is masked; the slider selects an object by its referring expression instead.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gr-mask-canvas" width="320" height="320"></canvas>
+        <p class="g-canvas-hint">Click a point on the scene to segment the nearest object, or move the slider to resolve a referring expression. The soft region is the mask the prompt returns.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Referring expression <span class="val">the mug on the left</span></label><input type="range" id="gr-ref" min="0" max="4" step="1" value="0"></div>
+        <div class="g-readout" id="gr-mask-readout"></div>
+        <p class="g-mini">A click is an implicit positive prompt: it says "this point is inside the thing". A box adds a boundary, and a negative point says "not this". The same decoder handles all three.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Promptable means amortised.</b> Training one model that accepts points, boxes and masks is what makes interactive segmentation usable: the user refines the region with successive clicks and the model never has to be fine-tuned for the particular object. Amortised here means the cost is paid once, at training time, rather than again for every object, and fine-tuning would mean updating the weights each time, which is the expense this design removes.</span></div>
+  </section>
+
+  <section class="g-step" id="computer">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Grounding a computer interface</h2></div>
+    <p class="g-eyebrow">The same coordinates, on a screen that happens to be an image</p>
+    <p>A screenshot is an image and every button on it has a rectangle, so grounding a computer interface is the grounding problem with a different vocabulary of objects: search fields, icons, list rows, submit buttons. The categories change, but the machinery does not, because a button is an object with a boundary like any other. A computer-use agent reads an instruction, grounds the element the instruction names to a box, and emits a click at that box's centre or a type action into it. The pixels are the observation and the coordinates are the action interface: the model never reaches into the underlying program, it only sees the rendered picture and it only acts by aiming at places in that picture. That is why vision-language-action models and GUI agents share their machinery &mdash; both turn a sentence into a target location and then into a movement, with coordinate tokens doing the work in between.</p>
+    <p>What changes is the precision the task demands. A mug box that is a few pixels off is still a correct caption; a submit-button box that is a few pixels off is a click on nothing, or worse on the wrong control. The tolerance for error shrinks because the consequence of error is an action rather than a description. Interface elements are also densely packed and text-heavy, so the model has to read labels as well as locate them: knowing that a rectangle holds a button is not enough if the model cannot tell "Submit" from "Cancel". On top of that, it must be robust to the same element appearing in a different place on the next screen, since layouts shift with window size, theme and content, and a model that memorised absolute positions would fail the moment the window changed. The schematic below marks the groundable elements of a page and highlights the one an instruction selects.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gr-gui-canvas" width="470" height="300"></canvas>
+        <p class="g-canvas-hint">A schematic interface with its groundable elements boxed. The slider picks the element the instruction refers to; the arrow runs from the phrase to the grounded box.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Instruction <span class="val">click the submit button</span></label><input type="range" id="gr-target" min="0" max="4" step="1" value="1"></div>
+        <div class="g-readout" id="gr-gui-readout"></div>
+        <p class="g-mini">The model must emit the box, not a pixel colour or a DOM id. Everything it knows about the page arrives through the screenshot, which is exactly the setting a grounded model was trained for.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>A grounded click is a real action.</b> Once a model can turn a phrase into a coordinate and a coordinate into a click, the output is no longer text that a person can read and reject. That is what makes the safety discussion in the serving part of this volume concrete: an injected instruction in a screenshot can be grounded and executed like any other.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One representation, many interfaces</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Perception</div>
+        <h3 style="margin:6px 0;">Detection and segmentation as language</h3>
+        <p style="margin-bottom:0;">Open-vocabulary detectors and promptable segmenters express their output as boxes, points and masks that a language model can emit token by token. Open-vocabulary means the set of things a model can find is not fixed in advance: because a class label is itself text, the detector can be asked for any object a phrase can name, including one it never saw as a labelled category. The unified models of <a href="{{ '/ai/multimodal/unified-models/' | relative_url }}">the previous part</a> provide the trunk; grounding is the task that teaches it where things are.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Action</div>
+        <h3 style="margin:6px 0;">The interface for robots and agents</h3>
+        <p style="margin-bottom:0;">A grounded box is the bridge from a sentence to a movement. It is the intermediate step that makes the sentence usable by a controller, since "pick up the mug" is not something an arm can execute but a rectangle around the mug is. <a href="{{ '/ai/multimodal/vla/' | relative_url }}">The next part</a> takes the coordinate one step further, into action tokens a policy emits to move an arm or a cursor, where a policy is the component that maps what the model currently sees to an action.</p>
+      </div>
+    </div>
+    <p>Grounding also shows up wherever an interface is being automated &mdash; document parsing that has to return a field's bounding box, meaning software that reads a form and reports the rectangle around each entry; accessibility tooling that labels controls, so a screen reader can announce what a control is and where it sits; and evaluation of multimodal models on whether they can point rather than merely describe. A model that names the right object in prose but marks the wrong rectangle has failed a different test, and a stricter one. The resolution and merge choices of <a href="{{ '/ai/multimodal/resolution/' | relative_url }}">the token-budget part</a> set the ceiling on all of it: a coordinate cannot be more precise than the grid the image was patched onto, so the finest box a model can ever emit is bounded by a decision made long before grounding is trained.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers introduce the segmentation model that made prompting standard, the multimodal models that emit coordinates as text, and the studies of grounding an interface as an action space. Read together they trace the same idea from three directions: a promptable segmenter showing how much one model can do without retraining, grounded language models showing coordinates becoming ordinary tokens, and interface agents showing what changes when a coordinate becomes a click.</p>
+    <ul class="g-refs">
+      <li>Alexander Kirillov, Eric Mintun, Nikhila Ravi and coauthors, <a href="https://arxiv.org/abs/2304.02643">"Segment Anything"</a>, 2023 &mdash; the promptable segmentation model, its prompt encoder and its mask decoder, and the point and box prompts the demo imitates.</li>
+      <li>Zhiliang Peng, Wenhui Wang, Li Dong and coauthors, <a href="https://arxiv.org/abs/2306.02816">"Kosmos-2: Grounding Multimodal Large Language Models to the World"</a>, 2023 &mdash; spatial tokens and the grounded box notation this part quantises.</li>
+      <li>Keqin Chen, Zhao Zhang, Weili Zeng and coauthors, <a href="https://arxiv.org/abs/2306.15195">"Shikra: Unleashing Multimodal LLM's Referential Dialogue Magic"</a>, 2023 &mdash; referring expressions and coordinate output from a chat model.</li>
+      <li>Jianwei Yang, Hao Zhang, Feng Li and coauthors, <a href="https://arxiv.org/abs/2310.11441">"Set-of-Mark Prompting Unleashes Extraordinary Visual Grounding in GPT-4V"</a>, 2023 &mdash; overlaying numbered regions so a model can refer to them by id.</li>
+      <li>Boyuan Zheng, Boyu Gou, Jihyung Kil and coauthors, <a href="https://arxiv.org/abs/2401.01614">"GPT-4V(ision) is a Generalist Web Agent, if Grounded"</a>, 2024 &mdash; grounding interface elements as boxes and acting on them, and the failure when the box is wrong.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Coordinate token</td><td>A quantised bin index standing in for a continuous coordinate</td></tr>
+        <tr><td>Bin resolution</td><td>Bins per side; more localises better but grows the vocabulary and the ways to be wrong</td></tr>
+        <tr><td>Grounded box</td><td>Four coordinate tokens marking two corners of an object, emitted after its phrase</td></tr>
+        <tr><td>Mask / polygon</td><td>An outline or dense region that a box cannot express; still a token sequence</td></tr>
+        <tr><td>Confidence threshold</td><td>The cut above which a predicted box is trusted; trades recall against noise</td></tr>
+        <tr><td>Referring expression</td><td>A phrase that selects one object by describing it and its relations</td></tr>
+        <tr><td>Promptable segmentation</td><td>One model that returns a mask for a point, box or mask prompt without retraining</td></tr>
+        <tr><td>GUI grounding</td><td>Localising interface elements to boxes so a click or keystroke can be emitted</td></tr>
+        <tr><td>Action interface</td><td>Coordinates as the boundary between perception and a real action on a screen or robot</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A grounded box tells a model where something is. A vision-language-action model has to go further and decide what to do about it, emitting movement instead of a caption. The gap between the two is the difference between perception and control: a box describes the scene, while an action chooses how to change it. The next part is about actions as tokens.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, c = Guide.colors();
+
+  var BINS = [8, 16, 32, 64, 128, 256];
+  var binIdx = 3;
+  var ptX = 0.62, ptY = 0.34;
+  var threshold = 0.5;
+  var selectedObj = 0;
+  var clickPt = null;
+  var guiTarget = 1;
+
+  var BOXES = [
+    { label: 'mug', x0: 0.12, y0: 0.58, x1: 0.34, y1: 0.80, conf: 0.91 },
+    { label: 'book', x0: 0.40, y0: 0.62, x1: 0.66, y1: 0.86, conf: 0.78 },
+    { label: 'plant', x0: 0.70, y0: 0.28, x1: 0.92, y1: 0.66, conf: 0.64 },
+    { label: 'cup', x0: 0.46, y0: 0.30, x1: 0.60, y1: 0.44, conf: 0.42 },
+    { label: 'phone', x0: 0.20, y0: 0.30, x1: 0.36, y1: 0.42, conf: 0.28 },
+    { label: 'person', x0: 0.62, y0: 0.08, x1: 0.82, y1: 0.32, conf: 0.18 }
+  ];
+
+  var OBJECTS = [
+    { name: 'mug', cx: 0.22, cy: 0.68, r: 0.11 },
+    { name: 'book', cx: 0.50, cy: 0.74, r: 0.13 },
+    { name: 'plant', cx: 0.78, cy: 0.46, r: 0.14 },
+    { name: 'cup', cx: 0.54, cy: 0.34, r: 0.09 },
+    { name: 'phone', cx: 0.28, cy: 0.34, r: 0.10 }
+  ];
+  var EXPRESSIONS = [
+    'the mug on the left',
+    'the book beside it',
+    'the plant in the corner',
+    'the small cup behind',
+    'the phone on the desk'
+  ];
+
+  var ELEMENTS = [
+    { name: 'search field', x0: 0.16, y0: 0.24, x1: 0.62, y1: 0.35 },
+    { name: 'submit button', x0: 0.68, y0: 0.24, x1: 0.87, y1: 0.35 },
+    { name: 'result row one', x0: 0.16, y0: 0.45, x1: 0.87, y1: 0.55 },
+    { name: 'result row two', x0: 0.16, y0: 0.60, x1: 0.87, y1: 0.70 },
+    { name: 'settings icon', x0: 0.86, y0: 0.07, x1: 0.94, y1: 0.17 }
+  ];
+  var INSTRUCTIONS = [
+    'type the query into the search field',
+    'click the submit button',
+    'open the first result',
+    'open the second result',
+    'open the settings menu'
+  ];
+
+  // ---- 1. coordinate quantisation -----------------------------------------
+  var coordsSetup = Guide.setupCanvas(document.getElementById('gr-coords-canvas'), 470, 280, function () { drawCoords(); });
+  function drawCoords() {
+    if (!coordsSetup) return;
+    var ctx = coordsSetup.ctx, W = 470, H = 280;
+    ctx.clearRect(0, 0, W, H);
+    var N = BINS[binIdx];
+    var gx0 = 44, gy0 = 24, size = 220, gx1 = gx0 + size, gy1 = gy0 + size;
+    ctx.save();
+    ctx.fillStyle = 'rgba(43,95,255,0.06)';
+    ctx.fillRect(gx0, gy0, size, size);
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 1.2;
+    ctx.strokeRect(gx0, gy0, size, size);
+    var step = size / N, i;
+    ctx.strokeStyle = 'rgba(120,120,120,0.4)'; ctx.lineWidth = 1;
+    for (i = 1; i < N; i++) {
+      ctx.beginPath(); ctx.moveTo(gx0 + i * step, gy0); ctx.lineTo(gx0 + i * step, gy1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(gx0, gy0 + i * step); ctx.lineTo(gx1, gy0 + i * step); ctx.stroke();
+    }
+    var kx = Math.min(N - 1, Math.max(0, Math.floor(ptX * N)));
+    var ky = Math.min(N - 1, Math.max(0, Math.floor(ptY * N)));
+    var snapX = (kx + 0.5) / N, snapY = (ky + 0.5) / N;
+    var pxX = gx0 + ptX * size, pxY = gy0 + ptY * size;
+    var sx = gx0 + snapX * size, sy = gy0 + snapY * size;
+    ctx.strokeStyle = 'rgba(214,0,108,0.55)'; ctx.lineWidth = 1.4;
+    ctx.strokeRect(gx0 + kx * step, gy0 + ky * step, step, step);
+    Guide.drawArrow(ctx, sx, sy, pxX, pxY, { color: c.accent2, width: 1.8, head: 8 });
+    ctx.beginPath(); ctx.arc(pxX, pxY, 5, 0, 2 * Math.PI); ctx.fillStyle = c.accent; ctx.fill();
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 2 * Math.PI); ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('N × N = ' + N + ' × ' + N + ' bins', gx0, gy1 + 22);
+    ctx.restore();
+    var err = Math.hypot(pxX - sx, pxY - sy) / size;
+    var el = document.getElementById('gr-coords-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">point</span> (' + ptX.toFixed(3) + ', ' + ptY.toFixed(3) + ')</div>' +
+        '<div><span class="k">coordinate tokens</span> <span class="hi">(' + kx + ', ' + ky + ')</span></div>' +
+        '<div><span class="k">snapped</span> (' + snapX.toFixed(3) + ', ' + snapY.toFixed(3) + ')</div>' +
+        '<div><span class="k">quantisation error</span> ' + err.toFixed(4) + ' of the side</div>' +
+        '<div><span class="k">grid</span> ' + N + ' × ' + N + ' = ' + (N * N) + ' distinct positions</div>' +
+        '<div class="g-mini">A box is four of these: two corners, each a row and a column. The bins set the precision floor, and no model can point finer than the grid it quantises onto.</div>';
+    }
+  }
+
+  // ---- 2. boxes and thresholds --------------------------------------------
+  var boxScene = GM.img.circles(28, 7, 3);
+  var boxRaster = GM.raster(document.getElementById('gr-boxes-canvas'), {
+    cols: 28, rows: 28, channels: 3, W: 320, H: 320,
+    onResize: function () { drawBoxes(); }
+  });
+  function drawBoxes() {
+    if (!boxRaster) return;
+    boxRaster.fromArray(boxScene.data);
+    boxRaster.draw();
+    var ctx = boxRaster.ctx, W = boxRaster.W, H = boxRaster.H;
+    var shown = 0, sum = 0;
+    BOXES.forEach(function (b) {
+      if (b.conf < threshold) return;
+      shown++; sum += b.conf;
+      var col = Guide.lerpColor([180, 200, 255], [214, 0, 108], b.conf);
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.strokeRect(b.x0 * W, b.y0 * H, (b.x1 - b.x0) * W, (b.y1 - b.y0) * H);
+      ctx.fillStyle = col;
+      var lw = ctx.measureText(b.label).width + 46;
+      ctx.fillRect(b.x0 * W, b.y0 * H - 16, Math.max(58, lw), 16);
+      ctx.fillStyle = '#fff'; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(b.label + ' ' + b.conf.toFixed(2), b.x0 * W + 4, b.y0 * H - 8);
+      ctx.restore();
+    });
+    var el = document.getElementById('gr-boxes-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">threshold</span> ' + threshold.toFixed(2) + '</div>' +
+        '<div><span class="k">boxes shown</span> <span class="hi">' + shown + ' / ' + BOXES.length + '</span></div>' +
+        '<div><span class="k">mean confidence</span> ' + (shown ? (sum / shown).toFixed(2) : '—') + '</div>' +
+        '<div><span class="k">tokens per box</span> 4 coordinates + label</div>' +
+        '<div class="g-mini">Lower the threshold and recall rises at the cost of ghost boxes; raise it and the occluded object disappears. A grounded model returns both the box and the score so the caller chooses.</div>';
+    }
+  }
+
+  // ---- 3. promptable segmentation -----------------------------------------
+  var maskScene = GM.img.circles(28, 11, 3);
+  var maskCanvas = document.getElementById('gr-mask-canvas');
+  var maskRaster = GM.raster(maskCanvas, {
+    cols: 28, rows: 28, channels: 3, W: 320, H: 320,
+    onResize: function () { drawMask(); }
+  });
+  function drawMask() {
+    if (!maskRaster) return;
+    maskRaster.fromArray(maskScene.data);
+    maskRaster.draw();
+    var ctx = maskRaster.ctx, W = maskRaster.W, H = maskRaster.H;
+    OBJECTS.forEach(function (o, i) {
+      ctx.save();
+      ctx.beginPath(); ctx.arc(o.cx * W, o.cy * H, i === selectedObj ? 5 : 3, 0, 2 * Math.PI);
+      ctx.fillStyle = i === selectedObj ? c.accent2 : 'rgba(255,255,255,0.7)';
+      ctx.fill();
+      ctx.restore();
+    });
+    var o = OBJECTS[selectedObj];
+    var cx = o.cx * W, cy = o.cy * H, rr = o.r * W;
+    ctx.save();
+    var grad = ctx.createRadialGradient(cx, cy, rr * 0.25, cx, cy, rr);
+    grad.addColorStop(0, 'rgba(214,0,108,0.55)');
+    grad.addColorStop(1, 'rgba(214,0,108,0.04)');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.ellipse(cx, cy, rr, rr * 0.85, 0, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
+    if (clickPt) {
+      ctx.save();
+      ctx.beginPath(); ctx.arc(clickPt.x * W, clickPt.y * H, 5, 0, 2 * Math.PI);
+      ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.strokeStyle = c.text; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.restore();
+    }
+    var el = document.getElementById('gr-mask-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">expression</span> <span class="hi">' + EXPRESSIONS[selectedObj] + '</span></div>' +
+        '<div><span class="k">grounded object</span> ' + o.name + '</div>' +
+        '<div><span class="k">prompt</span> ' + (clickPt ? 'point click' : 'referring expression') + '</div>' +
+        '<div><span class="k">output</span> a mask region, not a box</div>' +
+        '<div class="g-mini">The click and the phrase are two prompts into the same decoder. A point says "inside this thing"; the expression has to pick the thing first. Both return a region.</div>';
+    }
+  }
+  if (maskCanvas) {
+    maskCanvas.addEventListener('pointerdown', function (ev) {
+      var p = Guide.hitTest(maskCanvas, ev);
+      var nx = p.x / maskRaster.W, ny = p.y / maskRaster.H;
+      var best = 0, bestD = Infinity;
+      for (var i = 0; i < OBJECTS.length; i++) {
+        var d = Math.hypot(nx - OBJECTS[i].cx, ny - OBJECTS[i].cy);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      selectedObj = best;
+      clickPt = { x: nx, y: ny };
+      var refEl = document.getElementById('gr-ref');
+      if (refEl) {
+        refEl.value = String(best);
+        var v = refEl.parentElement ? refEl.parentElement.querySelector('.val') : null;
+        if (v) v.textContent = EXPRESSIONS[best];
+      }
+      drawMask();
+    });
+  }
+
+  // ---- 4. GUI grounding ----------------------------------------------------
+  var guiSetup = Guide.setupCanvas(document.getElementById('gr-gui-canvas'), 470, 300, function () { drawGui(); });
+  function drawGui() {
+    if (!guiSetup) return;
+    var ctx = guiSetup.ctx, W = 470, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var ox = 20, oy = 48, iw = 300, ih = 220;
+    ctx.save();
+    ctx.fillStyle = 'rgba(43,95,255,0.05)';
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1.4;
+    ctx.fillRect(ox, oy, iw, ih);
+    ctx.strokeRect(ox, oy, iw, ih);
+    ctx.fillStyle = 'rgba(120,120,120,0.18)';
+    ctx.fillRect(ox, oy, iw, 14);
+    ELEMENTS.forEach(function (e) {
+      ctx.fillStyle = 'rgba(43,95,255,0.10)';
+      ctx.strokeStyle = 'rgba(120,120,120,0.5)';
+      ctx.fillRect(ox + e.x0 * iw, oy + e.y0 * ih, (e.x1 - e.x0) * iw, (e.y1 - e.y0) * ih);
+      ctx.strokeRect(ox + e.x0 * iw, oy + e.y0 * ih, (e.x1 - e.x0) * iw, (e.y1 - e.y0) * ih);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('schematic interface', ox, oy - 8);
+    ctx.restore();
+    var t = ELEMENTS[guiTarget];
+    var bx = ox + t.x0 * iw, by = oy + t.y0 * ih, bw = (t.x1 - t.x0) * iw, bh = (t.y1 - t.y0) * ih;
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.4;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = c.text; ctx.font = '11.5px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('"' + INSTRUCTIONS[guiTarget] + '"', 336, 30);
+    ctx.restore();
+    Guide.drawArrow(ctx, 350, 36, bx + bw / 2, by - 2, { color: c.accent2, width: 1.8, head: 8 });
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('grounded box', bx, by + bh + 14);
+    ctx.restore();
+    var el = document.getElementById('gr-gui-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">instruction</span> ' + INSTRUCTIONS[guiTarget] + '</div>' +
+        '<div><span class="k">element</span> <span class="hi">' + t.name + '</span></div>' +
+        '<div><span class="k">box (normalised)</span> (' + t.x0.toFixed(2) + ', ' + t.y0.toFixed(2) + ') to (' + t.x1.toFixed(2) + ', ' + t.y1.toFixed(2) + ')</div>' +
+        '<div><span class="k">action</span> click at the box centre</div>' +
+        '<div class="g-mini">The same coordinate tokens that mark a mug mark a button. What changes is the cost of being a few pixels wrong — a caption survives it, a click does not.</div>';
+    }
+  }
+
+  function redraw() { drawCoords(); drawBoxes(); drawMask(); drawGui(); }
+
+  Guide.bindSliders(document.querySelectorAll('#gr-bins'), function (el) {
+    binIdx = parseInt(el.value, 10);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = BINS[binIdx];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#gr-ptx'), function (el) {
+    ptX = Math.min(0.999, parseInt(el.value, 10) / 100);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = ptX.toFixed(2);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#gr-pty'), function (el) {
+    ptY = Math.min(0.999, parseInt(el.value, 10) / 100);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = ptY.toFixed(2);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#gr-conf'), function (el) {
+    threshold = parseInt(el.value, 10) / 100;
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = threshold.toFixed(2);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#gr-ref'), function (el) {
+    selectedObj = parseInt(el.value, 10);
+    clickPt = null;
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = EXPRESSIONS[selectedObj];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#gr-target'), function (el) {
+    guiTarget = parseInt(el.value, 10);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = INSTRUCTIONS[guiTarget];
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'grounding-coordinate-token',
+      kind: 'choice',
+      prompt: 'How does a grounded language model represent a detected box?',
+      options: [
+        { label: 'As four quantised coordinate tokens — two corners, each a row and a column bin.', correct: true },
+        { label: 'As a fixed-length embedding of the image patch at the box centre.', correct: false },
+        { label: 'As a bitmap of the pixels the box encloses.', correct: false }
+      ],
+      explanation: 'A box is two corners, and each corner is a row and a column on the quantisation grid. The model emits those bin indices as ordinary tokens after the object phrase, and the caller decodes them back into a rectangle.'
+    },
+    {
+      id: 'grounding-grid-numeric',
+      kind: 'numeric',
+      prompt: 'A scene is quantised onto a 32×32 coordinate grid. How many distinct corner positions can a box use?',
+      answer: 1024,
+      tolerance: 0.5,
+      explanation: 'A 32×32 grid has 32 × 32 = 1024 cells, so there are 1024 distinct positions a corner can snap to. That is the precision floor: no box corner can be placed between cells.'
+    },
+    {
+      id: 'grounding-promptable',
+      kind: 'choice',
+      prompt: 'What makes a promptable segmentation model "promptable"?',
+      options: [
+        { label: 'One trained model returns a mask for a point, box or mask prompt without being fine-tuned per object.', correct: true },
+        { label: 'It segments every object in the image and the user picks one afterwards.', correct: false },
+        { label: 'It retrains its mask decoder on each new image before answering.', correct: false }
+      ],
+      explanation: 'The prompt encoder turns the click or box into a vector and the mask decoder combines it with the image embeddings. The same weights answer any prompt, which is what makes interactive refinement practical.'
+    },
+    {
+      id: 'grounding-gui',
+      kind: 'choice',
+      prompt: 'Why is grounding a computer interface harder than grounding a photograph?',
+      options: [
+        { label: 'Interface elements are densely packed and text-heavy, and a few pixels off means a click on the wrong control rather than a slightly loose caption.', correct: true },
+        { label: 'Screenshots have no coordinate system, so boxes cannot be drawn on them.', correct: false },
+        { label: 'Interface elements are always larger than objects in photographs, so boxes overlap.', correct: false }
+      ],
+      explanation: 'A screenshot is an image with rectangles, so the machinery is the same. The difference is the cost of error: a detection box that is slightly off still captions correctly, but a button box that is slightly off clicks nothing or the wrong thing.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

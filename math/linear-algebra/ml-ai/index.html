@@ -1,0 +1,471 @@
+---
+title: "Linear Algebra, Interactively — Part 22: Linear algebra in ML and AI"
+description: "Attention as three learned matrices whose inner products score token similarity, a low-rank update that fine-tunes a frozen weight, and the embedding geometry a transformer runs on."
+permalink: "/math/linear-algebra/ml-ai/"
+section: "math"
+series: "linear_algebra"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-emb-note { font-size: 12.5px; opacity: 0.7; margin-top: 10px; }
+  .g-attn-matrix { margin-top: 10px; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.linear_algebra %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Linear algebra</span>
+    <h1>Linear algebra in ML and AI</h1>
+    <p>Every claim in this series has been about a picture you could draw or a decomposition you could compute. The last part of the guide points all of it at the machinery of a modern language model. A transformer attention head is three learned matrices multiplying the same token embeddings three different ways, an inner product that scores how alike two tokens are, and a softmax that turns those scores into a mixing recipe. Fine-tuning those weights with LoRA is the low-rank approximation you built a few parts ago, applied to a frozen matrix. Nothing new is introduced; the same four operations, stacked deep.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Where the whole series was heading</p>
+    <p>This guide began with a vector as an arrow, a list of numbers, and an object you can add and scale. It end here, in a stack of matrix multiplies that predicts the next token. That is not a metaphor. A transformer layer is a short program written in exactly the operations of this series: project a token's embedding with a learned matrix (Part 3), measure similarity between two tokens with an inner product (Part 8), normalise a row of scores so it sums to one (Part 8), and mix the value vectors with those weights (Part 4). Repeat, and add nonlinearity between the blocks.</p>
+    <p>The applied act of the series built up to this. <a href="{{ '/math/linear-algebra/optimization/' | relative_url }}">Part 21</a> turned the derivative of a vector-valued function into a Jacobian and the Gauss&ndash;Newton step into a least-squares problem; that is exactly the machinery used to train the matrices you will see here. <a href="{{ '/math/linear-algebra/low-rank-pca/' | relative_url }}">Part 17</a> proved that truncating the SVD gives the closest rank-<var>r</var> matrix; that theorem is, almost word for word, the definition of LoRA. This part is the payoff: the ideas are not toy examples for a textbook, they are what runs.</p>
+    <p>It is worth saying why a linear algebra guide ends here rather than with a survey of models. The architecture is novel, but the algebra is not. Almost every operation that makes a transformer work is one this series has already named and drawn: a change of basis, a projection onto a subspace, a matrix product that does not commute, a rank that controls how much information survives, a decomposition that sorts directions by how much of the data they carry. Learning to see those in a large model is the same as learning to see them in a small one; only the numbers get bigger.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> an attention head is three learned matrices producing queries, keys and values, why the score matrix <var>QKᵀ/√d</var> is a table of inner products measuring token similarity, why a row of softmax weights is a recipe for mixing the values, and why fine-tuning a giant model with a rank-<var>r</var> update <var>BA</var> is the same low-rank approximation you already know &mdash; just stored as two skinny matrices instead of one big one.</span></div>
+    <div class="g-toc">
+      <a href="#attention">2 · Three matrices</a>
+      <a href="#softmax">3 · Softmax weights</a>
+      <a href="#lora">4 · LoRA</a>
+      <a href="#geometry">5 · Embedding geometry</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#reading">7 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="attention">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>An attention head is three matrix multiplies</h2></div>
+    <p class="g-eyebrow">Similarity, read off an inner product</p>
+    <p>Collect the token embeddings of a short sentence into a matrix <var>X</var>, one row per token, <var>d</var> columns per embedding. A single attention head learns three <var>d×d</var> weight matrices and multiplies <var>X</var> by each of them:</p>
+    <div class="g-math g-katex">$$Q = XW_Q, \qquad K = XW_K, \qquad V = XW_V$$</div>
+    <p>The name of each result says what it is for. A <b>query</b> is what a token is looking for, a <b>key</b> is what a token advertises, and a <b>value</b> is what a token will hand over if it is chosen. The three matrices are learned, so the projection from &ldquo;meaning&rdquo; to &ldquo;looking for&rdquo; and &ldquo;advertising&rdquo; is chosen by training, not by us. But the scoring rule between a query and a key is fixed, and it is the one from <a href="{{ '/math/linear-algebra/dot-product/' | relative_url }}">Part 8</a>: the inner product. A query matches a key when their dot product is large, so the score matrix is</p>
+    <div class="g-math g-katex">$$S = \frac{QK^\top}{\sqrt{d}}$$</div>
+    <p>Row <var>i</var>, column <var>j</var> of <var>S</var> is the similarity of token <var>i</var>'s query to token <var>j</var>'s key. The division by <var>√d</var> is bookkeeping, not geometry: as the embedding dimension grows, so does the typical size of a dot product, and dividing keeps the numbers from blowing up before the softmax. In the demo below, the head starts with near-identity projections so the first thing you see is raw embedding similarity &mdash; the score table is <var>XXᵀ/√d</var>. Edit any entry of <var>W_Q</var>, <var>W_K</var> or <var>W_V</var> to change what each token looks for and advertises, and nudge a single embedding coordinate to watch that token's whole row of scores move.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="attn-score-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Rows are queries, columns are keys. The outlined row is the token whose embedding you are nudging.</p>
+        <div class="g-attn-matrix" id="attn-q"></div>
+        <div class="g-attn-matrix" id="attn-k"></div>
+        <div class="g-attn-matrix" id="attn-v"></div>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Token to nudge <span class="val">1</span></label><input type="range" id="attn-token" min="0" max="4" step="1" value="1"></div>
+        <div class="g-field"><label>Nudge its first embedding coordinate <span class="val">0</span></label><input type="range" id="attn-delta" min="-2" max="2" step="0.1" value="0"></div>
+        <div class="g-field"><label>Softmax temperature <span class="val">1</span></label><input type="range" id="attn-temp" min="0.2" max="3" step="0.1" value="1"></div>
+        <div class="g-field"><label style="justify-content:flex-start;gap:8px;align-items:center;"><input type="checkbox" id="attn-causal"> causal mask (token <var>i</var> sees only <var>j ≤ i</var>)</label></div>
+        <div class="g-btnrow"><button id="attn-preset">Reset weights to presets</button></div>
+        <div style="font-size:12.5px;margin-bottom:6px;">W<sub>Q</sub></div><div id="attn-wq"></div>
+        <div style="font-size:12.5px;margin:12px 0 6px;">W<sub>K</sub></div><div id="attn-wk"></div>
+        <div style="font-size:12.5px;margin:12px 0 6px;">W<sub>V</sub></div><div id="attn-wv"></div>
+      </div>
+    </div>
+    <p>Read the score table the way you would read a similarity chart. A dark cell means the row token's query points nearly along the column token's key; a pale cell means the two projections are close to perpendicular. When you nudge one embedding, only the rows and columns that touch that token change, because the score is built from that token's query and key and nothing else. This is the entire mechanism by which a transformer decides &ldquo;which other tokens is this one about?&rdquo; &mdash; a matrix of inner products, one per pair.</p>
+    <p>The shapes are worth tracking, because they explain what the block can and cannot do. If <var>X</var> is <var>n×d</var> then each of <var>Q</var>, <var>K</var> and <var>V</var> is <var>n×d</var>, the score matrix is <var>n×n</var>, and the output is <var>n×d</var> again. The one place the sequence length <var>n</var> enters twice is the score matrix, and that is exactly the object that grows with the square of the context in the naive forward pass. Everything else is a fixed-width projection. When people say attention is expensive at long context, they are pointing at the <var>n×n</var> table you just drew and the softmax that has to normalise each of its <var>n</var> rows. A real layer does not use one head but several, splitting the <var>d</var> columns into groups, running a head on each group, and concatenating the results back into one <var>n×d</var> output. The heads are independent attention tables looking at different projected features, and the arithmetic per head is precisely the arithmetic in this demo.</p>
+  </section>
+
+  <section class="g-step" id="softmax">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Softmax turns scores into a mixing recipe</h2></div>
+    <p class="g-eyebrow">From similarities to weights that sum to one</p>
+    <p>The score table is a set of raw numbers, one per pair, and they can be any size and either sign. To use them as weights you need them to be positive and to sum to one along each row, so that &ldquo;how much of each value to take&rdquo; is a genuine proportion. The softmax does exactly that, row by row: exponentiate every score so it becomes positive, then divide by the row's total. With <var>S</var> the scored matrix and <var>M</var> the mask,</p>
+    <div class="g-math g-katex">$$A = \operatorname{softmax}(S + M), \qquad \text{out} = AV$$</div>
+    <p>where the mask <var>M</var> sets the scores of forbidden pairs to a very large negative number, which the exponential flattens to zero. That is a <b>causal mask</b>: at position <var>i</var> a token is allowed to attend to itself and everything before it, but not to tokens that come later. Turn the toggle on and the upper triangle of the weight matrix goes to zero; that is how a decoder-only model is prevented from reading the answer it is about to predict. The temperature slider divides the scores before exponentiating: a low temperature makes the largest score dominate and the distribution spike, a high temperature flattens it toward a uniform average over the row.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="attn-weight-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Each row sums to one: how much attention the query token pays to every key.</p>
+        <div class="g-attn-matrix" id="attn-score-matrix"></div>
+        <div class="g-attn-matrix" id="attn-out"></div>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="attn-readout"></div>
+        <div class="g-emb-note">The output row is a weighted sum of the value vectors, which is why it is the same width as an embedding. A single head produces one such mixed vector per token; a real layer runs several heads side by side and concatenates the results.</div>
+        <p style="margin-top:12px;font-size:13px;">Watch the outlined query row. With the mask on, the leading entries survive and the rest are deleted; with the temperature low, the recipe concentrates on one column and the output snaps toward that token's value. Both changes are the same operation &mdash; a re-weighting of a linear combination.</p>
+      </div>
+    </div>
+    <p>This is the point of contact with the rest of the series. The output is literally a linear combination of the rows of <var>V</var>, with coefficients taken from a row of <var>A</var>. Attention is not a special new operation; it is a way of letting the model choose the coefficients of a linear combination from the data, and then applying them. Everything downstream &mdash; the feed-forward block, the residual stream, the unembedding &mdash; is more matrix multiplies on top of that choice.</p>
+    <p>Why exponentiate at all, rather than simply normalising the raw scores? Two reasons, and both are visible in the demo. First, scores can be negative and a weight cannot, so the exponential is a smooth way to make every entry positive while preserving the ranking of the scores. Second, it is a soft version of picking the single largest score: a low temperature drives the row toward a one-hot vector on the argmax, while a high temperature drives it toward the uniform average. That single dial runs from hard nearest-neighbour lookup to a plain mean over the row, and every setting in between is a legitimate weighted combination. The mask fits the same frame. Adding a very large negative number to a forbidden score sends its weight to zero without changing the arithmetic of the allowed entries, so the causal constraint costs nothing but one addition before the exponential. In training you can mask and score all positions at once; at generation time the same head runs on one new token against the cached keys and values, which is why the serving guide cares so much about the sizes of <var>K</var> and <var>V</var>.</p>
+  </section>
+
+  <section class="g-step" id="lora">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>LoRA is the low-rank update you already proved</h2></div>
+    <p class="g-eyebrow">Eckart&ndash;Young, applied to a weight matrix</p>
+    <p>Fine-tuning a large model by updating every weight is expensive for a reason you can count: a weight matrix with <var>d_{in}</var> columns and <var>d_{out}</var> rows has <var>d_{in}d_{out}</var> numbers, and optimiser state multiplies that again. <b>LoRA</b> freezes the pretrained weight <var>W</var> and learns only a correction <var>ΔW</var>, factored into two skinny matrices:</p>
+    <div class="g-math g-katex">$$W' = W + BA, \qquad B \in \mathbb{R}^{d_{out}\times r}, \quad A \in \mathbb{R}^{r \times d_{in}}$$</div>
+    <p>Only <var>B</var> and <var>A</var> are trained, and they hold <var>r(d_{in}+d_{out})</var> numbers instead of <var>d_{in}d_{out}</var>. For a square weight and a small rank, that is a large saving: at <var>r</var> equal to a few percent of the dimension you store a few percent of the parameters. The reason this is not merely a compression trick is <a href="{{ '/math/linear-algebra/low-rank-pca/' | relative_url }}">Part 17</a>. When you truncate the SVD of <var>ΔW</var> at rank <var>r</var>,</p>
+    <div class="g-math g-katex">$$\Delta W_r = U_r\,\Sigma_r\,V_r^\top = B A,$$</div>
+    <p>you get the closest rank-<var>r</var> matrix to <var>ΔW</var>, with error equal to the energy of the singular values you threw away. Real fine-tuning updates are close to low rank &mdash; the direction of adaptation is a few dominant patterns &mdash; which is why a small <var>r</var> reconstructs most of the update. The demo below builds a seeded target update and lets you dial the rank, watching the reconstruction fill in.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lora-dw-canvas" width="640" height="160"></canvas>
+        <p class="g-canvas-hint">The target update <var>ΔW</var>, seeded as a low-rank pattern plus a little noise.</p>
+        <canvas id="lora-ba-canvas" width="640" height="160" style="margin-top:14px;"></canvas>
+        <p class="g-canvas-hint">The best rank-<var>r</var> approximation <var>BA = U_rΣ_rV_rᵀ</var>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Rank <var>r</var> <span class="val">3</span></label><input type="range" id="lora-r" min="0" max="8" step="1" value="3"></div>
+        <div class="g-readout" id="lora-readout"></div>
+        <div style="margin-top:14px;font-size:12.5px;">W + BA</div>
+        <div class="g-attn-matrix" id="lora-w"></div>
+      </div>
+    </div>
+    <p>Slide the rank up and two things move together. The picture on the right gains the fine-grained cells it was missing, and the relative error falls toward the floor set by the noise that was never low-rank to begin with. The parameter count climbs linearly, <var>r</var> times the two side lengths, while the full matrix costs their product. There is a rank where the picture already looks like the target and the count is still a small fraction of the whole; finding that rank is the same skill Part 17 taught for images and point clouds, now spent on a model's adaptation.</p>
+    <p>There is a second reason the factored form is more than storage. Once training is done you can multiply <var>B</var> and <var>A</var> together and add the result to the frozen weight, folding the adapter back into <var>W</var> with no extra matrices at inference time. The product <var>BA</var> is an ordinary <var>d_{out}×d_{in}</var> matrix; it is only during training that you need the two factors, because that is what lets the gradient reach a small number of parameters instead of all of them. LoRA is the low-rank approximation idea used not as a compressor but as a parametrisation: you constrain the update to live in the set of rank-<var>r</var> matrices, and the truncated SVD tells you exactly what that constraint costs in error.</p>
+  </section>
+
+  <section class="g-step" id="geometry">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Embedding geometry: meaning as angle</h2></div>
+    <p class="g-eyebrow">Back to the dot product</p>
+    <p>The scores in the attention head are inner products, and an inner product is a length and a cosine in disguise. For two embedding vectors <var>u</var> and <var>v</var>,</p>
+    <div class="g-math g-katex">$$\cos\theta = \frac{u\cdot v}{\lVert u\rVert\,\lVert v\rVert}$$</div>
+    <p>so the angle between two embeddings &mdash; not their distance, and not their individual lengths &mdash; is what &ldquo;similar meaning&rdquo; means when people say a language model represents words as directions. Two tokens with nearly parallel embeddings have a cosine near one; unrelated tokens have a cosine near zero; a cosine near minus one would mean they point opposite. The demo below uses a small seeded set of embeddings built as two clusters, and shows their pairwise cosine similarity. Pick a token and compare its angle to each of the others: the similar tokens cluster on the diagonal blocks, and the odd one out sits in the pale band.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="emb-canvas" width="640" height="240"></canvas>
+        <p class="g-canvas-hint">Cosine similarity between token embeddings; the diagonal is 1 because every vector is parallel to itself.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query token <span class="val">0</span></label><input type="range" id="emb-sel" min="0" max="4" step="1" value="0"></div>
+        <div class="g-readout" id="emb-readout"></div>
+        <div class="g-emb-note">This is the picture <a href="{{ '/math/linear-algebra/dot-product/' | relative_url }}">Part 8</a> drew, running at full scale: an attention score is a scaled cosine between two learned projections, and a softmax over those scores is a soft nearest-neighbour lookup over directions.</div>
+      </div>
+    </div>
+    <p>Seen this way the whole head is geometry. Each token projects its embedding into a query direction and a key direction; the score measures the angle between one token's query and another's key; the softmax picks the nearest few. The value vectors are the payload that gets averaged, and the output is a new direction per token that the next layer will treat as its embedding. Stack the layers and the geometry keeps composing, one projection and one weighted average at a time.</p>
+    <p>It matters that the measure is an angle and not a distance, and the reason is the normalisation. An embedding's length is not something the token controls in any meaningful way; what carries meaning is the direction it points. Cosine similarity throws the lengths away by construction, so a token cannot become &ldquo;more important&rdquo; merely by having a long embedding vector &mdash; only by pointing in a direction the query is looking for. That normalisation also makes the quantity bounded between minus one and one, which is what lets you read a cosine matrix as a correlation chart without worrying about scale. The score in the attention head is this same number, except that the query and key are already projections of the embedding, so the model first chooses which directions to compare and only then measures the angle between them. Similarity in a transformer is angle, measured after a learned change of coordinates.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One idea, two worlds</p>
+    <p>The four moves in this part &mdash; project with a matrix, score with an inner product, normalise with a softmax, mix with a weighted sum &mdash; are not unique to attention. The same four moves, with different names and different shapes, are what a robot uses to reconcile a thousand noisy measurements into one coherent pose.</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">The transformer and its cache</h3>
+        <p style="margin-bottom:0;">Every block of a language model is the matrix multiplies you just edited: the <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">architecture chapter</a> lays out the tensors and how many of them there are, and the <a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">KV cache</a> is simply the keys and values from this head kept in memory so a new token does not recompute them. Generation is, in the end, a stream of inner products.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Jacobians and least squares</h3>
+        <p style="margin-bottom:0;">The same operations fit a robot. A pose-graph optimiser linearises its residuals into a Jacobian, forms the normal equations, and solves a sparse least-squares problem &mdash; the subject of <a href="{{ '/math/linear-algebra/optimization/' | relative_url }}">Part 21</a>, running on real sensors in the <a href="{{ '/vision/nonlinear-optimization/pose-graph/' | relative_url }}">pose-graph chapter</a>. Attention and bundle adjustment are different problems wearing the same linear algebra.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <ul class="g-refs">
+      <li>Denim Patel, <a href="{{ '/ai/llm-training/' | relative_url }}">LLM training guide</a> &mdash; the architecture this part describes, built up tensor by tensor.</li>
+      <li>3Blue1Brown, <a href="https://www.youtube.com/watch?v=P5mlg91as1c">"The SVD"</a> and <a href="https://www.youtube.com/watch?v=eMlx5fFNoYc">"Attention in transformers, visually explained"</a> &mdash; the two visuals this part is in conversation with.</li>
+      <li>Gilbert Strang, <a href="https://ocw.mit.edu/courses/18-06-linear-algebra-spring-2010/">18.06 Linear Algebra</a>, MIT OpenCourseWare &mdash; Lectures 29&ndash;30, the SVD and linear transformations.</li>
+      <li>Jay Alammar, <a href="https://jalammar.github.io/illustrated-transformer/">"The Illustrated Transformer"</a> &mdash; the standard picture-first walkthrough of Q, K, V and multi-head attention.</li>
+      <li>Edward Hu et al., <a href="https://arxiv.org/abs/2106.09685">"LoRA: Low-Rank Adaptation of Large Language Models"</a>, 2021 &mdash; the paper that made <var>W + BA</var> a default.</li>
+      <li>The series reference card: <a href="{{ '/math/linear-algebra/glossary/' | relative_url }}">Glossary and identities to know</a>.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the series. Every idea in it &mdash; span, rank, projection, eigenvector, SVD &mdash; is now something a model computes, in a loop, billions of times.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.linear_algebra teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var LA = LinAlg;
+
+  function el(id) { return document.getElementById(id); }
+  function mul(A, B) { return LA.mat.mul(A, B); }
+  function sub(A, B) { return A.map(function (r, i) { return r.map(function (x, j) { return x - B[i][j]; }); }); }
+  function add(A, B) { return LA.mat.add(A, B); }
+  function fro(A) { var s = 0; A.forEach(function (r) { r.forEach(function (x) { s += x * x; }); }); return Math.sqrt(s); }
+  function copyInto(dst, src) { for (var i = 0; i < dst.length; i++) for (var j = 0; j < dst[i].length; j++) dst[i][j] = src[i][j]; }
+  function randMat(m, n, rng, s) {
+    var M = [];
+    for (var i = 0; i < m; i++) { var row = []; for (var j = 0; j < n; j++) row.push((rng() * 2 - 1) * s); M.push(row); }
+    return M;
+  }
+
+  // ==================================================================
+  // Demo A — an attention head on five tokens, d = 4
+  // ==================================================================
+  var TOK = ['the', 'cat', 'sat', 'on', 'mat'];
+  var D = 4, N = TOK.length;
+
+  var PRESET_Q = [
+    [1, 0.2, 0, 0],
+    [0, 1, 0.2, 0],
+    [0, 0, 1, 0.2],
+    [0.2, 0, 0, 1]
+  ];
+  var PRESET_K = [
+    [1, 0, 0.2, 0],
+    [0.2, 1, 0, 0],
+    [0, 0.2, 1, 0],
+    [0, 0, 0.2, 1]
+  ];
+  var PRESET_V = [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+  ];
+  var WQ = [], WK = [], WV = [];
+  (function () { WQ = PRESET_Q.map(function (r) { return r.slice(); }); WK = PRESET_K.map(function (r) { return r.slice(); }); WV = PRESET_V.map(function (r) { return r.slice(); }); })();
+
+  var rngA = Guide.seededRandom(20260913);
+  var Xbase = [];
+  (function () {
+    for (var i = 0; i < N; i++) {
+      var row = [];
+      for (var j = 0; j < D; j++) row.push(Math.round((rngA() * 2 - 1) * 1.2 * 1000) / 1000);
+      Xbase.push(row);
+    }
+  })();
+
+  var editTok = 1, editDelta = 0, temp = 1, causal = false;
+  var setupS = null, setupW = null;
+
+  function currentX() {
+    return Xbase.map(function (r, i) {
+      var row = r.slice();
+      if (i === editTok) row[0] = Math.round((row[0] + editDelta) * 1000) / 1000;
+      return row;
+    });
+  }
+
+  function computeAttn() {
+    var X = currentX();
+    var Q = mul(X, WQ), K = mul(X, WK), V = mul(X, WV);
+    var S = [];
+    for (var i = 0; i < N; i++) {
+      var row = [];
+      for (var j = 0; j < N; j++) row.push(LA.vdot(Q[i], K[j]) / Math.sqrt(D));
+      S.push(row);
+    }
+    var masked = S.map(function (r, i) {
+      return r.map(function (v, j) { return (causal && j > i) ? -1e9 : v; });
+    });
+    var A = masked.map(function (r) { return Guide.softmax(r, temp); });
+    var out = mul(A, V);
+    return { X: X, Q: Q, K: K, V: V, S: S, A: A, out: out };
+  }
+
+  function renderAttn() {
+    if (!setupS && !setupW) return;
+    var r = computeAttn();
+    if (setupS) {
+      var geo = Guide.drawHeatmap(setupS.ctx, 640, 220, r.S, { rowLabels: TOK, colLabels: TOK });
+      if (geo) {
+        var ctx = setupS.ctx;
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.5;
+        ctx.strokeRect(geo.padL + 0.5, geo.padT + editTok * geo.cellH + 0.5, geo.cellW * N - 1, geo.cellH - 1);
+      }
+    }
+    if (setupW) {
+      Guide.drawHeatmap(setupW.ctx, 640, 220, r.A, { rowLabels: TOK, colLabels: TOK, min: 0 });
+    }
+    LA.setMatrix(el('attn-q'), r.Q, { digits: 2, label: 'Q =' });
+    LA.setMatrix(el('attn-k'), r.K, { digits: 2, label: 'K =' });
+    LA.setMatrix(el('attn-v'), r.V, { digits: 2, label: 'V =' });
+    LA.setMatrix(el('attn-score-matrix'), r.S, { digits: 2, label: 'S =' });
+    LA.setMatrix(el('attn-out'), r.out, { digits: 2, label: 'AV =' });
+    var row = r.A[editTok];
+    var best = 0;
+    for (var j = 1; j < N; j++) if (row[j] > row[best]) best = j;
+    var lines = TOK.map(function (t, k) {
+      return '<div><span class="k">' + t + '</span> <span class="' + (k === best ? 'hi' : '') + '">' + row[k].toFixed(3) + '</span></div>';
+    }).join('');
+    el('attn-readout').innerHTML = '<div><span class="k">query row</span> ' + TOK[editTok] + '</div>' + lines;
+  }
+
+  setupS = Guide.setupCanvas(el('attn-score-canvas'), 640, 220, renderAttn);
+  setupW = Guide.setupCanvas(el('attn-weight-canvas'), 640, 220, renderAttn);
+
+  var wqIn = LA.matrixInput(el('attn-wq'), WQ, function () { renderAttn(); }, { digits: 2 });
+  var wkIn = LA.matrixInput(el('attn-wk'), WK, function () { renderAttn(); }, { digits: 2 });
+  var wvIn = LA.matrixInput(el('attn-wv'), WV, function () { renderAttn(); }, { digits: 2 });
+
+  Guide.bindSliders([el('attn-token')], function (s) { editTok = parseInt(s.value, 10); renderAttn(); });
+  Guide.bindSliders([el('attn-delta')], function (s) { editDelta = parseFloat(s.value); renderAttn(); });
+  Guide.bindSliders([el('attn-temp')], function (s) { temp = parseFloat(s.value); renderAttn(); });
+  el('attn-causal').addEventListener('change', function () { causal = this.checked; renderAttn(); });
+  el('attn-preset').addEventListener('click', function () {
+    copyInto(WQ, PRESET_Q); copyInto(WK, PRESET_K); copyInto(WV, PRESET_V);
+    if (wqIn) wqIn.rebuild(); if (wkIn) wkIn.rebuild(); if (wvIn) wvIn.rebuild();
+    renderAttn();
+  });
+  renderAttn();
+
+  // ==================================================================
+  // Demo B — LoRA: the best rank-r approximation of a weight update
+  // ==================================================================
+  var rngL = Guide.seededRandom(1103);
+  var B0 = randMat(8, 2, rngL, 1.0);
+  var A0 = randMat(2, 8, rngL, 1.0);
+  var DW = mul(B0, A0);
+  for (var iL = 0; iL < 8; iL++) for (var jL = 0; jL < 8; jL++) DW[iL][jL] += (rngL() * 2 - 1) * 0.04;
+  var Wbase = randMat(8, 8, rngL, 0.5);
+  var svdL = LA.mat.svd(DW);
+  var loraR = 3;
+  var setupLw = null, setupLb = null;
+
+  function loraApprox(r) {
+    var U = svdL.U, S = svdL.S, V = svdL.V, m = 8, n = 8;
+    if (r <= 0) return { BA: LA.mat.zeros(m, n), Wplus: LA.mat.clone(Wbase) };
+    var Ur = [], Vr = [], Sr = S.slice(0, r);
+    var i, q;
+    for (i = 0; i < m; i++) { var ru = []; for (q = 0; q < r; q++) ru.push(U[i][q]); Ur.push(ru); }
+    for (i = 0; i < n; i++) { var rv = []; for (q = 0; q < r; q++) rv.push(V[i][q]); Vr.push(rv); }
+    var Acc = LA.mat.zeros(r, n);
+    for (q = 0; q < r; q++) for (var j = 0; j < n; j++) Acc[q][j] = Sr[q] * Vr[j][q];
+    var BA = mul(Ur, Acc);
+    return { BA: BA, Wplus: add(Wbase, BA) };
+  }
+
+  function renderLora() {
+    if (!setupLw && !setupLb) return;
+    var a = loraApprox(loraR);
+    if (setupLw) Guide.drawHeatmap(setupLw.ctx, 640, 160, DW, { padL: 6, padB: 6, padT: 6 });
+    if (setupLb) Guide.drawHeatmap(setupLb.ctx, 640, 160, a.BA, { padL: 6, padB: 6, padT: 6 });
+    LA.setMatrix(el('lora-w'), a.Wplus, { digits: 2 });
+    var full = 8 * 8;
+    var params = loraR * (8 + 8);
+    var relErr = fro(sub(DW, a.BA)) / (fro(DW) || 1);
+    var tot = 0, cap = 0;
+    svdL.S.forEach(function (s, k) { tot += s * s; if (k < loraR) cap += s * s; });
+    el('lora-readout').innerHTML =
+      '<div><span class="k">rank r</span> <span class="hi">' + loraR + '</span> of 8</div>' +
+      '<div><span class="k">params r(d_in+d_out)</span> ' + params + ' vs ' + full + '</div>' +
+      '<div><span class="k">relative error</span> <span class="' + (relErr > 0.1 ? 'bad' : 'hi') + '">' + (relErr * 100).toFixed(1) + '%</span></div>' +
+      '<div><span class="k">energy kept</span> ' + (tot ? (100 * cap / tot).toFixed(1) : '0') + '%</div>';
+  }
+
+  setupLw = Guide.setupCanvas(el('lora-dw-canvas'), 640, 160, renderLora);
+  setupLb = Guide.setupCanvas(el('lora-ba-canvas'), 640, 160, renderLora);
+  Guide.bindSliders([el('lora-r')], function (s) { loraR = parseInt(s.value, 10); renderLora(); });
+  renderLora();
+
+  // ==================================================================
+  // Demo C — embedding geometry: cosine similarity as angle
+  // ==================================================================
+  var TOK2 = ['cat', 'dog', 'kitten', 'puppy', 'car'];
+  var rngE = Guide.seededRandom(505);
+  var EMBS = [];
+  (function () {
+    var dirA = [1, 1, 0.3, 0.2], dirB = [-0.6, 0.4, -1, 0.7];
+    for (var i = 0; i < TOK2.length; i++) {
+      var base = i < 4 ? dirA : dirB;
+      var row = base.map(function (x) { return Math.round((x + (rngE() * 2 - 1) * 0.35) * 1000) / 1000; });
+      EMBS.push(row);
+    }
+  })();
+
+  function cosine(a, b) { return LA.vdot(a, b) / ((LA.vnorm(a) || 1) * (LA.vnorm(b) || 1)); }
+
+  var COS = [];
+  (function () {
+    for (var i = 0; i < EMBS.length; i++) {
+      var row = [];
+      for (var j = 0; j < EMBS.length; j++) row.push(cosine(EMBS[i], EMBS[j]));
+      COS.push(row);
+    }
+  })();
+
+  var embSel = 0;
+  var setupE = null;
+
+  function renderEmb() {
+    if (!setupE) return;
+    Guide.drawHeatmap(setupE.ctx, 640, 240, COS, { rowLabels: TOK2, colLabels: TOK2, min: -1, max: 1 });
+    var lines = TOK2.map(function (t, j) {
+      if (j === embSel) return '';
+      var cos = Math.max(-1, Math.min(1, COS[embSel][j]));
+      var ang = Math.acos(cos) * 180 / Math.PI;
+      return '<div><span class="k">' + t + '</span> cos ' + cos.toFixed(3) + ' <span class="hi">' + ang.toFixed(1) + '&deg;</span></div>';
+    }).join('');
+    el('emb-readout').innerHTML = '<div><span class="k">query</span> ' + TOK2[embSel] + '</div>' + lines;
+  }
+
+  setupE = Guide.setupCanvas(el('emb-canvas'), 640, 240, renderEmb);
+  Guide.bindSliders([el('emb-sel')], function (s) { embSel = parseInt(s.value, 10); renderEmb(); });
+  renderEmb();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'mlai-qkv-roles',
+      kind: 'choice',
+      prompt: 'In an attention head, what do the query, key and value projections mean?',
+      options: [
+        { label: 'A query is what a token is looking for, a key is what a token advertises, and a value is what a token hands over if it is chosen.', correct: true },
+        { label: 'Query, key and value are three different ways of measuring a token’s embedding length.', correct: false },
+        { label: 'The query and key are identical by construction, and only the value projection is actually learned.', correct: false }
+      ],
+      explanation: 'Q = XW_Q, K = XW_K and V = XW_V are three separately learned projections of the same embeddings. The scoring rule between a query and a key is the fixed dot product, but what each token projects itself to as "looking for" versus "advertising" versus "handing over" is chosen entirely by training.'
+    },
+    {
+      id: 'mlai-sqrt-d',
+      kind: 'choice',
+      prompt: 'Why does the attention score divide by <var>&radic;d</var>, as in <var>S = QK&#7488;/&radic;d</var>?',
+      options: [
+        { label: 'It is bookkeeping, not geometry — as the embedding dimension grows, dot products typically grow too, and dividing keeps the numbers from blowing up before the softmax.', correct: true },
+        { label: 'It converts the dot product into a true cosine similarity between −1 and 1.', correct: false },
+        { label: 'It is required to keep Q and K orthogonal to each other.', correct: false }
+      ],
+      explanation: 'The page is explicit that the division by √d "is bookkeeping, not geometry." A larger embedding dimension d tends to produce larger raw dot products, and dividing by √d keeps the scores in a stable range so the softmax does not saturate before training even starts.'
+    },
+    {
+      id: 'mlai-cosine-meaning',
+      kind: 'choice',
+      prompt: 'When people say a language model represents "similar meaning" as nearly parallel embeddings, which quantity are they pointing at?',
+      options: [
+        { label: 'The angle between the two embedding vectors (their cosine similarity) — not their individual lengths or the distance between their tips.', correct: true },
+        { label: 'The Euclidean distance between the two embedding vectors.', correct: false },
+        { label: 'Which one of the two vectors has the larger norm.', correct: false }
+      ],
+      explanation: 'Cosine similarity is u·v / (‖u‖‖v‖), which throws the lengths away by construction and measures only the angle. That is deliberate: a token cannot become "more important" merely by having a long embedding, only by pointing in a direction the query is looking for.'
+    },
+    {
+      id: 'mlai-lora-params',
+      kind: 'numeric',
+      prompt: 'The LoRA demo updates an 8&times;8 weight (<var>d_in = d_out = 8</var>) with a rank-<var>r</var> = 3 correction, storing <var>r(d_in + d_out)</var> numbers instead of <var>d_in&middot;d_out</var>. How many numbers does the low-rank update store at r = 3?',
+      answer: 48,
+      tolerance: 0,
+      explanation: 'r(d_in + d_out) = 3 × (8 + 8) = 3 × 16 = 48, versus the full 8 × 8 = 64 parameters of the dense weight. The saving grows sharply for larger matrices, which is why LoRA is practical on weight matrices with thousands of rows and columns even at a small rank.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

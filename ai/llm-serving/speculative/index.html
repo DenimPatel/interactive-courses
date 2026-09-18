@@ -1,0 +1,581 @@
+---
+title: "LLM Serving, Interactively — Part 11: Speculative decoding"
+description: "Verify many tokens, generate one; acceptance rates, draft models, tree attention, and why engines turn speculation off under load."
+permalink: "/ai/llm-serving/speculative/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .sg-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .sg-tok {
+    font-family: var(--font-mono); font-size: 12.5px; padding: 5px 9px; border-radius: var(--radius-sm);
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    transition: background 0.2s, opacity 0.2s;
+  }
+  .sg-tok.ctx { opacity: 0.7; }
+  .sg-tok.proposal { background: var(--color-neutral-200); opacity: 0.7; }
+  .sg-tok.accepted { background: var(--color-accent); border-color: var(--color-accent); color: #fff; }
+  .sg-tok.rejected { text-decoration: line-through; background: var(--color-accent-2-100); border-color: var(--color-accent-2); color: var(--color-accent-2-800); }
+  .sg-tok.discarded { opacity: 0.3; }
+  .sg-tok.correction { background: var(--color-accent-2); border-color: var(--color-accent-2); color: #fff; }
+  .sg-legend { font-size: 11.5px; line-height: 1.7; opacity: 0.82; }
+  .sg-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 11 of 20</span>
+    <h1>Speculative decoding</h1>
+    <p>Decode produces one token per full sweep of the weights. Speculation breaks that rule: a cheap model guesses several tokens, and the expensive model checks all of them in a single pass. Done right it is exactly lossless, and done at the wrong batch size it is a regression.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="verify">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Verify many, generate one</h2></div>
+    <p class="g-eyebrow">The inversion</p>
+    <p>Autoregressive decoding is a sequence of forward passes that each produce a single token. Every pass reads the entire model, so at batch size 1 the step time is essentially weights-over-bandwidth no matter how small the useful output is. Speculative decoding inverts the ratio. A small <strong>draft</strong> model proposes the next <var>k</var> tokens cheaply; the target model then runs <em>one</em> forward pass over all <var>k</var> proposals at once, in parallel, and accepts the longest prefix that matches what it would itself have generated. When the draft is good, one expensive pass yields several tokens, and the per-token cost of the expensive model falls.</p>
+    <p>Press play. The draft proposes five tokens in one cheap pass; the target verifies them left to right. The first proposal that disagrees is struck through, the rest are discarded, and the target's own token is substituted at that position — then the cycle begins again from a longer context.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap" style="flex:1 1 100%;">
+        <div class="sg-strip" id="sg-anim-strip"></div>
+        <div class="g-btnrow" style="margin-top:14px;">
+          <button id="sg-play" class="g-primary">Play</button>
+          <button id="sg-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="sg-anim-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="free">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Why the verify pass is nearly free</h2></div>
+    <p class="g-eyebrow">Memory-bound, not compute-bound</p>
+    <p>Verifying <var>k</var> tokens is a forward pass in which the query dimension is <var>k</var> instead of 1 — structurally a tiny prefill. The weights are still read exactly once, so the memory time barely changes; only the FLOPs scale with <var>k</var>. For an 8B model on an H100-class part, the decode step is about <span class="qz">4.8 ms</span> of memory time against <span class="qz">0.02 ms</span> of compute for one token. Verifying five tokens raises the compute term to roughly 0.08 ms and leaves the 4.8 ms memory term untouched. The target model's verification is, to first order, <em>free per extra token</em>.</p>
+    <p>What is not free is the draft. Running a second model, or extra heads, costs real forward passes on the same GPU, and at large batch those passes compete for compute with the requests you are trying to serve. That asymmetry — verification is memory, drafting is compute — is the entire tuning problem of this part, and it is why the batch-size crossover in section 8 exists.</p>
+  </section>
+
+  <section class="g-step" id="lossless">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Rejection sampling preserves the distribution</h2></div>
+    <p class="g-eyebrow">Why this is not approximate</p>
+    <p>The training guide named speculative decoding but did not open it up (<a href="{{ '/ai/llm-training/inference/' | relative_url }}">Part 11 of that series</a> lists it among further serving techniques). The important property is that it is <strong>exact</strong>: the tokens it produces are drawn from the target model's distribution, not an approximation of it. The mechanism is rejection sampling. The draft samples a token <var>x</var> from its distribution <var>q</var>. The target computes its own probability <var>p(x)</var> and accepts with probability <span class="sg-legend">min(1, p(x)/q(x))</span>. If the proposal is rejected, a replacement is drawn from the residual distribution proportional to <span class="sg-legend">max(0, p(x) − q(x))</span>, renormalized. Some algebra shows the accepted-token distribution is exactly <var>p</var>, so with greedy or sampled target decoding alike the output is identical to what the target alone would have produced — not just similar. The draft's only effect is on speed, never on what the model says.</p>
+    <div class="g-goal">💡 <span><b>Consequence for tuning:</b> because the distribution is preserved, you can change the draft model, tree shape, or <var>k</var> at runtime, per request and per load condition, without changing your quality contract. Every degree of freedom here is purely a performance knob.</span></div>
+  </section>
+
+  <section class="g-step" id="acceptance">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Acceptance rate, expected tokens, and the optimum k</h2></div>
+    <p class="g-eyebrow">The formula that sizes everything</p>
+    <p>Let <var>α</var> be the per-token acceptance probability, assumed roughly constant across positions. The expected number of tokens advanced by one verify pass is a geometric series:</p>
+    <div class="g-math g-katex">$$E[\text{tokens}] = \frac{1-\alpha^{k+1}}{1-\alpha}$$</div>
+    <p>At <var>α</var> = 1 this is <var>k</var>+1; at <var>α</var> = 0 it is 1, and speculation buys nothing. The net speedup is the expected tokens divided by the real cost of producing them, and that denominator grows with <var>k</var> because the draft model must run <var>k</var> cheap steps to make <var>k</var> proposals. With a draft cost <var>c</var> per proposed token, expressed as a fraction of one target step, the net speedup is <span class="sg-legend">E[tokens] / (1 + k·c)</span>. That denominator is what puts a peak in the curve: past the optimum, extra proposals are more likely to be rejected than to be accepted, and each one still costs a draft step.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sg-formula-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Blue (left axis): net speedup. Red (right axis): expected accepted tokens. The dashed line marks the optimum k.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Acceptance rate α <span class="val">0.80</span></label><input type="range" id="sg-alpha" min="0.3" max="0.98" step="0.01" value="0.8"></div>
+        <div class="g-field"><label>Draft cost c per proposal <span class="val">0.10</span></label><input type="range" id="sg-cost" min="0.02" max="0.5" step="0.01" value="0.1"></div>
+        <div class="g-field"><label>Draft length k <span class="val">4</span></label><input type="range" id="sg-k" min="1" max="12" step="1" value="4"></div>
+        <div class="g-readout" id="sg-formula-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="drafts">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Draft models, Medusa heads, EAGLE</h2></div>
+    <p class="g-eyebrow">Three ways to get proposals</p>
+    <p><strong>A separate draft model</strong> is the simplest and the original formulation: a smaller model from the same family, served alongside the target. It is exactly lossless and easy to reason about, but it costs a second set of weights in memory and a second forward pass per cycle, which is why it is usually paired with a low <var>k</var>.</p>
+    <p><strong>Medusa</strong> avoids the second model by attaching several lightweight prediction heads to the frozen target backbone, each trained to predict a token at a different offset. The heads can be combined into a tree of candidates verified in one pass, reporting &gt;2.2× for Medusa-1 and 2.3–3.6× for the jointly fine-tuned Medusa-2 — at the cost of a fine-tuning step and extra heads.</p>
+    <p><strong>EAGLE</strong> pushes further by drafting in the target's feature space rather than its token space: a light autoregressive head over hidden states, which raises acceptance because it is conditioned on the target's own internal representation. EAGLE-2 adds a context-aware dynamic draft tree and reports 3.05–4.26× end-to-end, 20–40% over EAGLE-1. EAGLE-3 moves to direct token prediction with multi-layer feature fusion, claims up to 6.5× at low batch and about 1.4× over EAGLE-2, and reports 1.38× throughput even at batch 64 in SGLang. Those maxima are single-request and low-batch numbers; the batch-64 figure is the honest production one.</p>
+  </section>
+
+  <section class="g-step" id="ngram">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>n-gram and prompt-lookup: a free draft</h2></div>
+    <p class="g-eyebrow">Zero model, zero parameters</p>
+    <p>The cheapest draft of all is a lookup. Instead of a model, scan the prompt (and the tokens generated so far) for a suffix that matches the current context, and propose the tokens that followed it last time. There is no draft model, no extra weights, and no draft forward pass — the proposals are nearly free. On workloads where the output copies the input — summarisation, retrieval-augmented answers, code editing, format conversion — the hit rate is high and this is a large, essentially free win. On open-ended chat it is close to useless and can even be a small loss once the verification and bookkeeping overhead are counted, which is why engines expose it as a per-request opt-in rather than a global default. This is the clearest case of speculation being a <em>workload</em> decision before it is a model decision.</p>
+  </section>
+
+  <section class="g-step" id="tree">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Tree attention: verifying a branching draft</h2></div>
+    <p class="g-eyebrow">One pass, many candidate continuations</p>
+    <p>A single linear draft chain wastes its budget: if the second token is wrong, the rest of the chain is dead. Instead, draft a <em>tree</em> — at each position, several plausible tokens with their own continuations. The target verifies the entire tree in one forward pass, and the accepted path can branch in a different direction than a linear draft could. The mechanism that makes this valid is a <strong>tree attention mask</strong>: each candidate token attends to the shared root and to its own ancestors only, and never to tokens in sibling branches. In the flattened token order that mask is block-lower-triangular — attention is confined within each branch's path, which is exactly the block-diagonal structure shown below.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sg-tree-canvas" width="640" height="230"></canvas>
+        <canvas id="sg-mask-canvas" width="640" height="300" style="margin-top:12px;"></canvas>
+        <p class="g-canvas-hint">Top: the drafted candidate tree. Bottom: the attention mask — 1 (dark) where a token may attend.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="sg-tree-branch"></div>
+        <div class="g-field"><label>Draft depth <span class="val">3</span></label><input type="range" id="sg-tree-depth" min="1" max="3" step="1" value="3"></div>
+        <div class="g-readout" id="sg-tree-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="crossover">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>The batch-size crossover</h2></div>
+    <p class="g-eyebrow">Why engines disable speculation under load</p>
+    <p>Speculation trades compute for latency. It only pays while decode is <em>memory-bound</em>, which is true at low batch: the verify pass reads the weights once and the extra FLOPs are hidden. As batch grows, the same step becomes compute-bound, and now the draft model's forward passes are stealing tensor-core time from requests that were already saturating the GPU. The two throughput curves cross: speculation wins at low batch and loses above the crossover. A serving engine therefore runs speculation when the queue is short and turns it off (or drops <var>k</var> toward 1) as load rises — the same request gets a latency win when the system is idle and does not tax the system when it is full.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sg-batch-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Throughput versus batch size for the target alone and with speculation; they cross once.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Draft length k <span class="val">4</span></label><input type="range" id="sg-batch-k" min="1" max="8" step="1" value="4"></div>
+        <div class="g-field"><label>Draft model size <span class="val">1.0</span> B</label><input type="range" id="sg-batch-draft" min="0.3" max="2" step="0.1" value="1"></div>
+        <div class="g-field"><label>Acceptance rate α <span class="val">0.80</span></label><input type="range" id="sg-batch-alpha" min="0.4" max="0.95" step="0.01" value="0.8"></div>
+        <div class="g-readout" id="sg-batch-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="tuning">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Tuning: measure acceptance, not vibes</h2></div>
+    <p class="g-eyebrow">The production checklist</p>
+    <p>The one number to instrument is the acceptance rate, broken down by workload and by position in the draft. A high average that comes from the first one or two positions with a near-zero tail is normal; if the tail is collapsing, shorten the draft. Cap <var>k</var> — the formula's optimum is usually between 3 and 7 even at excellent acceptance, because the draft-cost term eventually dominates. Choose the mechanism by workload: n-gram for copy-heavy traffic, a separate draft model when you cannot fine-tune, Medusa/EAGLE when you can and want the last few multiples. And make speculation a load-aware policy, not a deployment constant.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sg-methods-canvas" width="640" height="300"></canvas>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="sg-methods-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Paper maxima are not production numbers.</b> The speedups below are best-case, usually single-request or low-batch, and the n-gram figure in particular is highly workload-dependent and can fall below 1× when the hit rate is low. Treat the ranking as a starting hypothesis and confirm it against your own traces.</span></div>
+    <div style="overflow-x:auto;">
+      <table class="g-cheat" id="sg-methods-table">
+        <thead><tr><th>Method</th><th>Acceptance</th><th>Reported speedup</th><th>Notes</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="sg-methods-source"></p>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+      <table class="g-cheat">
+        <thead><tr><th>Concept</th><th>What it means in practice</th></tr></thead>
+        <tbody>
+          <tr><td>Draft and verify</td><td>Cheap model proposes k tokens; target verifies all in one memory-bound pass and accepts the longest correct prefix</td></tr>
+          <tr><td>Losslessness</td><td>Rejection sampling makes the output distribution exactly the target's; speculation is a speed knob only</td></tr>
+          <tr><td>Expected tokens</td><td>(1 − α<sup>k+1</sup>) / (1 − α); at α = 0.8 and k = 3 it is about 2.95 tokens per verify pass</td></tr>
+          <tr><td>Optimum k</td><td>Where the marginal acceptance falls below the marginal draft cost; typically 3–7, lower for expensive drafts</td></tr>
+          <tr><td>Tree attention</td><td>A branching draft tree verified in one pass with a mask confining each token to its own ancestors</td></tr>
+          <tr><td>Batch crossover</td><td>Speculation helps at low batch and hurts once the step is compute-bound — disable it under load</td></tr>
+          <tr><td>Workload fit</td><td>n-gram/prompt lookup for copy-heavy output; learned drafts (Medusa, EAGLE) for open-ended generation</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Leviathan, Kalman &amp; Matias, <a href="https://arxiv.org/abs/2211.17192">Fast Inference from Transformers via Speculative Decoding</a>, ICML 2023 — the exact rejection-sampling argument.</li>
+      <li>Chen et al., <a href="https://arxiv.org/abs/2302.01318">Accelerating Large Language Model Decoding with Speculative Sampling</a>, 2023.</li>
+      <li>Cai et al., <a href="https://arxiv.org/abs/2401.10774">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</a>, 2024.</li>
+      <li>Li et al., <a href="https://arxiv.org/abs/2406.16858">EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees</a>, 2024.</li>
+      <li>Li et al., <a href="https://arxiv.org/abs/2503.01840">EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test</a>, 2025.</li>
+      <li>Saxena, <a href="https://github.com/apoorvumang/prompt-lookup-decoding">Prompt Lookup Decoding</a> — the n-gram draft.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A single model now goes faster. Next: what happens when one GPU is not enough.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide;
+  var c = G.colors();
+
+  // ============================================================
+  // 1. Draft-and-verify animation
+  // ============================================================
+  (function () {
+    var CONTEXT = ['The', 'cat', 'sat', 'on', 'the'];
+    var DRAFT = ['mat', 'and', 'then', 'slept', 'quietly'];
+    var K = DRAFT.length;
+    var r = G.seededRandom(20260101);
+    var accepted = [], sawReject = false;
+    for (var i = 0; i < K; i++) {
+      var ok = !sawReject && r() < 0.72;
+      accepted.push(ok);
+      if (!ok) sawReject = true;
+    }
+    var correction = 'rug';
+    var step = 0, MAX = K + 1;
+    var strip = document.getElementById('sg-anim-strip');
+    var readout = document.getElementById('sg-anim-readout');
+    var playBtn = document.getElementById('sg-play');
+    var resetBtn = document.getElementById('sg-reset');
+
+    function render() {
+      var html = '';
+      CONTEXT.forEach(function (tk) { html += '<span class="sg-tok ctx">' + tk + '</span>'; });
+      html += '<span class="sg-tok ctx" style="border-style:dashed;opacity:.5">|</span>';
+      var rejectedAt = accepted.indexOf(false);
+      var firstRejectReached = rejectedAt < 0 ? K : rejectedAt;
+      DRAFT.forEach(function (tk, d) {
+        var cls = 'proposal';
+        var verified = d < step;
+        if (verified) {
+          if (rejectedAt < 0 || d < rejectedAt) cls = 'accepted';
+          else if (d === rejectedAt) cls = 'rejected';
+          else cls = 'discarded';
+        }
+        html += '<span class="sg-tok ' + cls + '">' + tk + '</span>';
+      });
+      // correction token appears once the rejection has been reached (or the whole draft is accepted)
+      var showCorrection = (step > K);
+      if (showCorrection) {
+        if (rejectedAt < 0) html += '<span class="sg-tok correction">' + correction + '</span>';
+        else html += '<span class="sg-tok correction">' + correction + '</span>';
+      }
+      strip.innerHTML = html;
+
+      var verifiedCount = Math.min(step, K);
+      var accCount = 0;
+      for (var d2 = 0; d2 < verifiedCount; d2++) if (rejectedAt < 0 || d2 < rejectedAt) accCount++;
+      var produced = showCorrection ? accCount + 1 : accCount;
+      var status;
+      if (step === 0) status = 'draft pass complete: ' + K + ' proposals ready, target has not run yet';
+      else if (step <= K) status = 'verifying proposal ' + Math.min(step, K) + ' of ' + K;
+      else status = 'cycle complete';
+      readout.innerHTML =
+        '<span class="k">' + status + '</span><br>' +
+        '<span class="k">accepted so far:</span> <span class="hi">' + accCount + '</span>' +
+        ' · <span class="k">first rejection at position</span> ' + (rejectedAt < 0 ? '—' : rejectedAt + 1) + '<br>' +
+        '<span class="k">tokens produced this cycle:</span> <span class="hi">' + produced + '</span> for one target pass' +
+        (showCorrection ? ' (' + accCount + ' accepted + 1 correction)' : '');
+    }
+    var runner = G.loop({
+      interval: 620,
+      onStep: function () {
+        step++;
+        if (step > MAX) { runner.stop(); playBtn.textContent = 'Play'; step = MAX; }
+        render();
+      }
+    });
+    function syncBtn() { playBtn.textContent = runner.running() ? 'Pause' : 'Play'; }
+    playBtn.addEventListener('click', function () {
+      if (!runner.running() && step === 0) { runner.start(); }
+      else if (!runner.running() && step >= MAX) { step = 0; render(); runner.start(); }
+      else if (runner.running()) { runner.stop(); }
+      else { runner.start(); }
+      syncBtn();
+    });
+    resetBtn.addEventListener('click', function () {
+      runner.stop(); step = 0; render(); syncBtn();
+    });
+    render();
+  })();
+
+  // ============================================================
+  // 4. Acceptance formula + optimum k
+  // ============================================================
+  (function () {
+    var KMAX = 12;
+    var alpha = 0.8, cost = 0.1, kCur = 4;
+    function E(a, k) { return (1 - Math.pow(a, k + 1)) / (1 - a); }
+    function Net(a, k, co) { return E(a, k) / (1 + k * co); }
+    var ctx = null;
+    var view = G.setupCanvas(document.getElementById('sg-formula-canvas'), 640, 320, function () { draw(); });
+    ctx = view.ctx;
+    function draw() {
+      if (!ctx) return;
+      var ks = [], Epts = [], Spts = [];
+      var maxE = 0, maxS = 0, optK = 1, optS = 0;
+      for (var k = 1; k <= KMAX; k++) {
+        var e = E(alpha, k), s = Net(alpha, k, cost);
+        ks.push(k); Epts.push({ x: k, y: e }); Spts.push({ x: k, y: s });
+        maxE = Math.max(maxE, e); maxS = Math.max(maxS, s);
+        if (s > optS) { optS = s; optK = k; }
+      }
+      var yMaxS = Math.ceil(maxS * 10) / 10 + 0.2;
+      var yMaxE = Math.ceil(maxE) + 0.5;
+      var axes = G.drawLines(ctx, 640, 320, [
+        { points: Spts, color: c.accent, width: 2.5 }
+      ], [1, KMAX], [0, yMaxS], { xLabel: 'draft length k', yLabel: 'net speedup' });
+      function pyE(e) { return axes.padT + axes.plotH * (1 - e / yMaxE); }
+      // expected-tokens curve on the secondary (left) axis
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.5; ctx.beginPath();
+      Epts.forEach(function (p, i) {
+        var X = axes.px(p.x), Y = pyE(p.y);
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      });
+      ctx.stroke();
+      // right axis ticks for expected tokens
+      ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      for (var t = 0; t <= yMaxE; t += Math.max(1, Math.round(yMaxE / 4))) {
+        ctx.fillText(String(t), axes.padL + axes.plotW + 4, pyE(t) + 3);
+      }
+      // optimum marker
+      var xo = axes.px(optK);
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.5; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(xo, axes.padT); ctx.lineTo(xo, axes.padT + axes.plotH); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.textAlign = 'center'; ctx.font = '600 11px ' + c.font;
+      ctx.fillText('optimum k = ' + optK, xo, axes.padT - 2);
+      // current k markers
+      var xc = axes.px(kCur);
+      ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(xc, axes.py(Math.min(yMaxS, Net(alpha, kCur, cost))), 4.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(xc, pyE(E(alpha, kCur)), 4.5, 0, Math.PI * 2); ctx.fill();
+      // legend
+      ctx.textAlign = 'left'; ctx.font = '11px ' + c.font;
+      ctx.fillStyle = c.accent2; ctx.fillText('● expected accepted tokens (right axis)', axes.padL + 8, 16);
+      ctx.fillStyle = c.accent; ctx.fillText('● net speedup (left axis)', axes.padL + 8 + 250, 16);
+
+      document.getElementById('sg-formula-readout').innerHTML =
+        '<span class="k">E[tokens | α=' + alpha.toFixed(2) + ', k=' + kCur + ']:</span> <span class="hi">' + E(alpha, kCur).toFixed(2) + '</span><br>' +
+        '<span class="k">net speedup at k=' + kCur + ':</span> <span class="hi">' + Net(alpha, kCur, cost).toFixed(2) + '×</span><br>' +
+        '<span class="k">optimum:</span> k = ' + optK + ' → ' + optS.toFixed(2) + '× (draft cost ' + cost.toFixed(2) + '/token)<br>' +
+        '<span class="k">tokens per verify pass at optimum:</span> ' + E(alpha, optK).toFixed(2);
+    }
+    G.bindSliders(document.querySelectorAll('#sg-alpha'), function (el) { alpha = parseFloat(el.value); draw(); });
+    G.bindSliders(document.querySelectorAll('#sg-cost'), function (el) { cost = parseFloat(el.value); draw(); });
+    G.bindSliders(document.querySelectorAll('#sg-k'), function (el) { kCur = parseInt(el.value, 10); draw(); });
+    draw();
+  })();
+
+  // ============================================================
+  // 7. Tree attention
+  // ============================================================
+  (function () {
+    var branch = 2, depth = 3;
+    function buildTree(d, b) {
+      var nodes = [], edges = [];
+      function rec(parent, level) {
+        var id = nodes.length;
+        nodes.push({ id: id, parent: parent, level: level, children: [] });
+        if (parent != null) { nodes[parent].children.push(id); edges.push([parent, id]); }
+        if (level < d) for (var q = 0; q < b; q++) rec(id, level + 1);
+      }
+      rec(null, 0);
+      return { nodes: nodes, edges: edges };
+    }
+    var treeCtx = null, maskCtx = null;
+    var treeView = G.setupCanvas(document.getElementById('sg-tree-canvas'), 640, 230, function () { drawTree(); });
+    treeCtx = treeView.ctx;
+    var maskView = G.setupCanvas(document.getElementById('sg-mask-canvas'), 640, 300, function () { drawMask(); });
+    maskCtx = maskView.ctx;
+
+    function ancestors(tree, id) {
+      var set = {}, n = id;
+      while (n != null) { set[n] = 1; n = tree.nodes[n].parent; }
+      return set;
+    }
+    function drawTree() {
+      if (!treeCtx) return;
+      var tree = buildTree(depth, branch);
+      var W = 640, H = 230, padT = 26, padB = 20, padX = 26;
+      // leaf x positions, then parents average
+      var leaves = tree.nodes.filter(function (n) { return !n.children.length; });
+      var leafX = {};
+      leaves.forEach(function (n, i) { leafX[n.id] = padX + (W - 2 * padX) * (i + 0.5) / leaves.length; });
+      function assignX(n) {
+        if (leafX[n.id] != null) return leafX[n.id];
+        var xs = n.children.map(function (ch) { return assignX(tree.nodes[ch]); });
+        return leafX[n.id] = xs.reduce(function (a, b) { return a + b; }, 0) / xs.length;
+      }
+      assignX(tree.nodes[0]);
+      function px(n) { return leafX[n.id]; }
+      function py(n) { return padT + (H - padT - padB) * (n.level / Math.max(1, depth)); }
+      treeCtx.clearRect(0, 0, W, H);
+      treeCtx.strokeStyle = c.divider; treeCtx.lineWidth = 1.5;
+      tree.edges.forEach(function (e) {
+        var a = tree.nodes[e[0]], b = tree.nodes[e[1]];
+        treeCtx.beginPath(); treeCtx.moveTo(px(a), py(a)); treeCtx.lineTo(px(b), py(b)); treeCtx.stroke();
+      });
+      tree.nodes.forEach(function (n) {
+        treeCtx.beginPath(); treeCtx.arc(px(n), py(n), n.level === 0 ? 9 : 7, 0, Math.PI * 2);
+        treeCtx.fillStyle = n.level === 0 ? c.accent2 : (n.children.length ? c.accent500 : c.accent);
+        treeCtx.fill();
+        treeCtx.fillStyle = '#fff'; treeCtx.font = '9px ' + c.font; treeCtx.textAlign = 'center';
+        treeCtx.fillText(String(n.id), px(n), py(n) + 3);
+      });
+      treeCtx.fillStyle = c.text; treeCtx.font = '11px ' + c.font; treeCtx.textAlign = 'left';
+      treeCtx.fillText('candidate tree · ' + tree.nodes.length + ' nodes · one verify pass verifies them all', padX, 16);
+      document.getElementById('sg-tree-readout').innerHTML =
+        '<span class="k">tree nodes:</span> <span class="hi">' + tree.nodes.length + '</span><br>' +
+        '<span class="k">draft depth:</span> ' + depth + ' · branch ' + branch + '<br>' +
+        '<span class="k">sequential decode steps replaced:</span> ' + (depth + 1) + ' → 1 verify pass<br>' +
+        '<span class="k">mask density:</span> ' + (maskDensity(tree) * 100).toFixed(0) + '% of the full square';
+    }
+    function maskDensity(tree) {
+      var n = tree.nodes.length, on = 0;
+      for (var i = 0; i < n; i++) { var a = ancestors(tree, i); for (var j = 0; j < n; j++) if (a[j]) on++; }
+      return on / (n * n);
+    }
+    function drawMask() {
+      if (!maskCtx) return;
+      var tree = buildTree(depth, branch);
+      var n = tree.nodes.length, M = [], labels = [];
+      for (var i = 0; i < n; i++) {
+        var a = ancestors(tree, i), row = [];
+        labels.push(String(i));
+        for (var j = 0; j < n; j++) row.push(a[j] ? 1 : 0);
+        M.push(row);
+      }
+      G.drawHeatmap(maskCtx, 640, 300, M, {
+        min: 0, max: 1, colorLow: [238, 238, 238], colorHigh: [43, 95, 255],
+        rowLabels: labels, colLabels: labels, fontSize: n > 20 ? 8 : 10
+      });
+      maskCtx.fillStyle = c.text; maskCtx.font = '11px ' + c.font; maskCtx.textAlign = 'left';
+      maskCtx.fillText('tree attention mask — each token attends to root + its own ancestors only', 60, 14);
+    }
+    var host = document.getElementById('sg-tree-branch');
+    [2, 3].forEach(function (b) {
+      var btn = document.createElement('button');
+      btn.textContent = 'branch ' + b;
+      btn.addEventListener('click', function () {
+        branch = b;
+        Array.prototype.forEach.call(host.children, function (x) { x.className = ''; });
+        btn.className = 'active'; drawTree(); drawMask();
+      });
+      host.appendChild(btn);
+    });
+    host.children[0].className = 'active';
+    G.bindSliders(document.querySelectorAll('#sg-tree-depth'), function (el) { depth = parseInt(el.value, 10); drawTree(); drawMask(); });
+    drawTree(); drawMask();
+  })();
+
+  // ============================================================
+  // 8. Batch-size crossover
+  // ============================================================
+  (function () {
+    var PARAMS = 8, BW = 3.35, PEAK = 989;
+    var k = 4, draftB = 1.0, alpha = 0.8;
+    function stepT(pB, batch, flopsMul) {
+      return window.ServingSim.stepTime({
+        paramsB: pB, bytesPerParam: 2, batch: batch, bwTBs: BW, peakTFLOPs: PEAK,
+        flops: 2 * pB * 1e9 * batch * flopsMul, kvBytes: 0
+      }).totalMs;
+    }
+    function expected(a, kk) { return (1 - Math.pow(a, kk + 1)) / (1 - a); }
+    function baseTps(batch) { return batch * 1000 / stepT(PARAMS, batch, 1); }
+    function specTps(batch) {
+      var verify = stepT(PARAMS, batch, k + 1);
+      var draft = k * stepT(draftB, batch, 1);
+      return batch * expected(alpha, k) * 1000 / (verify + draft);
+    }
+    var ctx = null;
+    var view = G.setupCanvas(document.getElementById('sg-batch-canvas'), 640, 320, function () { draw(); });
+    ctx = view.ctx;
+    var N = 48, batches = [], xs = [];
+    for (var i = 0; i <= N; i++) { var b = Math.pow(10, 3 * i / N); batches.push(b); xs.push(Math.log10(b)); }
+    function draw() {
+      if (!ctx) return;
+      var basePts = batches.map(function (b, i2) { return { x: xs[i2], y: baseTps(b) }; });
+      var specPts = batches.map(function (b, i2) { return { x: xs[i2], y: specTps(b) }; });
+      var yMax = Math.max.apply(null, basePts.concat(specPts).map(function (p) { return p.y; })) * 1.08;
+      var axes = G.drawLines(ctx, 640, 320, [
+        { points: basePts, color: c.accent700, width: 2.5 },
+        { points: specPts, color: c.accent2, width: 2.5 }
+      ], [0, 3], [0, yMax], { xLabel: 'log₁₀ batch size', yLabel: 'tokens / second' });
+      // find crossover: first sample where spec falls below base, refine by scanning
+      var cross = null;
+      for (var bb = 1; bb <= 1024; bb *= 1.02) {
+        if (specTps(bb) < baseTps(bb)) { cross = bb; break; }
+      }
+      if (cross) {
+        var X = axes.px(Math.log10(cross));
+        ctx.strokeStyle = c.text; ctx.globalAlpha = 0.55; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(X, axes.padT); ctx.lineTo(X, axes.padT + axes.plotH); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('crossover ≈ batch ' + Math.round(cross), X, axes.padT - 2);
+      }
+      ctx.textAlign = 'left'; ctx.font = '11px ' + c.font;
+      ctx.fillStyle = c.accent700; ctx.fillText('■ target alone', axes.padL + 8, 16);
+      ctx.fillStyle = c.accent2; ctx.fillText('■ target + spec (k=' + k + ', draft ' + draftB.toFixed(1) + 'B)', axes.padL + 8 + 150, 16);
+      // x ticks
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      [1, 8, 64, 512].forEach(function (b) { ctx.fillText(String(b), axes.px(Math.log10(b)), 320 - 8); });
+
+      var r1 = specTps(1) / baseTps(1);
+      var r64 = specTps(64) / baseTps(64);
+      document.getElementById('sg-batch-readout').innerHTML =
+        '<span class="k">throughput ratio at batch 1:</span> <span class="hi">' + r1.toFixed(2) + '×</span><br>' +
+        '<span class="k">at batch 64:</span> ' + r64.toFixed(2) + '×<br>' +
+        '<span class="k">crossover:</span> ' + (cross ? '≈ batch ' + Math.round(cross) + ' — above it, speculation loses' : 'none in range') + '<br>' +
+        '<span class="k">expected tokens:</span> ' + expected(alpha, k).toFixed(2) + ' per verify pass';
+    }
+    G.bindSliders(document.querySelectorAll('#sg-batch-k'), function (el) { k = parseInt(el.value, 10); draw(); });
+    G.bindSliders(document.querySelectorAll('#sg-batch-draft'), function (el) { draftB = parseFloat(el.value); draw(); });
+    G.bindSliders(document.querySelectorAll('#sg-batch-alpha'), function (el) { alpha = parseFloat(el.value); draw(); });
+    draw();
+  })();
+
+  // ============================================================
+  // 9. Method comparison (from the numbers JSON)
+  // ============================================================
+  (function () {
+    var FALLBACK = {
+      speculative: {
+        source: "Medusa (Cai et al., arXiv:2401.10774): Medusa-2 2.3-3.6x. EAGLE-2 (arXiv:2406.16858): 3.05-4.26x. EAGLE-3 (arXiv:2503.01840): up to 6.5x, 1.38x throughput at batch 64. Draft-model speculative decoding (Leviathan et al., arXiv:2211.17192): 2x-3x on T5-XXL. N-gram/prompt-lookup gains are highly workload-dependent. Speedups are paper maxima, not guaranteed production numbers.",
+        items: [
+          { method: 'n-gram / prompt lookup', acceptance: 'High only when the continuation copies the prompt', speedup: 2.0, note: 'No draft model; can be <1x when hit rate is low.' },
+          { method: 'Medusa', acceptance: 'Multiple decoding heads verified in parallel', speedup: 3.6, note: 'Adds extra heads; needs fine-tuning.' },
+          { method: 'EAGLE-2', acceptance: 'Context-aware dynamic draft tree', speedup: 4.26, note: 'Lossless; 20-40% faster than EAGLE-1.' },
+          { method: 'EAGLE-3', acceptance: 'Direct token prediction with multi-layer feature fusion', speedup: 6.5, note: '1.38x throughput at batch 64; 6.5x is a low-batch maximum.' },
+          { method: 'Separate draft model', acceptance: 'Depends on draft/target agreement', speedup: 3.0, note: 'Exact but costs extra memory and a second model.' }
+        ]
+      }
+    };
+    var mCtx = null;
+    var mView = G.setupCanvas(document.getElementById('sg-methods-canvas'), 640, 300, function () { if (mCtx) drawBars(); });
+    mCtx = mView.ctx;
+    var items = FALLBACK.speculative.items;
+    function drawBars() {
+      var data = items.map(function (it, i) {
+        return { label: it.method, value: it.speedup, valueLabel: it.speedup.toFixed(2) + '×', color: i === 0 ? c.accent500 : (i === items.length - 1 ? c.accent700 : c.accent) };
+      });
+      G.drawBars(mCtx, 640, 300, data, { maxV: 7, padL: 190 });
+    }
+    function render(data) {
+      var spec = (data && data.speculative) || FALLBACK.speculative;
+      items = spec.items;
+      var tbody = document.querySelector('#sg-methods-table tbody');
+      tbody.innerHTML = items.map(function (it) {
+        return '<tr><td><b>' + it.method + '</b></td><td>' + it.acceptance + '</td><td>' + it.speedup.toFixed(2) + '×</td><td>' + (it.note || '') + '</td></tr>';
+      }).join('');
+      drawBars();
+      var best = items.reduce(function (a, b) { return b.speedup > a.speedup ? b : a; });
+      document.getElementById('sg-methods-readout').innerHTML =
+        '<span class="k">methods compared:</span> ' + items.length + '<br>' +
+        '<span class="k">highest reported:</span> <span class="hi">' + best.method + ' (' + best.speedup.toFixed(2) + '×)</span><br>' +
+        '<span class="k">note:</span> maxima are low-batch / single-request unless stated otherwise.';
+      document.getElementById('sg-methods-source').textContent = spec.source;
+    }
+    render(FALLBACK);
+    fetch(window.NUMBERS_URL).then(function (r) { return r.json(); }).then(render).catch(function () { render(FALLBACK); });
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

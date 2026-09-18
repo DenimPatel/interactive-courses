@@ -1,0 +1,394 @@
+---
+title: "Steering a frozen model"
+description: "LoRA and DreamBooth, ControlNet and IP-Adapter, inpainting and SDEdit editing, and where along the trajectory each intervention bites."
+permalink: "/ai/generative-media/control/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  .g-raster-row { display: flex; gap: 10px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Steering a frozen model</h1>
+    <p>A trained diffusion model is a fixed function of noise and conditioning, and retraining it every time you want a new subject or a new composition is out of the question. So control is bolted on around the weights instead: a tiny low-rank update, a second network that injects structure, an adapter that supplies an identity, or a noise level that decides how much of an existing image survives. This part draws where each intervention touches the trajectory, and shows why the low-noise end is where fidelity is decided.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="weights">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Adapting the weights</h2></div>
+    <p class="g-eyebrow">A rank-r correction to a frozen matrix</p>
+    <p>Low-rank adaptation, LoRA, leaves the pretrained weight $W$ untouched and learns a correction $\Delta W = (\alpha/r)\,BA$, where $B$ is tall, $A$ is wide, and the product has rank at most $r$. Only $A$ and $B$ receive gradients, and the trained model is still the original one until the delta is added in. The parameter count is the selling point: a full $16\times16$ matrix has 256 entries, while a rank-4 correction of the same shape has $2\cdot4\cdot16 = 128$ &mdash; and for the large attention projections of a real model the ratio is far more lopsided, because $r$ stays small while the matrix grows.</p>
+    <p>The heatmaps below show the correction and the corrected matrix at the current rank. The left panel is the delta, which is constrained to lie in a low-rank subspace no matter how the slider moves; the right is the frozen matrix after the delta is added. At rank one the delta is a single outer product, a pattern of rows all proportional to one direction; raising the rank lets independent directions accumulate until the correction can express an arbitrary matrix.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lora-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Left: the low-rank update $\Delta W = (\alpha/r)\,BA$. Right: the frozen $W$ with the update added, on the same colour scale.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>LoRA rank r <span class="val">1</span></label><input type="range" id="lora-rank" min="1" max="6" step="1" value="1"></div>
+        <div class="g-readout" id="lora-readout"></div>
+        <p class="g-mini">DreamBooth and textual inversion solve the same problem differently: one fine-tunes the whole model on a handful of subject images with a class-preservation loss, the other learns a new token embedding and leaves the weights alone.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say which knob changes the weights (LoRA, DreamBooth), which adds a parallel control network (ControlNet), which supplies a global vector (IP-Adapter), and which simply chooses a noise level on the existing trajectory (SDEdit).</span></div>
+    <div class="g-toc">
+      <a href="#structure">2 · Structural conditioning</a>
+      <a href="#identity">3 · Identity and style</a>
+      <a href="#editing">4 · Editing an existing image</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="structure">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Structural conditioning</h2></div>
+    <p class="g-eyebrow">ControlNet and the parallel copy</p>
+    <p>Text is a weak handle on geometry. A caption can say "a person with arms crossed" but not where the arms are, and no amount of prompt engineering fixes a pose. ControlNet answers this by training a second network that copies the encoder half of the denoiser and accepts an extra spatial input &mdash; a pose skeleton, a depth map, a set of edges, a segmentation mask &mdash; whose features are added into the frozen model through zero-initialised connections.</p>
+    <p>The zero initialisation is the trick that makes it safe: at the start of training the control branch contributes nothing, so the base model is unchanged and the new signal is learned as a residual. The conditioning bites hardest at the low-noise end, where the model is committed to layout, so a strong structural input holds the geometry while the base model fills in texture. Crucially, the base weights never move; a ControlNet for a new modality is a new branch, and several branches can be stacked for multiple constraints.</p>
+  </section>
+
+  <section class="g-step" id="identity">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Identity and style</h2></div>
+    <p class="g-eyebrow">A vector where the structure is not spatial</p>
+    <p>Some conditioning is neither text nor geometry: it is the identity of a particular face, the look of a particular palette. IP-Adapter handles this by encoding a reference image with a small image encoder and feeding the resulting vector into the denoiser through cross-attention, exactly where text tokens are injected. Nothing in the base model changes and nothing is spatial, so it composes with a ControlNet and a prompt at the same time: structure from the skeleton, identity from the reference, semantics from the caption.</p>
+    <p>DreamBooth takes the opposite route and moves the weights, fine-tuning the whole model on a few images of a subject paired with a rare token, plus a class-preservation term that stops the model from forgetting what the class looks like. Textual inversion keeps the weights and learns only a new embedding for that token, which is cheaper but can express less. The three methods are a spectrum from a vector to a full fine-tune, and each has a characteristic failure: an adapter leaks style, a DreamBooth overfits its background, an inverted token struggles with poses it never saw.</p>
+  </section>
+
+  <section class="g-step" id="editing">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Editing an existing image</h2></div>
+    <p class="g-eyebrow">Masks and noise levels</p>
+    <p>Editing starts from an image rather than noise, and the two classic controls are a mask and a noise level. Inpainting keeps the pixels outside the mask and lets the model regenerate inside it, so the composited result is the original everywhere the mask is off &mdash; the demo below mixes a generated gradient into a masked disc of a procedural image. The mask is a hard choice of what survives, and the model only ever sees the trajectory inside it.</p>
+    <p>SDEdit is softer. It adds noise to the whole image up to a chosen time $t_0$ and then denoises with the model, which lets the edit be large or small without a mask. The bottom canvas traces that path for several noise levels: with a little noise the result stays close to the original, and with a lot it drifts toward whatever the model considers plausible. That single knob is the difference between a retouch and a re-imagining, and it is the same dial the inversion methods tune when they search for the noise that reconstructs an image exactly.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="inpaint-canvas" width="420" height="420"></canvas>
+        <p class="g-canvas-hint">A masked disc of the base image replaced with generated content; the dashed circle marks the mask boundary.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Mask radius <span class="val">0.45</span></label><input type="range" id="inpaint-mask" min="5" max="95" step="1" value="45"></div>
+        <div class="g-readout" id="inpaint-readout"></div>
+      </div>
+    </div>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sdedit-canvas" width="620" height="300"></canvas>
+        <p class="g-canvas-hint">Denoising paths from a start at noise level $t_0$. Faint curves are other levels; the bold curve is the one selected.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Noise level t₀ <span class="val">400</span></label><input type="range" id="sdedit-t0" min="40" max="960" step="20" value="400"></div>
+        <div class="g-readout" id="sdedit-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Editing and inversion are not the same problem.</b> SDEdit needs no inverse and no optimisation, which is why it is fast, but it cannot promise that the untouched regions stay identical. Methods based on DDIM inversion spend extra passes to recover the exact noise that reconstructs the original, buying faithfulness at low noise levels at the cost of those passes.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every interface you have used</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">LoRA libraries and ControlNet packs</h3>
+        <p style="margin-bottom:0;">The community ecosystems around Stable Diffusion are exactly this part's primitives: hundreds of small rank corrections, each a style or a character, plus a ControlNet per structural modality. The <a href="{{ '/ai/generative-media/latent-diffusion/' | relative_url }}">latent diffusion</a> backbone is what makes them cheap, because the adapters sit on the compressed latent rather than the pixel grid.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Video &amp; editing</div>
+        <h3 style="margin:6px 0;">Edits that must stay temporally consistent</h3>
+        <p style="margin-bottom:0;">In video, an inpainting mask that moves and an IP-Adapter identity that must persist across frames are the same two ideas under a temporal constraint, developed in the <a href="{{ '/ai/generative-media/video-coherence/' | relative_url }}">video coherence chapter</a>. Reference-image conditioning is also how subject-preserving generation in <a href="{{ '/ai/multimodal/' | relative_url }}">multimodal models</a> is exposed to a user.</p>
+      </div>
+    </div>
+    <p>The unifying observation is that control is layered. A prompt sets semantics, a ControlNet sets geometry, an adapter sets identity, and a noise level sets how much of an existing image is allowed to change. Each layer touches the trajectory at a different noise range, and getting a good result is usually a matter of not asking two layers to decide the same thing.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Control started as a way to avoid retraining and became a small field of its own. These are the five papers that define its vocabulary: the low-rank correction, the subject fine-tune, the spatial branch, the image adapter, and the noise-level edit.</p>
+    <p>Hu and coauthors show that a rank-r correction matches full fine-tuning on many tasks; Ruiz and coauthors fine-tune on a subject with a preservation loss; Zhang and coauthors add the parallel control branch; Ye and coauthors supply identity through cross-attention; and Meng and coauthors introduce the noise-level edit that needs no inversion.</p>
+    <ul class="g-refs">
+      <li>Edward Hu, Yelong Shen, Phillip Wallis and coauthors, <a href="https://arxiv.org/abs/2106.09685">"LoRA: Low-Rank Adaptation of Large Language Models"</a>, 2021 &mdash; the low-rank update.</li>
+      <li>Nataniel Ruiz, Yuanzhen Li, Varun Jampani and coauthors, <a href="https://arxiv.org/abs/2208.12242">"DreamBooth: Fine Tuning Text-to-Image Diffusion Models for Subject-Driven Generation"</a>, 2022 &mdash; a rare token and a class-preservation loss.</li>
+      <li>Lvmin Zhang, Anyi Rao and Maneesh Agrawala, <a href="https://arxiv.org/abs/2302.05543">"Adding Conditional Control to Text-to-Image Diffusion Models"</a>, 2023 &mdash; ControlNet and the zero-initialised branch.</li>
+      <li>Hu Ye, Jun Zhang, Sibo Liu, Xiao Han and Wei Yang, <a href="https://arxiv.org/abs/2308.06721">"IP-Adapter: Text Compatible Image Prompt Adapter for Text-to-Image Diffusion Models"</a>, 2023 &mdash; an image encoded into a cross-attention vector.</li>
+      <li>Chenlin Meng, Yutong He, Yang Song and coauthors, <a href="https://arxiv.org/abs/2108.01073">"SDEdit: Guided Image Synthesis and Editing with Stochastic Differential Equations"</a>, 2021 &mdash; editing by adding noise to a chosen level.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Method</th><th>What it changes</th></tr></thead>
+      <tbody>
+        <tr><td>LoRA</td><td>Adds a rank-r update $\Delta W = (\alpha/r)BA$; base weights frozen</td></tr>
+        <tr><td>DreamBooth</td><td>Fine-tunes the whole model on a subject with a preservation loss</td></tr>
+        <tr><td>Textual inversion</td><td>Learns a new token embedding; weights untouched</td></tr>
+        <tr><td>ControlNet</td><td>A parallel encoder branch, added through zero-initialised connections</td></tr>
+        <tr><td>IP-Adapter</td><td>Encodes a reference image into a vector injected by cross-attention</td></tr>
+        <tr><td>Inpainting</td><td>Keeps pixels outside the mask, regenerates inside; <code>Diffusion.inpaintMix</code></td></tr>
+        <tr><td>SDEdit</td><td>Noise to level $t_0$, then denoise; the size of the edit is $t_0$</td></tr>
+        <tr><td>Where it bites</td><td>Structure at low noise, identity through attention, edits at chosen $t_0$</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Every control in this part acts on a single image. The next part changes the modality and the dimensionality: a video is a three-dimensional signal, and the token and attention budget a clip really costs is where video diffusion stops being image diffusion in a loop.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var sch = D.schedule('linear', 1000);
+
+  // ---- LoRA -----------------------------------------------------------------
+  var N = 12;
+  var loraRank = 1;
+  var rw = GM.rng(31337);
+  var W0 = [];
+  for (var i = 0; i < N; i++) {
+    var row = [];
+    for (var j = 0; j < N; j++) row.push(0.6 * GM.gauss(rw));
+    W0.push(row);
+  }
+  function loraFactors(rank) {
+    var r = GM.rng(500 + rank);
+    var A = [], B = [], k;
+    for (k = 0; k < rank; k++) {
+      var ar = [];
+      for (j = 0; j < N; j++) ar.push(0.8 * GM.gauss(r));
+      A.push(ar);
+    }
+    for (i = 0; i < N; i++) {
+      var br = [];
+      for (k = 0; k < rank; k++) br.push(0.8 * GM.gauss(r));
+      B.push(br);
+    }
+    return { A: A, B: B };
+  }
+
+  var loraSetup = Guide.setupCanvas(document.getElementById('lora-canvas'), 640, 320, function () { drawLora(); });
+
+  function drawLora() {
+    if (!loraSetup) return;
+    var fac = loraFactors(loraRank);
+    var updated = D.loraDelta(W0, fac.A, fac.B, loraRank);
+    var delta = [], fr = 0;
+    for (i = 0; i < N; i++) {
+      var dr = [];
+      for (j = 0; j < N; j++) {
+        var d = updated[i][j] - W0[i][j];
+        dr.push(d); fr += d * d;
+      }
+      delta.push(dr);
+    }
+    var ctx = loraSetup.ctx, W = 640, H = 320, half = W / 2;
+    ctx.clearRect(0, 0, W, H);
+    Guide.drawHeatmap(ctx, half, H, delta, {
+      min: -2, max: 2, colorLow: [234, 240, 255], colorHigh: [214, 0, 108], fontSize: 9
+    });
+    ctx.save(); ctx.translate(half, 0);
+    Guide.drawHeatmap(ctx, half, H, updated, {
+      min: -2, max: 2, colorLow: [234, 240, 255], colorHigh: [43, 95, 255], fontSize: 9
+    });
+    ctx.restore();
+    ctx.fillStyle = c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('ΔW, rank ' + loraRank, half / 2, H - 6);
+    ctx.fillText('W + ΔW', half + half / 2, H - 6);
+    var el = document.getElementById('lora-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">rank r</span> <span class="hi">' + loraRank + '</span></div>' +
+        '<div><span class="k">trainable params</span> 2·r·N = ' + (2 * loraRank * N) + '</div>' +
+        '<div><span class="k">full matrix W</span> N² = ' + (N * N) + '</div>' +
+        '<div><span class="k">‖ΔW‖ (Frobenius)</span> ' + Math.sqrt(fr).toFixed(2) + '</div>' +
+        '<div class="g-mini">The correction is confined to a rank-≤r subspace however the slider moves.</div>';
+    }
+  }
+
+  // ---- inpainting -----------------------------------------------------------
+  var SIZE = 40;
+  var maskFrac = 0.45;
+  var baseImg = GM.img.circles(SIZE, 3, 5);
+  var genImg = GM.img.gradient(SIZE);
+  var inpaintRaster = GM.raster(document.getElementById('inpaint-canvas'), {
+    cols: SIZE, rows: SIZE, channels: 3, W: 420, H: 420,
+    onResize: function () { redrawInpaint(); }
+  });
+
+  function redrawInpaint() {
+    if (!inpaintRaster) return;
+    var known = baseImg.data, gen = genImg.data;
+    var mask = new Array(SIZE * SIZE * 3);
+    var center = (SIZE - 1) / 2, rad = maskFrac * (SIZE / 2);
+    var masked = 0, total = SIZE * SIZE;
+    for (var y = 0; y < SIZE; y++) {
+      for (var x = 0; x < SIZE; x++) {
+        var d = Math.hypot(x - center, y - center);
+        var m = d <= rad ? 1 : 0;
+        if (m) masked++;
+        for (var ch = 0; ch < 3; ch++) mask[(y * SIZE + x) * 3 + ch] = m;
+      }
+    }
+    var comp = D.inpaintMix(known, gen, mask);
+    inpaintRaster.fromArray(comp);
+    inpaintRaster.draw();
+    var ctx = inpaintRaster.ctx;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.setLineDash([5, 4]); ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(inpaintRaster.W / 2, inpaintRaster.H / 2, rad * (inpaintRaster.W / SIZE), 0, 2 * Math.PI);
+    ctx.stroke();
+    ctx.restore();
+    var el = document.getElementById('inpaint-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">mask radius</span> <span class="hi">' + maskFrac.toFixed(2) + '</span></div>' +
+        '<div><span class="k">masked area</span> ' + Guide.fmtPct(masked / total, 1) + '</div>' +
+        '<div><span class="k">kept from original</span> ' + Guide.fmtPct(1 - masked / total, 1) + '</div>' +
+        '<div class="g-mini">Outside the disc the composite is the original pixel, exactly.</div>';
+    }
+  }
+
+  // ---- SDEdit ---------------------------------------------------------------
+  var X0S = 1.0, XEDIT = -0.7, SD_SEED = 77, SD_STEPS = 40;
+  var t0 = 400;
+
+  function predictEdit(x, t) {
+    var ab = D.abAt(sch, t);
+    return D.epsFromX0(x, XEDIT, ab) * 0.6;
+  }
+  function sdeditResult(t0v) {
+    var path = D.sdeditPath(sch, X0S, t0v, SD_STEPS, predictEdit, GM.rng(SD_SEED));
+    return { path: path, x: path[path.length - 1].x };
+  }
+
+  var sdPlot = GM.plot(document.getElementById('sdedit-canvas'), {
+    W: 620, H: 300, xRange: [0, 1000], yRange: [-1.1, 1.3],
+    xLabel: 'timestep t', yLabel: 'x_t', onResize: function () { redrawSdedit(); }
+  });
+
+  function redrawSdedit() {
+    if (!sdPlot) return;
+    sdPlot.clear();
+    sdPlot.axes({ xLabel: 'timestep t', yLabel: 'x_t' });
+    [80, 300, 600, 900].forEach(function (ref) {
+      var p = sdeditResult(ref).path;
+      sdPlot.curve(p.map(function (q) { return [q.t, q.x]; }), { color: c.divider, width: 1.2 });
+    });
+    sdPlot.hline(X0S, { color: c.accent400, dashed: true, width: 1.2, label: 'original x₀', labelX: 20 });
+    sdPlot.hline(XEDIT, { color: c.accent2, dashed: true, width: 1.2, label: 'edit target', labelX: 20 });
+    var cur = sdeditResult(t0);
+    sdPlot.curve(cur.path.map(function (q) { return [q.t, q.x]; }), { color: c.accent, width: 2.8 });
+    sdPlot.points([[t0, cur.x]], { color: c.accent, r: 4 });
+    sdPlot.legend([
+      { label: 'selected t₀ = ' + t0, color: c.accent },
+      { label: 'other noise levels', color: c.divider },
+      { label: 'original', color: c.accent400, dashed: true },
+      { label: 'edit target', color: c.accent2, dashed: true }
+    ], { dy: 6 });
+    var el = document.getElementById('sdedit-readout');
+    if (el) {
+      var change = Math.abs(cur.x - X0S);
+      var span = Math.abs(XEDIT - X0S);
+      el.innerHTML =
+        '<div><span class="k">t₀</span> <span class="hi">' + t0 + '</span> of 1000</div>' +
+        '<div><span class="k">|result − original|</span> ' + change.toFixed(3) + '</div>' +
+        '<div><span class="k">fraction toward edit</span> ' + Guide.fmtPct(change / span, 0) + '</div>' +
+        '<div class="g-mini">More noise means a larger edit; less noise means a retouch.</div>';
+    }
+  }
+
+  function redraw() { drawLora(); redrawInpaint(); redrawSdedit(); }
+
+  Guide.bindSliders(document.querySelectorAll('#lora-rank'), function (el) {
+    loraRank = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#inpaint-mask'), function (el) {
+    maskFrac = parseInt(el.value, 10) / 100;
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#sdedit-t0'), function (el) {
+    t0 = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'control-lora-rank',
+      kind: 'numeric',
+      prompt: 'A LoRA update to an $n \\times n$ matrix has rank $r$, stored as an $n \\times r$ and an $r \\times n$ factor. For $n = 16$ and $r = 4$, how many trainable parameters does the update hold?',
+      answer: 128,
+      tolerance: 0.5,
+      explanation: 'The two factors hold $n\\cdot r + r\\cdot n = 2\\cdot16\\cdot4 = 128$ parameters, against $16^2 = 256$ for the full matrix. As n grows the gap widens, because the parameter count is linear in r but quadratic in n.'
+    },
+    {
+      id: 'control-controlnet',
+      kind: 'choice',
+      prompt: 'Why are ControlNet\'s connections into the base model initialised to zero?',
+      options: [
+        { label: 'So the control branch starts as a no-op and the base model is unchanged until it learns something useful.', correct: true },
+        { label: 'So the control branch can be trained without any data.', correct: false },
+        { label: 'So the base model\'s weights are updated by the control signal.', correct: false }
+      ],
+      explanation: 'Zero initialisation makes the new branch contribute nothing at the start of training, so the pretrained model\'s behaviour is preserved and the branch is learned as a residual. The base weights stay frozen throughout.'
+    },
+    {
+      id: 'control-inpaint',
+      kind: 'choice',
+      prompt: 'In an inpainting composite, which pixels come from the original image?',
+      options: [
+        { label: 'Every pixel outside the mask; the region inside the mask comes from the generated image.', correct: true },
+        { label: 'Every pixel inside the mask; the outside is regenerated.', correct: false },
+        { label: 'A random half of the pixels, chosen by the model.', correct: false }
+      ],
+      explanation: 'The mask is a hard switch. Outside it the original is kept exactly, which is why inpainting is the most faithful of the editing controls and why the mask matters more than the prompt for what survives.'
+    },
+    {
+      id: 'control-sdedit',
+      kind: 'choice',
+      prompt: 'You increase the SDEdit noise level t₀. What happens to the edit?',
+      options: [
+        { label: 'The result moves further from the original and closer to whatever the model finds plausible.', correct: true },
+        { label: 'The result stays closer to the original because more noise is removed.', correct: false },
+        { label: 'Nothing changes; t₀ only affects the sampling speed.', correct: false }
+      ],
+      explanation: 'The noise level is the size of the edit. A little noise lets the model retouch, a lot of noise lets it re-imagine the image, and there is no mask to guarantee any region survives.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

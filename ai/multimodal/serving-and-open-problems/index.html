@@ -1,0 +1,388 @@
+---
+title: "Serving and evaluating multimodal systems"
+description: "Encoder disaggregation and caching, the prefill-and-decode inversion an image causes, the cost model, safety, and the open problems."
+permalink: "/ai/multimodal/serving-and-open-problems/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-legend { font-size: 11.5px; opacity: 0.72; margin-top: 8px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Serving and evaluating multimodal systems</h1>
+    <p>A text request is a stream of tokens that arrives and is answered. A multimodal request &mdash; one that carries an image alongside its text &mdash; has a second workload hiding inside it: before the language model sees a single image token, a vision encoder has to turn the pixels into them. The encoder is the vision tower from earlier in this volume: the half of the system that cuts an image into patches and turns each patch into a vector of numbers the language model can read. That encoder runs different kernels &mdash; different low-level GPU programs than the language model uses &mdash; has a different bottleneck, and can be cached independently. A bottleneck is whichever resource a stage is waiting on, and the two stages wait on different things: the encoder is limited by arithmetic, the decoding half by memory traffic, which is why the serving story for a vision-language model is not the language-model story with a longer prompt. This part prices the request, splits the encoder from the decoder, caches the embeddings that repeat (the vectors the encoder outputs, which depend only on the picture), and then turns to the two things the arithmetic cannot settle: safety, and the open problems the field has not closed. The first half is engineering, where a measurement settles the question; the second half is judgement, where it does not.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Where the cost is</h2></div>
+    <p class="g-eyebrow">Encoder, prefill and decode are three different bills</p>
+    <p>A multimodal request is paid for in three stages, and it is worth separating them because each one is limited by a different resource. The <em>encoder</em> runs the vision tower over every patch, a compute-bound convolution-plus-attention pass over the whole image. Being compute-bound means the stage is limited by how fast the GPU can perform arithmetic rather than by how fast it can move data. The <em>prefill</em> then runs the language stack over the image tokens and the text prompt at once, which is compute-bound and carries the quadratic attention term. Prefill is the single first pass in which the model reads the whole prompt before it generates anything, and its attention term is quadratic because every token in that prompt compares itself with every other token, so doubling the prompt length roughly quadruples that part of the work. The <em>decode</em> finally generates the answer one token at a time, re-reading the whole KV cache on every step, which is bandwidth-bound. The KV cache is the running notebook of keys and values the model keeps for everything it has already read, so it does not redo the prompt for every new word, and decode is bandwidth-bound because it spends its time moving that notebook out of memory rather than doing arithmetic on it. The sizes are very different: an image of two thousand tokens is a large prefill and a permanently larger cache, so the request drifts from the decode-heavy shape a chat turn has toward a prefill-and-cache-heavy shape. That is the inversion an image causes, and <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18</a> of the serving guide states it for a text workload.</p>
+    <p>The plot draws all three against image size, so you can watch the balance between them shift as the image grows. Encoder time is linear in the token count and divided by the encoder pool, where a pool is the set of identical GPU workers the stage is spread across; image encodes are independent of each other, so they parallelise cleanly across that pool. Prefill is roughly quadratic in the young sequence, because at that point the prompt is short and the quadratic attention term is still modest compared with the per-token projections. Decode grows with the cache that the image tokens leave behind, and that cache does not shrink once the prompt is read. The readout turns the three into a total and names the moment when the encoder is a large enough share of it to be worth pulling onto its own pool, which is the decision the next step makes properly. Until it is, the encoder shares the language pool and its cost hides inside the decode-heavy total.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="srv-cost-canvas" width="470" height="280"></canvas>
+        <p class="g-canvas-hint">Encoder, prefill and decode time against image tokens, from <code>Multimodal.cost.prefillFlops</code> and <code>Multimodal.cost.kvBytes</code>. The marker is the current image size.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Image tokens <span class="val">2048</span></label><input type="range" id="srv-it" min="0" max="4096" step="256" value="2048"></div>
+        <div class="g-field"><label>Concurrency <span class="val">8</span></label><input type="range" id="srv-conc" min="1" max="64" step="1" value="8"></div>
+        <div class="g-field"><label>Encoder pool size <span class="val">4</span></label><input type="range" id="srv-pool" min="1" max="8" step="1" value="4"></div>
+        <div class="g-readout" id="srv-cost-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> separate the encoder, prefill and decode bills for one request, explain why an image inverts the prefill-and-decode ratio, decide when to run the encoder on its own pool, quantify the saving from caching repeated embeddings, and name the open problems in evaluation and safety. Together those five skills are the whole serving picture: what a request costs, how to split it, how to avoid repeating work, and what the arithmetic leaves to judgement.</span></div>
+    <div class="g-toc">
+      <a href="#disagg">2 · Disaggregating the encoder</a>
+      <a href="#cache">3 · Caching embeddings</a>
+      <a href="#safety">4 · Safety</a>
+      <a href="#open">5 · Open problems</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="disagg">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Disaggregating the encoder</h2></div>
+    <p class="g-eyebrow">A different bottleneck on a different pool</p>
+    <p>The encoder and the decoder want opposite things from a GPU, and that opposition is the whole reason to consider separating them. Batching means running many requests through the hardware at once so it is kept busy. The encoder processes a whole image at once, so it saturates compute and prefers large batches of images; the decoder processes one token at a time, so it is memory-bandwidth-bound and prefers a large batch of sequences. Memory-bandwidth-bound means the stage is limited by how quickly keys and values can be moved out of memory, not by how many arithmetic operations it can perform. Running both on the same devices means they interfere: an image encode arrives, takes the SMs &mdash; the streaming multiprocessors, the GPU's arithmetic units &mdash; for a few milliseconds, and stalls every decode step that was mid-flight, spiking the inter-token latency for every other user. Inter-token latency is the delay between one generated word and the next, and it is what a person actually feels when a reply types out slowly, so a single burst of image work can raise it for every conversation sharing the machine. This is the same argument that produced prefill-decode disaggregation in <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">LLM Serving, Part 13</a>, applied one stage earlier. Disaggregation here means running the two kinds of work on separate pools of devices instead of the same ones.</p>
+    <p>Disaggregating the encoder gives it its own pool, sized for image throughput, and ships the resulting embeddings to the language pool over the fabric. Throughput here means how many images the pool can encode per second, as opposed to how quickly any single one of them finishes, and the fabric is the high-speed interconnect, such as InfiniBand or NVLink, that joins the machines in a serving cluster. An embedding is the vector an image patch becomes after the encoder has processed it, so a two-thousand-token image is two thousand such vectors, each as wide as the model's hidden dimension. The trade is the transfer: embeddings are large &mdash; thousands of vectors of the model's width &mdash; so the link has to carry them faster than the encoder would have blocked the decoder for it to be a win. The bars compare a co-located request, where encoder and decoder share the same devices, with a disaggregated one at the current settings; the readout says whether the encoder is a large enough share of the bill to justify the split, and how many workers the pool has.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="srv-disagg-canvas" width="470" height="220"></canvas>
+        <p class="g-canvas-hint">Total request time when the encoder shares the decode pool (it blocks) and when it runs on its own pool (it overlaps, at the cost of shipping embeddings).</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="srv-disagg-readout"></div>
+        <p class="g-mini">The encoder is only worth disaggregating when it is a meaningful share of the request. For a small image on an idle GPU the transfer costs more than the block it removes.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Disaggregation moves the bottleneck, it does not remove it.</b> A dedicated encoder pool sized for peak image traffic sits idle on a text-only hour, and a pool sized for the average queues images at the peak. As with prefill-decode splitting, the win is a goodput win under a mixed load, not a free speedup. Goodput counts the requests that complete within their target time rather than the raw rate, so the gain shows up as fewer stalls across all users, not as a shorter encode.</span></div>
+  </section>
+
+  <section class="g-step" id="cache">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Caching embeddings</h2></div>
+    <p class="g-eyebrow">The same image should be encoded once</p>
+    <p>Many multimodal workloads send the same image again and again, and the repetition is often invisible from the vantage point of any single request. A document assistant re-uploads the same page as the conversation moves; a computer-use agent screenshots an interface that has not changed; a batch job runs a hundred questions against one chart. In all of those the encoder is doing identical work, and its output &mdash; the image's embedding vectors &mdash; depends only on the pixels and the encoder weights, not on the question being asked about them. An encoder cache exploits exactly that: caching those embeddings, keyed by a hash of the image so identical pixels map to the same entry, turns a repeated encode into a memory read, exactly as prefix caching turns a repeated prompt into a KV read in <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">LLM Serving, Part 8</a>. The saving is bounded by the hit rate &mdash; the fraction of requests whose image is already in the cache &mdash; which is a property of the workload rather than of the model, so the same cache is worth far more to a document assistant than to a camera that never sees the same photograph twice. The cost is the cache's memory: embeddings are image tokens times the model's width, which for a two-thousand-token image is tens of megabytes apiece.</p>
+    <p>The plot shows request time as the hit rate rises. At zero every request encodes; at one the encoder never runs for a repeat and only the prefill and decode remain, so the curve flattens at the cost of those two stages and cannot fall below it. The marker is the hit rate on the slider, and the readout reports the encoder time saved and the size of one cached image, which is the memory the cache spends per distinct picture it remembers.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="srv-cache-canvas" width="470" height="250"></canvas>
+        <p class="g-canvas-hint">Request time against encoder-cache hit rate at the current settings. The dashed line is the no-cache total; the curve is what caching removes in proportion to the hits.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Encoder cache hit rate <span class="val">40%</span></label><input type="range" id="srv-hit" min="0" max="100" step="1" value="40"></div>
+        <div class="g-readout" id="srv-cache-readout"></div>
+        <p class="g-mini">Caching is a workload bet. Screenshots and documents repeat and cache well; one-shot photographs do not, and the cache is pure memory cost.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Two caches, two keys.</b> An encoder cache is keyed by the image and saves the vision tower; a prefix cache is keyed by the token sequence and saves the language model's KV. A multimodal request can hit both, and the two evolve on different timescales because the image changes far less often than the conversation does. Keeping them separate is also what makes each saving legible: a miss in one need not evict the other.</span></div>
+  </section>
+
+  <section class="g-step" id="safety">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Safety</h2></div>
+    <p class="g-eyebrow">The pixels are an instruction channel too</p>
+    <p>Text alignment is trained on text, and a multimodal model accepts a second input channel that was never part of that training. Alignment here means teaching the model, from examples of harmful and harmless exchanges, which requests to decline. Two consequences follow, and both are architectural rather than incidental. First, the vision path is a new attack surface: an adversarial perturbation, a pattern of tiny pixel changes computed against the model and invisible to a person, can push a model past its refusal behaviour, because the perturbation is optimised in the same gradient space the language model reads. A refusal is the trained response in which the model declines a request instead of carrying it out, and defeating one this way is what the field calls a jailbreak. Second, and more directly exploitable, any text rendered inside an image is instructions to the model. A screenshot, a scanned form, a web page, a PDF, a caption burned into a video frame &mdash; all of them can carry a phrase that the model reads and obeys, with no user ever typing it.</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent-2);">Image jailbreaks</div>
+        <h3 style="margin:6px 0;">Pixels that flip a refusal</h3>
+        <p style="margin-bottom:0;">Optimised perturbations added to an image can suppress a model's safety training, so a request that would be refused in text succeeds when the same content is smuggled through the vision channel. The reason the attack transfers is that the perturbation rides in on the pixels but is computed against the model's own gradients, so it targets the same weights that the refusal behaviour was trained into. The defence is the same one text alignment uses &mdash; training on the attack, adding those perturbed images to the refusal examples &mdash; and it is a moving target, because the attack is re-optimised against each new defence and a defence that has not seen the latest perturbation is unlikely to hold.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent-2);">Prompt injection</div>
+        <h3 style="margin:6px 0;">Text in an image is untrusted input</h3>
+        <p style="margin-bottom:0;">This failure is called indirect prompt injection: a document or a screenshot can contain a sentence addressed to the model, and the model has no reliable way to tell it from the user's instruction, because to the language model both arrive as ordinary tokens in the same context window. When the model can also <a href="{{ '/ai/multimodal/grounding/' | relative_url }}">ground and click</a>, the injected instruction becomes an action rather than a topic: an adversarial page can ask a computer-use agent to exfiltrate data or open a file. To exfiltrate is to move data out of the system to somewhere the attacker can read it. Untrusted images must be treated as untrusted code.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Grounding converts a description into a capability.</b> A model that can only caption an injected instruction is a nuisance; a model that can ground it to a button and click is an agent acting on someone else's sentence. The permission boundary, not the model's refusal training, is what has to hold, which shifts the question from what the model can be persuaded to say to what the surrounding system allows it to touch.</span></div>
+  </section>
+
+  <section class="g-step" id="open">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Open problems</h2></div>
+    <p class="g-eyebrow">What the arithmetic does not settle</p>
+    <p>The engineering questions in this part have answers, which is why the cost model, the split and the cache can all be written down and tuned. The questions below do not, and they are the ones a practitioner should carry out of the volume. They are open in the specific sense that a plausible design choice exists for each and no benchmark yet decides between them. The six below are the ones this volume leaves unsettled: contaminated evaluation, the understanding-versus-generation settlement, grounding precision, resolution against cost, end-to-end evaluation of agents, and safety for a grounded model. That makes them worth knowing precisely because they are the places where a confident opinion is more likely to be a preference than a result.</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <h3 style="margin:6px 0;">Evaluation that is not contaminated</h3>
+        <p style="margin-bottom:0;">MMMU, MathVista, DocVQA, ChartQA and MMBench are the benchmarks &mdash; standardised test sets &mdash; behind the scores quoted in model cards, and each has a way of leaking. A benchmark leaks when something other than the ability it names can produce a good score: knowledge-heavy items answerable from the question text alone, template charts shared between train and test, documents solvable by OCR alone, and judges whose bias is part of the score. A high number with no held-out set is weak evidence: held-out means the test items were deliberately kept out of training, so a model that has never seen them cannot be scoring from memory. Freshly collected, dynamically generated, or adversarially held-out evaluations are the direction, and none is standard yet.</p>
+      </div>
+      <div class="g-card reveal">
+        <h3 style="margin:6px 0;">The understanding and generation settlement</h3>
+        <p style="margin-bottom:0;">The objective conflict from <a href="{{ '/ai/multimodal/unified-models/' | relative_url }}">the unified-model part</a> is unresolved. That conflict is between training one model to understand images and to generate them, when the two directions pull on the shared representation in different ways. Separate heads, continuous latent heads, and mixture-of-experts trunks are all live positions: a head is the small output layer that turns the trunk's shared representation into predictions, and a mixture-of-experts trunk splits the network into many expert subnetworks and routes each token to a few of them, so different parts can specialise. There is no clean benchmark that says which representation best serves both directions at once. Every unified model is a point on a line nobody has measured the whole of.</p>
+      </div>
+      <div class="g-card reveal">
+        <h3 style="margin:6px 0;">Grounding precision and reliability</h3>
+        <p style="margin-bottom:0;">Coordinate tokens set a hard precision floor, because a location written as a discrete token can only land on a smallest rectangle the vocabulary can express. On top of that floor, the boxes and masks a model emits are not consistently calibrated: the same query returns a tight box on one image and a loose one on the next, so the reported region cannot be trusted to the same degree twice. A mask is the finer-grained alternative to a box, an outline of the object at pixel level rather than a rectangle around it. For an interface agent a few pixels is the difference between a click and a miss, and there is no standard method for bounding that error the way a latency SLO &mdash; a service-level objective, the agreed target for response time &mdash; bounds a serving system.</p>
+      </div>
+      <div class="g-card reveal">
+        <h3 style="margin:6px 0;">Resolution against cost</h3>
+        <p style="margin-bottom:0;">Native-resolution encoders keep the detail that documents and charts need, and every token of it is paid for at prefill and again on every decode step. Native resolution means patching the image at its own size instead of shrinking it to a fixed square, and the merge and pruning tricks of <a href="{{ '/ai/multimodal/resolution/' | relative_url }}">the token-budget part</a> are the two ways to buy back room: merging groups neighbouring patches into one token, while pruning drops the uninformative ones outright. Either way the right point on that trade depends on the task and the context in a way no single architecture has settled, since a photographed contract and a casual snapshot are the same kind of input to the model but want very different token budgets. FastV is the complementary move on the inference side: it drops a large fraction of image tokens after an early language-model layer, ranked by the attention they actually receive, so the saving is made at serve time on the tokens the prompt produced rather than at train time on every input the way <a href="{{ '/ai/multimodal/resolution/' | relative_url }}#merge">the merge</a> does.</p>
+      </div>
+      <div class="g-card reveal">
+        <h3 style="margin:6px 0;">End-to-end evaluation of agents</h3>
+        <p style="margin-bottom:0;">A VLA &mdash; a vision-language-action model, one that turns what it sees and reads into motor commands &mdash; or a computer-use agent is graded on task success, which depends on the environment, the controller and the retries as much as on the model. That is the difficulty: the score is not a property of the model alone, so a change in the lab, the robot, or the website can move it without any change to the model. Reproducing a robot result on new hardware, or a web-agent result on a changed site, is still harder than it should be, so cross-system comparison is weak.</p>
+      </div>
+      <div class="g-card reveal">
+        <h3 style="margin:6px 0;">Safety for a grounded model</h3>
+        <p style="margin-bottom:0;">Refusal training assumes the dangerous content arrives as a request. A multimodal agent breaks that assumption twice: it reads instructions from images, where the text is content rather than a turn in a conversation, and it acts on them, so declining to say something is no longer the only thing at stake. The relevant boundary is therefore the set of capabilities the system is allowed to exercise, not the set of phrases the model is trained to decline.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These sources cover the serving split this part reuses, the caching it borrows, and the two safety failures that are specific to a channel that carries instructions as pixels. Read the first two together and the pattern is visible: the same argument that justified splitting prefill from decode justifies separating the encoder one stage earlier, and the same idea of a reusable cache applies to a repeated image as it does to a repeated prompt prefix.</p>
+    <ul class="g-refs">
+      <li>Yinmin Zhong, Shengyu Liu, Junda Chen and coauthors, <a href="https://arxiv.org/abs/2401.09670">"DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving"</a>, OSDI 2024 &mdash; the prefill-decode split that encoder disaggregation extends one stage earlier.</li>
+      <li>Ruoyu Qin, Zheming Li, Weiran He and coauthors, <a href="https://arxiv.org/abs/2407.00079">"Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving"</a>, 2024 &mdash; the KVCache store, the prefix-cache counterpart to the embedding cache here.</li>
+      <li>Xiangyu Qi, Kaixiong Zhou, Yiming Li and coauthors, <a href="https://arxiv.org/abs/2306.13213">"Visual Adversarial Examples Jailbreak Aligned Large Language Models"</a>, 2023 &mdash; a perturbation optimised in pixel space that defeats text-only alignment.</li>
+      <li>Kai Greshake, Sahar Abdelnabi, Shailesh Mishra and coauthors, <a href="https://arxiv.org/abs/2302.12173">"Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection"</a>, 2023 &mdash; instructions hidden in retrieved content, the mechanism a screenshot injection reuses.</li>
+      <li>LLM Serving, <a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13: Disaggregation</a> and <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18: Workloads</a> &mdash; the pooling and the prefill/decode accounting this part applies to vision.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Encoder stage</td><td>Running the vision tower over the patches; compute-bound and divisible across a pool</td></tr>
+        <tr><td>Prefill</td><td>Running the language stack over image plus text tokens at once; carries the quadratic term</td></tr>
+        <tr><td>Decode</td><td>One token at a time, re-reading the enlarged KV cache; bandwidth-bound</td></tr>
+        <tr><td>The inversion</td><td>An image makes a request prefill- and cache-heavy where a chat turn is decode-heavy</td></tr>
+        <tr><td>Encoder disaggregation</td><td>Its own pool, sized for image throughput, with embeddings shipped to the language pool</td></tr>
+        <tr><td>Embedding cache</td><td>Reusing a vision tower's output for a repeated image, keyed by the picture</td></tr>
+        <tr><td>Prefix cache</td><td>Reusing the language model's KV for a repeated token prefix; the other half of the pair</td></tr>
+        <tr><td>Image jailbreak</td><td>A pixel perturbation that suppresses refusal behaviour trained on text</td></tr>
+        <tr><td>Indirect injection</td><td>An instruction a model reads from content rather than from the user; a screenshot is content</td></tr>
+        <tr><td>Open problems</td><td>Contamination-proof evaluation, the objective settlement, grounding calibration, cost against resolution, agent evaluation, and safety for a grounded model</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the end of the volume: seeing, gluing, one trunk, and then grounding, acting and serving. You have followed an image from pixels to tokens, from tokens into a shared space with language, and from there into a system that reasons, points and acts, and at each stage you have seen what the work costs and where it can go wrong. The glossary collects every term and the tables behind the numbers, so the definitions and the arithmetic sit in one place when you come back to them.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var TEXT = 128, OUT = 64, LAYERS = 32, D = 4096, FF = 11008, KVH = 8, HEADDIM = 128;
+  var PREFILL_RATE = 4e11;
+  var ENC_RATE = 40;
+  var BW = 3.35e9;
+
+  var it = 2048, conc = 8, pool = 4, hit = 0.4;
+
+  function kvB(seq) { return MM.cost.kvBytes(seq, LAYERS, KVH, HEADDIM, 2); }
+  function prefillMs(seq, C) { return MM.cost.prefillFlops(seq, LAYERS, D, FF) / PREFILL_RATE * (1 + C / 40); }
+  function decodeMs(seq, C) { return OUT * kvB(seq) * C / BW; }
+  function encMs(n, C, E) { return n / (ENC_RATE * E) * (1 + C / (E * 24)); }
+  function ms(v) { return v.toFixed(1) + ' ms'; }
+
+  // ---- 1. cost model -------------------------------------------------------
+  var costPlot = GM.plot(document.getElementById('srv-cost-canvas'), {
+    W: 470, H: 280, xRange: [0, 4096], yRange: [0, 1],
+    xLabel: 'image tokens', yLabel: 'time (ms)',
+    onResize: function () { drawCost(); }
+  });
+  function drawCost() {
+    if (!costPlot) return;
+    var xMax = 4096;
+    var maxV = Math.max(encMs(xMax, conc, pool), prefillMs(xMax + TEXT, conc), decodeMs(xMax + TEXT, conc));
+    costPlot.xRange[0] = 0; costPlot.xRange[1] = xMax;
+    costPlot.yRange[0] = 0; costPlot.yRange[1] = maxV * 1.15 || 1;
+    costPlot.clear();
+    costPlot.axes({ xLabel: 'image tokens', yLabel: 'time (ms)' });
+    costPlot.curve(function (x) { return encMs(x, conc, pool); }, { color: c.accent400, width: 2.2, samples: 40 });
+    costPlot.curve(function (x) { return prefillMs(x + TEXT, conc); }, { color: c.accent, width: 2.4, samples: 40 });
+    costPlot.curve(function (x) { return decodeMs(x + TEXT, conc); }, { color: c.accent2, width: 2.4, samples: 40 });
+    costPlot.vline(it, { color: c.text, dashed: true, width: 1.2, label: it + ' tok', labelY: costPlot.yRange[1] * 0.9 });
+    costPlot.legend([
+      { label: 'encoder', color: c.accent400 },
+      { label: 'prefill', color: c.accent },
+      { label: 'decode', color: c.accent2 }
+    ], { dy: 6 });
+    var e = encMs(it, conc, pool), p = prefillMs(it + TEXT, conc), dd = decodeMs(it + TEXT, conc);
+    var total = e + p + dd;
+    var share = total > 0 ? e / total : 0;
+    var el = document.getElementById('srv-cost-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">image tokens</span> ' + it + ' · text ' + TEXT + '</div>' +
+        '<div><span class="k">encoder</span> ' + ms(e) + ' (' + Guide.fmtPct(share, 0) + ' of the bill)</div>' +
+        '<div><span class="k">prefill</span> ' + ms(p) + '</div>' +
+        '<div><span class="k">decode</span> ' + ms(dd) + '</div>' +
+        '<div><span class="k">total</span> <span class="hi">' + ms(total) + '</span></div>' +
+        '<div><span class="k">decision</span> ' + (share > 0.15 ? 'encoder large enough to justify its own pool' : 'encoder small; a dedicated pool would sit idle') + '</div>' +
+        '<div class="g-mini">An image grows the prefill and the KV cache the decode reads, which is the inversion: a chat turn is decode-heavy, an image-heavy request is not.</div>';
+    }
+  }
+
+  // ---- 2. encoder disaggregation ------------------------------------------
+  var disaggSetup = Guide.setupCanvas(document.getElementById('srv-disagg-canvas'), 470, 220, function () { drawDisagg(); });
+  function drawDisagg() {
+    if (!disaggSetup) return;
+    var ctx = disaggSetup.ctx, W = 470, H = 220;
+    ctx.clearRect(0, 0, W, H);
+    var e = encMs(it, conc, pool), p = prefillMs(it + TEXT, conc), dd = decodeMs(it + TEXT, conc);
+    var colocated = e + p + dd;
+    var transfer = 0.1 * e;
+    var decodePath = p + dd;
+    var disaggregated = Math.max(decodePath, e) + transfer;
+    var critical = e > decodePath;
+    var maxV = Math.max(colocated, disaggregated) * 1.15 || 1;
+    Guide.drawBars(ctx, W, H, [
+      { label: 'co-located', value: colocated, valueLabel: ms(colocated), color: c.accent400 },
+      { label: 'disaggregated', value: disaggregated, valueLabel: ms(disaggregated), color: c.accent }
+    ], { padL: 116, padR: 96, padT: 46, padB: 18, maxV: maxV, gap: 22, fontSize: 12 });
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('encoder ' + ms(e) + ' blocks decode when co-located · own pool overlaps it · transfer ' + ms(transfer), 12, 22);
+    ctx.restore();
+    var el = document.getElementById('srv-disagg-readout');
+    if (el) {
+      var speedup = disaggregated > 0 ? colocated / disaggregated : 1;
+      el.innerHTML =
+        '<div><span class="k">encoder pool</span> ' + pool + ' worker' + (pool === 1 ? '' : 's') + '</div>' +
+        '<div><span class="k">co-located total</span> ' + ms(colocated) + '</div>' +
+        '<div><span class="k">disaggregated total</span> <span class="hi">' + ms(disaggregated) + '</span></div>' +
+        '<div><span class="k">encoder</span> ' + (critical ? 'on the critical path; grow the pool' : 'fully hidden behind prefill + decode') + '</div>' +
+        '<div><span class="k">latency speedup</span> ' + speedup.toFixed(2) + '×, plus a pool to provision</div>' +
+        '<div class="g-mini">On its own pool the encoder overlaps the language work instead of blocking it. The latency win is the encoder time minus the transfer; the real cost is a pool sized for peak that idles on a text-only hour.</div>';
+    }
+  }
+
+  // ---- 3. embedding cache --------------------------------------------------
+  var cachePlot = GM.plot(document.getElementById('srv-cache-canvas'), {
+    W: 470, H: 250, xRange: [0, 1], yRange: [0, 1],
+    xLabel: 'encoder cache hit rate', yLabel: 'request time (ms)',
+    onResize: function () { drawCache(); }
+  });
+  function cacheTotal(h) {
+    return prefillMs(it + TEXT, conc) + decodeMs(it + TEXT, conc) + encMs(it, conc, pool) * (1 - h);
+  }
+  function drawCache() {
+    if (!cachePlot) return;
+    var e = encMs(it, conc, pool), p = prefillMs(it + TEXT, conc), dd = decodeMs(it + TEXT, conc);
+    var hi = p + dd + e, lo = p + dd;
+    cachePlot.yRange[0] = 0; cachePlot.yRange[1] = hi * 1.15 || 1;
+    cachePlot.clear();
+    cachePlot.axes({ xLabel: 'encoder cache hit rate', yLabel: 'request time (ms)' });
+    cachePlot.hline(hi, { color: c.divider, dashed: true, width: 1.2, label: 'no cache', labelX: 0.02 });
+    cachePlot.curve(function (h) { return cacheTotal(h); }, { color: c.accent, width: 2.6, samples: 40 });
+    cachePlot.vline(hit, { color: c.text, dashed: true, width: 1.2, label: Guide.fmtPct(hit, 0), labelY: cachePlot.yRange[1] * 0.9 });
+    var now = cacheTotal(hit);
+    var embedBytes = it * D * 2;
+    var el = document.getElementById('srv-cache-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">hit rate</span> <span class="hi">' + Guide.fmtPct(hit, 0) + '</span></div>' +
+        '<div><span class="k">encoder time</span> ' + ms(e) + ' per miss, 0 on a hit</div>' +
+        '<div><span class="k">time saved</span> ' + ms(e * hit) + '</div>' +
+        '<div><span class="k">request time</span> ' + ms(now) + ' (no cache ' + ms(hi) + ')</div>' +
+        '<div><span class="k">one cached image</span> ' + Guide.fmtBytes(embedBytes, 1) + '</div>' +
+        '<div class="g-mini">The saving is the hit rate times the encoder time; the cost is a cache entry this size for every distinct image. Documents and screenshots repeat and cache well; one-shot photographs do not.</div>';
+    }
+  }
+
+  function redraw() { drawCost(); drawDisagg(); drawCache(); }
+
+  Guide.bindSliders(document.querySelectorAll('#srv-it'), function (el) {
+    it = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#srv-conc'), function (el) {
+    conc = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#srv-pool'), function (el) {
+    pool = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#srv-hit'), function (el) {
+    hit = parseInt(el.value, 10) / 100;
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = Guide.fmtPct(hit, 0);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'serving-inversion',
+      kind: 'choice',
+      prompt: 'Why does adding an image to a request invert the prefill-and-decode ratio?',
+      options: [
+        { label: 'The image adds a large block of prompt tokens that must all be prefilled, and that larger cache is then re-read on every decode step.', correct: true },
+        { label: 'The image is decoded token by token before the text prompt is read.', correct: false },
+        { label: 'The encoder replaces the prefill stage entirely, so only decode remains.', correct: false }
+      ],
+      explanation: 'A chat turn is decode-heavy. An image adds a big compute-bound prefill and a permanently larger KV cache that decode re-reads each step, so the request moves toward the prefill-and-cache-bound shape. That is the inversion.'
+    },
+    {
+      id: 'serving-encoder-share-numeric',
+      kind: 'numeric',
+      prompt: 'A request costs 20 ms in the encoder, 30 ms in prefill and 50 ms in decode. What percentage of the total is the encoder?',
+      answer: 20,
+      tolerance: 0.5,
+      explanation: 'The total is 20 + 30 + 50 = 100 ms, so the encoder is 20 / 100 = 20 percent. That share is what decides whether a dedicated encoder pool is worth the embedding transfer.'
+    },
+    {
+      id: 'serving-disagg',
+      kind: 'choice',
+      prompt: 'What is the trade in splitting the encoder onto its own pool?',
+      options: [
+        { label: 'It stops the encoder from blocking in-flight decode steps, but the embeddings must be shipped over the fabric and the pool is sized for peak or for the mean.', correct: true },
+        { label: 'It removes the encoder cost entirely, so the split is always a pure win.', correct: false },
+        { label: 'It makes the encoder memory-bandwidth-bound like decode, so the two pools become identical.', correct: false }
+      ],
+      explanation: 'Disaggregation removes the interference between a compute-bound encode and a bandwidth-bound decode, at the cost of transferring the embeddings and provisioning a separate pool. Like prefill-decode splitting it is a goodput win under a mixed load, not a free speedup.'
+    },
+    {
+      id: 'serving-injection',
+      kind: 'choice',
+      prompt: 'Why is text rendered inside an image a safety problem for a grounded agent?',
+      options: [
+        { label: 'The model reads the text as an instruction, and if it can ground and click, an injected sentence can become an executed action.', correct: true },
+        { label: 'Rendered text is invisible to the model, so the risk is only in the caption.', correct: false },
+        { label: 'Images cannot contain text at the resolution a vision tower uses.', correct: false }
+      ],
+      explanation: 'A multimodal model accepts a second instruction channel that alignment training did not anticipate. A screenshot can carry a sentence addressed to the model, and grounding plus a click turns that sentence into a real action. Untrusted images must be treated as untrusted input.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

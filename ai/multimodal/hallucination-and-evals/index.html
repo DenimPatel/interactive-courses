@@ -1,0 +1,417 @@
+---
+title: "Why vision-language models hallucinate"
+description: "Objects that were never there, attention sinks on image tokens, the language prior overriding the pixels, and the benchmarks that measure it."
+permalink: "/ai/multimodal/hallucination-and-evals/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-legend { font-size: 11.5px; opacity: 0.72; margin-top: 8px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Why vision-language models hallucinate</h1>
+    <p>A vision-language model is a system that takes an image as input and writes text about it, and if you ask one what is in a picture it will often describe a perfectly plausible scene that is not the one in front of it: a person who is not there, a cup that is only a shadow, a caption lifted from the distribution of captions rather than from the pixels. That failure has a name. A <em>hallucination</em> is a confident, fluent statement that the evidence does not support &mdash; here, text about an image that the image itself does not justify. This is not a decoding accident, meaning a one-off slip produced when the model chooses its next word, and it is not limited to a few bad checkpoints, meaning a few unlucky saved sets of trained weights. It follows from the way these models are built. The text half is a language model with a strong <em>language prior</em> &mdash; a learned expectation about which words and objects usually go together, distilled from an enormous amount of text &mdash; and that prior is conditioned on an image whose tokens it may only partly use. The analogy to keep in mind is autocomplete finishing a plausible sentence: given "a man sat down at the table and picked up his", the next word is almost certainly a fork or a glass, whether or not those things are in the scene you actually asked about. This part separates the two forces, the prior and the pixels; shows where attention actually goes; and looks at the benchmarks &mdash; standardized test sets used to score models &mdash; that try to measure the difference.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="what">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>What hallucinations are</h2></div>
+    <p class="g-eyebrow">Confident, fluent, and not in the picture</p>
+    <p>An <em>object hallucination</em> is a named object that does not appear in the image, stated with the fluency of something that does. If the model says "a dog on the sofa" and there is no dog, that is an object hallucination even though the sentence is grammatical and confident. It is worth separating from a wrong answer, because the mechanism is different, and the fix may be different too. A wrong answer can come from a failure to understand the question, from a genuinely ambiguous image, or from a reasoning error; a clearer question or a better picture might repair it. A hallucination is specifically a claim that outruns the evidence in the pixels: the model is not confused about the answer, it is asserting content the image never supplied. Models produce them most readily for objects that are common in their training captions and plausible in the scene &mdash; a phone on a desk, a person at a table &mdash; because those are exactly the continuations the language model prefers. That is the autocomplete effect once more: the sentence is easy to finish, and ease of finishing is not the same thing as truth.</p>
+    <p>Three families are usually distinguished, and naming them helps you diagnose which one you are looking at. <em>Object</em> hallucination invents or misnames a thing, such as reporting a laptop where there is only a book. <em>Attribute</em> hallucination gets the colour or count wrong, such as calling three cups two, or describing a blue shirt as red. <em>Relation</em> hallucination puts real objects in the wrong spatial arrangement, such as saying the cup is to the left of the plate when it is to the right. Notice that in the last two cases every object named may genuinely be present; the error lies in a property of those objects or in the geometry between them, which makes these failures harder to catch by checking the object list alone. All three share a tell: the model's statement is more consistent with typical training text than with this particular image. The scene below makes the point with an abstract picture and a caption; drag the prior slider and watch the caption acquire an object the picture does not contain, while the picture itself never changes.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hal-scene-canvas" width="300" height="300"></canvas>
+        <p class="g-canvas-hint">A procedural scene from <code>GenMedia.img.circles</code> drawn with <code>GenMedia.raster</code>. Green labels name objects that are present; red labels are objects the language prior supplies.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Language prior strength <span class="val">0.6</span></label><input type="range" id="hal-prior" min="0" max="10" step="1" value="6"></div>
+        <div class="g-readout" id="hal-scene-readout"></div>
+        <p class="g-mini">A low prior leaves the caption grounded in the blobs that are actually there; a high prior lets the model complete the scene with what it expects to see.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> define object, attribute and relation hallucination, explain how a language prior can override pixel evidence, read an attention map for the sink behaviour that starves image tokens, and judge what a benchmark like MMMU or DocVQA actually measures. (Pixel evidence means what the image tokens actually support, and an attention map is a heatmap of how strongly each text query looks at each image token.)</span></div>
+    <div class="g-toc">
+      <a href="#prior">2 · The language prior</a>
+      <a href="#attention">3 · Attention over image tokens</a>
+      <a href="#measure">4 · Measuring it</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="prior">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The language prior</h2></div>
+    <p class="g-eyebrow">What the model expects, against what the pixels say</p>
+    <p>A vision-language model's answer is not a function of the image alone. It is a function of two probability distributions: what the language model expects to be talking about, and what the image tokens provide as evidence. One way to picture this is to imagine the model holding two score sheets at once. The first is the language prior: how likely each object is to be the subject of the sentence, judged from text alone. The second is the pixel evidence: how strongly the image tokens support that object. To produce an answer the model has to combine them. When the two agree, the model is confident and usually right. When they disagree, the answer depends on how strongly each is weighted, and that weighting is not a design choice made by the practitioner &mdash; it is baked in by the pretraining, the data mixture and the fine-tuning. Pretraining is the earlier, large-scale training that gave the model its general knowledge; the data mixture is the blend of examples used in the later stages; fine-tuning is the final, smaller round of training on task data. The bars below make the disagreement explicit. The blue bars are the language prior over six candidate objects; the pink bars are the evidence in the image. The marker is the model's combined claim as the prior is turned up, so you can watch the winning object flip from one the pixels support to one only the text expects.</p>
+    <p>There is an asymmetry that makes the failure systematic rather than random. The prior is shared across every image and was trained on vastly more text than the visual pathway was trained on images, so it is the older and more practised of the two habits. The evidence is narrow and specific, and it is compressed twice before the language model ever sees it: once by the vision tower, the half of the system that turns pixels into vectors, and again by the merge, the step that condenses a large grid of image tokens into a smaller set. By the time the language model reads the image, much of the fine detail is already gone, and it is working from a short summary rather than the full picture. A prior that is merely a little stronger therefore wins on exactly the objects that are plausible but absent, which is the definition of a hallucination. Grounding training &mdash; teaching the model to point at where in the image its answer comes from, as if circling the answer on the page &mdash; and preference tuning, which trains on pairs of better and worse answers, are both attempts to rebalance this equation; neither removes it, because neither changes the fact that the text habit is the broader one.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hal-prior-canvas" width="470" height="270"></canvas>
+        <p class="g-canvas-hint">Language prior and pixel evidence over the candidate objects, with the model's combined claim marked. The prior and the evidence are each normalised, then mixed geometrically by the slider.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="hal-prior-readout"></div>
+        <p class="g-legend"><span class="g-swatch" style="background:#2b5fff;"></span>language prior&nbsp;&nbsp;<span class="g-swatch" style="background:#d6006c;"></span>pixel evidence&nbsp;&nbsp;<span class="g-swatch" style="background:#c9a227;"></span>combined claim</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The prior is strongest where the evidence is weakest.</b> Objects that are common in captions are also the ones the model is most willing to assert without support, because it has seen them in so many similar scenes. That is why the hallucinated objects are rarely strange; they are the expected ones. When you are auditing a model, that tells you to probe the ordinary furniture of a scene &mdash; the phone, the chair, the laptop &mdash; and not only the exotic details.</span></div>
+  </section>
+
+  <section class="g-step" id="attention">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Attention over image tokens</h2></div>
+    <p class="g-eyebrow">Where the model actually looks</p>
+    <p>If the language prior were the whole story, a model that attends carefully to the image would be immune. It is not, because attention itself is uneven. Attention is the mechanism by which each token decides how much to read from every other token, and the weights it assigns form a probability distribution: they are all positive and they sum to one, so attention is a fixed budget that has to be spent somewhere. Transformer attention has a well-documented tendency to park that budget on a few positions &mdash; usually the first token or two, and some special tokens &mdash; that carry little information. These <em>attention sinks</em> act as a place to put "no opinion": a spot the model can dump weight on when it has nothing specific to look at. The behaviour is not a flaw the designers intended but a consequence of the softmax, which has to distribute a row of weights across every available position even when none of them is a useful match; over training the model turns a few low-information positions into a convenient resting spot. The behaviour was first described in text-only models and it persists into multimodal ones, where the sequence begins with a long block of image tokens. A few image tokens soak up a large share of the attention, and the tokens that contain the object you asked about are left with a thin slice of the remaining mass. The model looks like it is attending to the image; in aggregate it is attending mostly to itself.</p>
+    <p>Because the weights in a row sum to one, a large weight in one column has to come out of the others, which is why a sink is not a harmless curiosity. The heatmap below shows attention from text queries to image tokens, with a few sink columns. Turn the sink strength up and the real columns fade; that is the mechanism by which a correct answer to an easy question coexists with an invented object in the same caption. The model can read the easy feature and still miss the small object, because the easy feature happened to sit in a column that survived the sinks. The practical consequence is that adding more image tokens does not automatically make the model use them &mdash; at some point the added tokens dilute the ones that matter, spreading the same limited budget across a longer sequence.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hal-attn-canvas" width="440" height="300"></canvas>
+        <p class="g-canvas-hint">Attention from text queries (rows) to 64 image tokens (columns), from a seeded stream. Sharp yellow columns are attention sinks; the rest is the evidence the model is actually reading.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sink strength <span class="val">1.0</span></label><input type="range" id="hal-sink" min="0" max="10" step="1" value="5"></div>
+        <div class="g-readout" id="hal-attn-readout"></div>
+        <p class="g-mini">Sinks are a normal property of trained transformers, not a bug in one model. What varies is how much of the image's information survives them.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Attention maps explain, they do not excuse.</b> A sparse or sink-heavy map tells you why an answer ignored a region, which is useful for debugging. It does not by itself prove the model used the tokens it attended to, and attention weight is not the same as causal influence: a weight records how much a query looked at a key, not whether the information behind that key changed the final answer.</span></div>
+  </section>
+
+  <section class="g-step" id="measure">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Measuring it</h2></div>
+    <p class="g-eyebrow">A benchmark measures the task, and the task leaks</p>
+    <p>Evaluation means scoring a model on a fixed task so that two models can be compared on the same footing, and hallucination is measured in two ways: directly, by asking a model to describe an image and counting the objects that are not there, and indirectly, through benchmarks whose questions cannot be answered without looking. The direct methods &mdash; CHAIR, POPE and their descendants &mdash; are the cleanest, because they control the image and score the claim. CHAIR, short for Caption Hallucination Assessment with Image Relevance, takes a caption the model wrote and divides the number of invented objects by the number of objects it mentioned. POPE, short for Polling-based Object Probing Evaluation, asks a long list of yes-or-no questions of the form "is there a chair?", deliberately mixing objects that are present, objects that are absent, and objects that merely tend to co-occur. The indirect methods are the ones quoted in model cards, and each of them has a specific way of leaking. A multiple-choice question with a plausible option can sometimes be answered from the text of the question alone; a chart question drawn from a template lets a language model guess from the title; a document benchmark can be partly solved by an OCR system &mdash; optical character recognition, which reads text out of an image &mdash; with no vision-language reasoning at all. The price of the direct methods is that they need a reference caption and a trusted list of which objects are truly present, so they measure caption fluency as well as honesty; the indirect methods avoid that labour, but as a result they leave room to be passed without looking at the picture. A benchmark that can be gamed this way still produces a number, which is exactly why the number needs a caveat attached.</p>
+    <table class="g-cheat">
+      <thead><tr><th>Benchmark</th><th>What it measures</th><th>Main caveat</th></tr></thead>
+      <tbody>
+        <tr><td>MMMU</td><td>College-level reasoning across diagrams, charts, tables and figures</td><td>Knowledge-heavy; many items are answerable from the question text and subject knowledge without the image</td></tr>
+        <tr><td>MathVista</td><td>Mathematical reasoning grounded in visual contexts</td><td>Solvable from text for a fraction of items; contamination from public solution text is hard to rule out</td></tr>
+        <tr><td>DocVQA</td><td>Question answering over scanned documents</td><td>Mostly an OCR test; needs high resolution, and saturating on the leading models</td></tr>
+        <tr><td>ChartQA</td><td>Reasoning about values and trends in charts</td><td>Template-generated charts and augmented training data create leakage between train and test</td></tr>
+        <tr><td>MMBench</td><td>Many abilities, scored by a language-model judge</td><td>Judge bias and answer-style sensitivity; the score moves with the judge as well as the model</td></tr>
+      </tbody>
+    </table>
+    <div class="g-warn">⚠ <span><b>Contamination changes the meaning of a score.</b> If a benchmark's questions and answers were in the training data, the score measures recall of the benchmark rather than the ability it names. Web-scraped training corpora make this the default assumption until a provider shows a held-out or freshly collected set, where held-out means the test items were deliberately kept out of training so the model has never seen them. A high score with no contamination analysis is weaker evidence than a modest score with one. A modest score from a clean, freshly collected set is therefore real evidence about ability, while a large score from a contaminated set may only show that the test was seen before.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Every part of the pipeline contributes</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Compression</div>
+        <h3 style="margin:6px 0;">The token budget sets the ceiling</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/multimodal/resolution/' | relative_url }}">merge and tiling choices</a> decide how much pixel evidence survives to the language model. Compress aggressively and the small object the question is about may be one vector among many, averaged together with everything around it; the prior then has less to argue against, because the signal that would have contradicted it has been smoothed away. This is the fixed-size suitcase problem from the resolution discussion: a tighter pack fits into fewer tokens, but whatever you leave out cannot be recovered later.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Training</div>
+        <h3 style="margin:6px 0;">The mixture sets the prior</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/multimodal/training-a-vlm/' | relative_url }}">data mixture</a> is what fixes the language prior, and preference tuning is the rebalancing act that follows. A model trained mostly on short captions hallucinates differently from one trained on long instruction answers: the caption model tends to name the most typical object for the scene, while the instruction model tends to keep talking and to elaborate. That is why a hallucination is a clue about the training data, not only about the image in front of the model. Reasoning-tuned VLMs bought with group-relative RL &mdash; reinforcement learning that scores each attempt against the other samples drawn for the same prompt rather than against a fixed target &mdash; trade hallucination behaviour for accuracy and verbosity: they spend more tokens and more latency, and the extra reasoning both catches some invented objects and talks itself into others, so the hallucination rate is a property of the reward mix, not only the data mixture, as <a href="{{ '/ai/multimodal/training-a-vlm/' | relative_url }}#rl">the RL stage</a> makes plain.</p>
+      </div>
+    </div>
+    <p>The interface is implicated too: the <a href="{{ '/ai/multimodal/adapters/' | relative_url }}">bridge</a> decides how much of the vision tower's signal reaches the language model at all. A projector passes the vectors through more or less intact, whereas a Q-Former &mdash; a small module that reads the image with a fixed set of learned queries &mdash; returns only as many vectors as it has queries, so its query count is a hard cap on how many distinct things the model can be told. When a hallucination appears, the honest ordering of suspects is the mixture, the token budget, the bridge, and only then the decoding settings, where decoding means the choices made at generation time, such as how the next word is sampled. That order matters because decoding settings change the packaging of an answer far more than they change what the model knows: sampling more cautiously can make a model repeat itself or hedge, but it cannot put an object into the image.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The work below defines object hallucination, measures it with direct probes, traces it to the language prior, and shows how attention sinks behave in trained transformers. Read them in that order and the arc runs from a careful definition, to a benchmark that counts the errors, to a diagnosis of why they happen, and finally to the mechanism inside attention that lets some image tokens be ignored.</p>
+    <ul class="g-refs">
+      <li>Anna Rohrbach, Lisa Anne Hendricks, Kaylee Burns and coauthors, <a href="https://arxiv.org/abs/1809.02156">"Object Hallucination in Image Captioning"</a>, 2018 &mdash; CHAIR, the first systematic count of objects that were never in the image.</li>
+      <li>Yifan Li, Yifan Du, Kun Zhou and coauthors, <a href="https://arxiv.org/abs/2305.10355">"Evaluating Object Hallusion in Large Vision-Language Models"</a>, 2023 &mdash; POPE, polling-based probing that separates presence, absence and co-occurrence.</li>
+      <li>Zhiqing Xiao, Qingyan Guo, Yancheng He and coauthors, <a href="https://arxiv.org/abs/2402.09179">"Can We See Like a Language Model? A Survey on Hallucination in Large Vision-Language Models"</a>, 2024 &mdash; a taxonomy of object, attribute and relation hallucination and the training-side causes.</li>
+      <li>Guangxuan Xiao, Yuandong Tian, Beidi Chen and coauthors, <a href="https://arxiv.org/abs/2309.17453">"Efficient Streaming Language Models with Attention Sinks"</a>, 2023 &mdash; the sink phenomenon that multimodal attention inherits.</li>
+      <li>Xiang Yue, Yuansheng Ni, Kai Zhang and coauthors, <a href="https://arxiv.org/abs/2311.16502">"MMMU: A Massive Multi-discipline Multimodal Understanding and Reasoning Benchmark"</a>, 2023 &mdash; the benchmark whose knowledge-heavy items make the text-prior caveat concrete.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Object hallucination</td><td>Naming a thing that is not in the image</td></tr>
+        <tr><td>Attribute hallucination</td><td>Getting a colour, material or count wrong</td></tr>
+        <tr><td>Relation hallucination</td><td>Real objects placed in the wrong spatial relationship</td></tr>
+        <tr><td>Language prior</td><td>The model's expectation of what is being discussed, from text pretraining and the data mixture</td></tr>
+        <tr><td>Pixel evidence</td><td>What the image tokens actually support, after compression and the bridge</td></tr>
+        <tr><td>Attention sink</td><td>A few positions that absorb a large share of attention without carrying information</td></tr>
+        <tr><td>CHAIR / POPE</td><td>Direct hallucination measures; POPE polls presence, absence and co-occurrence</td></tr>
+        <tr><td>Contamination</td><td>Benchmark items present in training data, so the score measures recall, not ability</td></tr>
+        <tr><td>Judge bias</td><td>A model-scored benchmark moves when the judge changes, not only the model</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the vision-and-language half of the volume. You have followed an image from pixels to tokens, from tokens to a shared space with language, and now to the failure modes that survive the whole pipeline. The series contents page collects every part alongside the modality zoo, the generation material and the appendix glossary.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var OBJECTS = ['person', 'phone', 'cup', 'mug', 'book', 'plant'];
+  var PRIOR = [0.34, 0.24, 0.14, 0.10, 0.10, 0.08];
+  var EVIDENCE = [0.02, 0.03, 0.05, 0.42, 0.31, 0.17];
+  var SINKS = [0, 1, 32, 63];
+  var SCENE_ACTUAL = ['mug', 'book', 'plant'];
+  var SCENE_EXTRA = ['person', 'phone'];
+
+  var priorW = 0.6;
+  var sinkLevel = 1.0;
+
+  var SCENE_SIZE = 28;
+  var sceneImg = GM.img.circles(SCENE_SIZE, 11, 3);
+
+  function normalise(v) {
+    var s = 0, i;
+    for (i = 0; i < v.length; i++) s += v[i];
+    var out = [];
+    for (i = 0; i < v.length; i++) out.push(v[i] / (s || 1));
+    return out;
+  }
+
+  function combinedClaim(w) {
+    var p = normalise(PRIOR), e = normalise(EVIDENCE), logits = [];
+    for (var i = 0; i < p.length; i++) {
+      var lp = Math.log(p[i] + 1e-9), le = Math.log(e[i] + 1e-9);
+      logits.push((1 - w) * le + w * lp);
+    }
+    return Guide.softmax(logits, 1);
+  }
+
+  function argmax(v) {
+    var best = 0;
+    for (var i = 1; i < v.length; i++) if (v[i] > v[best]) best = i;
+    return best;
+  }
+
+  function fmtPctSafe(v) { return Guide.fmtPct(v, 1); }
+
+  // ---- 1. scene ------------------------------------------------------------
+  var sceneRaster = GM.raster(document.getElementById('hal-scene-canvas'), {
+    cols: SCENE_SIZE, rows: SCENE_SIZE, channels: 3, W: 300, H: 300,
+    onResize: function () { drawScene(); }
+  });
+
+  function drawScene() {
+    if (!sceneRaster) return;
+    sceneRaster.fromArray(sceneImg.data);
+    sceneRaster.draw();
+    var ctx = sceneRaster.ctx;
+    var nExtra = Math.round(priorW * SCENE_EXTRA.length);
+    ctx.save();
+    ctx.font = '12px ' + c.font;
+    var y = 22;
+    ctx.fillStyle = '#1f7a3d'; ctx.textAlign = 'left';
+    ctx.fillText('present: ' + SCENE_ACTUAL.join(', '), 10, y);
+    y += 18;
+    for (var i = 0; i < nExtra; i++) {
+      ctx.fillStyle = c.accent2;
+      ctx.fillText('claimed: ' + SCENE_EXTRA[i] + ' (not there)', 10, y);
+      y += 18;
+    }
+    ctx.restore();
+    var el = document.getElementById('hal-scene-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">objects present</span> ' + SCENE_ACTUAL.length + '</div>' +
+        '<div><span class="k">claimed absent objects</span> <span class="bad">' + nExtra + '</span></div>' +
+        '<div><span class="k">prior strength</span> ' + priorW.toFixed(1) + '</div>' +
+        '<div class="g-mini">The picture never changes. Only the strength of what the language model expects to see does.</div>';
+    }
+  }
+
+  // ---- 2. prior vs evidence ------------------------------------------------
+  var priorSetup = Guide.setupCanvas(document.getElementById('hal-prior-canvas'), 470, 270, function () { drawPrior(); });
+
+  function drawPrior() {
+    if (!priorSetup) return;
+    var ctx = priorSetup.ctx, W = 470, H = 270;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 44, padR = 16, padT = 40, padB = 46;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var n = OBJECTS.length, groupW = plotW / n, barW = groupW * 0.28;
+    var p = normalise(PRIOR), e = normalise(EVIDENCE), combo = combinedClaim(priorW);
+    var maxV = 0.5;
+    var i;
+    for (i = 0; i < n; i++) { maxV = Math.max(maxV, p[i] * (0.4 + 0.6 * priorW), e[i], combo[i]); }
+    maxV *= 1.15;
+    ctx.save();
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    for (i = 0; i < n; i++) {
+      var gx = padL + i * groupW + groupW * 0.12;
+      var ph = plotH * (p[i] * (0.4 + 0.6 * priorW) / maxV);
+      var eh = plotH * (e[i] / maxV);
+      ctx.fillStyle = c.accent;
+      ctx.fillRect(gx, padT + plotH - ph, barW, ph);
+      ctx.fillStyle = c.accent2;
+      ctx.fillRect(gx + barW + 3, padT + plotH - eh, barW, eh);
+      ctx.fillStyle = '#c9a227';
+      ctx.beginPath();
+      ctx.arc(gx + barW + 1.5, padT + plotH - plotH * combo[i] / maxV, 4, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(OBJECTS[i], gx + barW + 2, padT + plotH + 14);
+    }
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('probability', padL - 4, padT - 12);
+    ctx.restore();
+    var el = document.getElementById('hal-prior-readout');
+    if (el) {
+      var ci = argmax(combo), pi = argmax(p), ei = argmax(e);
+      var grounded = ci === ei;
+      el.innerHTML =
+        '<div><span class="k">prior argmax</span> ' + OBJECTS[pi] + '</div>' +
+        '<div><span class="k">evidence argmax</span> <span class="hi">' + OBJECTS[ei] + '</span></div>' +
+        '<div><span class="k">combined claim</span> <span class="' + (grounded ? 'hi' : 'bad') + '">' + OBJECTS[ci] + ' (' + fmtPctSafe(combo[ci]) + ')</span></div>' +
+        '<div><span class="k">grounded?</span> ' + (grounded ? 'yes' : 'no — the prior won') + '</div>' +
+        '<div class="g-mini">The claim is the geometric mixture of prior and evidence. As the prior weight rises, the most likely object flips from one the image supports to one only the text expects.</div>';
+    }
+  }
+
+  // ---- 3. attention sinks --------------------------------------------------
+  var attnSetup = Guide.setupCanvas(document.getElementById('hal-attn-canvas'), 440, 300, function () { drawAttn(); });
+
+  function isSink(col) {
+    for (var i = 0; i < SINKS.length; i++) if (SINKS[i] === col) return true;
+    return false;
+  }
+
+  function attnMatrix() {
+    var R = 8, P = 64, r = GM.rng(4242), out = [];
+    for (var q = 0; q < R; q++) {
+      var row = [];
+      for (var p = 0; p < P; p++) {
+        var base = isSink(p) ? sinkLevel * 3 : 0.02;
+        var signal = (p % 9 === q * 2 % 9) ? 0.22 : 0;
+        row.push(base + signal + 0.03 * Math.abs(GM.gauss(r)));
+      }
+      out.push(Guide.softmax(row, 1));
+    }
+    return out;
+  }
+
+  function drawAttn() {
+    if (!attnSetup) return;
+    var m = attnMatrix();
+    var sinkSum = 0, total = 0, maxV = 0;
+    m.forEach(function (row) {
+      row.forEach(function (v, p) {
+        total += v;
+        if (isSink(p)) sinkSum += v;
+        if (v > maxV) maxV = v;
+      });
+    });
+    Guide.drawHeatmap(attnSetup.ctx, 440, 300, m, {
+      min: 0, max: maxV || 1, colorLow: [234, 240, 255], colorHigh: [201, 162, 39], fontSize: 9
+    });
+    var ctx = attnSetup.ctx;
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('text query × 64 image tokens · 4 sink columns', 8, 14);
+    ctx.restore();
+    var el = document.getElementById('hal-attn-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">sink columns</span> ' + SINKS.length + ' of 64</div>' +
+        '<div><span class="k">attention on sinks</span> <span class="bad">' + fmtPctSafe(sinkSum / (total || 1)) + '</span></div>' +
+        '<div><span class="k">on real tokens</span> ' + fmtPctSafe(1 - sinkSum / (total || 1)) + '</div>' +
+        '<div><span class="k">sink strength</span> ' + sinkLevel.toFixed(1) + '</div>' +
+        '<div class="g-mini">Four positions out of sixty-four absorb a disproportionate share. The object the question is about may be sitting in a column that is receiving a few percent of the attention.</div>';
+    }
+  }
+
+  function redraw() { drawScene(); drawPrior(); drawAttn(); }
+
+  Guide.bindSliders(document.querySelectorAll('#hal-prior'), function (el) {
+    priorW = parseInt(el.value, 10) / 10;
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = priorW.toFixed(1);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#hal-sink'), function (el) {
+    sinkLevel = parseInt(el.value, 10) / 5;
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = sinkLevel.toFixed(1);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'hallucination-object',
+      kind: 'choice',
+      prompt: 'What distinguishes an object hallucination from an ordinary wrong answer?',
+      options: [
+        { label: 'The model names something that is not in the image, stated with normal fluency.', correct: true },
+        { label: 'The model refuses to answer, which counts as a hallucination of a refusal.', correct: false },
+        { label: 'The model gives the right object but the wrong colour.', correct: false }
+      ],
+      explanation: 'An object hallucination is a claim that outruns the pixels: a thing is named that is not present. A wrong colour is an attribute hallucination, and a refusal is neither.'
+    },
+    {
+      id: 'hallucination-prior',
+      kind: 'choice',
+      prompt: 'Why does the language prior tend to win against pixel evidence for plausible-but-absent objects?',
+      options: [
+        { label: 'The prior is shared across all images and trained on far more text, while the evidence is compressed and task-specific.', correct: true },
+        { label: 'The image tokens are removed from the sequence before generation, so there is no evidence.', correct: false },
+        { label: 'The softmax in the attention layers always assigns the largest weight to the first token.', correct: false }
+      ],
+      explanation: 'The prior is broad and strongly trained; the evidence is narrow and already compressed by the vision tower and the merge. For objects that are common in captions and plausible here, that asymmetry is enough for the prior to override a weak signal.'
+    },
+    {
+      id: 'hallucination-sinks',
+      kind: 'choice',
+      prompt: 'What is an attention sink in this context?',
+      options: [
+        { label: 'A few positions that absorb a large share of attention while carrying little information, starving the image tokens.', correct: true },
+        { label: 'A patch of the image that the vision encoder dropped during the merge.', correct: false },
+        { label: 'A token the language model repurposes to store the image once the KV cache is full.', correct: false }
+      ],
+      explanation: 'Trained transformers park attention mass on a small number of low-information positions. In a multimodal sequence that starts with many image tokens, the effect is that a handful of them take most of the attention and the informative columns get very little.'
+    },
+    {
+      id: 'hallucination-benchmark',
+      kind: 'numeric',
+      prompt: 'A benchmark has 400 questions, and 65% of them can be answered correctly from the question text and subject knowledge without looking at the image. How many genuinely require the image?',
+      answer: 140,
+      tolerance: 1,
+      explanation: 'The text-answerable fraction is 0.65 × 400 = 260, so 400 − 260 = 140 questions genuinely depend on the image. If the reported score does not separate those items, part of it measures the language prior, not multimodal understanding.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,751 @@
+---
+title: "Evaluating and shipping"
+description: "What FID, FVD and CLIPScore each miss, preference models and Elo arenas, memorisation and attribution, provenance with SynthID and C2PA, and the serving economics underneath."
+permalink: "/ai/generative-media/evaluation-and-provenance/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Evaluating and shipping</h1>
+    <p>A generative model produces a picture, and a picture is not a number. Everything in this guide so far was measurable: a loss, a schedule, a token count, a step size. The moment the output is an image or a clip, the honest measurements get harder, and the field's substitutes for them &mdash; FID, FVD, CLIPScore, preference models, arena Elo &mdash; are each a proxy with a specific blind spot. This part is about those blind spots, about the images a model reproduces rather than generates, about the provenance machinery that is supposed to say where a picture came from, and about the serving arithmetic that decides whether any of it is affordable.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="metrics">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>What the metrics measure</h2></div>
+    <p class="g-eyebrow">Three numbers, three different questions</p>
+    <p><b>FID</b> embeds a set of real images and a set of generated images with an Inception network, fits a Gaussian to each cloud of feature vectors, and reports the Fr&eacute;chet distance between the two Gaussians, $\mathrm{FID} = \lVert \mu_r - \mu_g \rVert^2 + \mathrm{Tr}\!\left(\Sigma_r + \Sigma_g - 2(\Sigma_r \Sigma_g)^{1/2}\right)$. <b>FVD</b> does the same with a video feature extractor. Both measure the <em>marginal</em> distribution of outputs: how much the cloud of generations looks like the cloud of photographs. Neither is shown the prompt. A model that ignores conditioning entirely and emits a diverse pile of plausible photographs can post a better FID than a model that follows every instruction, because instruction-following changes the conditional distribution while FID only looks at the pooled one. That is the first blind spot, and it is not a bug in the implementation; it is what the metric is.</p>
+    <p>The second blind spot is that a single scalar is diagnostically empty. A model whose faces melt, one that cannot count, and one that ignores half the prompt can share a score, and the number gives no clue which failure you have. Add the estimator's own noise: FID is biased upward at small sample sizes, it moves with the feature extractor and its resizing and quantisation, and it is not comparable across papers that preprocessed differently. FVD inherits all of it and adds a feature extractor that mixes spatial and temporal quality, so a temporal flicker and a blurry frame land in the same scalar.</p>
+    <p><b>CLIPScore</b> asks a different question: it is the cosine $\cos(\phi_\mathrm{img}(x), \phi_\mathrm{text}(c))$ between the image embedding and the text embedding, so it measures alignment, not realism. A cluttered image that contains every noun in the prompt scores highly while humans find it ugly; a beautiful, minimal, on-brief photograph can score lower because it does not show the literal objects. The point cloud below makes the divergence concrete: CLIP is computed for a set of samples, a human-preference proxy is drawn for the same samples, and the two can rank them in opposite orders.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ev-score-canvas" width="620" height="300"></canvas>
+        <p class="g-canvas-hint">CLIPScore against a human-preference proxy, three prompt families, drawn with <code>GenMedia.plot</code>. The line is the least-squares fit over all samples.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="ev-score-readout"></div>
+        <p class="g-mini">Each point is one generated sample drawn from a seeded stream. The orange family is prompt-literal but cluttered: CLIP likes it, the preference proxy does not. Pooling the three families gives a weak, misleading correlation &mdash; here r is about 0.3 &mdash; even though both quantities are meaningful inside each family.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say what FID, FVD and CLIPScore each measure and what each cannot see, explain how preference models and arena Elo are built and how they are biased, describe how memorisation is measured and what attribution can and cannot prove, place SynthID, C2PA and the EU marking obligations in relation to one another, and do the serving arithmetic for steps, precision and batch size.</span></div>
+    <div class="g-toc">
+      <a href="#preferences">2 · Preference models and arenas</a>
+      <a href="#memorisation">3 · Memorisation and attribution</a>
+      <a href="#provenance">4 · Provenance and regulation</a>
+      <a href="#serving">5 · Serving economics</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="preferences">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Preference models and arenas</h2></div>
+    <p class="g-eyebrow">Asking a model what a person would have chosen</p>
+    <p>A preference model is trained on human choices rather than on captions. Pick-a-Pic collected hundreds of thousands of comparisons on user-written prompts, HPS and its successor trained on the HPD v2 dataset, and the resulting scorers &mdash; PickScore among them &mdash; predict which of two images a person preferred. They correlate with human judgement noticeably better than CLIPScore does, and they are cheap and differentiable, which is exactly why they are dangerous: a differentiable proxy gets optimised, and a generator tuned against PickScore learns PickScore's quirks rather than human taste. The score also inherits the annotator pool, the prompt distribution and the interface that produced the comparisons. It is a statement about a particular population on a particular set of prompts, not a property of the image.</p>
+    <p>Human arenas take the other route. Users are shown two anonymous outputs to the same prompt, vote, and the votes are fitted with a Bradley&ndash;Terry model whose ratings are usually reported on an Elo scale. GenAI-Arena is the generative-media instance of the pattern. Elo is honest about what it is &mdash; a ranking inferred from pairwise votes &mdash; and it has all the classic fragilities: it is a <em>relative</em> scale that drifts as the pool of models changes, a small prompt set or a self-selected voter population shifts it, ties and abstentions have to be handled by a rule, and a model that wins by being visually striking rather than correct does well unless style is regressed out. The demo below simulates the arithmetic, including a deliberate bias: one model is given a prompt-set advantage it did not earn, and its rating climbs anyway.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ev-arena-canvas" width="620" height="260"></canvas>
+        <p class="g-canvas-hint">Elo fitted from simulated pairwise votes, drawn with <code>Guide.drawBars</code>. Bars start at 1100 so the spread is visible; the labels are the ratings themselves.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Pairwise votes <span class="val">240</span></label><input type="range" id="ev-arena-battles" min="40" max="1200" step="40" value="240"></div>
+        <div class="g-field"><label>Prompt-set bias on Kestrel <span class="val">0</span></label><input type="range" id="ev-arena-bias" min="0" max="100" step="5" value="0"></div>
+        <div class="g-readout" id="ev-arena-readout"></div>
+      </div>
+    </div>
+    <table class="g-cheat" style="margin-top:14px;">
+      <thead><tr><th>Rating sketch</th><th>Typical value</th><th>What it is a statement about</th></tr></thead>
+      <tbody>
+        <tr><td>FID (image sets)</td><td>single digits to ~30, lower better</td><td>the pooled distribution of outputs, conditioning ignored</td></tr>
+        <tr><td>CLIPScore</td><td>~0.25 to ~0.35 cosine</td><td>text&ndash;image alignment only, quality ignored</td></tr>
+        <tr><td>PickScore / HPS v2</td><td>~0.20 to ~0.24 probability</td><td>the choices of a specific annotator population</td></tr>
+        <tr><td>Arena Elo</td><td>~1100 to ~1300, mean pinned</td><td>pairwise votes over a prompt set and a model pool</td></tr>
+      </tbody>
+    </table>
+    <div class="g-warn">⚠ <span><b>An Elo lead is not a quality guarantee.</b> Ratings are relative, they are computed on the prompt set the arena happened to collect, they move when a strong model joins the pool, and any differentiable scorer will be gamed once it is used as a training signal. Report the prompt set, the vote count and the confidence interval, or the number means very little.</span></div>
+  </section>
+
+  <section class="g-step" id="memorisation">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Memorisation and attribution</h2></div>
+    <p class="g-eyebrow">When the model outputs a copy</p>
+    <p>Diffusion models do reproduce their training data. Carlini and coauthors extracted on the order of a hundred near-verbatim training images from Stable Diffusion by prompting for them, and Somepalli and coauthors found that replication concentrates on images that appear many times in the training set and are atypical for their caption. The mechanism is duplication in the data: a picture seen hundreds of times is a low-loss point for the denoiser, and the model can converge to reconstructing it almost exactly. De-duplicating the corpus and conditioning on richer captions both reduce it, which is why data curation is an evaluation topic rather than only a training one.</p>
+    <p>The measurement is a nearest-neighbour search. Embed the generation, embed the training set, and record the maximum cosine similarity $\max_{z \in \mathcal{D}} \cos(f(x), f(z))$. For an ordinary prompt the nearest neighbour sits well below one; for a memorised prompt the distribution grows a second mode close to one. The demo simulates a hundred prompts against a small training set and lets you raise the effective duplication, which is what a crawled corpus with near-duplicates looks like. Anything above roughly 0.9 in a feature space like this is the region where a lawyer and an auditor both want to look.</p>
+    <p>Attribution tries to answer the next question: which training items, if any, made this output. Influence functions attempt it by estimating how the loss on an output would change if a training item were removed; retrieval methods simply report the nearest neighbours with their captions; membership-inference methods ask whether a given image was in the training set at all. All of them are noisy and all of them are contested. Deduplication, licensed or opt-out corpora, and provenance recorded at creation time are the practical responses, because a metric that fires after the fact cannot un-train a model.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ev-memo-canvas" width="620" height="280"></canvas>
+        <p class="g-canvas-hint">Distribution of the maximum training-set cosine similarity over 96 prompts, from <code>GenMedia.attn.cosine</code>. Bins past the dashed line are near-duplicates.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Training duplication <span class="val">3</span>×</label><input type="range" id="ev-memo-dup" min="1" max="8" step="1" value="3"></div>
+        <div class="g-readout" id="ev-memo-readout"></div>
+        <p class="g-mini">The spike near one is the memorised mode. Raising duplication grows it; de-duplication removes it without changing the ordinary prompts.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>A low similarity proves nothing either.</b> Feature-space similarity is not the legal test &mdash; substantial similarity of protectable expression is &mdash; and a high score is not by itself proof of copying. Treat the number as a triage signal: it tells you which generations deserve a human and a lawyer, not what a court would say.</span></div>
+  </section>
+
+  <section class="g-step" id="provenance">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Provenance and regulation</h2></div>
+    <p class="g-eyebrow">Watermarks live in pixels, manifests live in metadata</p>
+    <p><b>SynthID</b> is the pixel-side answer. Rather than appending a tag after generation, it biases the sampling process so that the residual the sampler leaves behind carries a key-dependent, spatially distributed pattern. Detection correlates the image against the key, which is why the signal survives operations that a tag would not: a crop keeps the part of the pattern inside the crop, resizing keeps its frequency structure, and lossy compression attenuates but does not erase it. Formally the detector reports $z = \sqrt{n}\,\mathrm{corr}(v, k)$ for the retained pixels $v$ and the key $k$, so the statistic falls only with the square root of the retained pixel count. The demo below embeds a tiled key into a small procedural image and lets you crop it, then runs the correlation detector on two key layouts &mdash; a distributed one and a single corner tag. The distributed signal keeps verifying after a crop; the corner tag dies as soon as its corner is outside the crop.</p>
+    <p><b>C2PA</b> is the metadata-side answer, and it is a different trade. Content Credentials are a signed manifest attached to the file describing who created it, with which tool, and what edits were applied. The cryptography is strong: a manifest cannot be forged without the signer's key. It is also fragile in exactly the wrong place, because most social platforms strip metadata on upload, so a screenshot usually arrives with no manifest at all and the absence of a credential says nothing about the content. That is why the two techniques are complements rather than substitutes: a manifest is authoritative while it is attached, and a watermark is weaker but travels with the pixels.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ev-wm-canvas" width="300" height="300"></canvas>
+        <p class="g-canvas-hint">A watermarked procedural image (<code>GenMedia.raster</code>). The dashed square is the retained crop; the small box in the corner is the localised tag.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="ev-wm-plot" width="320" height="300"></canvas>
+        <p class="g-canvas-hint">Detector z-score against the retained fraction, for the distributed key and for the corner tag. Dashed line: the detection threshold. The tag carries far fewer carrier pixels at the same per-pixel amplitude, so its curve sits lower and needs more amplitude to reach the line at all.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Retained crop <span class="val">100</span>%</label><input type="range" id="ev-wm-crop" min="15" max="100" step="5" value="100"></div>
+        <div class="g-field"><label>Watermark amplitude (thousandths) <span class="val">20</span></label><input type="range" id="ev-wm-strength" min="5" max="50" step="5" value="20"></div>
+        <div class="g-readout" id="ev-wm-readout"></div>
+      </div>
+    </div>
+    <p>Regulation is the third leg, and it is the one with a date on it. <b>Article 50</b> of the EU AI Act sets transparency duties for providers and deployers of generative systems: providers must mark synthetic outputs in a machine-readable format, and deployers must label deepfakes. Those obligations bind from 2 August 2026. A machine-readable mark can be a watermark or a manifest, which is precisely why the two technical families matter beyond research: one of them has to survive contact with a platform that re-encodes every upload.</p>
+    <div class="g-warn">⚠ <span><b>The absence of a watermark is not evidence of authenticity.</b> A generated image can be washed through an edit that destroys the signal, re-photographed, or produced by a model that never embedded one. Provenance is positive evidence only: a verified mark says something; no mark says nothing.</span></div>
+  </section>
+
+  <section class="g-step" id="serving">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Serving economics</h2></div>
+    <p class="g-eyebrow">What an image actually costs on a GPU</p>
+    <p>An image is generated by a fixed number of forward passes of a large transformer, and each pass is compute-bound over thousands of latent tokens. The cost of one image is therefore roughly steps times FLOPs-per-step times the price of a GPU-second, divided by how well the hardware is actually used: $\text{cost} \propto s\,F / (\epsilon \cdot \text{peak})$ for $s$ steps, $F$ FLOPs per step and achieved efficiency $\epsilon$. The demo below prices a twelve-billion-parameter backbone at a four-thousand-token latent grid across three configurations, and the shape of the curves is the lesson: at batch one the GPU is under-occupied and per-image cost is high; as the batch grows the fixed weight read is amortised, efficiency rises toward its ceiling, and the curves flatten. Past that knee, more batch buys throughput headroom and latency smoothing rather than a cheaper image, because the arithmetic itself is now the limit.</p>
+    <p>The levers are the ones the rest of the guide has already built. <em>Fewer steps</em> is the largest: the distillation methods of the few-step part collapse fifty steps into one or four. <em>Step caching</em> is the cheapest: adjacent sampler steps produce similar features, so a cache that reuses a block's activations on the steps where the change is small can skip a substantial fraction of the work at a small quality cost, in the style of DeepCache and TeaCache. <em>Quantization</em> buys both bandwidth and FLOPs &mdash; FP8 weights and activations roughly double the arithmetic rate at a quality cost that has to be measured on images, not assumed from language-model results, because activation outliers behave differently in a vision backbone. <em>Batching</em> raises utilisation and absorbs arrival variance.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ev-cost-canvas" width="620" height="300"></canvas>
+        <p class="g-canvas-hint">Cost per thousand images against batch size, from the arithmetic in <code>GenMedia.cost</code>. Three configurations, one vline at the current batch.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sampler steps <span class="val">28</span></label><input type="range" id="ev-cost-steps" min="4" max="60" step="2" value="28"></div>
+        <div class="g-field"><label>Steps skipped by caching <span class="val">0</span>%</label><input type="range" id="ev-cost-cache" min="0" max="60" step="5" value="0"></div>
+        <div class="g-field"><label>Batch size <span class="val">8</span></label><input type="range" id="ev-cost-batch" min="1" max="32" step="1" value="8"></div>
+        <div class="g-readout" id="ev-cost-readout"></div>
+      </div>
+    </div>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Latency</div>
+        <h3 style="margin:6px 0;">The request-side view</h3>
+        <p style="margin-bottom:0;">A user waiting on one image cares about time to first pixel, not cost per thousand. Those two numbers trade against each other through batch size: large batches are cheap per image and slow per request. The serving guide's framing of latency budgets, queueing and goodput applies unchanged &mdash; <a href="{{ '/ai/llm-serving/' | relative_url }}">LLM Serving, Interactively</a> is the reference for the SLO arithmetic, the percentile discipline and the capacity planning that turns a per-image cost into a fleet size.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Levers</div>
+        <h3 style="margin:6px 0;">Where the seconds actually go</h3>
+        <p style="margin-bottom:0;">Steps dominate, so distillation and caching come first. Precision comes second: FP8 or FP4 weights and activations change the arithmetic rate, not the algorithm. Batch size comes third, and it is a utilisation lever with a knee rather than a slope. The <a href="{{ '/ai/generative-media/distillation/' | relative_url }}">few-step part</a> covers the step side and the <a href="{{ '/ai/generative-media/samplers/' | relative_url }}">samplers part</a> covers where the steps come from in the first place.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The evaluation literature is a sequence of proxies and their refutations. These are the primary sources for the metrics, the preference datasets and the arenas, the extraction results that made memorisation a first-class concern, and the provenance machinery that regulation now leans on.</p>
+    <p>Heusel and coauthors introduced FID; Unterthiner and coauthors carried the same construction to video as FVD; Hessel and coauthors proposed the reference-free CLIPScore. Kirstain and coauthors built Pick-a-Pic and PickScore; Wu and coauthors built HPS v2. Carlini and coauthors extracted training images from Stable Diffusion; Somepalli and coauthors characterised replication. On the provenance side, the SynthID papers and the C2PA specification define the two families of marking, and Article 50 of the EU AI Act supplies the deadline.</p>
+    <ul class="g-refs">
+      <li>Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, Sepp Hochreiter, <a href="https://arxiv.org/abs/1706.08500">"GANs Trained by a Two Time-Scale Update Rule Converge to a Local Nash Equilibrium"</a>, 2017 &mdash; the FID metric.</li>
+      <li>Thomas Unterthiner, Sjoerd van Steenkiste, Karol Kurach, Rapha&euml;l Marinier, Marcin Michalski, Sylvain Gelly, <a href="https://arxiv.org/abs/1812.01717">"Towards Accurate Generative Models of Video: A New Metric &amp; Challenges"</a>, 2018 &mdash; FVD.</li>
+      <li>Jack Hessel, Ari Holtzman, Maxwell Forbes, Ronan Le Bras, Yejin Choi, <a href="https://arxiv.org/abs/2104.08718">"CLIPScore: A Reference-free Evaluation Metric for Image Captioning"</a>, 2021 &mdash; the alignment metric this part criticises.</li>
+      <li>Yuval Kirstain, Adam Polyak, Uriel Singer, Shahbuland Matiana, Joe Penna, Omer Levy, <a href="https://arxiv.org/abs/2305.01569">"Pick-a-Pic: An Open Dataset of User Preferences for Text-to-Image Generation"</a>, 2023 &mdash; the preference dataset behind PickScore.</li>
+      <li>Xiaoshi Wu, Yiming Hao, Keqiang Sun, Yixiong Chen, Feng Zhu, Rui Zhao, Hongsheng Li, <a href="https://arxiv.org/abs/2306.09341">"Human Preference Score v2: A Solid Benchmark for Evaluating Human Preferences of Text-to-Image Synthesis"</a>, 2023 &mdash; HPS v2 and HPD v2.</li>
+      <li>Nicholas Carlini, Jamie Hayes, Milad Nasr, Matthew Jagielski, Vikash Sehwag, Florian Tram&egrave;r, Borja Balle, Daphne Ippolito, Eric Wallace, <a href="https://arxiv.org/abs/2301.13188">"Extracting Training Data from Diffusion Models"</a>, 2023 &mdash; near-verbatim extraction.</li>
+      <li>Gowthami Somepalli, Vasu Singla, Micah Goldblum, Jonas Geiping, Tom Goldstein, <a href="https://arxiv.org/abs/2212.03860">"Diffusion Art or Digital Forgery? Investigating Data Replication in Diffusion Models"</a>, 2022 &mdash; where replication comes from.</li>
+      <li>Sander Dieleman, <a href="https://arxiv.org/abs/2202.07481">"Guidance: a cheat code for diffusion models"</a> and the SynthID-Image technical report from Google DeepMind, 2023&ndash;2024 &mdash; the sampling-time watermark this part's demo models.</li>
+      <li>Coalition for Content Provenance and Authenticity, <a href="https://c2pa.org/specifications/specifications/2.1/index.html">"C2PA Technical Specification"</a> and the <a href="https://www.eu-digital-services-act.com/">text of Regulation (EU) 2024/1689, Article 50</a> &mdash; content credentials and the marking obligation that binds from 2 August 2026.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>FID</td><td>Fr&eacute;chet distance between Gaussians of real and generated Inception features; marginal realism only, no conditioning, noisy at small n</td></tr>
+        <tr><td>FVD</td><td>The same construction on video features; spatial and temporal quality collapse into one number</td></tr>
+        <tr><td>CLIPScore</td><td>Cosine between CLIP image and text embeddings; alignment, blind to realism, anatomy and aesthetics</td></tr>
+        <tr><td>PickScore / HPS</td><td>Preference models trained on human choices; inherit the annotator pool and the prompt set, and are gamed once optimised against</td></tr>
+        <tr><td>Arena Elo</td><td>Bradley&ndash;Terry ratings from pairwise human votes; relative, prompt-set dependent, style-sensitive</td></tr>
+        <tr><td>Nearest-neighbour similarity</td><td>Maximum cosine to the training set; the memorisation signal that spikes above roughly 0.9</td></tr>
+        <tr><td>Attribution</td><td>Influence functions, retrieval and membership inference; noisy evidence, not a legal conclusion</td></tr>
+        <tr><td>SynthID</td><td>Key-dependent residual embedded during sampling; detected by correlation, survives crops and compression</td></tr>
+        <tr><td>C2PA</td><td>Signed provenance manifest in metadata; authoritative while attached, stripped by most platforms</td></tr>
+        <tr><td>Article 50</td><td>Machine-readable marking of synthetic output, binding from 2 August 2026</td></tr>
+        <tr><td>Step caching</td><td>Reusing backbone features across adjacent sampler steps; the cheapest server-side speedup</td></tr>
+        <tr><td>Serving levers</td><td>Fewer steps, then precision, then batch size; the first is a training decision, the last has a knee</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the guide: from noise to images, through the backbones, samplers, video and sound, and out to the unglamorous work of measuring, marking and serving what was made. The reference page holds every term and every table in one place.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, c = Guide.colors();
+  var F_ACC = c.accent, F_A4 = c.accent400, F_A2 = c.accent2, F_TX = c.text;
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // =========================================================================
+  // 1. CLIPScore against a human-preference proxy
+  // =========================================================================
+  var FAM = [
+    { name: 'portraits and products', color: F_ACC, kind: 'align' },
+    { name: 'landscapes', color: F_A4, kind: 'align' },
+    { name: 'prompt-literal posters', color: F_A2, kind: 'clutter' }
+  ];
+  var divPts = [];
+
+  function buildDivergence() {
+    var r = GM.rng(4101);
+    divPts = [];
+    for (var f = 0; f < FAM.length; f++) {
+      for (var i = 0; i < 16; i++) {
+        var q = r();
+        var clip = clamp(0.212 + 0.118 * q + 0.011 * GM.gauss(r), 0.201, 0.359);
+        var human;
+        if (FAM[f].kind === 'align') human = 1.4 + 3.2 * q + 0.40 * GM.gauss(r);
+        else human = 4.75 - 3.0 * (clip - 0.212) / 0.118 + 0.55 * GM.gauss(r);
+        divPts.push({ f: f, x: clip, y: clamp(human, 1, 5) });
+      }
+    }
+  }
+
+  function pearson(pts) {
+    var n = pts.length, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (var i = 0; i < n; i++) {
+      var x = pts[i].x, y = pts[i].y;
+      sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+    }
+    var cov = sxy - sx * sy / n, vx = sxx - sx * sx / n, vy = syy - sy * sy / n;
+    if (vx <= 1e-12 || vy <= 1e-12) return 0;
+    return cov / Math.sqrt(vx * vy);
+  }
+
+  function fitLine(pts) {
+    var n = pts.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (var i = 0; i < n; i++) { sx += pts[i].x; sy += pts[i].y; sxx += pts[i].x * pts[i].x; sxy += pts[i].x * pts[i].y; }
+    var vx = sxx - sx * sx / n;
+    var m = vx <= 1e-12 ? 0 : (sxy - sx * sy / n) / vx;
+    return { m: m, b: sy / n - m * sx / n };
+  }
+
+  var divPlot = GM.plot(document.getElementById('ev-score-canvas'), {
+    W: 620, H: 300, xRange: [0.20, 0.36], yRange: [1, 5],
+    xLabel: 'CLIPScore (image-text cosine)', yLabel: 'human preference (1 to 5)',
+    onResize: function () { drawDivergence(); }
+  });
+
+  function drawDivergence() {
+    if (!divPlot) return;
+    divPlot.clear();
+    divPlot.axes({ xLabel: 'CLIPScore (image-text cosine)', yLabel: 'human preference (1 to 5)' });
+    var fit = fitLine(divPts);
+    divPlot.curve(function (x) { return fit.b + fit.m * x; }, { color: F_TX, width: 1.6, dashed: true });
+    for (var f = 0; f < FAM.length; f++) {
+      var pts = [], colors = [];
+      for (var i = 0; i < divPts.length; i++) {
+        if (divPts[i].f === f) { pts.push([divPts[i].x, divPts[i].y]); colors.push(FAM[f].color); }
+      }
+      divPlot.points(pts, { color: FAM[f].color, r: 3.4, colors: colors });
+    }
+    divPlot.legend([
+      { label: FAM[0].name, color: FAM[0].color },
+      { label: FAM[1].name, color: FAM[1].color },
+      { label: FAM[2].name, color: FAM[2].color },
+      { label: 'least-squares fit over all 48 samples', color: F_TX, dashed: true }
+    ], { dx: 12, dy: 14 });
+  }
+
+  function redrawScoreReadout() {
+    var el = document.getElementById('ev-score-readout');
+    if (!el) return;
+    var all = pearson(divPts);
+    var first = [], best = divPts[0], bestRank = 1;
+    for (var i = 0; i < divPts.length; i++) {
+      if (divPts[i].f === 0) first.push(divPts[i]);
+      if (divPts[i].x > best.x) best = divPts[i];
+    }
+    for (i = 0; i < divPts.length; i++) if (divPts[i].y > best.y) bestRank++;
+    el.innerHTML =
+      '<div><span class="k">samples</span> ' + divPts.length + ' over ' + FAM.length + ' families</div>' +
+      '<div><span class="k">correlation, all families</span> <span class="bad">r = ' + all.toFixed(2) + '</span></div>' +
+      '<div><span class="k">correlation, portraits</span> <span class="hi">r = ' + pearson(first).toFixed(2) + '</span></div>' +
+      '<div><span class="k">top-CLIP sample</span> human rank ' + bestRank + ' of ' + divPts.length + '</div>' +
+      '<div class="g-mini">Both numbers are meaningful within a family and disagree across families. FID would see only the pooled cloud and report one number for all of it.</div>';
+  }
+
+  // =========================================================================
+  // 2. Elo from simulated pairwise votes
+  // =========================================================================
+  var ARENA = ['Aurora 2', 'Meridian XL', 'Kestrel', 'Pallas', 'Nimbus 3', 'Vela', 'Orion-mini'];
+  var ARENA_S = [0.55, 0.40, 0.30, 0.10, -0.02, -0.14, -0.30];
+  var BIAS_MODEL = 2;
+  var arenaBattles = 240, arenaBias = 0;
+
+  function runArena(battles, bias) {
+    var r = GM.rng(8123), n = ARENA.length, elo = [];
+    for (var i = 0; i < n; i++) elo.push(1200);
+    for (var b = 0; b < battles; b++) {
+      var i0 = Math.floor(r() * n), i1 = Math.floor(r() * n);
+      if (i0 === i1) continue;
+      var d = ARENA_S[i0] - ARENA_S[i1];
+      if (i0 === BIAS_MODEL) d += bias / 100;
+      else if (i1 === BIAS_MODEL) d -= bias / 100;
+      var p0 = 1 / (1 + Math.exp(-d));
+      var win0 = r() < p0 ? 1 : 0;
+      var e0 = 1 / (1 + Math.pow(10, (elo[i1] - elo[i0]) / 400));
+      elo[i0] += 24 * (win0 - e0);
+      elo[i1] += 24 * ((1 - win0) - (1 - e0));
+    }
+    return elo;
+  }
+
+  var arenaSetup = Guide.setupCanvas(document.getElementById('ev-arena-canvas'), 620, 260, function () { drawArena(); });
+
+  function drawArena() {
+    if (!arenaSetup) return;
+    var elo = runArena(arenaBattles, arenaBias);
+    var rows = [];
+    for (var i = 0; i < ARENA.length; i++) rows.push({ label: ARENA[i], elo: elo[i] });
+    rows.sort(function (a, b) { return b.elo - a.elo; });
+    var data = rows.map(function (row, i) {
+      return {
+        label: row.label, value: row.elo - 1100,
+        valueLabel: Guide.fmtNum(row.elo, 0) + ' Elo',
+        color: i === 0 ? F_ACC : F_A4
+      };
+    });
+    Guide.drawBars(arenaSetup.ctx, 620, 260, data, { padL: 118, fontSize: 12 });
+    var ctx = arenaSetup.ctx;
+    ctx.fillStyle = F_TX; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('Elo after ' + arenaBattles + ' votes (bars drawn from 1100)', 118, 14);
+  }
+
+  function redrawArenaReadout() {
+    var el = document.getElementById('ev-arena-readout');
+    if (!el) return;
+    var elo = runArena(arenaBattles, arenaBias);
+    var clean = runArena(arenaBattles, 0);
+    var lo = elo[0], hi = elo[0], sum = 0;
+    for (var i = 0; i < elo.length; i++) { lo = Math.min(lo, elo[i]); hi = Math.max(hi, elo[i]); sum += elo[i]; }
+    el.innerHTML =
+      '<div><span class="k">votes</span> ' + arenaBattles + '</div>' +
+      '<div><span class="k">mean rating</span> ' + Guide.fmtNum(sum / elo.length, 0) + ' (pinned near 1200)</div>' +
+      '<div><span class="k">spread</span> <span class="hi">' + Guide.fmtNum(hi - lo, 0) + ' Elo</span></div>' +
+      '<div><span class="k">Kestrel, no bias</span> ' + Guide.fmtNum(clean[BIAS_MODEL], 0) + ' Elo</div>' +
+      '<div><span class="k">Kestrel, bias ' + arenaBias + '</span> <span class="bad">' + Guide.fmtNum(elo[BIAS_MODEL], 0) + ' Elo</span></div>' +
+      '<div class="g-mini">The bias is a prompt-set advantage, not a quality change: the rating moves anyway, which is the whole caution about ranking on votes alone.</div>';
+  }
+
+  // =========================================================================
+  // 3. Memorisation: nearest-neighbour similarity
+  // =========================================================================
+  var MEM_DIM = 48, MEM_N = 96;
+  var MEM_EDGES = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.01];
+  var memoDup = 3;
+
+  function vec(r, n) { var v = new Array(n); for (var i = 0; i < n; i++) v[i] = GM.gauss(r); return v; }
+
+  function similaritySample(dup) {
+    var r = GM.rng(9091), out = [];
+    var pMem = Math.min(0.55, 0.045 * dup);
+    for (var i = 0; i < MEM_N; i++) {
+      var v = vec(r, MEM_DIM);
+      var nn;
+      if (r() < pMem) {
+        nn = v.map(function (x) { return x + 0.10 * GM.gauss(r); });
+      } else {
+        nn = vec(r, MEM_DIM);
+      }
+      out.push(GM.attn.cosine(v, nn));
+    }
+    return out;
+  }
+
+  var memoPlot = GM.plot(document.getElementById('ev-memo-canvas'), {
+    W: 620, H: 280, xRange: [0.40, 1.0], yRange: [0, 20],
+    xLabel: 'max cosine similarity to the training set', yLabel: 'prompts',
+    onResize: function () { drawMemo(); }
+  });
+
+  function drawMemo() {
+    if (!memoPlot) return;
+    var sims = similaritySample(memoDup);
+    var counts = [], i;
+    for (i = 0; i + 1 < MEM_EDGES.length; i++) counts.push(0);
+    for (i = 0; i < sims.length; i++) {
+      var bin = counts.length - 1;
+      for (var k = 0; k + 1 < MEM_EDGES.length; k++) {
+        if (sims[i] < MEM_EDGES[k + 1]) { bin = k; break; }
+      }
+      counts[bin]++;
+    }
+    var maxC = 1;
+    for (i = 0; i < counts.length; i++) maxC = Math.max(maxC, counts[i]);
+    memoPlot.clear();
+    memoPlot.yRange[0] = 0;
+    memoPlot.yRange[1] = Math.ceil(maxC * 1.18) + 1;
+    memoPlot.axes({ xLabel: 'max cosine similarity to the training set', yLabel: 'prompts' });
+    var bins = [];
+    for (i = 0; i < counts.length; i++) {
+      bins.push({
+        x0: MEM_EDGES[i], x1: MEM_EDGES[i + 1], h: counts[i],
+        color: MEM_EDGES[i] >= 0.899 ? F_A2 : F_A4
+      });
+    }
+    memoPlot.columns(bins, { alpha: 0.85 });
+    memoPlot.vline(0.9, { color: F_A2, dashed: true, width: 1.4, label: 'near-duplicate threshold', labelY: memoPlot.yRange[1] * 0.72, labelColor: F_A2 });
+    memoPlot.legend([
+      { label: 'ordinary prompt', color: F_A4 },
+      { label: 'near-duplicate of a training item', color: F_A2 }
+    ], { dx: 12, dy: 12 });
+  }
+
+  function redrawMemoReadout() {
+    var el = document.getElementById('ev-memo-readout');
+    if (!el) return;
+    var sims = similaritySample(memoDup), above = 0, sum = 0, hi = 0;
+    for (var i = 0; i < sims.length; i++) {
+      sum += sims[i];
+      hi = Math.max(hi, sims[i]);
+      if (sims[i] >= 0.9) above++;
+    }
+    el.innerHTML =
+      '<div><span class="k">prompts sampled</span> ' + sims.length + '</div>' +
+      '<div><span class="k">mean similarity</span> ' + (sum / sims.length).toFixed(3) + '</div>' +
+      '<div><span class="k">highest</span> ' + hi.toFixed(3) + '</div>' +
+      '<div><span class="k">above 0.90</span> <span class="bad">' + above + ' of ' + sims.length + '</span> = ' + (1000 * above / sims.length).toFixed(0) + ' per 1,000 prompts</div>' +
+      '<div class="g-mini">Duplication factor ' + memoDup + 'x. Feature-space similarity is triage, not a legal test: it says which outputs deserve a closer look.</div>';
+  }
+
+  // =========================================================================
+  // 4. Provenance: a distributed watermark against a crop
+  // =========================================================================
+  var WM_N = 64, WM_KEY = 8, WM_TAG_LO = 2, WM_TAG_HI = 18;
+  var WM_THRESHOLD = 4.5;
+  var wmCrop = 1.0, wmStrength = 0.02;
+  var wmKey = [], wmBase = [], wmData = [], wmSigma = 1;
+
+  function buildWatermark() {
+    var r = GM.rng(31337), i;
+    for (i = 0; i < WM_KEY * WM_KEY; i++) wmKey.push(GM.gauss(r));
+    var src = GM.img.circles(WM_N, 12, 6);
+    wmBase = [];
+    wmData = [];
+    var n = WM_N * WM_N * 3;
+    for (i = 0; i < n; i++) wmBase.push(clamp(0.25 + 0.5 * src.data[i], 0, 1));
+    var mean = 0;
+    for (i = 0; i < wmBase.length; i++) mean += wmBase[i];
+    mean /= wmBase.length;
+    var varSum = 0;
+    for (i = 0; i < wmBase.length; i++) { var d = wmBase[i] - mean; varSum += d * d; }
+    wmSigma = Math.max(1e-3, Math.sqrt(varSum / wmBase.length));
+    embedWatermark();
+  }
+
+  function keyAt(x, y) { return wmKey[(y % WM_KEY) * WM_KEY + (x % WM_KEY)]; }
+  function keyDist(x, y) { return keyAt(x, y); }
+  function keyLocal(x, y) {
+    return (x >= WM_TAG_LO && x < WM_TAG_HI && y >= WM_TAG_LO && y < WM_TAG_HI) ? keyAt(x, y) : 0;
+  }
+
+  function embedWatermark() {
+    wmData = [];
+    for (var y = 0; y < WM_N; y++) {
+      for (var x = 0; x < WM_N; x++) {
+        var k = wmStrength * keyAt(x, y);
+        for (var ch = 0; ch < 3; ch++) {
+          var idx = (y * WM_N + x) * 3 + ch;
+          wmData[idx] = clamp(wmBase[idx] + k, 0, 1);
+        }
+      }
+    }
+  }
+
+  // Correlation detector: the z-score of the covariance between the retained
+  // pixels and the key pattern. A key-aware detector is what a watermark of this
+  // family uses; without the key it would have to be a learned model instead.
+  function detectorZ(keyFn, side) {
+    side = Math.max(2, Math.round(WM_N * side));
+    var x0 = Math.floor((WM_N - side) / 2), y0 = x0;
+    var n = 0, sv = 0, svv = 0, sk = 0, skk = 0, svk = 0;
+    for (var y = y0; y < y0 + side; y++) {
+      for (var x = x0; x < x0 + side; x++) {
+        var v = wmData[(y * WM_N + x) * 3 + 1];
+        var k = keyFn(x, y);
+        n++; sv += v; svv += v * v; sk += k; skk += k * k; svk += v * k;
+      }
+    }
+    var mv = sv / n, mk = sk / n;
+    var varv = Math.max(1e-9, svv / n - mv * mv);
+    var vark = Math.max(1e-9, skk / n - mk * mk);
+    var cov = svk / n - mv * mk;
+    return cov / Math.sqrt(varv * vark / n);
+  }
+
+  var wmRaster = GM.raster(document.getElementById('ev-wm-canvas'), {
+    cols: WM_N, rows: WM_N, channels: 3, W: 300, H: 300,
+    onResize: function () { drawWatermark(); }
+  });
+
+  function drawWatermark() {
+    if (!wmRaster) return;
+    wmRaster.fromArray(wmData);
+    wmRaster.draw();
+    var ctx = wmRaster.ctx, W = wmRaster.W, H = wmRaster.H;
+    var side = Math.round(W * wmCrop), x0 = Math.round((W - side) / 2);
+    var scale = W / WM_N;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(214,0,108,0.95)'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(WM_TAG_LO * scale, WM_TAG_LO * scale, (WM_TAG_HI - WM_TAG_LO) * scale, (WM_TAG_HI - WM_TAG_LO) * scale);
+    ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.lineWidth = 1.6;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(x0 + 0.8, x0 + 0.8, side - 1.6, side - 1.6);
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(4, H - 20, 152, 16);
+    ctx.fillStyle = '#fff'; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('crop keeps ' + Math.round(wmCrop * 100) + '% of the pixels', 8, H - 8);
+    ctx.restore();
+  }
+
+  var wmPlot = GM.plot(document.getElementById('ev-wm-plot'), {
+    W: 320, H: 300, xRange: [0.1, 1.0], yRange: [0, 20],
+    xLabel: 'retained fraction of the image', yLabel: 'detector z-score',
+    onResize: function () { drawWatermarkPlot(); }
+  });
+
+  function drawWatermarkPlot() {
+    if (!wmPlot) return;
+    var dist = [], loc = [], s;
+    var hi = WM_THRESHOLD * 1.6;
+    for (s = 0.15; s <= 1.001; s += 0.05) {
+      var zd = detectorZ(keyDist, s), zl = detectorZ(keyLocal, s);
+      hi = Math.max(hi, zd, zl);
+      dist.push([s, zd]);
+      loc.push([s, zl]);
+    }
+    wmPlot.clear();
+    wmPlot.yRange[0] = 0;
+    wmPlot.yRange[1] = Math.min(30, Math.max(8, Math.ceil(hi * 1.15)));
+    wmPlot.axes({ xLabel: 'retained fraction of the image', yLabel: 'detector z-score' });
+    wmPlot.hline(WM_THRESHOLD, { color: F_TX, dashed: true, width: 1.2, label: 'detection threshold ' + WM_THRESHOLD, labelX: 0.11, labelColor: F_TX });
+    wmPlot.curve(loc, { color: F_A2, width: 2 });
+    wmPlot.curve(dist, { color: F_ACC, width: 2 });
+    wmPlot.vline(wmCrop, { color: F_A4, dashed: true, width: 1.4, label: 'now', labelY: 1 });
+    wmPlot.legend([
+      { label: 'distributed key', color: F_ACC },
+      { label: 'corner tag', color: F_A2 }
+    ], { dx: 10, dy: 8 });
+  }
+
+  function redrawWatermarkReadout() {
+    var el = document.getElementById('ev-wm-readout');
+    if (!el) return;
+    var zd = detectorZ(keyDist, wmCrop), zl = detectorZ(keyLocal, wmCrop);
+    var pixels = Math.round(WM_N * WM_N * wmCrop * wmCrop);
+    function verdict(z) { return z >= WM_THRESHOLD ? 'verified' : 'below threshold'; }
+    el.innerHTML =
+      '<div><span class="k">retained pixels</span> ' + Guide.fmtNum(pixels, 0) + ' of ' + Guide.fmtNum(WM_N * WM_N, 0) + '</div>' +
+      '<div><span class="k">image noise floor</span> sigma = ' + wmSigma.toFixed(3) + '</div>' +
+      '<div><span class="k">distributed</span> z = ' + zd.toFixed(1) + ' <span class="hi">' + verdict(zd) + '</span></div>' +
+      '<div><span class="k">corner tag</span> z = ' + zl.toFixed(1) + ' <span class="bad">' + verdict(zl) + '</span></div>' +
+      '<div class="g-mini">Amplitude ' + wmStrength.toFixed(3) + ' (about ' + Math.round(wmStrength * 255) + ' of 255 levels). The distributed key loses signal only with the square root of the retained area; a localised tag needs its own corner. A C2PA manifest is a third option: exact while attached, gone the moment metadata is stripped.</div>';
+  }
+
+  // =========================================================================
+  // 5. Serving arithmetic
+  // =========================================================================
+  var SRV = {
+    params: 12e9, tokens: 4096, pricePerHour: 2.50,
+    flopsFp16: 4.0e14, flopsFp8: 7.0e14
+  };
+  var srvSteps = 28, srvCache = 0, srvBatch = 8;
+
+  function flopsPerImagePerStep() { return 2 * SRV.params * SRV.tokens; }
+  function utilisation(b) { return 0.62 * b / (b + 1.4); }
+  function usdPerThousand(steps, cache, batch, flopsPeak) {
+    var eff = steps * (1 - cache);
+    var gpuSeconds = 1000 * eff * flopsPerImagePerStep() / (flopsPeak * utilisation(batch));
+    return gpuSeconds * SRV.pricePerHour / 3600;
+  }
+  function secondsPerImage(steps, cache, batch, flopsPeak) {
+    var eff = steps * (1 - cache);
+    return eff * flopsPerImagePerStep() / (flopsPeak * utilisation(batch));
+  }
+
+  var costPlot = GM.plot(document.getElementById('ev-cost-canvas'), {
+    W: 620, H: 300, xRange: [1, 32], yRange: [0, 40],
+    xLabel: 'batch size', yLabel: 'cost per 1,000 images (USD)',
+    onResize: function () { drawCost(); }
+  });
+
+  function costCurve(steps, cache, flopsPeak) {
+    var pts = [];
+    for (var b = 1; b <= 32; b++) pts.push([b, usdPerThousand(steps, cache, b, flopsPeak)]);
+    return pts;
+  }
+
+  function drawCost() {
+    if (!costPlot) return;
+    var base = costCurve(srvSteps, 0, SRV.flopsFp16);
+    var quant = costCurve(srvSteps, 0, SRV.flopsFp8);
+    var both = costCurve(srvSteps, srvCache, SRV.flopsFp8);
+    var hi = 1;
+    [base, quant, both].forEach(function (pts) {
+      pts.forEach(function (p) { hi = Math.max(hi, p[1]); });
+    });
+    costPlot.clear();
+    costPlot.yRange[0] = 0;
+    costPlot.yRange[1] = Math.ceil(hi * 1.12);
+    costPlot.axes({ xLabel: 'batch size', yLabel: 'cost per 1,000 images (USD)' });
+    costPlot.curve(base, { color: F_A4, width: 2 });
+    costPlot.curve(quant, { color: F_ACC, width: 2 });
+    costPlot.curve(both, { color: F_A2, width: 2 });
+    costPlot.vline(srvBatch, { color: F_TX, dashed: true, width: 1.2, label: 'batch ' + srvBatch, labelY: costPlot.yRange[1] * 0.6 });
+    costPlot.legend([
+      { label: 'FP16, no cache', color: F_A4 },
+      { label: 'FP8', color: F_ACC },
+      { label: 'FP8 plus step caching', color: F_A2 }
+    ], { dx: 12, dy: 10 });
+  }
+
+  function redrawCostReadout() {
+    var el = document.getElementById('ev-cost-readout');
+    if (!el) return;
+    var base = usdPerThousand(srvSteps, 0, srvBatch, SRV.flopsFp16);
+    var quant = usdPerThousand(srvSteps, 0, srvBatch, SRV.flopsFp8);
+    var both = usdPerThousand(srvSteps, srvCache, srvBatch, SRV.flopsFp8);
+    var secs = secondsPerImage(srvSteps, srvCache, srvBatch, SRV.flopsFp8);
+    el.innerHTML =
+      '<div><span class="k">effective steps</span> ' + (srvSteps * (1 - srvCache)).toFixed(1) + ' of ' + srvSteps + '</div>' +
+      '<div><span class="k">utilisation at b=' + srvBatch + '</span> ' + Guide.fmtPct(utilisation(srvBatch), 0) + '</div>' +
+      '<div><span class="k">FP16</span> ' + base.toFixed(1) + ' USD / 1,000 images</div>' +
+      '<div><span class="k">FP8</span> ' + quant.toFixed(1) + ' USD / 1,000 images</div>' +
+      '<div><span class="k">FP8 + caching</span> <span class="hi">' + both.toFixed(1) + ' USD / 1,000 images</span></div>' +
+      '<div><span class="k">GPU time per image</span> ' + secs.toFixed(2) + ' s</div>' +
+      '<div class="g-mini">Speedup over the FP16 baseline at this batch: ' + (base / Math.max(0.01, both)).toFixed(1) + 'x. ' +
+      'Batch size raises utilisation toward its ' + Guide.fmtPct(0.62, 0) + ' ceiling; beyond the knee the curve is flat because the FLOPs are the limit.</div>';
+  }
+
+  // =========================================================================
+  // wiring
+  // =========================================================================
+  function redraw() {
+    drawDivergence(); redrawScoreReadout();
+    drawArena(); redrawArenaReadout();
+    drawMemo(); redrawMemoReadout();
+    drawWatermark(); drawWatermarkPlot(); redrawWatermarkReadout();
+    drawCost(); redrawCostReadout();
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#ev-arena-battles'), function (el) {
+    arenaBattles = parseInt(el.value, 10); redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-arena-bias'), function (el) {
+    arenaBias = parseInt(el.value, 10); redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-memo-dup'), function (el) {
+    memoDup = parseInt(el.value, 10); redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-wm-crop'), function (el) {
+    wmCrop = parseInt(el.value, 10) / 100; redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-wm-strength'), function (el) {
+    wmStrength = parseInt(el.value, 10) / 1000;
+    embedWatermark(); redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-cost-steps'), function (el) {
+    srvSteps = parseInt(el.value, 10); redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-cost-cache'), function (el) {
+    srvCache = parseInt(el.value, 10) / 100; redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ev-cost-batch'), function (el) {
+    srvBatch = parseInt(el.value, 10); redraw();
+  });
+
+  buildDivergence();
+  buildWatermark();
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'eval-fid-conditioning',
+      kind: 'choice',
+      prompt: 'FID compares two clouds of image features. What can it not see?',
+      options: [
+        { label: 'Whether each image matches the prompt it was generated from.', correct: true },
+        { label: 'The mean of the real feature cloud.', correct: false },
+        { label: 'The covariance of the generated feature cloud.', correct: false }
+      ],
+      explanation: 'FID pools all images into one distribution and compares it against the real one, so conditioning is invisible to it. A model that ignores the prompt entirely can score well on FID if its marginal statistics look like photographs, which is why FID is never sufficient on its own.'
+    },
+    {
+      id: 'eval-serving-latency',
+      kind: 'numeric',
+      prompt: 'A sampler runs 50 steps at 60 milliseconds per step. A step-caching scheme skips the compute of 40 percent of those steps. What is the per-image latency in seconds?',
+      answer: 1.8,
+      tolerance: 0.05,
+      unit: 's',
+      explanation: 'Fifty steps at 0.06 s each is 3.0 s. Skipping 40 percent of the compute leaves 60 percent of that, so 3.0 times 0.6 is 1.8 s. Step caching is the cheapest server-side lever; changing the step count in training is the largest.'
+    },
+    {
+      id: 'eval-clipscore-quality',
+      kind: 'choice',
+      prompt: 'Why is a high CLIPScore not evidence that an image is good?',
+      options: [
+        { label: 'It measures text-image alignment only, so it is blind to realism, anatomy and aesthetics.', correct: true },
+        { label: 'It can only be computed on images larger than 1024 pixels.', correct: false },
+        { label: 'It requires the training set to compute the Fr\u00e9chet distance.', correct: false }
+      ],
+      explanation: 'CLIPScore is a cosine between a CLIP image embedding and a text embedding. It rewards showing the prompt\'s concepts, so a cluttered literal image can beat a clean well-composed one. It says nothing about photographic realism, hands, text rendering or composition.'
+    },
+    {
+      id: 'eval-article-50',
+      kind: 'numeric',
+      prompt: 'In which year do the EU AI Act Article 50 machine-readable marking obligations for generative systems start to apply? Give the four-digit year.',
+      answer: 2026,
+      tolerance: 0.5,
+      explanation: 'Article 50 transparency duties, including marking synthetic outputs in a machine-readable format, bind from 2 August 2026. That is why both watermarks that live in the pixels and signed manifests that live in metadata are now an engineering requirement rather than a research curiosity.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

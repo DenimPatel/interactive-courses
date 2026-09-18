@@ -1,0 +1,595 @@
+---
+title: "Probability in Action, Interactively — Part 14: Bayes nets and factor graphs"
+description: "How a graph encodes which variables can influence which others: conditional independence read off the paths, d-separation, explaining away, and the sum-product messages that make inference local."
+permalink: "/math/probability-in-action/graphical-models/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-rule { display: flex; gap: 12px; align-items: baseline; margin: 10px 0; }
+  .g-rule .tag {
+    font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+    color: var(--color-accent-800); background: var(--color-accent-100);
+    border-radius: var(--radius-sm); padding: 3px 8px; flex: 0 0 auto;
+  }
+  #dag-canvas, #factor-canvas { background: var(--color-neutral-100); border-radius: var(--radius-sm); display: block; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>Bayes nets and factor graphs</h1>
+    <p>Write down the joint distribution of twenty binary variables and you have a table with a million entries; write down thirty and it has a billion. Nothing about the world justifies a number for every combination &mdash; most variables have no direct influence on most others, and the joint distribution is almost entirely built from local agreements. A graphical model is the bookkeeping that records only those local agreements. Draw an arrow from <var>X</var> to <var>Y</var> when <var>X</var> appears directly in the formula for <var>Y</var>, and the picture tells you, by inspection, which variables are independent, which become dependent once you observe something, and how to break a giant sum into a sequence of small ones. The graph is not a sketch of the model; it <em>is</em> the model, and the arithmetic follows the edges.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Structure is the only thing that makes inference possible</p>
+    <p>Probability theory gives you one operation that does everything: sum out the variables you do not care about. Given a joint distribution <var>$p(x_1,\dots,x_n)$</var> you can answer any question by marginalising, conditioning, or maximising. The difficulty is never the operation, it is the size of the object you apply it to. A full joint over <var>n</var> binary variables needs <var>2^n-1</var> independent numbers, and computing a single marginal costs a sum with <var>2^{n-1}</var> terms. At <var>n=30</var> that is more terms than there are seconds in the age of the universe.</p>
+    <p>Yet we routinely reason about models with hundreds of variables. The reason is that the joint distribution has a special form: it factors. Rain depends on clouds and season, not on the price of tea in the shop across the street. If you write each variable as a function of a small set of others &mdash; its <strong>parents</strong> &mdash; the full table never has to be stored, because it is a product of many small tables. This part is about the two standard languages for saying exactly which small tables, and the algorithms that run on them.</p>
+    <p>The first language is the <strong>Bayesian network</strong>, a directed acyclic graph whose arrows point from cause to effect. It says that the joint is the product of one conditional per node, conditioned on that node's parents. The second is the <strong>factor graph</strong>, a bipartite picture of variables and the functions they appear in, which drops the directionality and makes the algorithm for computing marginals look like messages passed along wires. The two are translations of each other, and together they turn a problem that is exponential in the number of variables into one that is exponential only in the width of the graph.</p>
+    <p>Along the way we meet the two facts that surprise everyone. Independence is a property of the <em>graph and the observations together</em>, not of the graph alone: two variables can be independent until you learn the value of a third, and dependent until you learn the value of a fourth. And explaining away &mdash; the reason a diagnosis becomes less likely once a second cause is confirmed &mdash; is not a quirk of human reasoning but a theorem about colliders.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a graph is a compact encoding of conditional independence, how d-separation lets you read those independencies off the paths, why conditioning on a common effect creates dependence, and how sum-product message passing computes marginals by local arithmetic.</span></div>
+    <div class="g-toc">
+      <a href="#bayes-nets">2 · Bayesian networks</a>
+      <a href="#dsep">3 · d-separation and active paths</a>
+      <a href="#explaining">4 · Explaining away</a>
+      <a href="#factor-graphs">5 · Factor graphs and messages</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="bayes-nets">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Bayesian networks and factorisation</h2></div>
+    <p class="g-eyebrow">One small table per node, and the chain rule does the rest</p>
+    <p>Start with a joint distribution over <var>$x_1,\dots,x_n$</var> and apply the chain rule in any order you like. Pick an order that respects the causal story: <var>$p(x_1,\dots,x_n)=\prod_i p(x_i\mid x_1,\dots,x_{i-1})$</var>. That identity is exact but useless, because each conditional still mentions everything before it. The modelling step is to assert that most of those conditionals do not actually depend on most of those predecessors. The variable <var>WetGrass</var> depends on <var>Rain</var> and <var>Sprinkler</var>; whether it is wet has nothing more to say once you know those two, regardless of the season or the barometer. Strike the irrelevant arguments and you are left with a set of parents <var>$\mathrm{pa}(i)$</var> and the defining equation of a Bayesian network.</p>
+    <div class="g-math g-katex">$$p(x_1,\dots,x_n)=\prod_{i=1}^{n} p\bigl(x_i \mid x_{\mathrm{pa}(i)}\bigr).$$</div>
+    <p>Read the equation as a storage budget. Each factor <var>$p(x_i\mid x_{\mathrm{pa}(i)})$</var> is a table indexed by <var>x_i</var> and its parents. A binary node with no parents costs one number; a binary node with one parent costs two; with two parents, four. In the classic four-node weather model &mdash; <var>Cloudy</var> feeding <var>Sprinkler</var> and <var>Rain</var>, both of which feed <var>WetGrass</var> &mdash; the network stores <var>1+2+2+4=9</var> numbers instead of the <var>15</var> a full joint over four binary variables would need. The saving looks modest here and becomes the difference between feasible and impossible at thirty variables, where the network might store a few hundred numbers against a billion.</p>
+    <p>The arrows are not decoration. If you draw one from <var>A</var> to <var>B</var>, the factorisation includes <var>A</var> in <var>B</var>'s conditional; if you do not, it excludes it. A missing arrow is a positive claim: <var>x_i</var> is conditionally independent of that variable given its parents. This is the <strong>local Markov property</strong>, and it is where all the graph-reading rules in the next section come from. A node is independent of everything that is neither its parent, its child, nor a parent of one of its children, once you condition on those neighbours.</p>
+    <p>The direction of the arrows is a choice, not a fact about the world. Any DAG that encodes the same conditional independencies describes the same distribution; you can reverse an arrow if you pay for it by enlarging a conditional. But causal directions are usually the ones that keep the tables small, because causes tend to be roughly independent of each other while their effects are correlated. Drawing arrows from cause to effect is therefore a compression strategy as much as a statement of belief.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="count-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Parameters needed for a full joint over <var>n</var> binary variables (magenta) against the same variables arranged in a chain, each depending only on the one before (blue). The vertical axis is logarithmic, so each step up is a factor of ten.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Largest network <span class="val">12</span></label><input type="range" id="count-n" min="4" max="16" step="1" value="12"></div>
+        <div class="g-readout" id="count-readout"></div>
+      </div>
+    </div>
+    <p>Notice that the blue bars are almost flat on this scale. A chain over <var>n</var> binary variables needs <var>1+2(n-1)</var> numbers, so doubling the number of variables roughly doubles the storage, while the full joint squares it. That is the entire promise of graphical models in one picture: the graph buys you a joint that grows linearly instead of exponentially, at the cost of asserting a structure you must be willing to defend.</p>
+  </section>
+
+  <section class="g-step" id="dsep">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>d-separation and active paths</h2></div>
+    <p class="g-eyebrow">Independence you can read off the picture</p>
+    <p>Suppose you want to know whether <var>X</var> and <var>Y</var> are independent given a set of observed variables <var>Z</var>. In a Bayes net you answer this without touching a single probability: walk the graph. Look at every undirected path from <var>X</var> to <var>Y</var> and ask whether information could flow along it. If every path is blocked, the variables are <strong>d-separated</strong> given <var>Z</var>, and d-separation implies conditional independence in every distribution that factorises according to the graph.</p>
+    <p>A path is a sequence of distinct nodes connected by edges, traversed in either direction. Each interior node on the path is either a <strong>collider</strong>, with both path edges pointing into it, or a <strong>non-collider</strong>, with at least one edge pointing out. The blocking rules are different for the two cases, and that asymmetry is the heart of the subject.</p>
+    <div class="g-rule"><span class="tag">chain</span><span><var>$X\to M\to Y$</var>. The middle node <var>M</var> is a non-collider. Observing <var>M</var> <em>blocks</em> the path: once you know the mediator, <var>X</var> has nothing more to say about <var>Y</var>.</span></div>
+    <div class="g-rule"><span class="tag">fork</span><span><var>$X\leftarrow M\to Y$</var>. The common cause <var>M</var> is also a non-collider. Observing <var>M</var> again <em>blocks</em> the path: two symptoms of the same cause become independent once the cause is known.</span></div>
+    <div class="g-rule"><span class="tag">collider</span><span><var>$X\to M\leftarrow Y$</var>. Now both edges point in. The path is blocked <em>by default</em>, and conditioning on <var>M</var> or any of its descendants <em>opens</em> it. This is the opposite of the previous two rules.</span></div>
+    <div class="g-math g-katex">$$X \perp\!\!\perp_G Y \mid Z \quad\Longleftrightarrow\quad \text{every path }X\text{--}Y\text{ is blocked by }Z,\qquad \text{collider open}\iff \{M\}\cup\mathrm{desc}(M)\cap Z\ne\varnothing.$$</div>
+    <p>The collider rule is the one that feels wrong until it clicks. Two independent causes, a sprinkler and rain, each make the grass wet. Before you look outside, learning that the sprinkler ran tells you nothing about the rain. But if you observe that the grass is wet, the two causes are suddenly correlated: rain becomes <em>less</em> likely once you learn the sprinkler was on, because the sprinkler already accounts for the evidence. Information flowed between two variables that had no arrow between them, and it flowed because we conditioned on their shared effect.</p>
+    <p>The canvas below lets you build this intuition by hand. It shows the four-node weather network: <var>Cloudy</var> is a fork into <var>Sprinkler</var> and <var>Rain</var>, and those two are a collider into <var>WetGrass</var>. Click any node to mark it observed, choose two query nodes, and the page colours each path green when active and red when blocked, then reports whether the queries are d-separated. Try observing <var>Cloudy</var> with <var>Sprinkler</var> and <var>Rain</var> as queries, then clear it and observe <var>WetGrass</var> instead.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dag-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Click a node to toggle whether it is observed. Green paths carry information; red dashed paths are blocked. The dark ring marks the two query nodes.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query node X</label><select id="dag-q1"></select></div>
+        <div class="g-field"><label>Query node Y</label><select id="dag-q2"></select></div>
+        <div class="g-btnrow"><button type="button" id="dag-reset">Clear observations</button></div>
+        <div class="g-readout" id="dag-readout"></div>
+      </div>
+    </div>
+    <p>Two warnings about reading too much into the picture. First, d-separation is sufficient for independence but not necessary: a particular distribution may have independencies that its graph does not show, and then the graph is merely not the tightest description. Second, the rules apply to the graph as drawn, so if you reverse an arrow the d-separation verdicts can change even though the distribution has not. The graph is a tool for deriving consequences of a factorisation, and different graphs of the same distribution derive different (all valid) consequences.</p>
+  </section>
+
+  <section class="g-step" id="explaining">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Explaining away</h2></div>
+    <p class="g-eyebrow">The collider, measured</p>
+    <p>Here is the smallest possible collider model. Two independent binary causes <var>A</var> and <var>B</var>, each with its own prior, both feed a binary effect <var>C</var>. The network asserts <var>$p(a,b,c)=p(a)\,p(b)\,p(c\mid a,b)$</var>. Because the joint factorises as a product of a term in <var>a</var> alone and a term in <var>b</var> alone, the marginals satisfy <var>p(a,b)=p(a)p(b)</var> exactly: <var>A</var> and <var>B</var> are independent. No conditioning on <var>C</var> has happened yet, and none is needed.</p>
+    <p>Now condition on the effect. By Bayes' rule, <var>$p(a,b\mid c)\propto p(a)p(b)p(c\mid a,b)$</var>, and the third factor couples <var>a</var> to <var>b</var> unless <var>c</var> is independent of one of them given the other. In general it is not, so <var>A</var> and <var>B</var> become dependent once <var>C</var> is known. The strength and direction of that dependence are exactly what the sliders below control. Watch three numbers as you move them: the marginal probabilities, which never move; the conditional probabilities given <var>C=1</var>, which both rise when the effect is a noisy OR; and the conditional probability of <var>A</var> given both <var>C=1</var> and <var>B=1</var>, which falls back below the value given <var>C=1</var> alone.</p>
+    <div class="g-math g-katex">$$p(a,b\mid c)=\frac{p(a)\,p(b)\,p(c\mid a,b)}{p(c)},\qquad p(a\mid c,b)=\frac{p(a)p(b)p(c\mid a,b)}{\sum_{a'}p(a')p(b)p(c\mid a',b)}.$$</div>
+    <p>That last drop is explaining away. Once you already know the sprinkler was on, the wet grass is explained, and the evidence no longer supports rain as strongly. Nothing in the arithmetic knows about causes or explanations; it is a consequence of dividing two sums that share a factor. The same computation is why a medical test result becomes less alarming once a second, unrelated condition that produces the same marker is confirmed, and why a fault diagnosis system has to reason about multiple simultaneous faults rather than assuming the simplest single explanation.</p>
+    <p>There is a numerical signature of the effect that is worth carrying away. Define the <strong>conditional mutual information</strong> <var>$I(A;B\mid C)$</var>. In a collider it is strictly positive whenever the effect depends on both causes, while the plain mutual information <var>I(A;B)</var> is exactly zero. The readout below reports both a difference-of-products test and this mutual information, so you can see the independence at the top of the model and the dependence created at the bottom in the same units.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ea-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Bars are probabilities of the event being one. Grey is the prior, blue is conditioned on <var>C=1</var>, magenta is <var>A=1</var> given both <var>C=1</var> and <var>B=1</var>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label><var>P(A=1)</var> <span class="val">0.10</span></label><input type="range" id="ea-pa" min="0.01" max="0.99" step="0.01" value="0.1"></div>
+        <div class="g-field"><label><var>P(B=1)</var> <span class="val">0.20</span></label><input type="range" id="ea-pb" min="0.01" max="0.99" step="0.01" value="0.2"></div>
+        <div class="g-field"><label><var>$P(C=1\mid A=1,B=1)$</var> <span class="val">0.95</span></label><input type="range" id="ea-c11" min="0.01" max="0.99" step="0.01" value="0.95"></div>
+        <div class="g-field"><label><var>$P(C=1\mid A=1,B=0)$</var> <span class="val">0.80</span></label><input type="range" id="ea-c10" min="0.01" max="0.99" step="0.01" value="0.8"></div>
+        <div class="g-field"><label><var>$P(C=1\mid A=0,B=1)$</var> <span class="val">0.80</span></label><input type="range" id="ea-c01" min="0.01" max="0.99" step="0.01" value="0.8"></div>
+        <div class="g-field"><label><var>$P(C=1\mid A=0,B=0)$</var> <span class="val">0.01</span></label><input type="range" id="ea-c00" min="0.01" max="0.99" step="0.01" value="0.01"></div>
+        <div class="g-readout" id="ea-readout"></div>
+      </div>
+    </div>
+    <p>Set the two middle sliders equal and the collider is symmetric; make them different and the two causes explain away at different rates. Push <var>$P(C=1\mid A=0,B=0)$</var> toward its maximum and the effect fires regardless, so <var>C</var> carries little information and the conditional dependence shrinks. Push it to the minimum and <var>C=1</var> becomes almost a proof that at least one cause fired, which is precisely the regime where explaining away is strongest.</p>
+  </section>
+
+  <section class="g-step" id="factor-graphs">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Factor graphs and message passing</h2></div>
+    <p class="g-eyebrow">The same model, with the arrows removed and the algorithm revealed</p>
+    <p>The directed graph is convenient for reading independencies, but the algorithm that computes marginals does not care about direction. Write the joint as a product of <strong>factors</strong>, each a function of a small set of variables. The directed factorisation <var>$\prod_i p(x_i\mid x_{\mathrm{pa}(i)})$</var> is already such a product, one factor per node. A <strong>factor graph</strong> is a bipartite graph with a circle for every variable and a square for every factor, connected exactly when the variable appears in the factor. Nothing is lost and a great deal is gained: the directed structure has become an undirected wiring diagram of the arithmetic.</p>
+    <p>The classic computation on this graph is the <strong>sum-product algorithm</strong>. Its rule is local. A variable sends to each factor it touches the product of the messages it received from all the <em>other</em> factors. A factor sends to each variable the sum over all its other variables of the factor value times the incoming messages. Compose the rules and every variable receives, from each factor, a summary of everything the rest of the graph knows about that variable.</p>
+    <div class="g-math g-katex">$$\mu_{v\to f}(x_v)=\!\!\prod_{g\in\mathrm{nb}(v)\setminus\{f\}}\!\!\mu_{g\to v}(x_v),\qquad \mu_{f\to v}(x_v)=\sum_{x_{\mathrm{nb}(f)\setminus v}} f\bigl(x_{\mathrm{nb}(f)}\bigr)\!\!\prod_{u\in\mathrm{nb}(f)\setminus v}\!\!\mu_{u\to f}(x_u).$$</div>
+    <p>For the collider model, absorb the two priors into a single factor <var>$f(a,b,c)=p(a)p(b)p(c\mid a,b)$</var>. The factor graph then has three variable circles and one factor square, connected to all three. The message from the factor to <var>A</var> is <var>$\mu_{f\to A}(a)=\sum_{b,c} f(a,b,c)\,\mu_{B\to f}(b)\,\mu_{C\to f}(c)$</var>, and the marginal is proportional to that message. It is a two-dimensional sum, not a five-dimensional one, and if the graph were a long chain the same local rule would cost a constant amount per node instead of an exponential amount per query. That is the entire content of the phrase "inference is local".</p>
+    <p>On trees the algorithm terminates in two sweeps and the messages are exact marginals. On graphs with cycles the same updates can be run until they settle, which is <strong>loopy belief propagation</strong>; it has no general guarantee but works well enough in practice that it underpins error-correcting codes and much of the inference in vision. The reason trees are special is that a tree has no path that carries information around a loop and back, so no message can depend on itself. Loops reintroduce the circularity that the whole graph was supposed to remove.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="factor-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">The Bayes net on the left, the same model as a factor graph on the right. Blue arrows are variable-to-factor messages; magenta arrows are factor-to-variable. Use the buttons to isolate one sweep.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="fg-v2f">Variables → factor</button>
+          <button type="button" id="fg-f2v">Factor → variables</button>
+          <button type="button" id="fg-both" class="active">Both</button>
+        </div>
+        <div class="g-readout" id="factor-readout"></div>
+      </div>
+    </div>
+    <p>One translation detail is worth stating because it trips people up. A directed graph and a factor graph of the same distribution are not in one-to-one correspondence: several factor graphs can describe the same distribution, and converting a Bayes net to a factor graph loses the directionality permanently. What is preserved is the set of conditional independencies implied by the factorisation, which is why the two pictures answer the same d-separation questions. The factor graph is the better picture for the algorithm; the Bayes net is the better picture for the story.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Graphs as the default modelling language</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Pose graphs and SLAM</h3>
+        <p style="margin-bottom:0;">A simultaneous-localisation-and-mapping problem is a factor graph whose variables are robot poses and landmark positions, and whose factors are the measurements between them. The <a href="{{ '/vision/nonlinear-optimization/pose-graph/' | relative_url }}">pose graph</a> part of the vision guide solves exactly this structure, and the loop-closure problem there is a loopy graph in the sense above; the <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM overview</a> places the smoothing and filtering views side by side.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Conditional independence</h3>
+        <p style="margin-bottom:0;">Everything on this page is a machine for generating conditional independence statements. The base case &mdash; what <var>$X\perp Y$</var> means and why it makes the joint a product &mdash; is developed in <a href="{{ '/math/probability/independence/' | relative_url }}">independence</a>. d-separation is the generalisation of that idea from two variables to a whole graph.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Filters as chains</h3>
+        <p style="margin-bottom:0;">A hidden Markov model is a chain graph: the hidden state at each step depends only on the previous state, and each observation only on its own state. Forward&ndash;backward is sum-product on that chain, which is why it runs in linear time. The <a href="{{ '/math/probability-in-action/hmm/' | relative_url }}">next part</a> builds it explicitly, and the filtering recurrences there are the messages of this section specialised to a line.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / ML</div>
+        <h3 style="margin:6px 0;">Latent-variable models</h3>
+        <p style="margin-bottom:0;">Mixture models, variational autoencoders and diffusion models are all graphs in which a small set of latent variables generates the observations. When exact messages are intractable, variational inference replaces them with an optimisation, which is the subject of <a href="{{ '/math/probability-in-action/latent-variables/' | relative_url }}">latent variables</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Factorisation</td><td><var>$p(x_1,\dots,x_n)=\prod_i p(x_i\mid x_{\mathrm{pa}(i)})$</var></td><td>One small conditional table per node.</td></tr>
+        <tr><td>Chain</td><td><var>$X\to M\to Y$</var></td><td>Non-collider. Observing <var>M</var> blocks the path.</td></tr>
+        <tr><td>Fork</td><td><var>$X\leftarrow M\to Y$</var></td><td>Non-collider. Observing the common cause blocks the path.</td></tr>
+        <tr><td>Collider</td><td><var>$X\to M\leftarrow Y$</var></td><td>Blocked by default; observing <var>M</var> or a descendant opens it.</td></tr>
+        <tr><td>d-separation</td><td><var>$X\perp\!\!\perp Y\mid Z$</var></td><td>Every path blocked by the observations.</td></tr>
+        <tr><td>Explaining away</td><td><var>$p(a\mid c,b)\ne p(a\mid c)$</var></td><td>A second cause lowers the first cause's posterior.</td></tr>
+        <tr><td>Conditional MI</td><td><var>$I(A;B\mid C)&gt;0$</var> for a collider</td><td>Marginal MI is zero; the effect creates the dependence.</td></tr>
+        <tr><td>Variable message</td><td><var>$\mu_{v\to f}=\prod_{g\ne f}\mu_{g\to v}$</var></td><td>Pass on everything except what came from <var>f</var>.</td></tr>
+        <tr><td>Factor message</td><td><var>$\mu_{f\to v}=\sum_{x_{\mathrm{nb}(f)\setminus v}} f\prod_{u\ne v}\mu_{u\to f}$</var></td><td>Multiply locally, sum out the rest.</td></tr>
+        <tr><td>Marginal</td><td><var>$p(x_v)\propto\prod_{f}\mu_{f\to v}(x_v)$</var></td><td>On a tree, exact after two sweeps.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Judea Pearl, <em>Probabilistic Reasoning in Intelligent Systems</em>, 1988 &mdash; the book that introduced Bayesian networks and the d-separation criterion.</li>
+      <li>Daphne Koller and Nir Friedman, <em>Probabilistic Graphical Models: Principles and Techniques</em>, 2009 &mdash; the standard reference; chapters 3 and 8&ndash;9 cover representation and exact inference.</li>
+      <li>Christopher Bishop, <em>Pattern Recognition and Machine Learning</em>, chapter 8 &mdash; factor graphs and the sum-product algorithm, worked through on trees and chains.</li>
+      <li>Frank Jensen, <em>An Introduction to Bayesian Networks</em>, 1996 &mdash; a gentle treatment of the independence semantics, with many small examples.</li>
+      <li>Martin Wainwright and Michael Jordan, <a href="https://www.nowpublishers.com/article/Details/MAL-001">"Graphical Models, Exponential Families, and Variational Inference"</a>, Foundations and Trends in Machine Learning, 2008 &mdash; the variational view of the same machinery.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A chain graph is the one case where the messages are cheap enough to run on every time step &mdash; which is exactly what a hidden Markov model does.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; return x.toFixed(d); }
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+  // Demo A — parameter count: full joint against a factored chain
+  var countState = { n: 12 }, countPlot = null;
+  function drawCount() {
+    if (!countPlot) return;
+    var pl = countPlot, N = countState.n, full = [], fact = [], i;
+    pl.clear(); pl.grid({ step: 0.5 });
+    for (i = 2; i <= N; i++) {
+      full.push({ x: i - 0.18, y: Math.log(Math.pow(2, i) - 1) / Math.LN10 });
+      fact.push({ x: i + 0.18, y: Math.log(2 * i - 1) / Math.LN10 });
+    }
+    pl.bars(full, { color: c.accent2, width: 0.34, label: 'full joint' });
+    pl.bars(fact, { color: c.accent, width: 0.34, label: 'chain (each node one parent)' });
+    pl.axes({ step: 1, xLabel: 'variables n', yLabel: 'log10 parameters' });
+    pl.legend();
+    var fullN = Math.pow(2, N) - 1, factN = 2 * N - 1;
+    el('count-readout').innerHTML =
+      '<div><span class="k">variables</span> <span class="hi">' + N + '</span></div>' +
+      '<div><span class="k">full joint parameters</span> ' + fullN.toLocaleString() + '</div>' +
+      '<div><span class="k">factored chain parameters</span> ' + factN.toLocaleString() + '</div>' +
+      '<div><span class="k">ratio</span> ' + Math.round(fullN / factN) + '&times;</div>' +
+      '<div style="margin-top:6px;">The full joint doubles per variable; the chain adds two numbers per variable.</div>';
+  }
+  countPlot = Prob.plot(el('count-canvas'), { W: 640, H: 360, xRange: [1.5, 16.5], yRange: [0, 5.5], onResize: drawCount });
+  Guide.bindSliders([el('count-n')], function (s) { countState.n = parseInt(s.value, 10); drawCount(); });
+  drawCount();
+
+  // Demo B — a clickable DAG with d-separation highlighting
+  var DAG_NODES = [
+    { name: 'Cloudy', x: 150, y: 78 },
+    { name: 'Sprinkler', x: 108, y: 252 },
+    { name: 'Rain', x: 528, y: 78 },
+    { name: 'Wet grass', x: 330, y: 296 }
+  ];
+  var DAG_EDGES = [[0, 1], [0, 2], [1, 3], [2, 3]];
+  var DAG_PARENTS = [[], [0], [0], [1, 2]];
+  var dagState = { observed: [false, false, false, false], q1: 1, q2: 2 };
+  var dagHandle = null;
+  var DAG_DESC = (function () {
+    var desc = [[], [], [], []], changed = true, i, v, k;
+    for (i = 0; i < DAG_EDGES.length; i++) desc[DAG_EDGES[i][1]].push(DAG_EDGES[i][0]);
+    while (changed) {
+      changed = false;
+      for (v = 0; v < 4; v++) for (k = 0; k < desc[v].length; k++) {
+        var u = desc[v][k], j;
+        for (j = 0; j < desc[u].length; j++) if (desc[v].indexOf(desc[u][j]) < 0) { desc[v].push(desc[u][j]); changed = true; }
+      }
+    }
+    return desc;
+  })();
+  var DAG_NB = (function () {
+    var nb = [[], [], [], []], i;
+    for (i = 0; i < DAG_EDGES.length; i++) {
+      nb[DAG_EDGES[i][0]].push(DAG_EDGES[i][1]); nb[DAG_EDGES[i][1]].push(DAG_EDGES[i][0]);
+    }
+    return nb;
+  })();
+  function dagPaths(a, b) {
+    var out = [], seen = {};
+    function walk(v, acc) {
+      if (v === b) { out.push(acc.slice()); return; }
+      for (var i = 0; i < DAG_NB[v].length; i++) {
+        var u = DAG_NB[v][i];
+        if (seen[u]) continue;
+        seen[u] = true; acc.push(u); walk(u, acc); acc.pop(); seen[u] = false;
+      }
+    }
+    seen[a] = true; walk(a, [a]);
+    return out;
+  }
+  function isColliderOnPath(path, i) {
+    return DAG_PARENTS[path[i]].indexOf(path[i - 1]) >= 0 && DAG_PARENTS[path[i]].indexOf(path[i + 1]) >= 0;
+  }
+  function pathBlockedBy(path) {
+    for (var i = 1, j; i < path.length - 1; i++) {
+      var v = path[i];
+      if (isColliderOnPath(path, i)) {
+        var open = dagState.observed[v];
+        for (j = 0; j < DAG_DESC[v].length; j++) if (dagState.observed[DAG_DESC[v][j]]) open = true;
+        if (!open) return { blocked: true, why: DAG_NODES[v].name + ' is an unobserved collider' };
+      } else if (dagState.observed[v]) {
+        return { blocked: true, why: DAG_NODES[v].name + ' is observed' };
+      }
+    }
+    return { blocked: false, why: 'no blocking node' };
+  }
+  function dagAssess() {
+    var paths = dagPaths(dagState.q1, dagState.q2), out = [], anyActive = false;
+    for (var i = 0; i < paths.length; i++) {
+      var r = pathBlockedBy(paths[i]);
+      if (!r.blocked) anyActive = true;
+      out.push({ path: paths[i], blocked: r.blocked, why: r.why });
+    }
+    return { paths: out, separated: !anyActive };
+  }
+  function drawDag() {
+    if (!dagHandle) return;
+    var ctx = dagHandle.ctx, W = 640, H = 360, nodes = DAG_NODES, assess = dagAssess(), i, j;
+    ctx.clearRect(0, 0, W, H);
+    for (i = 0; i < assess.paths.length; i++) {
+      var p = assess.paths[i], active = !p.blocked;
+      ctx.save();
+      ctx.strokeStyle = active ? 'rgba(42,157,143,0.40)' : 'rgba(214,0,108,0.30)';
+      ctx.lineWidth = 14; ctx.lineCap = 'round';
+      ctx.setLineDash(active ? [] : [10, 8]);
+      ctx.beginPath();
+      for (j = 0; j < p.path.length; j++) {
+        var nd = nodes[p.path[j]];
+        if (j === 0) ctx.moveTo(nd.x, nd.y); else ctx.lineTo(nd.x, nd.y);
+      }
+      ctx.stroke(); ctx.restore();
+    }
+    for (i = 0; i < DAG_EDGES.length; i++) {
+      var e = DAG_EDGES[i], from = nodes[e[0]], to = nodes[e[1]];
+      var dx = to.x - from.x, dy = to.y - from.y, len = Math.hypot(dx, dy), r = 24;
+      Guide.drawArrow(ctx, from.x + dx / len * r, from.y + dy / len * r,
+        to.x - dx / len * r, to.y - dy / len * r, { color: c.text, width: 1.6, head: 8 });
+    }
+    for (i = 0; i < nodes.length; i++) {
+      var n = nodes[i], isQ = (i === dagState.q1 || i === dagState.q2);
+      ctx.beginPath(); ctx.arc(n.x, n.y, 24, 0, Math.PI * 2);
+      ctx.fillStyle = dagState.observed[i] ? c.accent700 : '#ffffff'; ctx.fill();
+      ctx.lineWidth = isQ ? 3.5 : 1.6; ctx.strokeStyle = isQ ? c.accent2 : c.divider; ctx.stroke();
+      if (isQ) {
+        ctx.beginPath(); ctx.arc(n.x, n.y, 29, 0, Math.PI * 2);
+        ctx.lineWidth = 1.2; ctx.strokeStyle = c.accent2; ctx.stroke();
+      }
+      ctx.fillStyle = dagState.observed[i] ? '#ffffff' : c.text;
+      ctx.font = 'bold 12px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(n.name, n.x, n.y);
+      if (isQ) { ctx.fillStyle = c.accent2; ctx.font = 'bold 10px ' + c.font; ctx.fillText(i === dagState.q1 ? 'X' : 'Y', n.x, n.y - 34); }
+      if (dagState.observed[i]) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.fillText('observed', n.x, n.y + 38); }
+    }
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+    var lines = '';
+    for (i = 0; i < assess.paths.length; i++) {
+      var pp = assess.paths[i], names = [];
+      for (j = 0; j < pp.path.length; j++) names.push(nodes[pp.path[j]].name);
+      lines += '<div><span class="k">' + names.join(' &ndash; ') + '</span> ' +
+        (pp.blocked ? '<span style="color:#d6006c">blocked</span> (' + pp.why + ')' : '<span style="color:#2a9d8f">active</span>') + '</div>';
+    }
+    var obs = [];
+    for (i = 0; i < 4; i++) if (dagState.observed[i]) obs.push(nodes[i].name);
+    el('dag-readout').innerHTML = lines +
+      '<div style="margin-top:6px;"><span class="k">observed</span> ' + (obs.length ? obs.join(', ') : 'nothing') + '</div>' +
+      '<div><span class="k">verdict</span> <span class="hi">' + (assess.separated ? 'd-separated' : 'not d-separated') + '</span></div>' +
+      '<div style="margin-top:6px;">A collider path is blocked until you condition on the collider or one of its descendants.</div>';
+  }
+  dagHandle = Guide.setupCanvas(el('dag-canvas'), 640, 360, drawDag);
+  (function populateDagSelects() {
+    var s1 = el('dag-q1'), s2 = el('dag-q2'), i;
+    for (i = 0; i < DAG_NODES.length; i++) {
+      var o1 = document.createElement('option'), o2 = document.createElement('option');
+      o1.value = i; o1.textContent = DAG_NODES[i].name;
+      o2.value = i; o2.textContent = DAG_NODES[i].name;
+      s1.appendChild(o1); s2.appendChild(o2);
+    }
+    s1.value = dagState.q1; s2.value = dagState.q2;
+    s1.addEventListener('change', function () { dagState.q1 = parseInt(s1.value, 10); drawDag(); });
+    s2.addEventListener('change', function () { dagState.q2 = parseInt(s2.value, 10); drawDag(); });
+  })();
+  el('dag-canvas').addEventListener('click', function (ev) {
+    var p = Guide.hitTest(el('dag-canvas'), ev), i;
+    for (i = 0; i < DAG_NODES.length; i++) {
+      if (Math.hypot(p.x - DAG_NODES[i].x, p.y - DAG_NODES[i].y) <= 26) {
+        dagState.observed[i] = !dagState.observed[i]; drawDag(); return;
+      }
+    }
+  });
+  el('dag-reset').addEventListener('click', function () { dagState.observed = [false, false, false, false]; drawDag(); });
+  drawDag();
+
+  // Demo C — explaining away, numerically
+  var eaState = { pa: 0.1, pb: 0.2, c11: 0.95, c10: 0.8, c01: 0.8, c00: 0.01 }, eaPlot = null;
+  function eaStats() {
+    var pa = eaState.pa, pb = eaState.pb;
+    var ctab = [[eaState.c00, eaState.c01], [eaState.c10, eaState.c11]];
+    var j = [[[0, 0], [0, 0]], [[0, 0], [0, 0]]], a, b, cc, pC1 = 0, pA1C1 = 0, pB1C1 = 0, pAB1C1 = 0;
+    for (a = 0; a < 2; a++) for (b = 0; b < 2; b++) {
+      var pab = (a ? pa : 1 - pa) * (b ? pb : 1 - pb);
+      for (cc = 0; cc < 2; cc++) j[a][b][cc] = pab * (cc ? ctab[a][b] : 1 - ctab[a][b]);
+      pC1 += j[a][b][1];
+      if (a === 1) pA1C1 += j[a][b][1];
+      if (b === 1) { pB1C1 += j[a][b][1]; if (a === 1) pAB1C1 += j[a][b][1]; }
+    }
+    var denomC = Math.max(pC1, 1e-9);
+    var condA = pA1C1 / denomC, condB = pB1C1 / denomC, condAB = pAB1C1 / denomC;
+    var givenBoth = pAB1C1 / Math.max(pB1C1, 1e-9);
+    var mi = 0, a2, b2;
+    for (a2 = 0; a2 < 2; a2++) for (b2 = 0; b2 < 2; b2++) {
+      var pabC = j[a2][b2][1] / denomC, paC = a2 ? condA : 1 - condA, pbC = b2 ? condB : 1 - condB;
+      if (pabC > 1e-12 && paC > 1e-12 && pbC > 1e-12) mi += pabC * Math.log(pabC / (paC * pbC));
+    }
+    return { pC1: pC1, pA1: pa, pB1: pb, condA: condA, condB: condB, condAB: condAB, givenBoth: givenBoth, gap: condAB - condA * condB, mi: mi };
+  }
+  function drawEA() {
+    if (!eaPlot) return;
+    var pl = eaPlot, s = eaStats();
+    pl.clear(); pl.grid({ step: 0.2 });
+    pl.bars([{ x: 0.7, y: s.pA1 }, { x: 3.3, y: s.pB1 }], { color: '#9a9a9a', width: 0.62, label: 'marginal' });
+    pl.bars([{ x: 1.7, y: s.condA }, { x: 4.3, y: s.condB }], { color: c.accent, width: 0.62, label: 'given C = 1' });
+    pl.bars([{ x: 2.7, y: s.givenBoth }], { color: c.accent2, width: 0.62, label: 'A given C = 1 and B = 1' });
+    pl.axes({ step: 0.2, yLabel: 'probability' }); pl.legend();
+    el('ea-readout').innerHTML =
+      '<div><span class="k">P(A = 1)</span> <span class="hi">' + fmt(s.pA1, 3) + '</span>' +
+      ' &nbsp; <span class="k">P(B = 1)</span> <span class="hi">' + fmt(s.pB1, 3) + '</span></div>' +
+      '<div><span class="k">P(C = 1)</span> ' + fmt(s.pC1, 3) + '</div>' +
+      '<div><span class="k">P(A = 1 | C = 1)</span> ' + fmt(s.condA, 3) + ' &nbsp; <span class="k">P(B = 1 | C = 1)</span> ' + fmt(s.condB, 3) + '</div>' +
+      '<div><span class="k">P(A = 1, B = 1)</span> ' + fmt(s.pA1 * s.pB1, 3) + ' &nbsp; <span class="k">P(A = 1 | C = 1) P(B = 1 | C = 1)</span> ' + fmt(s.condA * s.condB, 3) + '</div>' +
+      '<div><span class="k">P(A = 1, B = 1 | C = 1)</span> ' + fmt(s.condAB, 3) + ' &nbsp; <span class="k">gap</span> ' + fmt(s.gap, 3) + '</div>' +
+      '<div><span class="k">P(A = 1 | C = 1, B = 1)</span> <span class="hi">' + fmt(s.givenBoth, 3) + '</span> &nbsp; <span class="k">I(A;B | C)</span> ' + fmt(s.mi, 4) + ' nats</div>' +
+      '<div style="margin-top:6px;">Marginal independence holds exactly; conditioning on the collider <var>C</var> creates dependence.</div>';
+  }
+  eaPlot = Prob.plot(el('ea-canvas'), { W: 640, H: 360, xRange: [0, 5], yRange: [0, 1], onResize: drawEA });
+  Guide.bindSliders([el('ea-pa'), el('ea-pb'), el('ea-c11'), el('ea-c10'), el('ea-c01'), el('ea-c00')], function () {
+    eaState.pa = clamp01(parseFloat(el('ea-pa').value));
+    eaState.pb = clamp01(parseFloat(el('ea-pb').value));
+    eaState.c11 = clamp01(parseFloat(el('ea-c11').value));
+    eaState.c10 = clamp01(parseFloat(el('ea-c10').value));
+    eaState.c01 = clamp01(parseFloat(el('ea-c01').value));
+    eaState.c00 = clamp01(parseFloat(el('ea-c00').value));
+    drawEA();
+  });
+  drawEA();
+
+  // Demo D — the collider model as a factor graph with messages
+  var fgState = { phase: 2 }, fgHandle = null;
+  function drawFactor() {
+    if (!fgHandle) return;
+    var ctx = fgHandle.ctx, W = 640, H = 360, i;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = c.text; ctx.font = 'bold 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('Bayes net', 24, 26); ctx.fillText('factor graph', 360, 26);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(320, 40); ctx.lineTo(320, 340); ctx.stroke();
+    var bn = [{ n: 'A', x: 70, y: 100 }, { n: 'B', x: 250, y: 100 }, { n: 'C', x: 160, y: 270 }];
+    for (i = 0; i < 2; i++) {
+      var dx = bn[2].x - bn[i].x, dy = bn[2].y - bn[i].y, len = Math.hypot(dx, dy), r = 22;
+      Guide.drawArrow(ctx, bn[i].x + dx / len * r, bn[i].y + dy / len * r,
+        bn[2].x - dx / len * r, bn[2].y - dy / len * r, { color: c.text, width: 1.6, head: 8 });
+    }
+    for (i = 0; i < 3; i++) {
+      ctx.beginPath(); ctx.arc(bn[i].x, bn[i].y, 22, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff'; ctx.fill(); ctx.strokeStyle = c.divider; ctx.lineWidth = 1.6; ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = 'bold 13px ' + c.font;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(bn[i].n, bn[i].x, bn[i].y);
+    }
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+    var va = { x: 400, y: 90 }, vb = { x: 590, y: 90 }, vc = { x: 495, y: 290 };
+    var f = { x: 495, y: 180 }, vars = [va, vb, vc], labels = ['A', 'B', 'C'];
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1.6;
+    for (i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(vars[i].x, vars[i].y); ctx.lineTo(f.x, f.y); ctx.stroke(); }
+    function msg(from, to, color, tag) {
+      var ddx = to.x - from.x, ddy = to.y - from.y, l = Math.hypot(ddx, ddy);
+      var nx = -ddy / l, ny = ddx / l, off = 7;
+      var x0 = from.x + ddx / l * 24 + nx * off, y0 = from.y + ddy / l * 24 + ny * off;
+      var x1 = to.x - ddx / l * 30 + nx * off, y1 = to.y - ddy / l * 30 + ny * off;
+      Guide.drawArrow(ctx, x0, y0, x1, y1, { color: color, width: 2, head: 9 });
+      ctx.fillStyle = color; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(tag, (x0 + x1) / 2 + nx * 10, (y0 + y1) / 2 + ny * 10);
+    }
+    if (fgState.phase === 0 || fgState.phase === 2) {
+      for (i = 0; i < 3; i++) msg(vars[i], f, c.accent, '\u03BC' + labels[i] + '\u2192f');
+    }
+    if (fgState.phase === 1 || fgState.phase === 2) {
+      for (i = 0; i < 3; i++) msg(f, vars[i], c.accent2, '\u03BCf\u2192' + labels[i]);
+    }
+    ctx.fillStyle = '#ffffff'; ctx.strokeStyle = c.text; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.rect(f.x - 22, f.y - 22, 44, 44); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = 'bold 13px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('f', f.x, f.y);
+    for (i = 0; i < 3; i++) {
+      ctx.beginPath(); ctx.arc(vars[i].x, vars[i].y, 22, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff'; ctx.fill(); ctx.strokeStyle = c.text; ctx.lineWidth = 1.8; ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = 'bold 13px ' + c.font; ctx.fillText(labels[i], vars[i].x, vars[i].y);
+    }
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+    var phaseText = fgState.phase === 0 ? 'variable-to-factor sweep' : (fgState.phase === 1 ? 'factor-to-variable sweep' : 'both sweeps');
+    el('factor-readout').innerHTML =
+      '<div><span class="k">showing</span> <span class="hi">' + phaseText + '</span></div>' +
+      '<div style="margin-top:6px;">Variable to factor: pass on the product of all other incoming messages. Factor to variable: multiply the factor by the other incoming messages, then sum out the other variables.</div>' +
+      '<div style="margin-top:6px;"><span class="k">&#956;f&#8594;A(a)</span> = &#931; b,c f(a,b,c) &#956;B&#8594;f(b) &#956;C&#8594;f(c), &nbsp; p(A) &#8733; &#956;f&#8594;A(a)</div>';
+  }
+  fgHandle = Guide.setupCanvas(el('factor-canvas'), 640, 360, drawFactor);
+  el('fg-v2f').addEventListener('click', function () { fgState.phase = 0; drawFactor(); });
+  el('fg-f2v').addEventListener('click', function () { fgState.phase = 1; drawFactor(); });
+  el('fg-both').addEventListener('click', function () { fgState.phase = 2; drawFactor(); });
+  drawFactor();
+
+  // Check your understanding
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'graphical-models-collider-block',
+      kind: 'choice',
+      prompt: 'In the path <var>$X \\to M \\leftarrow Y$</var>, when is the path blocked?',
+      options: [
+        { label: 'It is blocked by default, and opens if <var>M</var> or one of its descendants is observed.', correct: true },
+        { label: 'It is active by default, and blocks if <var>M</var> is observed.', correct: false },
+        { label: 'It is never blocked, because both edges point into <var>M</var>.', correct: false }
+      ],
+      explanation: 'A collider is the exception to the usual rule. Conditioning on a common effect, or on anything downstream of it, is what lets information flow between the two causes.'
+    },
+    {
+      id: 'graphical-models-full-joint-params',
+      kind: 'numeric',
+      prompt: 'How many independent parameters does a full joint distribution over four binary variables need?',
+      answer: 15,
+      tolerance: 0.001,
+      explanation: 'The table has 2⁴ = 16 entries and they sum to one, so 16 − 1 = 15 numbers determine it. A Bayesian network with sparse parents can do the same job with far fewer.'
+    },
+    {
+      id: 'graphical-models-chain-blocks',
+      kind: 'choice',
+      prompt: 'In a chain <var>$X \\to M \\to Y$</var>, what does observing the mediator <var>M</var> do to the dependence between <var>X</var> and <var>Y</var>?',
+      options: [
+        { label: 'It blocks the path, so <var>X</var> and <var>Y</var> become conditionally independent given <var>M</var>.', correct: true },
+        { label: 'It opens the path, so <var>X</var> and <var>Y</var> become more dependent.', correct: false },
+        { label: 'It has no effect, because <var>M</var> is not a collider.', correct: false }
+      ],
+      explanation: 'Once you know the value of the mediator, the upstream variable carries no further information about the downstream one. This is why conditioning on a variable that lies on the causal path removes the association.'
+    },
+    {
+      id: 'graphical-models-or-collider',
+      kind: 'numeric',
+      prompt: 'A noisy-OR collider has <var>P(A=1)=P(B=1)=0.5</var> and <var>$P(C=1\\mid A,B)=1$</var> if <var>A=1</var> or <var>B=1</var>, and <var>0</var> otherwise. What is <var>$P(A=1\\mid C=1)$</var>?',
+      answer: 0.6667,
+      tolerance: 0.01,
+      explanation: 'P(C=1) = 1 − P(A=0)P(B=0) = 1 − 0.25 = 0.75, and P(A=1, C=1) = 0.5. So P(A=1 | C=1) = 0.5 / 0.75 = 2/3. The other half of the explanation is equally likely to be B.'
+    },
+    {
+      id: 'graphical-models-factor-message',
+      kind: 'choice',
+      prompt: 'What does a factor-to-variable message <var>$\\mu_{f\\to v}$</var> do?',
+      options: [
+        { label: 'Multiplies the factor by the other incoming messages, then sums out every variable except <var>v</var>.', correct: true },
+        { label: 'Multiplies the factor by all incoming messages including the one from <var>v</var>.', correct: false },
+        { label: 'Returns the largest value of the factor over all its variables.', correct: false }
+      ],
+      explanation: 'The excluded message is the point: a node must not use the information it just sent, or the computation would be circular. Sum-product sums out the other variables; max-product would take a maximum instead, which is how Viterbi decoding works.'
+    },
+    {
+      id: 'graphical-models-loopy',
+      kind: 'choice',
+      prompt: 'Why is sum-product exact on a tree but only approximate on a graph with cycles?',
+      options: [
+        { label: 'On a tree no message can depend on itself, since no path returns to its starting point.', correct: true },
+        { label: 'Trees have fewer variables, so the sums are shorter.', correct: false },
+        { label: 'Cycles make the factors non-negative, which breaks the algorithm.', correct: false }
+      ],
+      explanation: 'Loopy belief propagation can oscillate or converge to the wrong marginals because a message travelling around a loop eventually feeds back into itself. In practice it often works well, and it is the basis of decoding for turbo and LDPC codes.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

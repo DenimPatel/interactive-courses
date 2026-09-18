@@ -1,0 +1,355 @@
+---
+title: "Text to speech"
+description: "From attention alignment and duration models to codec language models and two-stage autoregressive-plus-diffusion synthesis, with cloning and streaming latency."
+permalink: "/ai/generative-media/tts/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Text to speech</h1>
+    <p>Text is a sequence of symbols with no duration; speech is a waveform with a great deal of duration. Nearly everything in a speech synthesiser is a way of deciding how long each symbol lasts and what it sounds like, and the modern answer has moved from a hand-aligned spectrogram to a language model over codec tokens. This part follows that arc: attention alignment and the monotonicity it had to be forced into, the explicit duration models that replaced it, the codec language model that made zero-shot cloning routine, and the two-stage autoregressive-plus-diffusion design that trades a little complexity for streaming latency.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="pipeline">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>From text to sound</h2></div>
+    <p class="g-eyebrow">Five stages, and one alignment in the middle</p>
+    <p>The pipeline below is the shape almost every modern system shares. Text is normalised and turned into symbols. An encoder gives each symbol a vector. An <em>alignment</em> stage expands those vectors along the time axis, deciding how many frames of sound each symbol owns. An acoustic model produces a representation of sound &mdash; historically a mel spectrogram, now usually codec tokens &mdash; and a <em>vocoder</em> or decoder turns that representation into a waveform. The alignment stage is the one that has no counterpart in machine translation, and it is where the design battles of the last decade were fought.</p>
+    <p>The reason alignment is hard is that it is a many-to-many correspondence with no labels at training time. We know the text and we know the audio, and we do not know which frames belong to which phoneme. Early systems learned it implicitly with attention, which discovers a soft monotonic map as a side effect of predicting spectrogram frames. Later systems predicted it explicitly with a duration model, which is faster and more controllable. The codec language models of the last few years sidestep explicit alignment almost entirely by treating speech as a token sequence and letting a strong language model learn the correspondence from data.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tts-pipe-canvas" width="660" height="170"></canvas>
+        <p class="g-canvas-hint">The text-to-speech pipeline. The middle box &mdash; alignment and duration &mdash; is the stage the rest of this part is about.</p>
+      </div>
+      <div class="g-controls">
+        <p class="g-mini">Read the diagram left to right. Text becomes vectors, vectors are stretched in time, the stretched sequence becomes sound tokens, and the tokens become a waveform.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> explain why alignment needs monotonicity, describe attention-era alignment against explicit duration models, outline a codec language model such as VALL-E, and account for the first-chunk latency of a streaming two-stage synthesiser.</span></div>
+    <div class="g-toc">
+      <a href="#align">2 · Alignment and duration</a>
+      <a href="#codec-lm">3 · Codec language models</a>
+      <a href="#streaming">4 · Two-stage and streaming</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="align">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Alignment and duration</h2></div>
+    <p class="g-eyebrow">Which frames belong to which symbol</p>
+    <p>Attention-based synthesisers such as Tacotron let the decoder attend over the encoder's symbol vectors while generating frames one at a time. Trained on enough data, the attention settles into a roughly diagonal band: each frame looks at the symbol currently being spoken, and the band moves left to right as the utterance progresses. That band <em>is</em> the alignment, learned without labels. It is also fragile. Because the map is soft, the decoder can skip a symbol, repeat it, or stall, and failures are catastrophic rather than gradual.</p>
+    <p>Explicit duration models replaced the soft map with a hard one. A duration predictor estimates, for each symbol, how many frames it spans; at inference those counts are used to expand the symbol sequence to frame length, and the acoustic model becomes a non-autoregressive mapping from the enlarged sequence to spectrograms. This is the design of FastSpeech and its descendants. It is fast, it parallelises, and it makes timing directly controllable &mdash; you can slow a word down by editing its duration. The cost is that a duration error becomes an audible timing error rather than something attention can smooth away.</p>
+    <p>The heatmap is a hard alignment of the kind a duration model produces: a bright diagonal band, one frame column per time step, one row per symbol. Move the sliders to change how many symbols there are and how long the utterance runs; the band steepens or flattens but stays monotonic, because speech does not go backwards.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tts-align-canvas" width="660" height="260"></canvas>
+        <p class="g-canvas-hint">A monotonic alignment matrix: rows are text symbols, columns are frames. Bright means the symbol is being spoken in that frame.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Text symbols <span class="val">10</span></label><input type="range" id="tts-tokens" min="4" max="16" step="1" value="10"></div>
+        <div class="g-field"><label>Frames <span class="val">50</span></label><input type="range" id="tts-frames" min="20" max="80" step="2" value="50"></div>
+        <div class="g-readout" id="tts-align-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Monotonicity is a constraint, not a hope.</b> Nothing about a plain attention layer forbids looking backwards. Every attention synthesiser relies on either the data or an explicit monotonic bias to keep the band from folding, and when it folds you hear a skipped or repeated word. Explicit durations are what made the failure mode disappear.</span></div>
+  </section>
+
+  <section class="g-step" id="codec-lm">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Codec language models</h2></div>
+    <p class="g-eyebrow">Speech as text</p>
+    <p>Once a codec has reduced speech to a token stream, synthesis becomes conditional language modelling: given the text tokens, predict the acoustic tokens. VALL-E framed it exactly this way and added the property that made the field take notice &mdash; <em>zero-shot cloning</em>. Because the model is conditioned on both the text and a short acoustic prompt, three seconds of a target speaker's audio are enough to make it continue in that voice, with no fine-tuning and no per-speaker parameters. The prompt supplies timbre and recording conditions; the text supplies the words.</p>
+    <p>CosyVoice and Spark-TTS refine the recipe with a stronger text encoder, a supervised semantic stream, and flow-matching decoders, but they keep the core: a language model over codec tokens conditioned on text and a speaker prompt. The remaining weaknesses are the ones you would predict from that framing. Autoregressive token generation is slow enough to matter for real-time use, the models can hallucinate or drop words, and cloning raises the obvious consent and provenance questions taken up in the last part of this chapter.</p>
+  </section>
+
+  <section class="g-step" id="streaming">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Two-stage and streaming</h2></div>
+    <p class="g-eyebrow">Autoregressive structure, diffusion detail</p>
+    <p>The two-stage design splits the job. A first stage runs an autoregressive or flow-matching model that produces a compact, coarse token sequence &mdash; enough to fix the content and the rhythm. A second stage, often a diffusion transformer, takes that sequence and refines it into the fine acoustic tokens that the vocoder decodes. Systems such as GLM-TTS and DiTAR use this division so that the expensive autoregressive part generates few tokens and the detail is filled in by a parallel, non-autoregressive stage that can be run with few steps. The design pays off in streaming, where what matters is not total synthesis time but the latency of the <em>first chunk</em>.</p>
+    <p>For a conversational agent the number that users feel is the gap between the end of their speech and the first sound of the reply. That gap is the sum of the text-encoding time, the time to generate the first autoregressive chunk, and the time for the vocoder to render it; the rest of the utterance is synthesised while the first part is already playing. The budget bar makes the arithmetic concrete. The target for a natural turn is a few hundred milliseconds at most, and every stage in the chain gets a slice of it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tts-budget-canvas" width="660" height="200"></canvas>
+        <p class="g-canvas-hint">First-chunk latency budget, drawn with <code>Guide.drawStacked</code> from <code>GenMedia.timeline.budget</code>. The dashed line is a 300 ms target.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Text encoder <span class="val">15</span> ms</label><input type="range" id="tts-te" min="5" max="80" step="1" value="15"></div>
+        <div class="g-field"><label>First AR chunk <span class="val">60</span> ms</label><input type="range" id="tts-ar" min="20" max="200" step="5" value="60"></div>
+        <div class="g-field"><label>Vocoder <span class="val">25</span> ms</label><input type="range" id="tts-voc" min="5" max="120" step="1" value="25"></div>
+        <div class="g-readout" id="tts-budget-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Streaming changes the objective.</b> A model that takes a full second to synthesise five seconds of speech can still feel instant if the first hundred milliseconds arrive within the budget. Streaming synthesis is therefore an exercise in producing an early, good-enough first chunk, not in making the whole utterance fast.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Synthesis is half of every voice agent</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Dialogue</div>
+        <h3 style="margin:6px 0;">The speaking half of a duplex loop</h3>
+        <p style="margin-bottom:0;">A voice agent pairs synthesis with <a href="{{ '/ai/generative-media/asr-and-duplex/' | relative_url }}">recognition and turn-taking</a>. The first-chunk budget here and the barge-in behaviour there are two halves of the same conversational contract, and the codec vocabulary is shared between them.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Foundations</div>
+        <h3 style="margin:6px 0;">Everything rests on the codec</h3>
+        <p style="margin-bottom:0;">The token vocabulary, frame rate and bitrate come from the <a href="{{ '/ai/generative-media/audio-codecs/' | relative_url }}">neural codec</a> of the previous part. Change the codec and every latency number in this part changes with it.</p>
+      </div>
+    </div>
+    <p>Cloning and prosody are the two properties users judge first. Zero-shot cloning is now a commodity, which pushes the interesting questions to consent, watermarking and attribution &mdash; treated in the final part &mdash; while prosody, the right intonation for a question or an aside, remains the hardest thing to specify and to evaluate.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The papers below mark the shift from aligned spectrogram prediction to codec language modelling. If you take away one thing, take away the alignment constraint: monotonicity is what separates speech synthesis from generic sequence transduction.</p>
+    <ul class="g-refs">
+      <li>Wang, Skerry-Ryan, Stanton and coauthors, <a href="https://arxiv.org/abs/1703.10135">"Tacotron: Towards End-to-End Speech Synthesis"</a>, 2017 &mdash; attention alignment learned without labels.</li>
+      <li>Ren, Hu, Tan and coauthors, <a href="https://arxiv.org/abs/1905.09263">"FastSpeech: Fast, Robust and Controllable Text to Speech"</a>, 2019 &mdash; the explicit duration model.</li>
+      <li>Wang, Chen, Wu and coauthors, <a href="https://arxiv.org/abs/2301.02111">"Neural Codec Language Models are Zero-Shot Text to Speech Synthesizers"</a>, 2023 &mdash; VALL-E and zero-shot cloning.</li>
+      <li>Du, Chen, Zhang and coauthors, <a href="https://arxiv.org/abs/2407.05407">"CosyVoice: A Scalable Multilingual Zero-shot Text-to-speech Synthesizer"</a>, 2024 &mdash; semantic tokens and flow-matching decoding.</li>
+      <li>Peng, Li, Zhang and coauthors, <a href="https://arxiv.org/abs/2503.20215">"Spark-TTS"</a>, 2025 &mdash; a codec-language-model synthesiser with controllable attributes.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Alignment</td><td>The correspondence between text symbols and audio frames</td></tr>
+        <tr><td>Monotonicity</td><td>The band moves forward only; speech never speaks a symbol twice out of order</td></tr>
+        <tr><td>Attention alignment</td><td>Tacotron learns the map as a soft by-product of frame prediction</td></tr>
+        <tr><td>Duration model</td><td>Explicit frames-per-symbol prediction; FastSpeech-style, fast and controllable</td></tr>
+        <tr><td>Codec language model</td><td>Text-conditioned prediction over acoustic tokens; VALL-E and relatives</td></tr>
+        <tr><td>Zero-shot cloning</td><td>Copying a voice from a short prompt with no fine-tuning</td></tr>
+        <tr><td>Two-stage synthesis</td><td>Coarse autoregressive tokens, then diffusion-refined detail</td></tr>
+        <tr><td>First-chunk latency</td><td>Text encoder + first AR chunk + vocoder; the gap a listener feels</td></tr>
+        <tr><td>Vocoder</td><td>The decoder from sound tokens or spectrograms to a waveform</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Synthesis is only half a conversation. The next part is the listening half: how recognisers align text to audio, why streaming is hard for them too, and what a full-duplex turn budget really contains.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia;
+  var c = Guide.colors();
+
+  var textTokens = 10, frameCount = 50;
+  var teMs = 15, arMs = 60, vocMs = 25;
+
+  var PIPE_W = 660, PIPE_H = 170;
+  var ALIGN_W = 660, ALIGN_H = 260;
+  var BUDGET_W = 660, BUDGET_H = 200;
+
+  function drawPipe() {
+    if (!pipeSetup) return;
+    var ctx = pipeSetup.ctx;
+    ctx.clearRect(0, 0, PIPE_W, PIPE_H);
+    var labels = ['text', 'text\nencoder', 'alignment +\nduration', 'acoustic tokens\n(language model)', 'vocoder'];
+    var n = labels.length, gap = 32;
+    var bw = (PIPE_W - 20 - gap * (n - 1)) / n;
+    var by = 40, bh = 84;
+    for (var i = 0; i < n; i++) {
+      var x = 10 + i * (bw + gap);
+      ctx.fillStyle = i === n - 1 ? 'rgba(214,0,108,0.12)' : 'rgba(43,95,255,0.09)';
+      ctx.fillRect(x, by, bw, bh);
+      ctx.strokeStyle = i === n - 1 ? c.accent2 : c.accent400;
+      ctx.lineWidth = 1.4;
+      ctx.strokeRect(x + 0.5, by + 0.5, bw - 1, bh - 1);
+      var lines = labels[i].split('\n');
+      ctx.fillStyle = c.text;
+      ctx.font = '11px ' + c.font;
+      ctx.textAlign = 'center';
+      for (var j = 0; j < lines.length; j++) {
+        ctx.fillText(lines[j], x + bw / 2, by + bh / 2 + (j - (lines.length - 1) / 2) * 13 + 4);
+      }
+      if (i < n - 1) {
+        Guide.drawArrow(ctx, x + bw + 4, by + bh / 2, x + bw + gap - 4, by + bh / 2, { color: c.divider, width: 1.6, head: 7 });
+      }
+    }
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('text in', 10, 22);
+    ctx.textAlign = 'right';
+    ctx.fillText('waveform out', PIPE_W - 10, 22);
+  }
+
+  var pipeSetup = Guide.setupCanvas(document.getElementById('tts-pipe-canvas'), PIPE_W, PIPE_H, function () { drawPipe(); });
+  var alignSetup = Guide.setupCanvas(document.getElementById('tts-align-canvas'), ALIGN_W, ALIGN_H, function () { redraw(); });
+  var budgetSetup = Guide.setupCanvas(document.getElementById('tts-budget-canvas'), BUDGET_W, BUDGET_H, function () { redraw(); });
+
+  function drawAlign() {
+    if (!alignSetup) return;
+    var ctx = alignSetup.ctx;
+    var rows = textTokens, cols = frameCount;
+    var sigma = Math.max(0.8, (cols / rows) * 0.5);
+    var matrix = [], rowLabels = [], colLabels = [];
+    for (var i = 0; i < rows; i++) {
+      var centre = (i + 0.5) / rows * cols;
+      var row = [];
+      for (var t = 0; t < cols; t++) {
+        var d = t + 0.5 - centre;
+        row.push(Math.exp(-(d * d) / (2 * sigma * sigma)));
+      }
+      matrix.push(row);
+      rowLabels.push(i % Math.max(1, Math.ceil(rows / 8)) === 0 ? ('#' + (i + 1)) : '');
+    }
+    for (var t2 = 0; t2 < cols; t2++) colLabels.push(t2 % Math.max(1, Math.ceil(cols / 8)) === 0 ? (t2 * 20) + ' ms' : '');
+    Guide.drawHeatmap(ctx, ALIGN_W, ALIGN_H, matrix, {
+      rowLabels: rowLabels, colLabels: colLabels, padL: 40, padB: 24,
+      colorLow: [245, 245, 250], colorHigh: [214, 0, 108]
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('alignment: ' + rows + ' symbols × ' + cols + ' frames', 4, 12);
+    var el = document.getElementById('tts-align-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">symbols</span> ' + rows + '</div>' +
+        '<div><span class="k">frames</span> ' + cols + '</div>' +
+        '<div><span class="k">frames per symbol</span> <span class="hi">' + (cols / rows).toFixed(1) + '</span></div>' +
+        '<div><span class="k">frame step</span> 20 ms</div>' +
+        '<div class="g-mini">A duration model predicts the frames-per-symbol column directly.</div>';
+    }
+  }
+
+  function drawBudget() {
+    if (!budgetSetup) return;
+    var ctx = budgetSetup.ctx;
+    var b = GM.timeline.budget([
+      { name: 'text encoder', ms: teMs, color: c.accent400 },
+      { name: 'first AR chunk', ms: arMs, color: c.accent2 },
+      { name: 'vocoder', ms: vocMs, color: c.accent }
+    ]);
+    var rows = [{ label: 'first chunk', segments: b.segments.map(function (s) { return { value: s.ms, color: s.color, name: s.name }; }) }];
+    var geo = Guide.drawStacked(ctx, BUDGET_W, BUDGET_H, rows, { padL: 96, padT: 24, padB: 118, maxTotal: 300 });
+    var targetX = geo.padL + geo.scale * 300;
+    ctx.save();
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1.4; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(targetX, geo.padT - 6); ctx.lineTo(targetX, geo.padT + geo.barH + 6); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+    ctx.fillText('300 ms target', targetX - 4, geo.padT - 10);
+    ctx.restore();
+    var el = document.getElementById('tts-budget-readout');
+    if (el) {
+      var over = b.total > 300;
+      el.innerHTML =
+        '<div><span class="k">text encoder</span> ' + teMs + ' ms</div>' +
+        '<div><span class="k">first AR chunk</span> ' + arMs + ' ms</div>' +
+        '<div><span class="k">vocoder</span> ' + vocMs + ' ms</div>' +
+        '<div><span class="k">first chunk</span> <span class="' + (over ? 'bad' : 'hi') + '">' + Guide.fmtMs(b.total) + '</span></div>' +
+        '<div><span class="k">verdict</span> ' + (over ? 'over budget — listeners notice' : 'within budget') + '</div>';
+    }
+  }
+
+  function redraw() {
+    drawAlign();
+    drawBudget();
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#tts-tokens'), function (el) {
+    textTokens = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#tts-frames'), function (el) {
+    frameCount = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#tts-te'), function (el) {
+    teMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#tts-ar'), function (el) {
+    arMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#tts-voc'), function (el) {
+    vocMs = parseInt(el.value, 10);
+    redraw();
+  });
+
+  drawPipe();
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'tts-alignment',
+      kind: 'choice',
+      prompt: 'Why is monotonicity a required property of speech alignment?',
+      options: [
+        { label: 'Speech proceeds forward in time, so a symbol cannot be spoken again out of order.', correct: true },
+        { label: 'It makes the attention matrix smaller and cheaper to compute.', correct: false },
+        { label: 'It removes the need for a text encoder entirely.', correct: false }
+      ],
+      explanation: 'A plain attention map can fold or skip, which produces repeated or missing words. Explicit duration models and monotonic biases exist to make the collapse impossible rather than unlikely.'
+    },
+    {
+      id: 'tts-duration',
+      kind: 'choice',
+      prompt: 'What does an explicit duration model predict that attention alignment does not?',
+      options: [
+        { label: 'Frames per text symbol, used to expand symbols to frame length directly.', correct: true },
+        { label: 'The waveform samples for each phoneme.', correct: false },
+        { label: 'The speaker identity from a short prompt.', correct: false }
+      ],
+      explanation: 'Duration models give a hard frames-per-symbol count, so the acoustic model becomes a fast, parallel, non-autoregressive mapping and timing becomes directly editable.'
+    },
+    {
+      id: 'tts-first-chunk',
+      kind: 'numeric',
+      prompt: 'A two-stage synthesiser spends 15 ms on text encoding, 60 ms on the first autoregressive chunk and 25 ms in the vocoder. What is the first-chunk latency in milliseconds?',
+      answer: 100,
+      tolerance: 0.5,
+      explanation: 'First-chunk latency is the sum of the three stages: 15 + 60 + 25 = 100 ms, well inside the 300 ms target the demo draws.'
+    },
+    {
+      id: 'tts-cloning',
+      kind: 'choice',
+      prompt: 'What makes zero-shot voice cloning possible in a codec language model?',
+      options: [
+        { label: 'Speech is conditioned on a short acoustic prompt of the target speaker, so no fine-tuning is needed.', correct: true },
+        { label: 'The model stores a separate set of weights for each speaker.', correct: false },
+        { label: 'Cloning requires an hour of target audio to train an adapter.', correct: false }
+      ],
+      explanation: 'VALL-E-style models condition token generation on a few seconds of prompt audio, which supplies timbre and recording conditions. That is what turned cloning from a fine-tuning project into a prompt.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

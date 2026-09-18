@@ -1,0 +1,640 @@
+---
+title: "Probability in Action, Interactively — Part 20: Probability in machine learning"
+description: "Where probability hides inside machine learning: softmax as a tempered distribution, cross-entropy as negative log-likelihood, calibration and reliability diagrams, Gaussian-process uncertainty, and the latent-variable machinery behind VAEs, diffusion and the next-token distribution."
+permalink: "/math/probability-in-action/probabilistic-ml/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true plotly=true %}
+<style>
+  .g-plot { width: 100%; height: 360px; }
+  .g-flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; font-size: 12.5px; }
+  .g-flow-box { border: 1px solid var(--color-divider); border-radius: var(--radius-sm); padding: 6px 10px; background: var(--color-neutral-100); }
+  .g-flow-arrow { font-family: var(--font-mono); font-size: 11px; color: var(--color-accent-800); }
+  .g-meter { height: 8px; background: var(--color-neutral-200); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .g-meter > span { display: block; height: 100%; background: var(--color-accent-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability in Action</span>
+    <h1>Probability in machine learning</h1>
+    <p>Strip the marketing away and a modern model is a probability distribution with a large parameter count. A classifier outputs a categorical distribution over labels; a language model outputs one over the next token; a diffusion model learns to undo a noising process that is itself a chain of conditional Gaussians. Training is maximum likelihood in disguise, and every loss you have seen &mdash; cross-entropy, log loss, denoising score matching &mdash; is a negative log-likelihood of something. The subject of this volume was built for exactly these objects, and this last part walks the loop: a distribution is produced by a network, scored against reality by a likelihood, and then asked how much it should be trusted. By the end the softmax, the loss curve, the reliability diagram and the uncertainty band are not separate tricks but four views of one idea.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Where does the probability actually live?</p>
+    <p>Ask a working engineer where probability sits inside a neural network and the answer usually points at the loss. That is half right. The loss is where probability is <em>used</em>, but the probability is produced earlier, by an output layer that turns a vector of real numbers into something that sums to one. For a classification head that layer is the <strong>softmax</strong>; for a language model it is the same softmax applied to a vocabulary-sized vector of logits; for a Gaussian head it is a mean and a variance. Every one of those is a distribution parameterised by the network, and the network's job is to move that distribution onto the data.</p>
+    <p>Once you see the output as a distribution, the training objective stops being arbitrary. The likelihood of the observed label under the predicted distribution is a number between zero and one; training maximises it. Maximising a product is the same as minimising the sum of negative logs, which is why the loss is written with a minus sign and a logarithm. Cross-entropy is not a separate invention bolted onto the softmax &mdash; it is the negative log-likelihood of the categorical model the softmax defines. Flip the question around and the same identity explains why the loss is large when the model is confidently wrong: the predicted probability of the true label was tiny, and the negative log of a tiny number is large.</p>
+    <p>Two further questions follow from that picture, and they are where the probabilistic reading earns its keep. First, is the number the model reports <em>true</em>? A network that says 0.9 should be right about ninety percent of the time on that kind of input, and if it is not, the distribution is miscalibrated even when the accuracy is fine. Calibration is a statement about the distribution, not the decision, and it has its own diagnostic &mdash; the reliability diagram &mdash; and its own cheap fix, temperature scaling. Second, how much should a single prediction be believed at all? A point estimate throws away the shape of the distribution. Gaussian processes, variational autoencoders and diffusion models each preserve it in a different way: a closed-form posterior, a learned latent code, or a learned reverse process.</p>
+    <p>This part is the volume's cashing-in chapter. The softmax is a distribution built in the <a href="{{ '/math/probability-in-action/information/' | relative_url }}">information theory part</a>; the likelihood is Part 1; the latent-variable ELBO is Part 12; the Gaussian conditioning behind the GP is the multivariate Gaussian part of Volume I. Nothing new is introduced except the assembly. The plan is to take the output distribution apart, then the loss, then the calibration of the loss, then uncertainty, and finally the generative models that make the whole distribution the object being learned.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the softmax is a categorical distribution with a temperature, why cross-entropy is exactly the negative log-likelihood of the true label, how reliability diagrams expose overconfidence and temperature scaling repairs it, how a Gaussian process shrinks its uncertainty near data, and how VAEs and diffusion models learn transformations of distributions rather than single outputs.</span></div>
+    <div class="g-toc">
+      <a href="#softmax">2 · Softmax as a distribution</a>
+      <a href="#crossentropy">3 · Cross-entropy is negative log-likelihood</a>
+      <a href="#calibration">4 · Calibration and reliability</a>
+      <a href="#uncertainty">5 · Uncertainty: GPs, VAEs, diffusion</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="softmax">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Softmax as a distribution</h2></div>
+    <p class="g-eyebrow">A dial that controls how committed the model is</p>
+    <p>A network's final linear layer hands you a vector <var>$z$</var> of real numbers called logits. They have no units and can be any size or sign; the only thing that matters is their differences, because adding a constant to every logit changes nothing about the ranking. To turn them into probabilities you exponentiate and normalise. The exponential makes every entry positive and makes differences multiplicative, and the sum in the denominator forces the result to add to one. That is the whole definition:</p>
+    <div class="g-math g-katex">$$\operatorname{softmax}(z)_i=\frac{e^{z_i}}{\sum_{j=1}^{K}e^{z_j}},\qquad \operatorname{softmax}(z/T)_i=\frac{e^{z_i/T}}{\sum_{j=1}^{K}e^{z_j/T}}.$$</div>
+    <p>The second expression introduces a <strong>temperature</strong> <var>$T$</var>. Dividing every logit by <var>$T$</var> before the softmax reshapes the distribution without changing which class wins. When <var>$T$</var> is small the logits are stretched apart, the largest entry dominates, and the distribution becomes nearly one-hot &mdash; the model is confident. When <var>$T$</var> is large the logits are squashed together and the distribution flattens toward the uniform <var>$1/K$</var>, which has the maximum entropy any <var>$K$</var>-class distribution can have. This one dial is the difference between a greedy sampler and a creative one.</p>
+    <p>You have already met the dial in the serving guide. The <a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">decode loop</a> samples each token from the softmax over the next-token logits, and the temperature is the knob that trades diversity for reliability. Set it to zero and decoding becomes greedy argmax; raise it and the tail of the distribution gets sampled. <a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">Speculative decoding</a> takes the same distribution and uses a small draft model to propose tokens that a larger model then accepts or rejects, and the accept-reject test is written in terms of these probabilities &mdash; it is a couple of distributions being compared, nothing more.</p>
+    <p>Drag the four logits and the temperature. Two things are worth watching. The ranking of the bars is fixed by the logits; the temperature only changes how spread out they are. And as <var>$T$</var> falls the entropy drops toward zero, while as <var>$T$</var> rises it climbs toward the uniform ceiling <var>$\log K$</var>. The distribution is doing one smooth thing and the readout names it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="sm-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Bars are the class probabilities <var>$\operatorname{softmax}(z/T)$</var>. The dashed line is the uniform distribution <var>$1/K$</var>, the flattest this softmax can get.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>logit 0 <span class="val">2.0</span></label><input type="range" id="sm-l0" min="-3" max="5" step="0.1" value="2"></div>
+        <div class="g-field"><label>logit 1 <span class="val">0.5</span></label><input type="range" id="sm-l1" min="-3" max="5" step="0.1" value="0.5"></div>
+        <div class="g-field"><label>logit 2 <span class="val">0.0</span></label><input type="range" id="sm-l2" min="-3" max="5" step="0.1" value="0"></div>
+        <div class="g-field"><label>logit 3 <span class="val">-1.0</span></label><input type="range" id="sm-l3" min="-3" max="5" step="0.1" value="-1"></div>
+        <div class="g-field"><label>temperature <span class="val">1.0</span></label><input type="range" id="sm-temp" min="0.05" max="5" step="0.05" value="1"></div>
+        <div class="g-readout" id="sm-readout"></div>
+      </div>
+    </div>
+    <p>The distribution the softmax defines is called <strong>categorical</strong>, and its entropy is the number of nats of information the model is undecided by. That is not a metaphor: a distribution with entropy <var>$H$</var> costs at least <var>$H$</var> nats to encode, so an uncertain model is literally an expensive one. The next section makes that accounting exact by scoring the distribution against what actually happened.</p>
+  </section>
+
+  <section class="g-step" id="crossentropy">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Cross-entropy is negative log-likelihood</h2></div>
+    <p class="g-eyebrow">The loss is just the log of the probability you assigned to the truth</p>
+    <p>Suppose the true class is <var>$y$</var> and the model predicted the distribution <var>$q$</var>. The likelihood of the observation under the model is <var>$q(y)$</var>, a single number. Training wants that number to be as large as possible, and because logs turn products into sums, the equivalent objective is to minimise its negative logarithm. One example, one term:</p>
+    <div class="g-math g-katex">$$\mathrm{NLL}(y,q)=-\log q(y),\qquad H(p,q)=-\sum_{i=1}^{K}p_i\log q_i,\qquad H(p,q)=H(p)+\mathrm{KL}(p\,\|\,q).$$</div>
+    <p>The middle expression is the cross-entropy between a true distribution <var>$p$</var> and the model's <var>$q$</var>. When the label is a one-hot vector &mdash; all its mass on the true class &mdash; the sum collapses to the single term <var>$-\log q(y)$</var>, which is the negative log-likelihood. The identity on the right is the reason cross-entropy is the standard loss: it equals the entropy of the truth, which the model cannot change, plus the KL divergence from truth to model. Minimising cross-entropy therefore minimises the KL divergence, the same quantity the information theory part read as an excess codelength. And by Gibbs' inequality the KL is never negative, so the loss bottoms out at the true entropy and no lower.</p>
+    <p>The shape of the function carries the practical lesson. Because the logarithm is steep near zero, a confident mistake is punished hard: predicting <var>$q(y)=0.01$</var> costs about <var>$4.6$</var> nats, while <var>$q(y)=0.5$</var> costs only <var>$0.69$</var>. A model that puts almost no mass on the truth is driven by an enormous gradient, which is exactly the pressure that makes a classifier stop being confidently wrong. It also explains why numerical implementations clamp the log or use a fused log-softmax: the raw logarithm of a probability that underflowed to zero is not a number you want to compute.</p>
+    <p>In the demo the model's predicted distribution is fixed to one shape &mdash; a large logit on class 0, zeros elsewhere &mdash; and you choose which class is the truth. When the truth is class 0 the loss is small and falls as the margin grows. When the truth is any other class the model is confidently wrong, <var>$q(y)$</var> is minuscule, and the loss explodes. Move the margin slider with the truth set away from the peak and watch the meter fill.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ce-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Bars are the predicted distribution <var>$q$</var>. The dashed line marks the true class <var>$y$</var>; the loss is <var>$-\log q(y)$</var>, read from the height of the bar the line sits on.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>logit margin on class 0 <span class="val">1.5</span></label><input type="range" id="ce-margin" min="-2" max="4" step="0.1" value="1.5"></div>
+        <div class="g-field"><label>true class <span class="val">1</span></label><input type="range" id="ce-truth" min="0" max="3" step="1" value="1"></div>
+        <div class="g-readout" id="ce-readout"></div>
+      </div>
+    </div>
+    <p>This is the same object the <a href="{{ '/ai/llm-training/language-models/' | relative_url }}">language-model guide</a> calls the training loss and the <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation guide</a> calls perplexity. Perplexity is just <var>$e^{\mathrm{NLL}}$</var>, the effective number of equally likely choices the model was entertaining; a perplexity of <var>$K$</var> means the model was as confused as a uniform distribution over <var>$K$</var> tokens. And preference training in the <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">RLHF part</a> starts from the log probabilities the same softmax produced, so the whole pipeline from pretraining to alignment is arithmetic on a categorical distribution.</p>
+  </section>
+
+  <section class="g-step" id="calibration">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Calibration and reliability</h2></div>
+    <p class="g-eyebrow">A probability is a promise about frequency</p>
+    <p>A classifier that outputs <var>$0.9$</var> is making a falsifiable claim: on all the inputs it labels with confidence near <var>$0.9$</var>, about ninety percent should be correct. A model that satisfies this is <strong>calibrated</strong>. Calibration is separate from accuracy. A model can be accurate and wildly overconfident (right on most inputs, but claiming <var>$0.99$</var> when it is right only <var>$0.8$</var> of the time), or accurate and underconfident. Modern deep networks are usually the first: they win on accuracy and then report confidences no one should trust.</p>
+    <p>The diagnostic is a <strong>reliability diagram</strong>. Bin the predictions by their stated confidence, then for each bin compute the empirical accuracy &mdash; the fraction of those predictions that were actually correct. Plot accuracy against confidence. A perfectly calibrated model lies on the diagonal <var>$y=x$</var>, because its claimed confidence equals the observed frequency. Points below the diagonal are overconfident; points above are underconfident. The gap between the curve and the diagonal, weighted by how many predictions fall in each bin, is the <strong>expected calibration error</strong>:</p>
+    <div class="g-math g-katex">$$\mathrm{ECE}=\sum_{b=1}^{B}\frac{n_b}{N}\,\bigl|\,\mathrm{acc}_b-\mathrm{conf}_b\,\bigr|,\qquad \mathrm{conf}_b=\frac{1}{n_b}\sum_{i\in b}\hat p_i,\qquad \mathrm{acc}_b=\frac{1}{n_b}\sum_{i\in b}\mathbf{1}\{\hat y_i=y_i\}.$$</div>
+    <p>Overconfidence has a remarkably cheap repair called <strong>temperature scaling</strong>. Leave the trained network alone and divide its logits by a single number <var>$T&gt;1$</var> before the softmax. This softens every distribution, pulling the confidence down toward the accuracy without changing a single predicted class, because dividing by a positive number does not reorder the logits. You fit the one parameter <var>$T$</var> on a held-out set by minimising the same negative log-likelihood, and the reliability curve walks back to the diagonal. One scalar repairs a network with millions of weights.</p>
+    <p>The demo simulates a classifier whose predictions are warped by an overconfidence factor. The true probability of the positive class is drawn first, the label is sampled from it, and the model's confidence is a sharpened version of the truth, so its errors are exactly the overconfidence you would see in practice. The pink points are the raw model; the blue points are the same model after temperature scaling. Slide the temperature and watch the blue curve snap onto the diagonal while the class decisions never move.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cal-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Reliability diagram: predicted confidence on the <var>$x$</var>-axis, empirical accuracy on the <var>$y$</var>-axis. Pink is the raw model, blue is temperature-scaled; the pink verticals are the calibration gaps that add up to the ECE.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>overconfidence &alpha; <span class="val">2.6</span></label><input type="range" id="cal-alpha" min="1.0" max="3.5" step="0.05" value="2.6"></div>
+        <div class="g-field"><label>fix temperature T <span class="val">2.6</span></label><input type="range" id="cal-temp" min="0.5" max="4" step="0.05" value="2.6"></div>
+        <div class="g-readout" id="cal-readout"></div>
+      </div>
+    </div>
+    <p>Calibration is not the same as a good decision rule. If all you need is the argmax, a miscalibrated model may serve perfectly well; if the probability is going to be multiplied by a cost, fed into a Bayesian filter, or used to decide whether to hand a task to a human, then the number itself carries weight and ECE is the thing to watch. This is also why evaluation sets double as calibration sets in the <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation part</a>: the same held-out data that measures accuracy measures the honesty of the confidences.</p>
+  </section>
+
+  <section class="g-step" id="uncertainty">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Uncertainty: GPs, VAEs, diffusion</h2></div>
+    <p class="g-eyebrow">Keeping the whole distribution instead of one point</p>
+    <p>A point prediction throws the distribution away at the last moment. Three families of model refuse to. The first is the <strong>Gaussian process</strong>, which puts a prior over functions: any finite set of function values is jointly Gaussian, and conditioning on observations gives a posterior that is itself Gaussian everywhere. With an RBF kernel and a handful of noisy observations, the posterior mean is a smooth interpolation and the posterior variance has a shape you can read: it collapses toward the noise floor at each observed input and swells back toward the prior far away from all of them. The formulas are the multivariate Gaussian conditioning of Volume I, written for an infinite index set:</p>
+    <div class="g-math g-katex">$$\mu_*(x)=k(x)^\top\!\left(K+\sigma_n^2 I\right)^{-1}\!y,\qquad \sigma_*^2(x)=k(x,x)-k(x)^\top\!\left(K+\sigma_n^2 I\right)^{-1}\!k(x),\qquad k(x,x')=\sigma_f^2 e^{-(x-x')^2/2\ell^2}.$$</div>
+    <p>Drag the lengthscale and the noise and watch the band. A long lengthscale makes the function smooth and the uncertainty broad; a short one lets the posterior wiggle and the band pinch tightly at every observation. More noise raises the floor and keeps the band from ever reaching zero, because the observations themselves are not trusted. The important thing is not the curve &mdash; it is the second line of the plot, the variance, which no point-estimate model can draw at all.</p>
+    <div class="g-demo">
+      <div class="g-plot" id="gp-plot"></div>
+      <div class="g-controls">
+        <div class="g-field"><label>lengthscale &ell; <span class="val">1.00</span></label><input type="range" id="gp-ls" min="0.3" max="3" step="0.05" value="1"></div>
+        <div class="g-field"><label>observation noise &sigma;<sub>n</sub> <span class="val">0.12</span></label><input type="range" id="gp-noise" min="0.02" max="0.6" step="0.01" value="0.12"></div>
+        <div class="g-readout" id="gp-readout"></div>
+      </div>
+      <p class="g-canvas-hint">The line is the posterior mean; the shaded band is <var>$\pm 2\sigma_*$</var>. Markers are the noisy observations. The band pinches at each marker and widens back toward the prior between them.</p>
+    </div>
+    <p>The second family is the <strong>variational autoencoder</strong>, which buys a distribution over latent codes by learning the transformation itself. An encoder maps a data point <var>$x$</var> to a Gaussian <var>$q(z\mid x)$</var> in a low-dimensional latent space, a decoder maps a code <var>$z$</var> back to a distribution over data, and training maximises the evidence lower bound from Part 12: a reconstruction term plus a KL term that keeps the codes near a standard normal. Sampling from that latent Gaussian and decoding gives a whole cloud of plausible outputs, and the KL term is what makes the latent space smooth enough for interpolation to mean something.</p>
+    <p>The third family is <strong>diffusion</strong>, which learns a distribution by learning to destroy and then rebuild structure. The forward process is a fixed chain of Gaussians that adds a little noise at each step, and the reverse process is a network trained to undo one step at a time. The forward step is the simple object, and once you see it the rest of the pipeline is a matter of parameterisation:</p>
+    <div class="g-math g-katex">$$q(x_t\mid x_{t-1})=\mathcal{N}\!\left(x_t;\sqrt{1-\beta_t}\,x_{t-1},\;\beta_t I\right),\qquad q(x_t\mid x_0)=\mathcal{N}\!\left(x_t;\sqrt{\bar\alpha_t}\,x_0,\;(1-\bar\alpha_t)I\right).$$</div>
+    <p>Each step keeps the signal coefficient <var>$\sqrt{1-\beta_t}$</var> and adds variance <var>$\beta_t$</var>, so the chain is variance-preserving and the marginal at time <var>$t$</var> is a Gaussian whose mean shrinks as <var>$\sqrt{\bar\alpha_t}$</var> and whose variance grows toward one. Push the slider forward and the structured cloud dissolves into noise; a trained reverse network is what walks it back. Slide it and notice that the transformation is a path through distributions, exactly the kind of object the change-of-variables part of the calculus guide studies.</p>
+    <div class="g-demo">
+      <div class="g-flow">
+        <span class="g-flow-box">data x</span>
+        <span class="g-flow-arrow">encoder q(z|x) &rarr;</span>
+        <span class="g-flow-box">latent z ~ N(&mu;, &sigma;&sup2;)</span>
+        <span class="g-flow-arrow">decoder p(x|z) &rarr;</span>
+        <span class="g-flow-box">reconstruction</span>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="diff-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">The forward process adds Gaussian noise to a structured cloud; <var>$t=0$</var> is data and <var>$t=1$</var> is nearly pure noise. A trained reverse process learns to run this film backwards.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>diffusion time t <span class="val">0.00</span></label><input type="range" id="diff-t" min="0" max="1" step="0.01" value="0"></div>
+        <div class="g-btnrow"><button type="button" id="diff-play">Play forward</button></div>
+        <div class="g-readout" id="diff-readout"></div>
+      </div>
+    </div>
+    <p>All three are the same move made three ways. The Gaussian process closes the posterior in a formula; the VAE learns a latent density and a decoder; diffusion learns a chain of conditional denoisers. What they share is that the output of the model is a distribution &mdash; and so, for that matter, is the softmax of the next section's classifier. The softmax and the diffusion model differ in the size of the object, not in the kind.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The distribution under every output</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / Training</div>
+        <h3 style="margin:6px 0;">The language model's loss</h3>
+        <p style="margin-bottom:0;">Every <a href="{{ '/ai/llm-training/language-models/' | relative_url }}">language model</a> is a categorical distribution over the vocabulary at each position, trained by the negative log-likelihood of the next token. Perplexity is the exponential of that loss, and the softmax is the layer that defines it.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / Evaluation</div>
+        <h3 style="margin:6px 0;">Calibration and honest confidences</h3>
+        <p style="margin-bottom:0;">A model whose confidences are trusted downstream must be calibrated, and <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation</a> measures that with reliability diagrams and ECE. Temperature scaling is the cheap post-hoc fix when the curve misses the diagonal.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / Serving</div>
+        <h3 style="margin:6px 0;">Sampling the next token</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/ai/llm-serving/decode-loop/' | relative_url }}">decode loop</a> samples from the temperature-scaled softmax, and <a href="{{ '/ai/llm-serving/speculative/' | relative_url }}">speculative decoding</a> compares two such distributions to accept or reject draft tokens. The dial is the same one on this page.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / Alignment</div>
+        <h3 style="margin:6px 0;">Log-probabilities as preferences</h3>
+        <p style="margin-bottom:0;">Preference training in <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">RLHF</a> scores candidate completions by the log probability the model assigned them &mdash; cross-entropy read with a sign flip &mdash; and then pushes on the parameters to move that number.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Softmax</td><td><var>$\sigma(z)_i=e^{z_i}/\sum_j e^{z_j}$</var></td><td>Turns logits into a categorical distribution.</td></tr>
+        <tr><td>Temperature</td><td><var>$\sigma(z/T)_i=e^{z_i/T}/\sum_j e^{z_j/T}$</var></td><td>Small <var>$T$</var> sharpens, large <var>$T$</var> flattens toward uniform.</td></tr>
+        <tr><td>Entropy</td><td><var>$H(p)=-\sum_i p_i\log p_i$</var></td><td>How undecided the distribution is, in nats.</td></tr>
+        <tr><td>Cross-entropy</td><td><var>$H(p,q)=-\sum_i p_i\log q_i$</var></td><td>Cost of encoding the truth with the model's code.</td></tr>
+        <tr><td>Negative log-likelihood</td><td><var>$-\log q(y)$</var></td><td>The cross-entropy of a one-hot label; the training loss.</td></tr>
+        <tr><td>Decomposition</td><td><var>$H(p,q)=H(p)+\mathrm{KL}(p\,\|\,q)$</var></td><td>Minimising the loss is minimising the KL divergence.</td></tr>
+        <tr><td>Perplexity</td><td><var>$e^{\mathrm{NLL}}$</var></td><td>Effective number of equally likely choices.</td></tr>
+        <tr><td>Expected calibration error</td><td><var>$\sum_b (n_b/N)\,|\mathrm{acc}_b-\mathrm{conf}_b|$</var></td><td>Average gap between confidence and accuracy across bins.</td></tr>
+        <tr><td>Temperature scaling</td><td><var>$q=\sigma(z/T)$</var>, <var>$T&gt;1$</var></td><td>One parameter that softens an overconfident model.</td></tr>
+        <tr><td>GP posterior mean</td><td><var>$k(x)^\top(K+\sigma_n^2 I)^{-1}y$</var></td><td>Kernel-weighted interpolation of the observations.</td></tr>
+        <tr><td>GP posterior variance</td><td><var>$k(x,x)-k(x)^\top(K+\sigma_n^2 I)^{-1}k(x)$</var></td><td>Shrinks near data, returns to the prior far away.</td></tr>
+        <tr><td>RBF kernel</td><td><var>$k(x,x')=\sigma_f^2 e^{-(x-x')^2/2\ell^2}$</var></td><td>Smoothness set by the lengthscale <var>$\ell$</var>.</td></tr>
+        <tr><td>Diffusion forward step</td><td><var>$q(x_t|x_{t-1})=\mathcal{N}(\sqrt{1-\beta_t}\,x_{t-1},\beta_t I)$</var></td><td>Add noise, shrink the signal, keep the variance.</td></tr>
+        <tr><td>Diffusion marginal</td><td><var>$q(x_t|x_0)=\mathcal{N}(\sqrt{\bar\alpha_t}\,x_0,(1-\bar\alpha_t)I)$</var></td><td>Closed form for jumping straight to time <var>$t$</var>.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Christopher Bishop, <em>Pattern Recognition and Machine Learning</em>, chapters 4 and 6 &mdash; the logistic softmax and the Gaussian process regression chapter this part compresses.</li>
+      <li>Carl Rasmussen and Christopher Williams, <em>Gaussian Processes for Machine Learning</em>, 2006 &mdash; the definitive treatment, free online, with the kernel and conditioning formulas used here.</li>
+      <li>Guo, Pleiss, Sun and Weinberger, <a href="https://arxiv.org/abs/1706.04599">"On Calibration of Modern Neural Networks"</a>, 2017 &mdash; the reliability diagrams and temperature scaling result that made calibration a standard topic.</li>
+      <li>Kingma and Welling, <a href="https://arxiv.org/abs/1312.6114">"Auto-Encoding Variational Bayes"</a>, 2013 &mdash; the VAE and the ELBO, the latent-variable construction of Part 12 applied at scale.</li>
+      <li>Ho, Jain and Abbeel, <a href="https://arxiv.org/abs/2006.11239">"Denoising Diffusion Probabilistic Models"</a>, 2020 &mdash; the forward process written down and the reverse process trained to undo it.</li>
+      <li>Ian Goodfellow, Yoshua Bengio and Aaron Courville, <em>Deep Learning</em>, chapters 5 and 6 &mdash; maximum likelihood, cross-entropy and the probabilistic view of network outputs.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Every idea in this volume, mapped to the AI, vision and robotics guide that puts it to work.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-plot3d.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var P = Prob;
+  var LA = LinAlg;
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 3 : d; return (+x).toFixed(d); }
+
+  // ------------------------------------------------------------------
+  // Demo A — softmax as a distribution, with a temperature dial
+  // ------------------------------------------------------------------
+  var SM = { logits: [2.0, 0.5, 0.0, -1.0], T: 1.0 };
+  var smPlot = null;
+
+  function drawSoftmax() {
+    if (!smPlot) return;
+    var p = Guide.softmax(SM.logits, SM.T);
+    var pl = smPlot;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var items = [];
+    for (var i = 0; i < p.length; i++) {
+      items.push({ x: i, y: p[i], color: i === 0 ? c.accent : 'rgba(43,95,255,0.55)' });
+    }
+    pl.bars(items, { width: 0.72, baseline: 0 });
+    pl.hline(1 / p.length, { color: 'rgba(32,30,29,0.4)', dash: [5, 4], labelText: 'uniform 1/K' });
+    pl.axes({ step: 1, xLabel: 'class', yLabel: 'probability p' });
+    var best = 0;
+    for (var j = 1; j < p.length; j++) if (p[j] > p[best]) best = j;
+    var ent = P.info.entropy(p);
+    var maxEnt = Math.log(p.length);
+    el('sm-readout').innerHTML =
+      '<div><span class="k">temperature T</span> <span class="hi">' + fmt(SM.T, 2) + '</span></div>' +
+      '<div><span class="k">p (classes 0-3)</span> ' + fmt(p[0], 3) + ', ' + fmt(p[1], 3) + ', ' + fmt(p[2], 3) + ', ' + fmt(p[3], 3) + '</div>' +
+      '<div><span class="k">argmax</span> class ' + best + ' at ' + fmt(p[best], 3) + '</div>' +
+      '<div><span class="k">entropy</span> ' + fmt(ent, 3) + ' nats of ' + fmt(maxEnt, 3) + ' max</div>' +
+      '<div style="margin-top:6px;">T &rarr; &infin; flattens toward uniform; T &rarr; 0 sharpens to one-hot.</div>';
+  }
+
+  smPlot = Prob.plot(el('sm-canvas'), { W: 640, H: 340, xRange: [-0.5, 3.5], yRange: [0, 1], onResize: drawSoftmax });
+  Guide.bindSliders([el('sm-l0'), el('sm-l1'), el('sm-l2'), el('sm-l3')], function () {
+    SM.logits = [parseFloat(el('sm-l0').value), parseFloat(el('sm-l1').value), parseFloat(el('sm-l2').value), parseFloat(el('sm-l3').value)];
+    drawSoftmax();
+  });
+  Guide.bindSliders([el('sm-temp')], function (s) { SM.T = parseFloat(s.value); drawSoftmax(); });
+  drawSoftmax();
+
+  // ------------------------------------------------------------------
+  // Demo B — cross-entropy as the negative log-likelihood of the true label
+  // ------------------------------------------------------------------
+  var CE = { margin: 1.5, truth: 1 };
+  var CK = 4;
+  var cePlot = null;
+
+  function drawCE() {
+    if (!cePlot) return;
+    var q = Guide.softmax([CE.margin, 0, 0, 0], 1);
+    var pl = cePlot;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var items = [];
+    for (var i = 0; i < CK; i++) {
+      items.push({ x: i, y: q[i], color: i === CE.truth ? c.accent2 : 'rgba(43,95,255,0.5)' });
+    }
+    pl.bars(items, { width: 0.72, baseline: 0 });
+    pl.vline(CE.truth, { color: c.accent2, dash: [3, 3], labelText: 'true label' });
+    pl.axes({ step: 1, xLabel: 'class', yLabel: 'predicted q' });
+    var pt = Math.max(q[CE.truth], 1e-12);
+    var loss = -Math.log(pt);
+    var bits = loss / Math.log(2);
+    var meter = Math.max(2, Math.min(100, (loss / 6) * 100));
+    el('ce-readout').innerHTML =
+      '<div><span class="k">true class</span> <span class="hi">' + CE.truth + '</span></div>' +
+      '<div><span class="k">q(true)</span> ' + pt.toExponential(3) + '</div>' +
+      '<div><span class="k">loss &minus;log q(true)</span> <span class="hi">' + fmt(loss, 3) + ' nats</span></div>' +
+      '<div><span class="k">same, in bits</span> ' + fmt(bits, 3) + ' bits</div>' +
+      '<div class="g-meter"><span style="width:' + fmt(meter, 1) + '%"></span></div>' +
+      '<div style="margin-top:6px;">Confidently wrong is expensive: the loss blows up as q(true) &rarr; 0.</div>';
+  }
+
+  cePlot = Prob.plot(el('ce-canvas'), { W: 640, H: 340, xRange: [-0.5, 3.5], yRange: [0, 1], onResize: drawCE });
+  Guide.bindSliders([el('ce-margin')], function (s) { CE.margin = parseFloat(s.value); drawCE(); });
+  Guide.bindSliders([el('ce-truth')], function (s) { CE.truth = parseInt(s.value, 10); drawCE(); });
+  drawCE();
+
+  // ------------------------------------------------------------------
+  // Demo C — reliability diagram, ECE, and temperature-scaling repair
+  // ------------------------------------------------------------------
+  var CAL = { N: 800, alpha: 2.6, T: 2.6, seed: 20260920 };
+  var calPlot = null, calLogit = [], calY = [];
+
+  function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+
+  function buildCal() {
+    var r = P.rng(CAL.seed);
+    calLogit = []; calY = [];
+    for (var i = 0; i < CAL.N; i++) {
+      var pi = 0.1 + 0.8 * r.uniform();
+      calLogit.push(Math.log(pi / (1 - pi)));
+      calY.push(r.bernoulli(pi) ? 1 : 0);
+    }
+  }
+
+  function binsFor(scale) {
+    var nb = 10, b, i;
+    var cnt = [], conf = [], acc = [];
+    for (b = 0; b < nb; b++) { cnt.push(0); conf.push(0); acc.push(0); }
+    for (i = 0; i < CAL.N; i++) {
+      var p1 = sigmoid(calLogit[i] * scale);
+      var pred = p1 >= 0.5 ? 1 : 0;
+      var confidence = Math.max(p1, 1 - p1);
+      var bin = Math.min(nb - 1, Math.max(0, Math.floor(confidence * nb)));
+      cnt[bin] += 1; conf[bin] += confidence; acc[bin] += (pred === calY[i]) ? 1 : 0;
+    }
+    var out = [], ece = 0;
+    for (b = 0; b < nb; b++) {
+      if (cnt[b] === 0) { out.push(null); continue; }
+      var cf = conf[b] / cnt[b], ac = acc[b] / cnt[b];
+      out.push({ conf: cf, acc: ac, n: cnt[b] });
+      ece += (cnt[b] / CAL.N) * Math.abs(ac - cf);
+    }
+    return { bins: out, ece: ece };
+  }
+
+  function drawCal() {
+    if (!calPlot) return;
+    var raw = binsFor(CAL.alpha);
+    var fix = binsFor(CAL.alpha / CAL.T);
+    var pl = calPlot;
+    pl.clear();
+    pl.grid({ step: 0.1 });
+    pl.curve(function (x) { return x; }, { from: 0, to: 1, color: 'rgba(32,30,29,0.45)', dash: [5, 4], label: 'perfect calibration' });
+    var ctx = pl.ctx;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(214,0,108,0.5)';
+    ctx.lineWidth = 1.5;
+    for (var i = 0; i < raw.bins.length; i++) {
+      var bn = raw.bins[i];
+      if (!bn) continue;
+      ctx.beginPath();
+      ctx.moveTo(pl.px(bn.conf), pl.py(bn.conf));
+      ctx.lineTo(pl.px(bn.conf), pl.py(bn.acc));
+      ctx.stroke();
+    }
+    ctx.restore();
+    var rawPts = [], fixPts = [];
+    for (i = 0; i < raw.bins.length; i++) {
+      if (raw.bins[i]) rawPts.push({ x: raw.bins[i].conf, y: raw.bins[i].acc });
+      if (fix.bins[i]) fixPts.push({ x: fix.bins[i].conf, y: fix.bins[i].acc });
+    }
+    pl.points(rawPts, { color: c.accent2, r: 5, label: 'raw model' });
+    pl.points(fixPts, { color: c.accent, r: 4, label: 'temperature-scaled' });
+    pl.axes({ step: 0.1, xLabel: 'predicted confidence', yLabel: 'empirical accuracy' });
+    pl.legend();
+    var verdict = raw.ece > 0.08 ? 'overconfident' : 'close to calibrated';
+    el('cal-readout').innerHTML =
+      '<div><span class="k">overconfidence &alpha;</span> <span class="hi">' + fmt(CAL.alpha, 2) + '</span></div>' +
+      '<div><span class="k">fix temperature T</span> ' + fmt(CAL.T, 2) + '</div>' +
+      '<div><span class="k">ECE raw</span> <span class="hi">' + fmt(raw.ece, 3) + '</span></div>' +
+      '<div><span class="k">ECE scaled</span> ' + fmt(fix.ece, 3) + '</div>' +
+      '<div><span class="k">verdict</span> ' + verdict + '</div>' +
+      '<div style="margin-top:6px;">Set T &asymp; &alpha; (here ' + fmt(CAL.alpha, 2) + ') and the blue points land on the diagonal; the class decisions never change.</div>';
+  }
+
+  buildCal();
+  calPlot = Prob.plot(el('cal-canvas'), { W: 640, H: 340, xRange: [0, 1], yRange: [0, 1], onResize: drawCal });
+  Guide.bindSliders([el('cal-alpha')], function (s) { CAL.alpha = parseFloat(s.value); drawCal(); });
+  Guide.bindSliders([el('cal-temp')], function (s) { CAL.T = parseFloat(s.value); drawCal(); });
+  drawCal();
+
+  // ------------------------------------------------------------------
+  // Demo D — a 1-D Gaussian process posterior with shrinking uncertainty
+  // ------------------------------------------------------------------
+  var GP = { ls: 1.0, noise: 0.12, xt: [-3.2, -1.1, 0.6, 2.4], yt: [0.9, -0.5, 0.4, -1.0] };
+  var gpGrid = [];
+  (function () { for (var i = 0; i < 121; i++) gpGrid.push(-5 + 10 * i / 120); })();
+
+  function rbf(a, b, ls) { var d = a - b; return Math.exp(-0.5 * d * d / (ls * ls)); }
+
+  function gpPosterior() {
+    var n = GP.xt.length, i, j;
+    var K = [];
+    for (i = 0; i < n; i++) {
+      K.push([]);
+      for (j = 0; j < n; j++) {
+        K[i].push(rbf(GP.xt[i], GP.xt[j], GP.ls) + (i === j ? GP.noise * GP.noise : 0));
+      }
+    }
+    var Kinv = LA.mat.inverse(K);
+    if (!Kinv) { Kinv = []; for (i = 0; i < n; i++) { Kinv.push([]); for (j = 0; j < n; j++) Kinv[i].push(i === j ? 1 : 0); } }
+    var alpha = [];
+    for (i = 0; i < n; i++) {
+      var s = 0;
+      for (j = 0; j < n; j++) s += Kinv[i][j] * GP.yt[j];
+      alpha.push(s);
+    }
+    var mean = [], sd = [];
+    for (var g = 0; g < gpGrid.length; g++) {
+      var x = gpGrid[g], m = 0, kv = [];
+      for (j = 0; j < n; j++) { kv.push(rbf(x, GP.xt[j], GP.ls)); m += kv[j] * alpha[j]; }
+      var q = 0;
+      for (i = 0; i < n; i++) { var t = 0; for (j = 0; j < n; j++) t += Kinv[i][j] * kv[j]; q += kv[i] * t; }
+      var v = 1 - q; if (v < 0) v = 0;
+      mean.push(m); sd.push(Math.sqrt(v));
+    }
+    return { mean: mean, sd: sd };
+  }
+
+  var gpDiv = el('gp-plot');
+
+  function nearestIdx(x) {
+    var best = 0, bd = 1e9;
+    for (var k = 0; k < gpGrid.length; k++) {
+      var d = Math.abs(gpGrid[k] - x);
+      if (d < bd) { bd = d; best = k; }
+    }
+    return best;
+  }
+
+  function drawGP() {
+    if (!gpDiv || !window.Plotly) return;
+    var post = gpPosterior();
+    var lo = [], hi = [];
+    for (var i = 0; i < gpGrid.length; i++) {
+      lo.push(post.mean[i] - 2 * post.sd[i]);
+      hi.push(post.mean[i] + 2 * post.sd[i]);
+    }
+    var traces = [
+      { type: 'scatter', mode: 'lines', x: gpGrid, y: hi, line: { color: 'rgba(43,95,255,0.12)', width: 0 }, hoverinfo: 'skip', showlegend: false },
+      { type: 'scatter', mode: 'lines', x: gpGrid, y: lo, fill: 'tonexty', fillcolor: 'rgba(43,95,255,0.18)', line: { color: 'rgba(43,95,255,0.12)', width: 0 }, hoverinfo: 'skip', showlegend: false },
+      { type: 'scatter', mode: 'lines', x: gpGrid, y: post.mean, line: { color: c.accent, width: 2.4 }, hoverinfo: 'skip', showlegend: false },
+      { type: 'scatter', mode: 'markers', x: GP.xt, y: GP.yt, marker: { color: c.accent2, size: 9, line: { color: '#ffffff', width: 1.5 } }, hoverinfo: 'skip', showlegend: false }
+    ];
+    var layout = {
+      autosize: true,
+      margin: { l: 44, r: 12, t: 10, b: 36 },
+      paper_bgcolor: 'transparent',
+      plot_bgcolor: 'transparent',
+      showlegend: false,
+      xaxis: { range: [-5, 5], title: { text: 'x', font: { size: 11 } }, gridcolor: c.divider, zerolinecolor: c.divider, color: c.text },
+      yaxis: { range: [-2.6, 2.6], title: { text: 'f(x)', font: { size: 11 } }, gridcolor: c.divider, zerolinecolor: c.divider, color: c.text }
+    };
+    var opts = { displayModeBar: false, responsive: true };
+    if (!gpDiv.__plotlyInit) { Plotly.newPlot(gpDiv, traces, layout, opts); gpDiv.__plotlyInit = true; }
+    else { Plotly.react(gpDiv, traces, layout, opts); }
+    var near = 2 * post.sd[nearestIdx(GP.xt[0])];
+    var far = 2 * post.sd[nearestIdx(4.4)];
+    el('gp-readout').innerHTML =
+      '<div><span class="k">lengthscale &ell;</span> <span class="hi">' + fmt(GP.ls, 2) + '</span></div>' +
+      '<div><span class="k">noise &sigma;<sub>n</sub></span> ' + fmt(GP.noise, 2) + '</div>' +
+      '<div><span class="k">&plusmn;2&sigma; at an observation</span> ' + fmt(near, 3) + '</div>' +
+      '<div><span class="k">&plusmn;2&sigma; far from data</span> <span class="hi">' + fmt(far, 3) + '</span></div>' +
+      '<div style="margin-top:6px;">The band pinches where the process has seen a point and swells back toward the prior where it has not.</div>';
+  }
+
+  Guide.bindSliders([el('gp-ls')], function (s) { GP.ls = parseFloat(s.value); drawGP(); });
+  Guide.bindSliders([el('gp-noise')], function (s) { GP.noise = parseFloat(s.value); drawGP(); });
+  window.addEventListener('resize', function () {
+    if (gpDiv && gpDiv.__plotlyInit && window.Plotly) Plotly.Plots.resize(gpDiv);
+  });
+
+  // ------------------------------------------------------------------
+  // Demo E — diffusion as a transformation of a distribution
+  // ------------------------------------------------------------------
+  var DIFF = { t: 0, seed: 20260921 };
+  var diffPlot = null, ringX = [], ringY = [], epsX = [], epsY = [];
+
+  (function buildDiff() {
+    var r = P.rng(DIFF.seed);
+    for (var i = 0; i < 140; i++) {
+      var th = 2 * Math.PI * i / 140;
+      ringX.push(1.35 * Math.cos(th) + 0.28 * Math.cos(2 * th));
+      ringY.push(1.35 * Math.sin(th));
+      epsX.push(r.normal(0, 1));
+      epsY.push(r.normal(0, 1));
+    }
+  })();
+
+  function drawDiff() {
+    if (!diffPlot) return;
+    var a = Math.exp(-3.2 * DIFF.t);
+    var s = Math.sqrt(a), ns = Math.sqrt(1 - a);
+    var cur = [], orig = [];
+    for (var i = 0; i < ringX.length; i++) {
+      cur.push({ x: s * ringX[i] + ns * epsX[i], y: s * ringY[i] + ns * epsY[i] });
+      orig.push({ x: ringX[i], y: ringY[i] });
+    }
+    var pl = diffPlot;
+    pl.clear();
+    pl.grid({ step: 1 });
+    pl.points(orig, { color: 'rgba(32,30,29,0.18)', r: 2.2, label: 'data x' });
+    pl.points(cur, { color: 'rgba(43,95,255,' + fmt(0.35 + 0.6 * DIFF.t, 2) + ')', r: 2.4, label: 'noised x_t' });
+    pl.axes({ step: 1, xLabel: 'latent coordinate 1', yLabel: 'latent coordinate 2' });
+    pl.legend();
+    var snr = a / Math.max(1e-9, 1 - a);
+    el('diff-readout').innerHTML =
+      '<div><span class="k">diffusion time t</span> <span class="hi">' + fmt(DIFF.t, 2) + '</span></div>' +
+      '<div><span class="k">signal &alpha;&#772; = e^(-3.2 t)</span> ' + fmt(a, 3) + '</div>' +
+      '<div><span class="k">noise variance</span> ' + fmt(1 - a, 3) + '</div>' +
+      '<div><span class="k">signal-to-noise ratio</span> ' + fmt(snr, 2) + '</div>' +
+      '<div style="margin-top:6px;">Forward adds noise; a learned reverse step denoises. A VAE decoder learns the same kind of transformation in one shot.</div>';
+  }
+
+  diffPlot = Prob.plot(el('diff-canvas'), { W: 640, H: 320, xRange: [-3, 3], yRange: [-3, 3], onResize: drawDiff });
+  Guide.bindSliders([el('diff-t')], function (s) { DIFF.t = parseFloat(s.value); drawDiff(); });
+  var diffTimer = null;
+  el('diff-play').addEventListener('click', function () {
+    if (diffTimer) { clearInterval(diffTimer); diffTimer = null; el('diff-play').textContent = 'Play forward'; return; }
+    el('diff-play').textContent = 'Stop';
+    diffTimer = setInterval(function () {
+      DIFF.t += 0.02;
+      if (DIFF.t >= 1) { DIFF.t = 1; clearInterval(diffTimer); diffTimer = null; el('diff-play').textContent = 'Play forward'; }
+      el('diff-t').value = String(DIFF.t);
+      drawDiff();
+    }, 60);
+  });
+  drawDiff();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'probabilistic-ml-softmax-temperature',
+      kind: 'choice',
+      prompt: 'As the softmax temperature <var>T</var> grows without bound, what does the output distribution approach?',
+      options: [
+        { label: 'The uniform distribution over the classes, <var>1/K</var>.', correct: true },
+        { label: 'A one-hot distribution on the largest logit.', correct: false },
+        { label: 'A distribution whose probabilities are the logits themselves.', correct: false }
+      ],
+      explanation: 'Dividing the logits by a large T shrinks their differences toward zero, so all exponents approach one and the distribution flattens to uniform 1/K — the maximum-entropy categorical. A one-hot result is the opposite limit, T → 0.'
+    },
+    {
+      id: 'probabilistic-ml-nll-bits',
+      kind: 'numeric',
+      prompt: 'A classifier assigns probability <var>0.25</var> to the true class. What is the negative log-likelihood in bits, <var>&minus;log<sub>2</sub>(0.25)</var>?',
+      answer: 2,
+      tolerance: 0.01,
+      explanation: '0.25 = 1/4, and −log2(1/4) = log2 4 = 2 bits. In nats the same loss is −ln 0.25 ≈ 1.386.'
+    },
+    {
+      id: 'probabilistic-ml-ce-nll',
+      kind: 'choice',
+      prompt: 'Why is cross-entropy the standard classification loss?',
+      options: [
+        { label: 'For a one-hot label it is exactly the negative log-likelihood <var>&minus;log q(y)</var>, and minimising it minimises <var>KL(p &#8741; q)</var>.', correct: true },
+        { label: 'Because it is bounded between zero and one for every prediction.', correct: false },
+        { label: 'Because it is the only loss whose gradient exists everywhere.', correct: false }
+      ],
+      explanation: 'With a one-hot truth the cross-entropy sum collapses to −log q(y), the negative log-likelihood. It also equals H(p) + KL(p‖q), and H(p) is fixed, so minimising the loss is minimising the KL divergence. It is not bounded — it diverges as q(y) → 0.'
+    },
+    {
+      id: 'probabilistic-ml-ece-bin',
+      kind: 'numeric',
+      prompt: 'In one bin of a reliability diagram, <var>40</var> of <var>100</var> total predictions have average confidence <var>0.9</var> and empirical accuracy <var>0.7</var>. What is this bin&rsquo;s contribution <var>(n<sub>b</sub>/N)</var> &times; |<var>acc<sub>b</sub> &minus; conf<sub>b</sub></var>| to the ECE?',
+      answer: 0.08,
+      tolerance: 0.005,
+      explanation: 'The bin holds 40 of 100 predictions, so n_b/N = 0.4, and |0.7 − 0.9| = 0.2. The contribution is 0.4 × 0.2 = 0.08. Sum that over all ten bins for the full ECE.'
+    },
+    {
+      id: 'probabilistic-ml-gp-uncertainty',
+      kind: 'choice',
+      prompt: 'In a Gaussian process posterior with an RBF kernel, how does the predictive variance behave along the input axis?',
+      options: [
+        { label: 'It shrinks toward the noise floor at observed inputs and returns to the prior variance far from any observation.', correct: true },
+        { label: 'It is constant everywhere, because the kernel is stationary.', correct: false },
+        { label: 'It grows without bound at observed inputs, since the mean is pinned there.', correct: false }
+      ],
+      explanation: 'Conditioning on data removes uncertainty where data exist, so the variance drops near observations; where no kernel correlates the test point with any observation, the posterior variance returns to the prior. Stationarity fixes the kernel shape, not the posterior variance.'
+    },
+    {
+      id: 'probabilistic-ml-diffusion-coef',
+      kind: 'numeric',
+      prompt: 'The forward diffusion step is <var>q(x<sub>t</sub> | x<sub>t&minus;1</sub>) = N(&radic;(1 &minus; &beta;<sub>t</sub>) x<sub>t&minus;1</sub>, &beta;<sub>t</sub> I)</var>. With <var>&beta;<sub>t</sub> = 0.19</var>, what is the signal coefficient <var>&radic;(1 &minus; &beta;<sub>t</sub>)</var>?',
+      answer: 0.9,
+      tolerance: 0.005,
+      explanation: '1 − 0.19 = 0.81, and √0.81 = 0.9. Each step keeps 90% of the signal amplitude and adds variance 0.19, which is the variance-preserving form used here.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+
+  drawSoftmax();
+  drawCE();
+  drawCal();
+  drawGP();
+  drawDiff();
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

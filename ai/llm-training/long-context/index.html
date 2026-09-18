@@ -1,0 +1,597 @@
+---
+title: "LLM Training, Interactively — Part 13: Long-context & context extension"
+description: "Why context extension is its own late training stage — stretching RoPE (base scaling, position interpolation, YaRN), long-context data and synthetic aggregation tasks, best-fit packing and intra-document masking, and how RULER and HELMET measure it."
+permalink: "/ai/llm-training/long-context/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-long-context.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .lc-note { font-family: var(--font-mono); font-size: 12.5px; }
+  .lc-legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; margin-top:6px; }
+  .lc-legend span { display:flex; align-items:center; gap:6px; }
+  .lc-swatch { width:12px; height:12px; border-radius:2px; display:inline-block; }
+  .cwe-passage { font-size:13.5px; line-height:1.7; background:var(--color-bg); border-radius:var(--radius-sm); padding:12px 14px; }
+  .cwe-passage mark { background:var(--color-accent-100); color:inherit; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 13 of 15</span>
+    <h1>Long-context &amp; Context Extension</h1>
+    <p>Every model in this series so far reads a window of a few thousand tokens. But real work — a whole codebase, a stack of papers, a long agent trajectory — needs far more. Training directly at long sequence lengths is prohibitively expensive, so frontier models pretrain short and then <em>extend</em> their context in a dedicated late stage. OLMo 3 stretches from 8,192 to 65,536 tokens this way. In this part we open up that stage: how RoPE gets stretched, what data teaches long-range attention, how sequences are packed and masked, and how you know it actually worked.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="why">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Why context is its own stage</h2></div>
+    <p class="llmt-eyebrow">Pretrain short, extend late</p>
+    <p>Attention cost grows with the square of sequence length, so a training run at 64K costs dramatically more per token than the same run at 8K. The standard compromise is to pretrain and midtrain at a shorter window — OLMo 3 uses 8,192 tokens — and then spend a comparatively small number of tokens adapting the already-trained model to a longer one. Because the recipe only touches a few tens of billions of tokens, it is cheap enough to iterate on, and it can be tuned on the same base model repeatedly.</p>
+    <p>The catch is that the recipes are wildly inconsistent across labs. SmolLM3 and GLM 4.5 spend about 100B extension tokens; DeepSeek V3 spends 123B; Apertus 225B; Kimi K2 400B; Llama 3.1 and DeepSeek V3.1 spend 800–840B. The outliers prove how much the budget is an engineering choice rather than a law: AFM and Nemotron Nano 2 reach 64K and 128K respectively on fewer than 20B tokens. Labs also disagree on <em>when</em> to extend — Llama 3.1 extends before midtraining, Qwen 2.5/3 after it, and GLM 4.5 only after supervised fine-tuning.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p13-budget" width="620" height="360"></canvas>
+        <p class="llmt-canvas-hint">Extension-stage token budgets for open models (billions of tokens). Click a bar for the note. Bars are sorted largest-first; some models reach long windows far more cheaply.</p>
+      </div>
+      <div class="llmt-readout" id="p13-budget-readout">Click a bar to compare extension budgets.</div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Context is not the same as capability.</b> A model can accept 65K tokens and still fail to use information placed in the middle of that window. Everything in the rest of this part is about making the window <em>usable</em>, not just large.</span></div>
+  </section>
+
+  <section class="llmt-step" id="rope">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>Stretching RoPE</h2></div>
+    <p class="llmt-eyebrow">Positional embeddings</p>
+    <p>RoPE (Part 3) encodes position by rotating query and key vectors by an angle proportional to their position, with a different rotation frequency per dimension. A model pretrained on 8K positions has simply never seen the rotations that a 32K-token sequence produces, so its attention pattern breaks down past the training length. Context extension is mostly the art of re-mapping positions into the range the model already understands. Three families dominate:</p>
+    <ul>
+      <li><b>Base-frequency scaling</b> — change RoPE's base <var>&theta;</var> so the whole spectrum of frequencies stretches; lower frequencies now cover much longer distances before wrapping.</li>
+      <li><b>Position interpolation (PI)</b> — divide each position by a scale factor <var>s = L'/L</var>, compressing the long sequence back into the original range. Cheap, but it lowers resolution at every distance.</li>
+      <li><b>YaRN</b> — combine interpolation with a per-frequency correction and an attention “temperature” factor, interpolating only the slow dimensions and leaving fast ones near their pretrained frequencies. This is what OLMo 3 uses.</li>
+    </ul>
+    <p>OLMo 3's key finding is architectural: it uses <strong>sliding-window attention (SWA) in three of every four layers</strong>, with the last layer always full attention. YaRN works best when applied to the RoPE instances in the <em>full-attention</em> layers only. Touching the sliding-window layers as well hurts.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p13-rope" width="520" height="300"></canvas>
+        <p class="llmt-canvas-hint">Illustrative attention score at a given relative distance for each method (shapes modeled, not measured). The dashed line marks the 8K pretraining window.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow" id="rope-methods">
+          <button data-method="vanilla">Vanilla</button>
+          <button data-method="pi">Position interp.</button>
+          <button data-method="ntk">Base scaling</button>
+          <button data-method="yarn">YaRN</button>
+        </div>
+        <div class="llmt-field"><label>Apply RoPE extension to</label>
+          <select id="rope-layers">
+            <option value="full">Full-attention layers only</option>
+            <option value="all">All layers (incl. sliding window)</option>
+          </select>
+        </div>
+        <div class="llmt-readout" id="p13-rope-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="data">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Data for long context</h2></div>
+    <p class="llmt-eyebrow">Longmino Mix</p>
+    <p>A longer window is only useful if the training data actually has long-range dependencies. OLMo 3 builds <strong>Longmino Mix</strong> from a 639B-token pool of long documents — principally scientific PDFs processed by <em>olmocr</em> — plus synthetic augmentation, then mixes in high-quality short-context data from midtraining so short tasks don't regress. The final 50B mix is roughly 34% long-context data (long docs plus synthetic) and 66% short-context midtraining data; a 66/34 long-heavy mix measurably hurt short-context evals.</p>
+    <p>Two filters shape the raw documents:</p>
+    <ul>
+      <li><b>gzip compressibility</b> — compression ratio is a cheap proxy for redundancy. OLMo 3 throws away the most-compressible 20% (boilerplate, repetitive) and the least-compressible 20% (noise, garbled text), keeping the informative middle.</li>
+      <li><b>LongPPL</b> — a token is a “key” token if its perplexity drops a lot when given much more preceding context. OLMo 3 computed it over 10B tokens with Gemma 3 4B as reference, but found no thresholding strategy beat plain gzip, so it was tested and <em>not</em> used.</li>
+    </ul>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p13-gzip" width="520" height="260"></canvas>
+        <p class="llmt-canvas-hint">Illustrative compressibility distribution. The retention window keeps the middle; drag the cut to see how aggressively extremes are removed.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Remove extremes (top and bottom) <span class="val" id="gzip-val">20%</span></label>
+          <input type="range" id="gzip-slider" min="0" max="40" step="1" value="20"></div>
+        <div class="llmt-readout" id="p13-gzip-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-eyebrow">Synthetic aggregation tasks</p>
+    <p>Most long documents have no supervision for the tasks long-context models are actually used for — summarizing, counting, and synthesizing across a whole document. OLMo 3 injects that supervision synthetically, inspired by CLIPPER, by asking a model to build aggregation questions from snippets it can see. Two task types are used:</p>
+    <div class="llmt-grid2" style="margin:14px 0;">
+      <div class="llmt-card reveal"><b>CWE — Common Word Extraction</b><p style="font-size:13.5px;margin:6px 0 0;">QA pairs whose answer is the exact number of times a common unigram occurs in a document partition. Only answerable by scanning the whole window.</p></div>
+      <div class="llmt-card reveal"><b>REX — Rewriting EXpressions</b><p style="font-size:13.5px;margin:6px 0 0;">The same aggregation task rendered as one of 12 vignettes — a dialogue, flashcards, a quiz, a game show, a debate, an ELI5 explainer — forcing synthesis over the noun phrase throughout.</p></div>
+    </div>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <p style="margin:0 0 8px;font-size:13.5px;">Try a CWE task. The passage below is short enough to skim, but the same task at 32K tokens can only be answered by attending to the whole document. Count every occurrence of <b>“enzyme”</b>.</p>
+      <div class="cwe-passage" id="cwe-passage"></div>
+      <div class="llmt-btnrow" style="margin-top:10px;">
+        <input type="text" id="cwe-guess" placeholder="your count" style="max-width:140px;">
+        <button class="llmt-primary" id="cwe-check">Check</button>
+        <button id="cwe-reveal">Reveal answer</button>
+      </div>
+      <div class="llmt-readout" id="p13-cwe-readout">Enter a number and check it.</div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="packing">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Packing &amp; masking</h2></div>
+    <p class="llmt-eyebrow">Turning documents into training sequences</p>
+    <p>Training consumes fixed-length sequences, but real documents come in every length. The naive approach — concatenate all documents, then chop every <var>N</var> tokens — cuts documents mid-sentence and produces training instances shorter than the documents they came from. <strong>Best-fit document packing</strong> instead bins whole documents into fixed-length slots, so almost no document is split and almost no padding is added. On long-context benchmarks this alone is a large win.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow" id="pack-toggle">
+        <button data-mode="naive">Naive concat-then-split</button>
+        <button data-mode="bestfit" class="llmt-primary">Best-fit packing</button>
+      </div>
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p13-pack" width="640" height="240"></canvas>
+        <p class="llmt-canvas-hint">Ten sample documents packed into fixed-length sequences. Dark red slivers mark documents cut across a boundary; the light strip at the end of a row is padding.</p>
+      </div>
+      <div class="llmt-readout" id="p13-pack-readout"></div>
+    </div>
+    <p class="llmt-eyebrow">Intra-document masking</p>
+    <p>Packing documents next to each other creates a hazard: with only a causal mask, tokens in one document can attend into the previous document. That cross-document signal is spurious — during pretraining the model only ever saw coherent text — and it degrades long-range attention. <strong>Intra-document masking</strong> adds a block-diagonal structure so each position attends only within its own document (plus the usual causal constraint).</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p13-mask" width="360" height="360"></canvas>
+        <p class="llmt-canvas-hint">Attention mask for a packed sequence made of three documents (rows = query, columns = key).</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow" id="mask-toggle">
+          <button data-mode="causal" class="llmt-primary">Causal only</button>
+          <button data-mode="intra">Intra-document</button>
+        </div>
+        <div class="llmt-readout" id="p13-mask-readout"></div>
+      </div>
+    </div>
+    <p>OLMo 3 also splits the sequence across devices with <strong>8-way context parallelism</strong>: each of eight devices processes 8K of the 65K sequence. The all-gather attention strategy it borrows from Llama 3 supports irregular masks, which is what makes sliding-window and intra-document masking practical at the same time.</p>
+  </section>
+
+  <section class="llmt-step" id="results">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>Does it work?</h2></div>
+    <p class="llmt-eyebrow">RULER and HELMET</p>
+    <p>Long-context evaluation splits into a development suite and a held-out one. <strong>RULER</strong> bundles synthetic tasks — variants of needle-in-a-haystack and simple aggregation — and is the signal labs tune against. <strong>HELMET</strong> is broader (retrieval, in-context learning, summarization) and is kept unseen to check generalization; OLMo 3 is careful to note that RULER and HELMET overlap on the easier subsets, so it isn't a perfect held-out set. Toggle models below and watch how the spread widens as context grows.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow" id="ruler-toggles"></div>
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p13-ruler" width="640" height="320"></canvas>
+        <p class="llmt-canvas-hint">RULER dev-suite score (0–100) versus context length. Click a model to toggle it.</p>
+      </div>
+      <div class="llmt-readout" id="p13-ruler-readout"></div>
+    </div>
+    <p>Notice the shape of the deltas: at 4K almost every model is in the mid-90s, and the differences are uninformative. It is only at 32K and 65K that the curves separate. OLMo 3 also merges the last three extension checkpoints — a model soup — to get its final long-context 32B base checkpoint.</p>
+    <div class="llmt-goal">📌 <span><b>Cross-links:</b> the gzip and LongPPL filters here are the long-context arm of Part 4's data curation; the checkpoint merging is the same model-soup idea Part 5 covers for midtraining; and the RL context window this extension enables is exactly what Part 15's long-chain-of-thought training depends on.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td>Context extension stage</td><td>A short late-training phase that grows the window after pretraining/midtraining — OLMo 3: 8,192 → 65,536 tokens on 50B (7B) / 100B (32B) tokens.</td></tr>
+        <tr><td>Base-frequency scaling</td><td>Raise RoPE's base θ so long distances don't wrap past the learned range.</td></tr>
+        <tr><td>Position interpolation</td><td>Divide positions by s = L'/L to squeeze long sequences into the pretrained range.</td></tr>
+        <tr><td>YaRN</td><td>Per-frequency interpolation plus attention temperature; applied to full-attention layers only in OLMo 3.</td></tr>
+        <tr><td>Longmino Mix</td><td>639B pool of long docs (olmocr PDFs) plus synthetic data; final mix ≈ 34% long / 66% short.</td></tr>
+        <tr><td>gzip filter</td><td>Drop the most- and least-compressible 20% of documents.</td></tr>
+        <tr><td>LongPPL</td><td>Long-range-dependency proxy using perplexity under more context; tested, not used.</td></tr>
+        <tr><td>CWE / REX</td><td>Synthetic aggregation tasks (count a word / rewrite into a vignette) that require the full window.</td></tr>
+        <tr><td>Best-fit packing</td><td>Bin whole documents into fixed sequences to minimize splits and padding.</td></tr>
+        <tr><td>Intra-document masking</td><td>Block-diagonal mask so packed documents can't attend across boundaries.</td></tr>
+        <tr><td>Context parallelism</td><td>Split a long sequence across devices; OLMo 3 uses 8-way CP (8K per device).</td></tr>
+        <tr><td>RULER / HELMET</td><td>Synthetic dev suite / broad held-out long-context suite.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>OLMo 3 Team (Ai2), <a href="https://arxiv.org/abs/2512.13961">"OLMo 3"</a> (2025) — the long-context extension recipe (§3.6) and RULER/HELMET comparison.</li>
+      <li>Peng et al., <a href="https://arxiv.org/abs/2309.00071">"YaRN: Efficient Context Window Extension of Large Language Models"</a> (2023).</li>
+      <li>Chen et al., <a href="https://arxiv.org/abs/2306.15595">"Extending Context Window of Large Language Models via Positional Interpolation"</a> (2023).</li>
+      <li>Xiong et al., <a href="https://arxiv.org/abs/2309.16039">"Effective Long-Context Scaling of Foundation Models"</a> (2023) — base-frequency scaling.</li>
+      <li>Ding et al., <a href="https://arxiv.org/abs/2402.17463">"Fewer Truncations Improve Language Modeling"</a> (2024) — best-fit packing.</li>
+      <li>Gao et al., <a href="https://arxiv.org/abs/2411.06191">"ProLong"</a> (2024) and Wu et al., <a href="https://arxiv.org/abs/2502.01986">"LongAttn"</a> (2025) — token-efficient extension.</li>
+      <li>Hsieh et al., <a href="https://arxiv.org/abs/2404.06654">"RULER: What's the Real Context Size of Your Long-Context Language Models?"</a> (2024).</li>
+      <li>Yen et al., <a href="https://arxiv.org/abs/2410.02694">"HELMET: How to Evaluate Long-Context Language Models Effectively and Thoroughly"</a> (2024).</li>
+      <li>Pham et al., <a href="https://arxiv.org/abs/2502.12618">"CLIPPER"</a> (2025) — injected aggregation tasks.</li>
+      {% endraw %}<li>Serving consequence: <a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">LLM Serving, Part 15</a> takes the same window as given and asks what it costs per request.{% raw %}
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>Context windows large enough to hold a task also let a model hold a conversation with its environment — calling functions, reading results, and iterating. That is the next part.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/tools-agents/' | relative_url }}">Continue: tool use, function calling &amp; agents →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+  var DATA_URL = "{% endraw %}{{ '/assets/data/llm-published-numbers.json' | relative_url }}{% raw %}";
+  var C = function(k, fb){ return c[k] || fb; };
+
+  fetch(DATA_URL).then(function(r){ return r.json(); }).then(function(data){
+    var lc = data.olmo3_longcontext;
+    if (!lc || !lc.extension_budget_b){ console.warn('olmo3_longcontext data unavailable'); return; }
+
+    // ---------- 1. Extension budgets ----------
+    (function(){
+      var canvas = document.getElementById('p13-budget');
+      var readout = document.getElementById('p13-budget-readout');
+      var rows = lc.extension_budget_b.slice().sort(function(a,b){ return b.tokens_b - a.tokens_b; });
+      var selected = null;
+      var W = 620, H = 360;
+      G.setupCanvas(canvas, W, H, function(){ draw(); });
+      function draw(){
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var padL = 150, padR = 60, padT = 16, padB = 16;
+        var maxV = 860;
+        var n = rows.length;
+        var barH = (H - padT - padB) / n - 6;
+        ctx.font = '12px ' + c.font;
+        rows.forEach(function(d,i){
+          var y = padT + i*(barH+6);
+          var w = (W - padL - padR) * (d.tokens_b / maxV);
+          ctx.fillStyle = (selected === d) ? c.accent : (d.note ? c.accent400 : C('accent500', c.accent));
+          ctx.fillRect(padL, y, w, barH);
+          ctx.fillStyle = c.text; ctx.textAlign = 'right';
+          ctx.fillText(d.model, padL - 8, y + barH*0.72);
+          ctx.textAlign = 'left';
+          ctx.fillText(d.tokens_b + (d.note ? '*' : ''), padL + w + 6, y + barH*0.72);
+        });
+        ctx.fillStyle = c.text; ctx.globalAlpha = 0.55; ctx.font = '11px ' + c.font;
+        ctx.fillText('* <20B outlier', padL, H - 3); ctx.globalAlpha = 1;
+      }
+      canvas.addEventListener('click', function(e){
+        var rect = canvas.getBoundingClientRect();
+        var my = (e.clientY - rect.top) * (H / rect.height);
+        var padT = 16, padB = 16, n = rows.length;
+        var barH = (H - padT - padB) / n - 6;
+        var idx = Math.floor((my - padT) / (barH + 6));
+        if (idx >= 0 && idx < n){
+          selected = rows[idx];
+          readout.innerHTML = '<span class="hi">' + selected.model + '</span> — ' + selected.tokens_b + 'B extension tokens.' +
+            (selected.note ? ' Note: ' + selected.note + '.' : '');
+          draw();
+        }
+      });
+    })();
+
+    // ---------- 2. RoPE extension ----------
+    (function(){
+      var canvas = document.getElementById('p13-rope');
+      var readout = document.getElementById('p13-rope-readout');
+      var scope = document.getElementById('rope-layers');
+      var method = 'yarn';
+      var W = 520, H = 300;
+      var M = {
+        vanilla: { tau: 1100, omega: 0.010 },
+        pi:      { tau: 7000, omega: 0.0018 },
+        ntk:     { tau: 8200, omega: 0.0034 },
+        yarn:    { tau: 9500, omega: 0.0026 }
+      };
+      G.setupCanvas(canvas, W, H, function(){ render(); });
+      function render(){
+        var ctx = canvas.getContext('2d');
+        var m = M[method];
+        var tau = m.tau * (scope.value === 'all' ? 0.45 : 1);  // extending SWA layers too blurs long-range signal
+        var pts = [];
+        for (var d = 0; d <= 32768; d += 256){
+          pts.push({ x: d, y: Math.exp(-d/tau) * Math.cos(m.omega * d) });
+        }
+        var line = [{ points: pts, color: (scope.value === 'all') ? c.accent2 : c.accent }];
+        var ax = G.drawLines(ctx, W, H, line, [0,32768], [-1,1], { xLabel: 'relative distance (tokens)', yLabel: 'attention score' });
+        // 8K pretraining boundary
+        ctx.save();
+        ctx.strokeStyle = c.divider; ctx.setLineDash([4,4]); ctx.lineWidth = 1;
+        var x8 = ax.px(8192);
+        ctx.beginPath(); ctx.moveTo(x8, ax.padT); ctx.lineTo(x8, ax.padT + ax.plotH); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.font = '10px ' + c.font; ctx.fillStyle = c.text; ctx.globalAlpha = 0.7;
+        ctx.textAlign = 'center'; ctx.fillText('8K', x8, ax.padT - 3);
+        ctx.globalAlpha = 1; ctx.restore();
+        var labels = { vanilla:'Vanilla RoPE', pi:'Position interpolation', ntk:'Base-frequency scaling', yarn:'YaRN' };
+        readout.innerHTML =
+          '<span class="k">method:</span> ' + labels[method] + '<br>' +
+          '<span class="k">applied to:</span> ' + (scope.value === 'all' ? 'all layers' : 'full-attention layers only') + '<br>' +
+          '<span class="k">usable range:</span> ' + (tau > 6000 ? 'extends well past 8K' : 'collapses near the 8K boundary') + '<br>' +
+          (scope.value === 'all' && method !== 'vanilla' ? '<span class="bad">extending sliding-window layers too degrades long-range signal</span>' : '<span style="opacity:0.65">full-attention-only is the OLMo 3 finding</span>');
+      }
+      var btns = document.querySelectorAll('#rope-methods button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          method = b.getAttribute('data-method');
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          render();
+        });
+      });
+      scope.addEventListener('change', render);
+      btns[3].classList.add('llmt-primary');
+    })();
+
+    // ---------- 3a. gzip filter ----------
+    (function(){
+      var canvas = document.getElementById('p13-gzip');
+      var slider = document.getElementById('gzip-slider'), valEl = document.getElementById('gzip-val');
+      var readout = document.getElementById('p13-gzip-readout');
+      var W = 520, H = 260;
+      var rng = G.seededRandom(42);
+      var bins = [];
+      for (var i=0;i<28;i++){
+        // bimodal-ish compressibility: boilerplate low, noisy high, informative middle
+        var x = i/27;
+        var v = 0.25*Math.exp(-Math.pow((x-0.12)/0.14,2)) + 0.30*Math.exp(-Math.pow((x-0.88)/0.16,2)) + 0.9*Math.exp(-Math.pow((x-0.5)/0.22,2)) + rng()*0.08;
+        bins.push(v);
+      }
+      G.setupCanvas(canvas, W, H, function(){ render(); });
+      function render(){
+        var cut = parseFloat(slider.value)/100; valEl.textContent = slider.value + '%';
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var padL=30, padR=10, padT=14, padB=30;
+        var plotW=W-padL-padR, plotH=H-padT-padB;
+        var maxV=Math.max.apply(null,bins);
+        var barW=plotW/bins.length;
+        var kept=0, total=0;
+        bins.forEach(function(v,i){
+          var x=i/bins.length;
+          var inWindow = (x >= cut && x <= 1-cut);
+          var h=plotH*(v/maxV);
+          ctx.fillStyle = inWindow ? C('accent500', c.accent) : c.divider;
+          ctx.fillRect(padL+i*barW, padT+plotH-h, barW-1, h);
+          total += v; if (inWindow) kept += v;
+        });
+        ctx.strokeStyle=c.divider; ctx.beginPath(); ctx.moveTo(padL,padT+plotH); ctx.lineTo(padL+plotW,padT+plotH); ctx.stroke();
+        ctx.fillStyle=c.text; ctx.font='11px '+c.font; ctx.textAlign='left';
+        ctx.fillText('most compressible', padL, H-8); ctx.textAlign='right'; ctx.fillText('least compressible', W-padR, H-8);
+        var retainedPct = total ? (kept/total*100) : 0;
+        readout.innerHTML = '<span class="k">window kept:</span> ' + (100-2*parseFloat(slider.value)) + '% of the range<br>' +
+          '<span class="k">documents retained (approx.):</span> ' + retainedPct.toFixed(0) + '%<br>' +
+          '<span style="opacity:0.65">OLMo 3 uses a 20% cut on each side.</span>';
+      }
+      slider.addEventListener('input', render);
+    })();
+
+    // ---------- 3b. CWE mini task ----------
+    (function(){
+      var passageEl = document.getElementById('cwe-passage');
+      var guess = document.getElementById('cwe-guess');
+      var readout = document.getElementById('p13-cwe-readout');
+      var text = "A cell regulates its metabolism through signaling cascades. Each step in a cascade depends on a specific enzyme, and the same enzyme can act at several points. When the enzyme is inhibited, flux through the pathway falls. Researchers measured how quickly the enzyme recovered after inhibition, then compared that rate to a second enzyme in the same family. The slower enzyme set the pathway's overall pace. A third enzyme appeared only under stress, and its activity tracked the stress signal. Later work showed the first enzyme also modified a transcription factor, linking metabolism to gene expression.";
+      var n = (text.match(/enzyme/g) || []).length;
+      passageEl.textContent = text;
+      document.getElementById('cwe-check').addEventListener('click', function(){
+        var g = parseInt(guess.value, 10);
+        if (isNaN(g)) { readout.textContent = 'Enter a number first.'; return; }
+        readout.innerHTML = (g === n) ? '<span class="hi">Correct — '+n+' occurrences.</span>' :
+          '<span class="bad">Not quite.</span> You said '+g+'; the passage has '+n+'. Try scanning for the plural too.';
+      });
+      document.getElementById('cwe-reveal').addEventListener('click', function(){
+        passageEl.innerHTML = text.replace(/enzyme/g, '<mark>enzyme</mark>');
+        readout.innerHTML = '<span class="hi">'+n+' occurrences.</span> At 32K tokens a human can\'t skim; the model has to locate every mention.';
+      });
+    })();
+
+    // ---------- 4a. Packing ----------
+    (function(){
+      var canvas = document.getElementById('p13-pack');
+      var readout = document.getElementById('p13-pack-readout');
+      var mode = 'bestfit';
+      var docs = [5200, 3100, 2600, 4800, 1500, 7000, 2400, 900, 5600, 4200];
+      var SEQ = 8192, W = 640, H = 240;
+      var COLORS = ['#2b5fff','#93aefe','#5d85fd','#0b3cd0','#d6006c','#e0559a','#7a4bd0','#3aa66a','#c98a00','#5a6b7a'];
+      G.setupCanvas(canvas, W, H, function(){ draw(); });
+      function naive(){
+        var rows = [], buf = 0, row = [];
+        docs.forEach(function(len, di){
+          var remaining = len;
+          while (remaining > 0){
+            var space = SEQ - buf;
+            var take = Math.min(space, remaining);
+            row.push({ doc: di, len: take });
+            buf += take; remaining -= take;
+            if (buf >= SEQ){ rows.push(row); row = []; buf = 0; }
+          }
+        });
+        if (row.length) rows.push(row);
+        // count documents that appear in more than one row
+        var seen = {};
+        rows.forEach(function(r,i){ var inRow = {}; r.forEach(function(s){ inRow[s.doc]=true; }); Object.keys(inRow).forEach(function(d){ (seen[d]=seen[d]||[]).push(i); }); });
+        Object.keys(seen).forEach(function(d){ if (seen[d].length > 1) splits++; });
+        var used = rows.reduce(function(a,r){ return a + r.reduce(function(x,s){ return x+s.len; },0); },0);
+        var pad = rows.length*SEQ - used;
+        return { rows: rows, splits: splits, pad: pad };
+      }
+      function bestfit(){
+        var remaining = docs.map(function(len,i){ return {len:len, doc:i}; }).sort(function(a,b){ return b.len-a.len; });
+        var rows = [];
+        remaining.forEach(function(d){
+          var placed = false;
+          for (var i=0;i<rows.length && !placed;i++){
+            var r = rows[i];
+            var used = r.reduce(function(a,s){ return a+s.len; },0);
+            if (used + d.len <= SEQ){ r.push({ doc:d.doc, len:d.len }); placed = true; }
+          }
+          if (!placed) rows.push([{ doc:d.doc, len:d.len }]);
+        });
+        var used = rows.reduce(function(a,r){ return a + r.reduce(function(x,s){ return x+s.len; },0); },0);
+        return { rows: rows, splits: 0, pad: rows.length*SEQ - used };
+      }
+      function draw(){
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var res = (mode === 'naive') ? naive() : bestfit();
+        var padL = 8, padT = 18, rowH = 30, gap = 14;
+        var plotW = W - padL - 8;
+        ctx.font = '11px ' + c.font;
+        res.rows.forEach(function(r, ri){
+          var x = padL, y = padT + ri*(rowH+gap);
+          ctx.fillStyle = c.divider; ctx.globalAlpha = 0.40;
+          ctx.fillRect(padL, y, plotW, rowH); ctx.globalAlpha = 1;
+          r.forEach(function(s){
+            var w = plotW * (s.len / SEQ);
+            ctx.fillStyle = COLORS[s.doc % COLORS.length];
+            ctx.fillRect(x, y, Math.max(1,w-1), rowH);
+            ctx.fillStyle = '#fff';
+            if (w > 26) ctx.fillText('D' + (s.doc+1), x + 4, y + rowH*0.68);
+            x += w;
+          });
+        });
+        readout.innerHTML = '<span class="k">sequences used:</span> ' + res.rows.length +
+          ' &nbsp; <span class="k">documents split:</span> ' + res.splits +
+          ' &nbsp; <span class="k">padding:</span> ' + res.pad.toLocaleString() + ' tokens<br>' +
+          (res.splits === 0 ? '<span style="opacity:0.65">best-fit keeps every document whole; padding is the only cost.</span>'
+                            : '<span class="bad">naive packing cuts documents at sequence boundaries</span>');
+      }
+      var btns = document.querySelectorAll('#pack-toggle button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          mode = b.getAttribute('data-mode');
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          draw();
+        });
+      });
+    })();
+
+    // ---------- 4b. Intra-document mask ----------
+    (function(){
+      var canvas = document.getElementById('p13-mask');
+      var readout = document.getElementById('p13-mask-readout');
+      var mode = 'causal';
+      var N = 16, docOf = [];
+      for (var i=0;i<N;i++) docOf.push(i < 6 ? 0 : (i < 13 ? 1 : 2));
+      var W = 360, H = 360;
+      G.setupCanvas(canvas, W, H, function(){ render(); });
+      function render(){
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var pad = 40, cell = (W - pad - 16) / N;
+        ctx.font = '10px ' + c.font; ctx.fillStyle = c.text;
+        for (var q=0;q<N;q++){
+          for (var k=0;k<N;k++){
+            var allowed;
+            if (mode === 'causal') allowed = (k <= q);
+            else allowed = (k <= q) && (docOf[k] === docOf[q]);
+            ctx.fillStyle = allowed ? C('accent500', c.accent) : '#e9e9e9';
+            ctx.fillRect(pad + k*cell, pad + q*cell, cell-1, cell-1);
+          }
+        }
+        // doc separators
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+        [6,13].forEach(function(b){
+          ctx.beginPath(); ctx.moveTo(pad, pad + b*cell); ctx.lineTo(pad + N*cell, pad + b*cell); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(pad + b*cell, pad); ctx.lineTo(pad + b*cell, pad + N*cell); ctx.stroke();
+        });
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right';
+        ctx.fillText('query', pad-6, pad + (N*cell)/2);
+        ctx.textAlign = 'left';
+        ctx.fillText('key →', pad + (N*cell)/2 - 20, pad - 8);
+      }
+      var btns = document.querySelectorAll('#mask-toggle button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          mode = b.getAttribute('data-mode');
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          render();
+          readout.innerHTML = (mode === 'causal')
+            ? '<span class="k">causal only:</span> document 3 can attend back into documents 1 and 2 — spurious cross-document signal.'
+            : '<span class="k">intra-document:</span> attention is block-diagonal — each document only sees itself (red lines mark document boundaries).';
+        });
+      });
+      readout.innerHTML = '<span class="k">causal only:</span> document 3 can attend back into documents 1 and 2 — spurious cross-document signal.';
+    })();
+
+    // ---------- 5. RULER chart ----------
+    (function(){
+      var canvas = document.getElementById('p13-ruler');
+      var readout = document.getElementById('p13-ruler-readout');
+      var toggles = document.getElementById('ruler-toggles');
+      var models = lc.ruler.models;
+      var ctxs = lc.ruler.contexts;
+      var active = { 'OLMo 3 7B': true, 'OLMo 3 32B': true, 'Llama 3.1 8B': true, 'Qwen 2.5 7B': false, 'Qwen 2.5 32B': true, 'Mistral Small 3.1 24B': false };
+      var palette = [c.accent, c.accent2, C('accent500', c.accent), '#7a4bd0', '#3aa66a', '#c98a00'];
+      var names = Object.keys(models);
+      var W = 640, H = 320;
+      G.setupCanvas(canvas, W, H, function(){ draw(); });
+      names.forEach(function(name, i){
+        var b = document.createElement('button');
+        b.textContent = name;
+        b.style.borderColor = palette[i % palette.length];
+        if (active[name]) { b.classList.add('llmt-primary'); b.style.background = palette[i % palette.length]; b.style.color = '#fff'; }
+        b.addEventListener('click', function(){
+          active[name] = !active[name];
+          b.classList.toggle('llmt-primary', active[name]);
+          b.style.background = active[name] ? palette[i % palette.length] : '';
+          b.style.color = active[name] ? '#fff' : '';
+          draw();
+        });
+        toggles.appendChild(b);
+      });
+      function draw(){
+        var ctx = canvas.getContext('2d');
+        var series = [], idx = 0;
+        names.forEach(function(name, i){
+          if (!active[name]) return;
+          var ruler = models[name].ruler;
+          var pts = ctxs.map(function(x, j){ return { x: x/1024, y: ruler[j] }; });
+          series.push({ points: pts, color: palette[i % palette.length] });
+        });
+        var ax = G.drawLines(ctx, W, H, series, [4,64], [40,100], { xLabel: 'context length (K tokens)', yLabel: 'RULER score' });
+        ctx.font = '11px ' + c.font;
+        series.forEach(function(s, i){
+          ctx.fillStyle = s.color; ctx.fillText('•', ax.px(s.points[s.points.length-1].x) - 3, ax.py(s.points[s.points.length-1].y) + 4);
+        });
+        var parts = [];
+        names.forEach(function(name){
+          if (active[name]) parts.push(name + ': ' + models[name].ruler[4].toFixed(1));
+        });
+        readout.innerHTML = '<span class="k">RULER @ 65K:</span> ' + (parts.length ? parts.join(' &nbsp;·&nbsp; ') : '(none selected)') +
+          '<br><span style="opacity:0.65">OLMo 3 32B reaches ' + models['OLMo 3 32B'].ruler[4].toFixed(1) + ' with 100B extension tokens; HELMET @65K is ' + models['OLMo 3 32B'].helmet[3].toFixed(1) + '.</span>';
+      }
+    })();
+  }).catch(function(err){
+    console.error('Failed to load long-context data', err);
+  });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

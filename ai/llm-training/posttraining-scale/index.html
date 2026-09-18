@@ -1,0 +1,727 @@
+---
+title: "LLM Training, Interactively — Part 15: Post-training at scale"
+description: "The full frontier post-training recipe — SFT to DPO to RLVR, Delta Learning's contrastive signal, preference-tuning pitfalls, the upgraded GRPO behind OLMoRL, domain verifiers, asynchronous RL systems, and RL from base with contamination controls."
+permalink: "/ai/llm-training/posttraining-scale/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-posttraining-scale.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .vz-row { display:grid; grid-template-columns: 130px 1fr; gap:10px; align-items:baseline; font-size:13.5px; margin-bottom:6px; }
+  .vz-row .lbl { opacity:0.6; font-size:11.5px; letter-spacing:0.05em; text-transform:uppercase; }
+  .vz-badge { display:inline-block; font-family:var(--font-mono); font-size:11.5px; padding:2px 8px; border-radius:10px; }
+  .vz-badge.pass { background:var(--color-accent-100); color:var(--color-accent-800); }
+  .vz-badge.fail { background:var(--color-accent-2-100); color:var(--color-accent-2-800); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 15 of 15</span>
+    <h1>Post-training at Scale</h1>
+    <p>Parts 7–9 introduced supervised fine-tuning, preference optimization, and verifiable-reward RL one at a time. A frontier model uses all three, in sequence, across four domains, on top of a base model that was itself carefully midtrained. This part is the integration: the measured three-stage recipe, the counter-intuitive Delta Learning trick, the upgrades that turned GRPO into OLMoRL, the verifiers behind each domain, and the systems work that makes RL fast enough to run at all.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="recipe">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>The three-stage recipe</h2></div>
+    <p class="llmt-eyebrow">SFT → DPO → RLVR</p>
+    <p>OLMo 3 Think is trained in three stages on top of the midtrained base: supervised fine-tuning on curated thinking traces (<b>Dolci-Think-SFT</b>), preference tuning (<b>Dolci-Think-DPO</b>), then reinforcement learning with verifiable rewards (<b>OLMoRL</b>). Many open reasoning models stop after SFT — OpenThoughts3 and s1 used only SFT; SmolLM3 used SFT and DPO with no RL. OLMo 3's claim is that each stage adds something the previous one cannot, and that <strong>RL works better when it starts from a DPO checkpoint than directly from SFT</strong>. The stage table below shows the pattern: DPO tends to lift the reasoning and code benchmarks, and RL then lifts instruction-following and the hardest math.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p15-stages" width="660" height="330"></canvas>
+        <p class="llmt-canvas-hint">OLMo 3 Think 7B across post-training stages. Bars are SFT / DPO / final RL. Hover-free: values are printed at the bar ends.</p>
+      </div>
+    </div>
+    <div class="llmt-goal">📌 <span><b>Why order matters:</b> DPO first gives the policy a cleaner starting distribution for RL, and filtering the RL data with the DPO checkpoint (offline difficulty filtering) selects prompts that still have signal. The rest of this part is mostly about making each stage actually work.</span></div>
+  </section>
+
+  <section class="llmt-step" id="delta">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>Delta Learning</h2></div>
+    <p class="llmt-eyebrow">The signal is the contrast, not the quality</p>
+    <p>Here is the counter-intuitive finding. By the time you have a strong SFT model, generating <em>better</em> completions with a bigger model and doing more SFT on them can <em>hurt</em>. On OLMo 3's dev checkpoint, continued SFT on Qwen3-32B thinking traces dropped the average from 70.3 to 64.5 — a 5.8-point regression. The model was already saturated on imitation. <strong>Delta Learning</strong> extracts signal from those same, now-useless completions by turning them into preference pairs: pick the strong completion as <em>chosen</em> and deliberately pair it with a much weaker one as <em>rejected</em>. The quality of the pairing depends on the <em>difference</em> between the two, not on either alone. Pairing Qwen3-32B with Qwen3-0.6B and running DPO lifted the average to 72.9 — better than the original SFT checkpoint.</p>
+    <div class="llmt-math llmt-katex">$$\text{gain} \;\propto\; \big(y_c - y_r\big), \qquad y_c \succ y_r$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-delta" width="520" height="280"></canvas>
+        <p class="llmt-canvas-hint">Illustrative model of imitation vs contrastive signal. Lowering the rejected quality restores gradient even when the chosen model is saturated.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Chosen capability (Qwen3-32B ≈ 83) <span class="val" id="delta-c-val">83</span></label>
+          <input type="range" id="delta-c" min="50" max="95" step="1" value="83"></div>
+        <div class="llmt-field"><label>Rejected capability (Qwen3-0.6B ≈ 35) <span class="val" id="delta-r-val">35</span></label>
+          <input type="range" id="delta-r" min="5" max="60" step="1" value="35"></div>
+        <div class="llmt-readout" id="p15-delta-readout"></div>
+      </div>
+    </div>
+    <p>The Instruct model uses the same trick without thinking traces, and supplements it with <b>delta-aware GPT-judged pairs</b>: instead of trusting a judge to pick a good rejected answer from a pool of strong models, the pipeline forces weaker models into the pool and selects the <em>worst</em> response as rejected. Raising only the chosen model's quality had <em>failed</em> to improve over the OLMo 2 preference baseline; maximizing the delta fixed it.</p>
+  </section>
+
+  <section class="llmt-step" id="pitfalls">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Preference-tuning pitfalls</h2></div>
+    <p class="llmt-eyebrow">Dataset size, length bias, multi-turn</p>
+    <p>DPO has three failure modes that are easy to miss. First, <strong>more data is not monotonically better</strong>: AlpacaEval and ZebraLogic peak around 75–100K preference pairs and then decline, while AIME is still improving at that budget. The optimum depends on the downstream task, so dataset size is swept as a hyperparameter and early stopping is essential. Second, preference data has a <strong>length bias</strong> — chosen responses are systematically longer than rejected ones (80th percentile difference: 538 tokens for GPT-judged pairs, 564 for delta-heuristic pairs), and the model learns verbosity along with quality. OLMo 3 caps the difference at 100 tokens for chat and multi-turn subsets. Third, single-turn preferences don't teach <strong>multi-turn coherence</strong>; OLMo 3 synthesizes multi-turn conversations two ways (self-talk and synthetic-context) and changes only the final turn, so the ranking is unambiguous.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-dpo-size" width="560" height="280"></canvas>
+        <p class="llmt-canvas-hint">Preference dataset size (K pairs) vs benchmark score. Drag the budget to see which tasks are past their peak.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Preference dataset size <span class="val" id="dpo-size-val">75K</span></label>
+          <input type="range" id="dpo-size" min="10" max="200" step="5" value="75"></div>
+        <div class="llmt-readout" id="p15-dpo-size-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-length" width="520" height="250"></canvas>
+        <p class="llmt-canvas-hint">Chosen-minus-rejected token difference (illustrative distribution). Pairs above the cap are filtered from chat/multi-turn data.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Length-difference cap <span class="val" id="len-cap-val">100 tokens</span></label>
+          <input type="range" id="len-cap" min="0" max="800" step="10" value="100"></div>
+        <div class="llmt-readout" id="p15-length-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="grpo">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>GRPO, upgraded</h2></div>
+    <p class="llmt-eyebrow">OLMoRL</p>
+    <p>Part 9's GRPO used a group's own mean and standard deviation as the baseline. OLMoRL keeps the group-relative idea but changes seven things, most of them from DAPO and Dr.GRPO:</p>
+    <ul>
+      <li><b>Zero-gradient filtering</b> — drop groups where every reward is identical (zero advantage, zero gradient).</li>
+      <li><b>Active sampling</b> — keep resampling prompts until the batch is full of non-zero-gradient completions, so filtering doesn't shrink batches over time.</li>
+      <li><b>Token-level loss</b> — normalize by total tokens in the batch, not per sample, removing a length bias.</li>
+      <li><b>No KL loss</b> — remove the reference-model penalty; updates are less restricted and training stays stable.</li>
+      <li><b>Clip-higher</b> — set the upper clipping bound above the lower one so probability can rise more than it falls.</li>
+      <li><b>Truncated importance sampling</b> — correct for the gap between inference-engine and trainer log-probabilities.</li>
+      <li><b>No std normalization</b> — divide by nothing: <span class="lc-note">A<sub>i</sub> = r<sub>i</sub> − mean(r)</span> rather than <span class="lc-note">(r<sub>i</sub> − mean)/std</span>.</li>
+    </ul>
+    <div class="llmt-math llmt-katex">$$\hat{A}_i = r_i - \operatorname{mean}\big(\{r_1,\dots,r_G\}\big)$$</div>
+    <p>The last change fixes a <strong>difficulty bias</strong>: dividing by a small group standard deviation inflates the advantages of prompts that are almost always right or almost always wrong — exactly the prompts that carry the least learning signal. Removing the division stops those prompts from dominating the update.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-adv" width="520" height="250"></canvas>
+        <p class="llmt-canvas-hint">Illustrative: how much std-normalization inflates a fixed reward gap as the group's reward spread shrinks.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Reward gap within the group <span class="val" id="adv-gap-val">0.5</span></label>
+          <input type="range" id="adv-gap" min="0.1" max="1" step="0.05" value="0.5"></div>
+        <div class="llmt-readout" id="p15-adv-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-clip" width="520" height="250"></canvas>
+        <p class="llmt-canvas-hint">The clipped surrogate objective at a fixed positive advantage. Clip-higher raises only the upper bound.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow" id="clip-toggle">
+          <button data-mode="sym" class="llmt-primary">Symmetric ±0.2</button>
+          <button data-mode="higher">Clip-higher (−0.2 / +0.28)</button>
+        </div>
+        <div class="llmt-readout" id="p15-clip-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-tokloss" width="540" height="250"></canvas>
+        <p class="llmt-canvas-hint">Per-token gradient weight by sequence length. Sample-level normalization makes long sequences count less per token; token-level makes every token equal.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-readout" id="p15-tokloss-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="verifiers">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>Reward design across domains</h2></div>
+    <p class="llmt-eyebrow">One verifier per domain</p>
+    <p>RLVR replaces a learned reward model with a deterministic verifier, but “deterministic” looks different in each domain. OLMo 3 uses a separate verifier (or LM judge) per domain, and each has a characteristic failure mode. Pick a domain to see a candidate completion, its reward, and what typically goes wrong.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow" id="vz-select"></div>
+      <div id="vz-body"></div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Recall the format sensitivity from Part 9:</b> an answer the verifier cannot parse gets zero reward no matter how correct it is. That is why OLMo 3 cleans evaluation prompts (stripping <span class="lc-note">\boxed{}</span>) to look like training prompts, and why format is a first-class part of reward design.</span></div>
+  </section>
+
+  <section class="llmt-step" id="systems">
+    <div class="llmt-step-head"><span class="llmt-step-num">6</span><h2>RL systems</h2></div>
+    <p class="llmt-eyebrow">Inference is the bottleneck</p>
+    <p>RL for long reasoning is an inference problem wearing a training costume. OLMo 3 generated rollouts up to 32K tokens (mean ≈ 14,628 for the reasoner models), and the learner spends <strong>75% of its time waiting for data</strong>: the 32B run used 8 H100 nodes for training and 20 for inference, roughly <strong>5×</strong> the compute for inference; the 7B run used 2 training nodes and 7 inference nodes, about <strong>14×</strong>. The fix is a fully asynchronous actor–learner setup with three big wins.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow" id="batch-toggle">
+        <button data-mode="static">Static batching</button>
+        <button data-mode="continuous" class="llmt-primary">Continuous batching</button>
+      </div>
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p15-batching" width="660" height="280"></canvas>
+        <p class="llmt-canvas-hint">Six variable-length rollouts (columns = generation steps). Grey cells are idle GPU slots. Continuous batching backfills as soon as a slot frees.</p>
+      </div>
+      <div class="llmt-readout" id="p15-batching-readout"></div>
+    </div>
+    <p>The other two wins: <strong>active sampling</strong> replaces DAPO's 3× oversampling with continuous resampling from a result queue, stabilizing batch size and loss; and <strong>inflight weight updates</strong> push new weights to the actors without pausing generation or invalidating the KV cache — up to <strong>4×</strong> faster. Stacked together, the infrastructure ablation below takes throughput from 881 to 2,949 tokens/second and memory-bandwidth utilization from 12.9% to 43.2%.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p15-infra" width="660" height="260"></canvas>
+        <p class="llmt-canvas-hint">OLMoRL infrastructure ablation: training throughput (tokens/second) as each component is added. MBU/MFU shown below each bar.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="rlzero">
+    <div class="llmt-step-head"><span class="llmt-step-num">7</span><h2>RL from base + contamination control</h2></div>
+    <p class="llmt-eyebrow">RL-Zero and spurious rewards</p>
+    <p>OLMo 3 also releases <strong>RL-Zero</strong>: RLVR applied directly to the midtrained base model with no SFT or DPO warm-up, over math, code, instruction-following, and chat. Two findings matter beyond the numbers. First, <strong>“simple” prompt templates beat standard post-trained templates</strong> when starting from a base model that never saw chat special tokens — the same special-token lesson from Part 5. Second, <strong>offline difficulty filtering</strong>: for each prompt, sample eight rollouts and remove prompts the model solves more than 62.5% of the time, keeping only prompts with learning signal. The 32B run then relies on active sampling at train time rather than offline filtering.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-canvas-wrap" style="flex:1 1 100%;">
+        <canvas id="p15-difficulty" width="640" height="240"></canvas>
+        <p class="llmt-canvas-hint">Pass-rate histogram from eight rollouts per prompt. Prompts right of the cutoff are filtered out as too easy.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Keep prompts solved below <span class="val" id="diff-cut-val">62.5%</span></label>
+          <input type="range" id="diff-cut" min="37.5" max="100" step="12.5" value="62.5"></div>
+        <div class="llmt-readout" id="p15-difficulty-readout"></div>
+      </div>
+    </div>
+    <p>Contamination is the silent failure of RLVR: if the evaluation data leaked into pretraining or midtraining, a model can improve on benchmarks by <em>memorizing</em> rather than reasoning. The check is elegant — train with <strong>spurious rewards</strong>, assigning random binary scores independent of correctness. Real learning cannot occur, so benchmark performance stays flat. If it rises, the eval was contaminated. OLMo 3's curve stays flat or degrades, evidence that decontamination worked.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p15-spurious" width="520" height="250"></canvas>
+        <p class="llmt-canvas-hint">Illustrative reward curves: a real verifier improves, a spurious (random) reward does not.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-readout" id="p15-spurious-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-goal">📌 <span><b>The through-line:</b> the recipe only works because the base model was midtrained with the right data (Part 5), the context window was extended to hold long chains of thought (Part 13), the preference stage was redesigned around contrast (Part 8), and RL ran on infrastructure fast enough to iterate (Part 11). Post-training at scale is the integration of everything before it.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td>Three-stage recipe</td><td>SFT → DPO → RLVR; DPO-before-RL beats SFT-before-RL.</td></tr>
+        <tr><td>Delta Learning</td><td>Preference signal comes from the chosen-minus-rejected contrast, not the chosen quality alone.</td></tr>
+        <tr><td>Delta-aware judging</td><td>Force weak models into the candidate pool and pick the worst response as rejected.</td></tr>
+        <tr><td>Dataset-size U-shape</td><td>Preference performance peaks (~75–100K pairs) then declines by task; sweep size and early-stop.</td></tr>
+        <tr><td>Length bias</td><td>Chosen responses skew long; cap the chosen-minus-rejected token difference.</td></tr>
+        <tr><td>Multi-turn preferences</td><td>Synthesize conversations and vary only the final turn so the ranking is unambiguous.</td></tr>
+        <tr><td>Zero-gradient filtering</td><td>Drop groups with identical rewards (no advantage).</td></tr>
+        <tr><td>Active sampling</td><td>Resample until the batch has enough non-zero-gradient completions.</td></tr>
+        <tr><td>Token-level loss</td><td>Normalize by total batch tokens, removing length bias.</td></tr>
+        <tr><td>Clip-higher</td><td>Upper clip bound above lower bound; let probabilities rise more than fall.</td></tr>
+        <tr><td>Truncated importance sampling</td><td>Correct inference-engine vs trainer log-prob mismatch.</td></tr>
+        <tr><td>No std normalization</td><td>Advantage = reward − group mean; avoids difficulty bias.</td></tr>
+        <tr><td>Verifier zoo</td><td>SymPy math, test-case code (cloud), IF constraints, LM-judge chat.</td></tr>
+        <tr><td>Offline difficulty filtering</td><td>Remove prompts solved &gt;62.5% of 8 rollouts.</td></tr>
+        <tr><td>Spurious-reward control</td><td>Random rewards should not improve benchmarks; if they do, data is contaminated.</td></tr>
+        <tr><td>Inflight updates</td><td>Update actor weights without pausing generation — up to 4× throughput.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>OLMo 3 Team (Ai2), <a href="https://arxiv.org/abs/2512.13961">"OLMo 3"</a> (2025) — the full post-training recipe (§4–6).</li>
+      <li>Geng et al., <a href="https://arxiv.org/abs/2506.13585">"Delta Learning"</a> (2025) — the contrast is the signal.</li>
+      <li>Yu et al., <a href="https://arxiv.org/abs/2503.14476">"DAPO: An Open-Source LLM Reinforcement Learning System at Scale"</a> (2025) — clip-higher, token-level loss, dynamic sampling.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2503.20783">"Understanding R1-Zero-Like Training: A Critical Perspective"</a> (2025) — Dr.GRPO, no std normalization, prompt templates.</li>
+      <li>Shao et al., <a href="https://arxiv.org/abs/2507.18071">"Spurious Rewards: Rethinking Training Signals in RLVR"</a> (2025) — contamination control.</li>
+      <li>Hu et al., <a href="https://arxiv.org/abs/2501.12948">"Open-Reasoner-Zero"</a> (2025) and DeepSeek-AI, <a href="https://arxiv.org/abs/2501.12948">"DeepSeek-R1"</a> (2025).</li>
+      <li>Noukhovitch et al., <a href="https://arxiv.org/abs/2405.11106">"Asynchronous RLHF"</a> (2024) and the PipelineRL approach — async actor–learner updates.</li>
+      <li>Lambert et al., <a href="https://arxiv.org/abs/2411.15124">"Tulu 3"</a> (2024) — the recipe OLMo 3 builds on.</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>You've reached the end of the series. Every term introduced across all 15 parts — linked back to where it appears — is collected in the glossary.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/glossary/' | relative_url }}">Continue: glossary &amp; numbers →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+  var DATA_URL = "{% endraw %}{{ '/assets/data/llm-published-numbers.json' | relative_url }}{% raw %}";
+  function C(k, fb){ return c[k] || fb; }
+
+  // Vertical grouped bar helper.
+  function groupedBars(ctx, W, H, labels, series, opts){
+    opts = opts || {};
+    ctx.clearRect(0,0,W,H);
+    var padL = opts.padL != null ? opts.padL : 44, padR = opts.padR != null ? opts.padR : 14;
+    var padT = opts.padT != null ? opts.padT : 26, padB = opts.padB != null ? opts.padB : 40;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var maxV = opts.maxV != null ? opts.maxV : 100;
+    var minV = opts.minV != null ? opts.minV : 0;
+    var scale = plotH / ((maxV - minV) || 1);
+    function Y(v){ return padT + plotH - (v - minV) * scale; }
+    var groupW = plotW / labels.length;
+    var nS = series.length;
+    var barW = Math.min(26, (groupW - 12) / nS);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+plotH); ctx.lineTo(padL+plotW, padT+plotH); ctx.stroke();
+    if (minV < 0){
+      ctx.save(); ctx.setLineDash([3,3]); ctx.globalAlpha = 0.6;
+      ctx.beginPath(); ctx.moveTo(padL, Y(0)); ctx.lineTo(padL+plotW, Y(0)); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.font = '10px ' + c.font;
+    labels.forEach(function(lab, i){
+      var gx = padL + i*groupW;
+      series.forEach(function(s, j){
+        var v = s.values[i];
+        var x = gx + (groupW - barW*nS)/2 + j*barW;
+        var y0 = Y(0), y1 = Y(v);
+        ctx.fillStyle = s.color;
+        ctx.fillRect(x, Math.min(y0,y1), barW - 1, Math.max(1, Math.abs(y1 - y0)));
+        if (opts.showValues){
+          ctx.fillStyle = c.text; ctx.textAlign = 'center';
+          ctx.save(); ctx.translate(x + barW/2, Math.min(y0,y1) - 3); ctx.rotate(-Math.PI/2);
+          ctx.fillText(String(Math.round(v*10)/10), 0, 0); ctx.restore();
+        }
+      });
+      ctx.fillStyle = c.text; ctx.textAlign = 'center';
+      ctx.save(); ctx.translate(gx + groupW/2, H - 8);
+      if (lab.length > 12){ ctx.rotate(-0.35); }
+      ctx.fillText(lab, 0, 0); ctx.restore();
+    });
+    // legend
+    ctx.textAlign = 'left'; ctx.font = '10.5px ' + c.font;
+    var lx = padL;
+    series.forEach(function(s){
+      ctx.fillStyle = s.color; ctx.fillRect(lx, 10, 10, 10);
+      ctx.fillStyle = c.text; ctx.fillText(s.name, lx + 14, 19);
+      lx += ctx.measureText(s.name).width + 38;
+    });
+    return { padL:padL, padT:padT, plotW:plotW, plotH:plotH };
+  }
+
+  fetch(DATA_URL).then(function(r){ return r.json(); }).then(function(data){
+    var pt = data.olmo3_posttrain;
+    var rl = data.olmo3_rl;
+    if (!pt || !rl || !pt.think_stages){ console.warn('olmo3_posttrain data unavailable'); return; }
+
+    // ---------- 1. Stage gains ----------
+    (function(){
+      var canvas = document.getElementById('p15-stages');
+      var W = 660, H = 330;
+      var want = ['AIME 2025','LiveCodeBench v3','IFEval','ZebraLogic','AlpacaEval 2 LC','OMEGA'];
+      var rows = pt.think_stages.filter(function(d){ return want.indexOf(d.benchmark) !== -1; });
+      rows.sort(function(a,b){ return want.indexOf(a.benchmark) - want.indexOf(b.benchmark); });
+      var labels = rows.map(function(d){ return d.benchmark; });
+      var series = [
+        { name:'SFT', color:C('accent400', c.accent), values: rows.map(function(d){ return d.sft; }) },
+        { name:'DPO', color:C('accent500', c.accent), values: rows.map(function(d){ return d.dpo; }) },
+        { name:'Final RL', color:c.accent2, values: rows.map(function(d){ return d.final; }) }
+      ];
+      G.setupCanvas(canvas, W, H, function(W2,H2){
+        groupedBars(canvas.getContext('2d'), W, H, labels, series, { maxV:100, showValues:true });
+      });
+    })();
+
+    // ---------- 2. Delta Learning ----------
+    (function(){
+      var canvas = document.getElementById('p15-delta');
+      var sC = document.getElementById('delta-c'), sR = document.getElementById('delta-r');
+      var vC = document.getElementById('delta-c-val'), vR = document.getElementById('delta-r-val');
+      var readout = document.getElementById('p15-delta-readout');
+      var W = 520, H = 280;
+      function render(){
+        var sc = parseFloat(sC.value), sr = parseFloat(sR.value);
+        vC.textContent = sc; vR.textContent = sr;
+        var delta = sc - sr;
+        var sftGain = 4 - 0.28*(sc - 70);              // imitation saturates and eventually hurts
+        var dpoGain = 0.075*delta - 0.02*(sc - 70);    // contrastive signal survives saturation
+        var labels = ['more SFT on chosen', 'Delta-learning DPO'];
+        var series = [{ name:'avg-point gain', color:c.accent, values:[sftGain, Math.max(-6, dpoGain)] }];
+        groupedBars(canvas.getContext('2d'), W, H, labels, series, { maxV:20, minV:-8, padB:48, padT:30, showValues:false });
+        readout.innerHTML = '<span class="k">capability delta:</span> ' + delta.toFixed(0) +
+          ' &nbsp; <span class="k">SFT gain:</span> <span class="' + (sftGain<0?'bad':'') + '">' + sftGain.toFixed(1) + '</span>' +
+          ' &nbsp; <span class="k">DPO gain:</span> <span class="hi">' + dpoGain.toFixed(1) + '</span><br>' +
+          (sftGain < 0 ? '<span class="bad">chosen model saturated — more imitation hurts</span>' : '<span style="opacity:0.65">imitation still helps a little</span>') +
+          (delta > 0 ? ' &nbsp;·&nbsp; a larger delta keeps DPO positive' : '');
+      }
+      sC.addEventListener('input', render); sR.addEventListener('input', render);
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 3a. DPO size sweep ----------
+    (function(){
+      var canvas = document.getElementById('p15-dpo-size');
+      var slider = document.getElementById('dpo-size'), valEl = document.getElementById('dpo-size-val');
+      var readout = document.getElementById('p15-dpo-size-readout');
+      var W = 560, H = 280;
+      var sizes = [10,25,50,75,100,150,200];
+      var curves = [
+        { name:'AlpacaEval', color:c.accent,  pts:[44,47,49.5,50.6,50.4,48,45], peak:75 },
+        { name:'ZebraLogic', color:c.accent2, pts:[48,55,59,60.6,59.5,56,52], peak:75 },
+        { name:'AIME 2024',  color:'#3aa66a', pts:[55,64,70,74.6,77,79,80], peak:200 }
+      ];
+      function render(){
+        var size = parseFloat(slider.value); valEl.textContent = size + 'K';
+        var series = curves.map(function(cu){ return { points: sizes.map(function(s,i){ return { x:s, y:cu.pts[i] }; }), color:cu.color }; });
+        G.drawLines(canvas.getContext('2d'), W, H, series, [10,200], [40,85], { xLabel:'preference pairs (K)', yLabel:'score' });
+        readout.innerHTML = curves.map(function(cu){
+          var peakVal = cu.pts[sizes.indexOf(cu.peak)];
+          var status = (cu.peak < 200 && size > cu.peak) ? ' <span class="bad">past peak</span>' : ' <span class="hi">still improving</span>';
+          return '<span class="k">' + cu.name + '</span>: peak ~' + cu.peak + 'K' + status;
+        }).join('<br>');
+      }
+      slider.addEventListener('input', render);
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 3b. Length bias ----------
+    (function(){
+      var canvas = document.getElementById('p15-length');
+      var slider = document.getElementById('len-cap'), valEl = document.getElementById('len-cap-val');
+      var readout = document.getElementById('p15-length-readout');
+      var W = 520, H = 250;
+      var NB = 24, MAXD = 1600;
+      var rng = G.seededRandom(7);
+      function expSample(b){ return -b*Math.log(1 - rng()); }
+      var bGpt = 538/Math.log(5), bDelta = 564/Math.log(5);
+      var gpt = [], delta = [];
+      for (var i=0;i<5000;i++){ gpt.push(Math.min(MAXD, expSample(bGpt))); delta.push(Math.min(MAXD, expSample(bDelta))); }
+      function hist(arr){
+        var h = new Array(NB).fill(0);
+        arr.forEach(function(v){ h[Math.min(NB-1, Math.floor(v/MAXD*NB))]++; });
+        return h;
+      }
+      function render(){
+        var cap = parseFloat(slider.value); valEl.textContent = cap + ' tokens';
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var padL=30, padR=12, padT=24, padB=30, plotW=W-padL-padR, plotH=H-padT-padB;
+        var hG = hist(gpt), hD = hist(delta);
+        var maxH = Math.max.apply(null, hG.concat(hD));
+        var barW = plotW/NB;
+        for (var i=0;i<NB;i++){
+          var x = padL + i*barW;
+          var h1 = plotH*hG[i]/maxH, h2 = plotH*hD[i]/maxH;
+          ctx.fillStyle = C('accent400', c.accent); ctx.fillRect(x, padT+plotH-h1, barW*0.45, h1);
+          ctx.fillStyle = c.accent2; ctx.fillRect(x+barW*0.5, padT+plotH-h2, barW*0.45, h2);
+        }
+        var cx = padL + plotW*(cap/MAXD);
+        ctx.strokeStyle = c.text; ctx.setLineDash([4,4]);
+        ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT+plotH); ctx.stroke(); ctx.setLineDash([]);
+        ctx.font='11px '+c.font; ctx.fillStyle=c.text; ctx.textAlign='left';
+        ctx.fillText('0', padL, H-10); ctx.textAlign='right'; ctx.fillText('1600+ tokens', W-padR, H-10);
+        ctx.textAlign='left'; ctx.fillStyle=C('accent400', c.accent); ctx.fillText('▬ GPT-judged', padL, 14);
+        ctx.fillStyle=c.accent2; ctx.fillText('▬ delta heuristic', padL+110, 14);
+        var fracG = Math.exp(-cap/bGpt), fracD = Math.exp(-cap/bDelta);
+        readout.innerHTML = '<span class="k">pairs kept (GPT-judged):</span> ' + ((1-fracG)*100).toFixed(0) + '%' +
+          ' &nbsp; <span class="k">(delta heuristic):</span> ' + ((1-fracD)*100).toFixed(0) + '%<br>' +
+          '<span style="opacity:0.65">80th-percentile difference is 538 (GPT) / 564 (delta); OLMo 3 caps chat and multi-turn at 100 tokens.</span>';
+      }
+      slider.addEventListener('input', render);
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 4a. Advantage normalization ----------
+    (function(){
+      var canvas = document.getElementById('p15-adv');
+      var slider = document.getElementById('adv-gap'), valEl = document.getElementById('adv-gap-val');
+      var readout = document.getElementById('p15-adv-readout');
+      var W = 520, H = 250;
+      function render(){
+        var gap = parseFloat(slider.value); valEl.textContent = gap.toFixed(2);
+        var pts = [];
+        for (var s=0.05;s<=1.0001;s+=0.02) pts.push({ x:s, y: Math.min(12, gap/s) });
+        var raw = [{ points:[{x:0.05,y:gap},{x:1,y:gap}], color:'#3aa66a' }];
+        var ax = G.drawLines(canvas.getContext('2d'), W, H, [{ points:pts, color:c.accent2 }].concat(raw), [0,1], [0,12], { xLabel:'group reward std', yLabel:'advantage' });
+        ctxLabels(canvas.getContext('2d'), ax, [['normalized (÷std)', c.accent2, 0], ['raw (no std)', '#3aa66a', 1]], gap);
+        readout.innerHTML = '<span class="k">raw advantage:</span> ' + gap.toFixed(2) +
+          ' &nbsp; <span class="k">normalized at std=0.1:</span> ' + (gap/0.1).toFixed(1) + '<br>' +
+          '<span style="opacity:0.65">Dr.GRPO drops normalization so near-identical groups cannot dominate.</span>';
+      }
+      function ctxLabels(ctx, ax, items, gap){
+        ctx.font='11px '+c.font; ctx.textAlign='left';
+        items.forEach(function(it, i){ ctx.fillStyle=it[1]; ctx.fillText(it[0], ax.padL+8, ax.padT+14+i*14); });
+      }
+      slider.addEventListener('input', render);
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 4b. Clip-higher ----------
+    (function(){
+      var canvas = document.getElementById('p15-clip');
+      var readout = document.getElementById('p15-clip-readout');
+      var mode = 'sym';
+      var W = 520, H = 250;
+      function render(){
+        var elow = 0.2, ehigh = (mode === 'higher') ? 0.28 : 0.2;
+        var A = 1;
+        var pts = [];
+        for (var r=0.2;r<=2.0001;r+=0.02){
+          var unclipped = r*A;
+          var clipped = Math.min(Math.max(r, 1-elow), 1+ehigh)*A;
+          pts.push({ x:r, y: Math.min(unclipped, clipped) });
+        }
+        G.drawLines(canvas.getContext('2d'), W, H, [{ points:pts, color: mode==='higher'?c.accent:c.accent2 }], [0,2], [0,1.4], { xLabel:'probability ratio r', yLabel:'objective' });
+        readout.innerHTML = '<span class="k">lower clip:</span> ' + (1-elow).toFixed(2) +
+          ' &nbsp; <span class="k">upper clip:</span> ' + (1+ehigh).toFixed(2) + '<br>' +
+          (mode==='higher' ? '<span class="hi">clip-higher</span> lets up-weighted tokens rise further before the bound binds.'
+                           : '<span style="opacity:0.65">symmetric clipping caps both directions equally.</span>');
+      }
+      var btns = document.querySelectorAll('#clip-toggle button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          mode = b.getAttribute('data-mode');
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          render();
+        });
+      });
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 4c. Token-level vs sample-level loss ----------
+    (function(){
+      var canvas = document.getElementById('p15-tokloss');
+      var readout = document.getElementById('p15-tokloss-readout');
+      var W = 540, H = 250;
+      var lengths = [200, 400, 800, 1000];
+      var labels = lengths.map(function(l){ return l + ' tok'; });
+      var total = lengths.reduce(function(a,b){ return a+b; },0);
+      // sample-level: each sample gets equal total weight 1/4, so per-token weight ∝ 1/len (relative, ×1000)
+      var sampleLevel = lengths.map(function(l){ return (1/lengths.length)/l*1000; });
+      var tokenLevel = lengths.map(function(){ return (1/total)*1000; });
+      var series = [
+        { name:'sample-level per-token', color:C('accent400', c.accent), values:sampleLevel },
+        { name:'token-level per-token', color:c.accent2, values:tokenLevel }
+      ];
+      G.setupCanvas(canvas, W, H, function(){
+        groupedBars(canvas.getContext('2d'), W, H, labels, series, { maxV: Math.max.apply(null, sampleLevel)*1.15, showValues:false });
+      });
+      readout.innerHTML = '<span class="k">sample-level:</span> a 200-token sample gets the same total weight as a 1000-token one, so each of its tokens carries 5× the gradient.<br>' +
+        '<span class="k">token-level:</span> every token contributes equally. OLMoRL uses this form.';
+    })();
+
+    // ---------- 5. Verifier zoo ----------
+    (function(){
+      var V = {
+        math: { label:'Math', candidate:'… 17 × 24 = 340 + 68 = 408. Final answer: 408', reward:'1', cls:'pass', how:'SymPy normalizes both answers and checks symbolic equality.', fail:'Answer format the extractor cannot parse (no final answer, or a stray number after it) gets 0.' },
+        code: { label:'Code', candidate:'def solve(x):\\n    return x * 2  # passes 8/10 tests', reward:'0 (all-or-nothing) or 0.8 (fraction)', cls:'fail', how:'A test-case harness executes the completion; OLMo 3 runs it on AWS Lambda so verification never blocks the trainer.', fail:'Timeouts, large test suites, and nondeterminism are the hazards; pass-fraction vs all-or-nothing was ablated.' },
+        if: { label:'Instruction following', candidate:'Response that satisfies 4 of 5 explicit constraints', reward:'0', cls:'fail', how:'A set of checker functions validates each constraint in the prompt; reward is 1 only if all pass.', fail:'A single missed constraint zeroes the reward, so long constraint lists are noisy.' },
+        chatref: { label:'Chat — reference', candidate:'A concise answer compared to a gold reference', reward:'score in [0,1]', cls:'pass', how:'An LM judge scores quality against a provided reference answer.', fail:'Judges are noisy and can reward verbosity or surface style over correctness.' },
+        chatopen: { label:'Chat — open-ended', candidate:'A helpful reply judged with no reference', reward:'score in [0,1]', cls:'pass', how:'An LM judge scores quality without a reference (Qwen3 32B, thinking off, 32K input / 2K output).', fail:'No ground truth makes this the most gameable reward; length-control verifiers were tried and not used.' }
+      };
+      var current = 'math';
+      var sel = document.getElementById('vz-select'), body = document.getElementById('vz-body');
+      Object.keys(V).forEach(function(k){
+        var b = document.createElement('button'); b.textContent = V[k].label; b.setAttribute('data-k', k);
+        if (k === current) b.classList.add('llmt-primary');
+        b.addEventListener('click', function(){
+          current = k;
+          sel.querySelectorAll('button').forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary'); render();
+        });
+        sel.appendChild(b);
+      });
+      function render(){
+        var v = V[current];
+        body.innerHTML = '<div class="vz-row"><div class="lbl">candidate</div><div class="lc-note">' + v.candidate.replace(/\\n/g,'<br>') + '</div></div>' +
+          '<div class="vz-row"><div class="lbl">reward</div><div><span class="vz-badge ' + v.cls + '">' + v.reward + '</span></div></div>' +
+          '<div class="vz-row"><div class="lbl">how</div><div>' + v.how + '</div></div>' +
+          '<div class="vz-row"><div class="lbl">failure mode</div><div>' + v.fail + '</div></div>';
+      }
+      render();
+    })();
+
+    // ---------- 6a. Batching timeline ----------
+    (function(){
+      var canvas = document.getElementById('p15-batching');
+      var readout = document.getElementById('p15-batching-readout');
+      var mode = 'continuous';
+      var W = 660, H = 280;
+      var lens = [12,7,5,9,4,6];
+      var maxT = 12;
+      function draw(){
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var padL=120, padR=14, padT=24, padB=34;
+        var plotW = W-padL-padR, plotH = H-padT-padB;
+        var rowH = plotH/lens.length;
+        var cellW = plotW/maxT;
+        ctx.font='11px '+c.font;
+        lens.forEach(function(l, i){
+          var y = padT + i*rowH;
+          ctx.fillStyle=c.text; ctx.textAlign='right';
+          ctx.fillText('rollout ' + (i+1) + ' (' + l + ')', padL-8, y + rowH*0.62);
+          ctx.fillStyle = c.divider; ctx.globalAlpha = 0.35;
+          ctx.fillRect(padL, y+1, plotW, rowH-2); ctx.globalAlpha = 1;
+        });
+        if (mode === 'static'){
+          lens.forEach(function(l, i){
+            var y = padT + i*rowH;
+            for (var t=0;t<l;t++){
+              ctx.fillStyle = C('accent500', c.accent);
+              ctx.fillRect(padL + t*cellW + 1, y+1, cellW-2, rowH-2);
+            }
+          });
+        } else {
+          // continuous: backfill a queue of extra jobs so slots never idle
+          var queue = [8,6,10,5,7,9,4,6,11,5];
+          var rowEnd = lens.slice();
+          var qi = 0;
+          lens.forEach(function(_, i){
+            var y = padT + i*rowH, t = 0;
+            while (t < maxT){
+              var l = (t === 0) ? lens[i] : (queue[qi++] || 6);
+              var end = Math.min(maxT, t + l);
+              ctx.fillStyle = (t === 0) ? C('accent500', c.accent) : c.accent2;
+              ctx.fillRect(padL + t*cellW + 1, y+1, (end-t)*cellW-2, rowH-2);
+              t = end;
+            }
+          });
+        }
+        ctx.fillStyle=c.text; ctx.font='10.5px '+c.font; ctx.textAlign='left';
+        ctx.globalAlpha=0.65; ctx.fillText('generation step →', padL, H-10); ctx.globalAlpha=1;
+      }
+      var btns = document.querySelectorAll('#batch-toggle button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          mode = b.getAttribute('data-mode');
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          draw(); update();
+        });
+      });
+      function update(){
+        var mean = rl.batching.mean_gen_tokens, max = rl.batching.max_gen_tokens;
+        var waste = (max - mean)/max*100;
+        readout.innerHTML = '<span class="k">published rollout stats:</span> mean ' + mean.toLocaleString() + ' / max ' + max.toLocaleString() + ' tokens<br>' +
+          '<span class="k">static-batching waste:</span> <span class="bad">' + waste.toFixed(0) + '%</span> &nbsp;·&nbsp; ' +
+          (mode === 'continuous' ? '<span class="hi">continuous backfills finished rows immediately</span>' : '<span style="opacity:0.65">pink = backfilled work that static batching cannot do</span>');
+      }
+      G.setupCanvas(canvas, W, H, function(){ draw(); update(); });
+    })();
+
+    // ---------- 6b. Infra ablation ----------
+    (function(){
+      var canvas = document.getElementById('p15-infra');
+      var W = 660, H = 260;
+      var rows = rl.infra_ablation;
+      var labels = rows.map(function(d){ return d.stage.replace('OLMo 2','baseline').replace(' (OLMo 3)',''); });
+      var series = [{ name:'tokens / second', color:c.accent, values: rows.map(function(d){ return d.tok_per_s; }) }];
+      G.setupCanvas(canvas, W, H, function(){
+        groupedBars(canvas.getContext('2d'), W, H, labels, series, { maxV:3200, padB:52, showValues:true });
+      });
+    })();
+
+    // ---------- 7a. Difficulty filter ----------
+    (function(){
+      var canvas = document.getElementById('p15-difficulty');
+      var slider = document.getElementById('diff-cut'), valEl = document.getElementById('diff-cut-val');
+      var readout = document.getElementById('p15-difficulty-readout');
+      var W = 640, H = 240;
+      var rng = G.seededRandom(99);
+      var counts = new Array(9).fill(0); // number of prompts with k of 8 solved
+      for (var i=0;i<600;i++){
+        var d = 0.15 + 0.7*rng();          // prompt difficulty
+        var k = 0; for (var j=0;j<8;j++) if (rng() < d) k++;
+        counts[k]++;
+      }
+      function render(){
+        var cut = parseFloat(slider.value)/100; valEl.textContent = (cut*100).toFixed(1) + '%';
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var padL=34, padR=14, padT=24, padB=34, plotW=W-padL-padR, plotH=H-padT-padB;
+        var maxV = Math.max.apply(null, counts);
+        var barW = plotW/9;
+        var removed=0, kept=0;
+        counts.forEach(function(v,k){
+          var keep = (k/8) <= cut + 1e-9;
+          if (keep) kept += v; else removed += v;
+          var h = plotH*v/maxV;
+          ctx.fillStyle = keep ? C('accent500', c.accent) : c.divider;
+          ctx.fillRect(padL + k*barW + 2, padT+plotH-h, barW-4, h);
+          ctx.fillStyle = c.text; ctx.font='10px '+c.font; ctx.textAlign='center';
+          ctx.fillText(k + '/8', padL + k*barW + barW/2, H-12);
+        });
+        ctx.font='10.5px '+c.font; ctx.textAlign='left';
+        ctx.fillStyle=C('accent500', c.accent); ctx.fillText('▬ kept', padL, 14);
+        ctx.fillStyle=c.divider; ctx.fillText('▬ filtered (too easy)', padL+70, 14);
+        var total = kept+removed || 1;
+        readout.innerHTML = '<span class="k">prompts removed:</span> <span class="bad">' + (removed/total*100).toFixed(0) + '%</span>' +
+          ' &nbsp; <span class="k">kept:</span> <span class="hi">' + (kept/total*100).toFixed(0) + '%</span><br>' +
+          '<span style="opacity:0.65">OLMo 3 removes prompts solved in more than 5 of 8 rollouts (62.5%).</span>';
+      }
+      slider.addEventListener('input', render);
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 7b. Spurious rewards ----------
+    (function(){
+      var canvas = document.getElementById('p15-spurious');
+      var readout = document.getElementById('p15-spurious-readout');
+      var W = 520, H = 250;
+      var rng = G.seededRandom(11);
+      var real = [], spur = [];
+      for (var s=0;s<=100;s+=2){
+        real.push({ x:s, y: 0.30 + 0.35*(1-Math.exp(-s/35)) });
+        spur.push({ x:s, y: 0.30 + 0.02*Math.sin(s/7) + (rng()-0.5)*0.02 });
+      }
+      G.setupCanvas(canvas, W, H, function(){
+        G.drawLines(canvas.getContext('2d'), W, H, [
+          { points:real, color:c.accent },
+          { points:spur, color:c.accent2 }
+        ], [0,100], [0,0.8], { xLabel:'RL steps', yLabel:'reward / benchmark' });
+        var ctx = canvas.getContext('2d');
+        ctx.font='11px '+c.font; ctx.textAlign='left';
+        ctx.fillStyle=c.accent; ctx.fillText('real verifier', 56, 30);
+        ctx.fillStyle=c.accent2; ctx.fillText('spurious (random reward)', 56, 44);
+      });
+      readout.innerHTML = '<span class="k">real:</span> reward climbs as the policy learns.<br>' +
+        '<span class="k">spurious:</span> flat/degrading — random rewards cannot teach. A rising spurious curve would betray contaminated eval data.';
+    })();
+  }).catch(function(err){
+    console.error('Failed to load post-training data', err);
+  });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

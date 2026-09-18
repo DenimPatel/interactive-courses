@@ -1,0 +1,840 @@
+---
+title: "LLM Serving, Interactively — Part 20: Benchmarking, cost and capacity planning"
+description: "How to benchmark a serving system honestly — open versus closed loop, batch non-invariance and why greedy decoding is not deterministic, the signals and incident signatures worth a dashboard, routing and semantic caching, and the path from requests per second to GPUs to cost per task."
+permalink: "/ai/llm-serving/economics/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .e-sig { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.8; }
+  .e-sig .name { font-weight: 600; }
+  .e-rank { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.9; }
+  .e-rank .bar { display: inline-block; height: 9px; background: var(--color-accent-400); border-radius: 2px; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 20 of 20</span>
+    <h1>Benchmarking, cost and capacity planning</h1>
+    <p>A serving number is not a property of the model. It is a property of the model, the hardware, the workload, the harness and the SLO, sampled over a window. This final part builds the five instruments that keep those apart: a harness that can tell overload from a client ceiling, a batch-invariance demo that shows why greedy decoding is not reproducible, a dashboard whose incidents have names, a router frontier, and a capacity planner that goes from requests per second to GPUs to dollars per task.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="harness">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Open loop, closed loop, and the mistake everyone makes</h2></div>
+    <p class="g-eyebrow">The load generator is part of the result</p>
+    <p>An <strong>open-loop</strong> harness submits requests on a fixed schedule — Poisson or constant rate — whether or not the server is keeping up. Arrival rate is an input; latency and queue depth are outputs. A <strong>closed-loop</strong> harness keeps a fixed number of clients, each of which sends its next request only after the previous one returns. There, concurrency is the input and the request rate is an <em>output</em>, governed by Little's law: throughput equals clients divided by (think time + latency).</p>
+    <p>The mistake is reading a closed-loop result as a property of the system. When the server slows down, a closed-loop client slows down with it, so the queue that produces a real p99 never forms: the harness reports a tail several times better than the machine can actually produce. Worse, the throughput plateau it reports is <em>its own</em> ceiling — clients divided by cycle time — not the server's capacity. That is why <code>wrk</code>-style constant-concurrency tests are useful for finding a bottleneck but useless for arguing about overload, and why incident reviews should always ask which harness produced the number. The training guide's <a href="{{ '/ai/llm-training/inference/' | relative_url }}">inference chapter</a> built the mechanisms — the KV cache, prefill versus decode, continuous batching — from the model's point of view; this part is the instrument that measures the system those mechanisms produce. The same tension appears in <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation</a>, where a benchmark score is a protocol as much as a model property; a serving benchmark is that idea with a queue attached.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="loop-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Latency distribution for the same service under both harnesses. The selected harness is solid; the other is faded. The dashed line is the server's true capacity.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Offered load (req/s open · clients closed) <span class="val">24</span></label><input type="range" id="loop-load" min="4" max="32" step="4" value="24"></div>
+        <div class="g-btnrow"><button id="loop-toggle" class="g-primary">Harness: closed loop</button></div>
+        <div class="g-readout" id="loop-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The mistake:</b> a closed-loop harness cannot build the queue that creates the tail, so its p99 is optimistic and its throughput ceiling is a harness constant. Quote the harness, the think time and the concurrency alongside every number, or the number is not reproducible.</span></div>
+  </section>
+
+  <section class="g-step" id="tools">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The three harnesses you will actually run</h2></div>
+    <p class="g-eyebrow">vLLM bench, GenAI-Perf, MLPerf Inference</p>
+    <p><strong><code>vllm bench</code></strong> is the engine's own tool: <code>vllm bench serve</code> drives a running OpenAI-compatible endpoint, while <code>vllm bench throughput</code> and <code>vllm bench latency</code> run the engine in-process. It is open-loop by default and reports TTFT, TPOT, ITL and E2E percentiles; it is the fastest way to answer "did my change help on <em>this</em> model".</p>
+    <p><strong>GenAI-Perf</strong> (NVIDIA, a wrapper over the Triton perf analyzer) is a closed/open-loop capable client aimed at production endpoints, with per-request metrics, concurrency sweeps, and tokeniser-aware input/output token accounting. It is the natural fit when the deployment is TensorRT-LLM or Triton.</p>
+    <p><strong>MLPerf Inference</strong> is the opposite end: a fixed, audited benchmark with prescribed models, datasets, scenario modes (Offline, Server, SingleStream, MultiStream) and accuracy constraints. Its value is not that it maps to your workload — it does not — but that it is <em>comparable</em>: identical load generation and rules across vendors. Use it for procurement and public claims; use the other two for your own regressions.</p>
+    <p><strong>Real traces beat synthetic ones.</strong> Synthetic prompts are too short, too uniform and too independent. Production traces carry the properties that decide capacity: a heavy prompt-length tail, repeated prefixes that make a cache work, arrival bursts, and multi-turn sessions whose turns share context. A benchmark on 512-token independent prompts will understate prefill cost, overstate achievable batch, and miss the cache entirely. Replay a sampled, redacted trace whenever you can, and treat synthetic runs as unit tests rather than capacity evidence.</p>
+    <div class="g-goal">💡 <span><b>Pick the harness for the question.</b> Engine regression → <code>vllm bench</code>. Endpoint behaviour under concurrency → GenAI-Perf. Comparable public number → MLPerf Inference. Your own capacity plan → a replayed trace at your arrival process.</span></div>
+  </section>
+
+  <section class="g-step" id="report">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Warmup, and what must ride alongside a throughput number</h2></div>
+    <p class="g-eyebrow">A throughput number alone is not a measurement</p>
+    <p>The first requests a worker serves pay for CUDA context creation, CUDA-graph capture, allocator growth and kernel autotuning. A run that starts measuring immediately reports the transient: low early throughput, a fat early tail, and a mean that depends on how long you ran. Always discard a warmup period — enough requests to reach a stable step time, typically tens of seconds or a few hundred requests — and then measure a steady-state window. Report the warmup length too, because a number taken over a 10-second window is mostly warmup.</p>
+    <p>A defensible throughput or latency claim needs five things next to it: the <strong>input and output token distributions</strong> (not just their means), the <strong>arrival process</strong> (open-loop rate, or closed-loop concurrency and think time), the <strong>SLO</strong> the number is judged against, the <strong>software stack</strong> (engine, version, quantization, parallelism, scheduler flags), and the <strong>measurement window</strong> after warmup. Drop any one and the number is not comparable to anything — including your own next run.</p>
+    <div class="g-goal">💡 <span><b>Write the card before the graph.</b> "1,240 output tok/s/GPU, p99 TTFT 1.8 s, Qwen-class 7B FP8, 4,000/500-token trace, 2.0 rps open loop, <code>vllm bench serve</code>, 120 s window after 30 s warmup" is a measurement. "Fast" is not.</span></div>
+  </section>
+
+  <section class="g-step" id="determinism">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Why temperature 0 is not deterministic</h2></div>
+    <p class="g-eyebrow">Batch non-invariance, in real float32</p>
+    <p>Greedy decoding picks the <code>argmax</code> logit, so it looks reproducible. It is not, and the reason is arithmetic rather than sampling: float32 addition is not associative. A dot product or a reduction is computed by splitting the work across lanes and combining partial sums, and the split depends on the batch shape, the sequence length and the kernel's tiling. Change any of those and every partial rounds differently. The final logits differ by a few ULPs — enough to flip an argmax when two candidates are near-tied. The same request batched with different neighbours can emit a different token, which is why "temperature 0, seed fixed" still fails reproducibility tests. The <a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">numerics part</a> covers where precision is lost; this demo shows that even exact FP32 loses it.</p>
+    <p>The demo below does the arithmetic for real, with <code>Math.fround</code> applied to every partial (a float32 rounding, not double). The left column is a sequential accumulation; the right is a pairwise tree. Toggle batch-invariant kernels to force one canonical order regardless of batch shape.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="bits-canvas" width="640" height="210"></canvas>
+        <p class="g-canvas-hint">One float32 sum, two reduction splits. Bits from the top (31) to the bottom (0); the first differing bit is outlined.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="inv-toggle" class="g-primary">Batch-invariant kernels: OFF</button></div>
+        <div class="g-readout" id="bits-readout"></div>
+      </div>
+    </div>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="logits-canvas" width="640" height="240"></canvas>
+        <p class="g-canvas-hint">Two near-tied candidate logits from the same arithmetic. The selected token changes with the reduction split unless kernels are batch-invariant.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="logits-readout"></div>
+        <div class="g-goal" style="margin-top:12px;">💡 <span><b>The fix is architectural:</b> batch-invariant kernels fix the reduction order — and often the GPU-graph/atomic choices — so that a token's logits do not depend on its batch neighbours. It costs some throughput and is a requirement for reproducible evaluation, not the default.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="signals">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>The eight signals worth a dashboard</h2></div>
+    <p class="g-eyebrow">One row per failure mode</p>
+    <p>A GPU-utilisation gauge is not a dashboard. Utilisation can read 100% in a healthy saturated server and 100% in a server spinning on preemption. What distinguishes states is a small set of quantities that move independently. These eight cover the failures in this series; each maps to a different remedy.</p>
+    <div class="g-grid2">
+      <div class="g-card reveal"><b>1 · Queue depth and wait time.</b> Requests admitted vs waiting, plus scheduler wait before first prefill. The earliest and cleanest overload signal.</div>
+      <div class="g-card reveal"><b>2 · TTFT p50 and p99.</b> p50 moves with prompt length and prefix-cache hit rate; a p99 that diverges from p50 is the queue, not the kernels.</div>
+      <div class="g-card reveal"><b>3 · TPOT/ITL p50 and p99.</b> Steady-state decode health. A p99 that spikes periodically is chunked-prefill interleaving or preemption churn.</div>
+      <div class="g-card reveal"><b>4 · Goodput fraction.</b> Share of admitted requests meeting both SLOs. Throughput can be flat while goodput collapses.</div>
+      <div class="g-card reveal"><b>5 · KV-cache occupancy and preemptions.</b> Used blocks, evictions, swaps and recomputes per second. Rising preemptions mean the cache, not the FLOPS, is the wall.</div>
+      <div class="g-card reveal"><b>6 · Prefix-cache hit rate.</b> Hit tokens over requested tokens. A sudden drop means the traffic's shared structure changed or routing scattered it.</div>
+      <div class="g-card reveal"><b>7 · Batch occupancy and step time.</b> Running sequences vs capacity, and milliseconds per iteration. It separates "slow model" from "empty batch".</div>
+      <div class="g-card reveal"><b>8 · Adapter/tenant mix and error-retry rate.</b> LoRA adapter count, per-tenant token rate, and 429/5xx/retry volume. Retries multiply load exactly when the system is saturated.</div>
+    </div>
+  </section>
+
+  <section class="g-step" id="incidents">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Incident signatures</h2></div>
+    <p class="g-eyebrow">Diagnose from the shape, not the spike</p>
+    <p>The dashboard below runs the shared discrete-event simulator in <code>ServingSim.run</code>. Press a lever to inject a failure and watch which of the eight signals move; the readout names the signature. The point is that each incident has a characteristic <em>pattern</em> across independent signals, and that pattern is what points at the fix. The long-prompt case below is the serving-side twin of <a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">long-context serving</a>, where the KV cache rather than the queue is the limiting resource.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap" style="flex:1 1 520px;">
+        <canvas id="slo-canvas" width="680" height="300"></canvas>
+        <p class="g-canvas-hint">Per-request Gantt for the current run: grey queued, light prefill, dark decode, gold preempted. Inject a failure and watch the bands change.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Base arrival rate (req/s) <span class="val">2.0</span></label><input type="range" id="slo-rate" min="0.5" max="4" step="0.25" value="2"></div>
+        <div class="g-btnrow">
+          <button id="inj-traffic" data-inj>Inject: traffic 3×</button>
+          <button id="inj-replica" data-inj>Inject: a replica dies</button>
+          <button id="inj-long" data-inj>Inject: 100K-token prompts</button>
+          <button id="inj-cache" data-inj>Inject: unique-prefix cache poison</button>
+        </div>
+        <div class="g-btnrow"><button id="slo-play" class="g-primary">▶ Live</button><button id="slo-reset">Reset</button></div>
+        <div class="g-readout" id="slo-readout"></div>
+        <div class="e-sig" id="slo-sig"></div>
+      </div>
+    </div>
+    <table class="g-cheat" style="margin-top:16px;">
+      <thead><tr><th>Signature</th><th>What moves</th><th>First check</th></tr></thead>
+      <tbody>
+        <tr><td>Overload / queue saturation</td><td>Queue depth ↑, TTFT p99 ↑↑, goodput ↓, throughput flat</td><td>Admission control and autoscaling headroom</td></tr>
+        <tr><td>Capacity loss</td><td>Preemptions ↑, TPOT p99 ↑, KV occupancy ↑, batch occupancy ↓</td><td>Replica health, then swap-vs-recompute policy</td></tr>
+        <tr><td>Long-prompt head-of-line</td><td>TTFT p50 ↑↑, ITL p99 spikes, short requests starve</td><td>Chunked prefill budget, then queueing policy</td></tr>
+        <tr><td>Prefix-cache thrash</td><td>Hit rate → 0, prefill volume ↑, KV pressure ↑, TTFT ↑</td><td>Routing affinity and cache uniqueness</td></tr>
+        <tr><td>Retry storm</td><td>Error rate ↑, arrivals ↑, everything above at once</td><td>Client timeouts and backoff, not the model</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="cascade">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Routing, cascades, semantic caching and the batch tier</h2></div>
+    <p class="g-eyebrow">Spend where the difficulty is</p>
+    <p>A <strong>router</strong> sends easy requests to a cheap model and hard ones to an expensive one; a <strong>cascade</strong> sends everything cheap first and escalates when a confidence check fails. Both trace an accuracy-versus-cost frontier: as the routing threshold moves, you buy accuracy with money along a curve whose shape is set by the difficulty distribution. The classic failure is a cascade that escalates on a noisy signal — you pay both models on the same request, and cost rises while accuracy stalls.</p>
+    <p><strong>Semantic caching</strong> answers a request from a near-duplicate already served, at near-zero model cost. It shifts the whole frontier toward lower cost, but it can also cap accuracy: a cached answer is only as good as the match. Cache the stable, high-frequency, low-risk requests, and make the similarity threshold a tunable so you can trade cost against a measured accuracy drop.</p>
+    <p><strong>The batch tier</strong> is the last routing decision: non-interactive work — offline scoring, evaluation, embeddings, bulk summarisation — belongs on a queue with no latency SLO, where the scheduler can use every token of batch capacity. Moving even a modest share of traffic off the interactive pool is often the cheapest capacity you can buy, and it is invisible in a token price. The <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">scheduler part</a> owns the queueing mechanics; the frontier below owns the trade.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cascade-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Accuracy vs cost. The faded curve is no cache; the solid curve is the current semantic-cache hit rate. The dot is the current routing threshold.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Semantic-cache hit rate <span class="val">50</span>%</label><input type="range" id="cas-cache" min="0" max="85" step="5" value="50"></div>
+        <div class="g-field"><label>Routing threshold (easy share) <span class="val">60</span>%</label><input type="range" id="cas-thresh" min="0" max="100" step="5" value="60"></div>
+        <div class="g-readout" id="cascade-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="capacity">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>RPS → GPUs → dollars, and cost per task</h2></div>
+    <p class="g-eyebrow">The closing planner</p>
+    <p>Capacity planning is a chain: a workload in requests per second and token lengths becomes GPU-seconds per second (prefill and decode separately, because one is compute-bound and one is memory-bound), divided by a utilisation target; GPU count times an hourly price becomes cost per million tokens; and that becomes cost per <strong>task</strong> only after you know how many tokens a task consumes and how often it succeeds. Per-token prices hide the last step, which is the one users feel. A task's token count is itself variable: <a href="{{ '/ai/llm-training/reasoning/' | relative_url }}">reasoning models</a> emit long thinking traces before any answer, and <a href="{{ '/ai/llm-training/tools-agents/' | relative_url }}">agents</a> spend several turns over a shared context. Pricing by the token averages those away.</p>
+    <p>Every lever the series introduced is a toggle here. GQA and MLA change the KV footprint (the mechanism is in the training guide's <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">architecture chapter</a>); KV and weight quantization shrink the bytes read per step; prefix caching removes prefill work; chunked prefill and disaggregation change how the two phases share a pool; speculation buys decode tokens; MoE serves only the active parameters. Each lever is annotated with the GPUs it is currently saving by itself, and the ranked list below the planner sorts them for the current inputs, so the biggest lever changes when you change the workload. The model is a first-order planner, not a substitute for a measured run — but the ranking is what you would spend the next benchmark on.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="planner-canvas" width="660" height="330"></canvas>
+        <p class="g-canvas-hint">GPUs saved by each lever in isolation, at the current inputs, sorted. Longer bar = bigger lever.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Target arrival rate (req/s) <span class="val">20</span></label><input type="range" id="pl-rps" min="2" max="80" step="1" value="20"></div>
+        <div class="g-field"><label>Mean prompt tokens <span class="val">4000</span></label><input type="range" id="pl-prompt" min="500" max="16000" step="500" value="4000"></div>
+        <div class="g-field"><label>Mean output tokens <span class="val">500</span></label><input type="range" id="pl-output" min="100" max="4000" step="100" value="500"></div>
+        <div class="g-field"><label>Prefix hit rate <span class="val">60</span>%</label><input type="range" id="pl-prefix" min="0" max="90" step="5" value="60"></div>
+        <div class="g-field"><label>GPU cost (USD/hr) <span class="val">2.50</span></label><input type="range" id="pl-cost" min="0.5" max="8" step="0.25" value="2.5"></div>
+        <div class="g-field"><label>Turns per task <span class="val">6</span></label><input type="range" id="pl-turns" min="1" max="20" step="1" value="6"></div>
+        <div class="g-field"><label>Task success rate <span class="val">90</span>%</label><input type="range" id="pl-success" min="50" max="100" step="1" value="90"></div>
+        <div class="g-btnrow" id="pl-levers"></div>
+        <div class="g-readout" id="planner-readout"></div>
+      </div>
+    </div>
+    <div class="e-rank" id="planner-rank"></div>
+    <p class="g-source" id="planner-source"></p>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <h2 style="margin-top:0;">Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Concern</th><th>Rule</th></tr></thead>
+      <tbody>
+        <tr><td>Open vs closed loop</td><td>Open loop: rate in, latency out. Closed loop: concurrency in, rate out, and the queue never builds. Quote the harness, concurrency and think time.</td></tr>
+        <tr><td>Harness choice</td><td><code>vllm bench</code> for engine regressions · GenAI-Perf for endpoint concurrency · MLPerf Inference for comparable public claims.</td></tr>
+        <tr><td>Workload realism</td><td>Synthetic prompts understate prefill cost and overstate cache hit rate. Replay a sampled trace for capacity.</td></tr>
+        <tr><td>Warmup</td><td>Discard tens of seconds or a few hundred requests; measure a steady-state window; report both.</td></tr>
+        <tr><td>Throughput claim</td><td>Report token distributions, arrival process, SLO, stack/version and window. Anything less is not comparable.</td></tr>
+        <tr><td>Determinism</td><td>FP32 addition is not associative; batch shape changes reduction order and can flip an argmax at temperature 0. Batch-invariant kernels fix it.</td></tr>
+        <tr><td>Eight signals</td><td>Queue wait · TTFT p50/p99 · TPOT p50/p99 · goodput · KV occupancy/preemptions · prefix hit rate · batch occupancy/step time · tenant mix/retries.</td></tr>
+        <tr><td>Incident triage</td><td>Queue growth = overload · preemptions+TPOT = capacity loss · TTFT p50 + ITL spike = long prompt · hit rate → 0 = cache thrash · errors+arrivals = retry storm.</td></tr>
+        <tr><td>Cost</td><td>Cost per million tokens falls with throughput and utilisation; cost per <em>successful task</em> also moves with turns and retries. Optimise the task, not the token.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="refs">
+    <h2 style="margin-top:0;">Further reading</h2>
+    <ul class="g-refs">
+      <li>Reddi et al., <a href="https://arxiv.org/abs/1911.02549">"MLPerf Inference Benchmark"</a> (ISCA 2020) and the <a href="https://mlcommons.org/benchmarks/inference-datacenter/">MLCommons Inference rules</a> — the audited, comparable end of benchmarking.</li>
+      <li>NVIDIA, <a href="https://github.com/triton-inference-server/perf_analyzer/tree/main/genai-perf">GenAI-Perf</a> — production endpoint load generation and per-request metrics.</li>
+      <li>vLLM, <a href="https://docs.vllm.ai/en/latest/contributing/benchmarks.html">benchmarking documentation</a> for <code>vllm bench serve</code> / <code>throughput</code> / <code>latency</code>.</li>
+      <li>Thinking Machines Lab, <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">"Defeating Nondeterminism in LLM Inference"</a> (2025) — batch non-invariance and batch-invariant kernels; see also the <a href="https://github.com/vllm-project/vllm/issues/10591">vLLM batch-invariance discussion</a>.</li>
+      <li>Zhong et al., <a href="https://arxiv.org/abs/2401.09670">"DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving"</a> (OSDI 2024) — the 7.4×/12.6× goodput result used by the disaggregation lever.</li>
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">"Efficient Memory Management for Large Language Model Serving with PagedAttention"</a> (SOSP 2023) — the engine that made these measurements routine.</li>
+    </ul>
+  </section>
+
+
+</main>
+
+{% capture next_teaser %}That is the end of the series. The glossary and numbers card collects every constant and definition used across all twenty parts.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.__SERVING_NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  var f32 = Math.fround;
+
+  // Convert a double/float value's float32 bit pattern to hex.
+  function hex32(x) {
+    var b = new ArrayBuffer(4), d = new DataView(b);
+    d.setFloat32(0, x);
+    return "0x" + ("00000000" + d.getUint32(0).toString(16)).slice(-8);
+  }
+  function bitArray(x) {
+    var b = new ArrayBuffer(4), d = new DataView(b);
+    d.setFloat32(0, x);
+    var u = d.getUint32(0), a = [];
+    for (var i = 31; i >= 0; i--) a.push((u >>> i) & 1);
+    return a;
+  }
+  function firstDiffBit(x, y) {
+    var b = new ArrayBuffer(8), d = new DataView(b);
+    d.setFloat32(0, x); d.setFloat32(4, y);
+    var diff = (d.getUint32(0) ^ d.getUint32(4)) >>> 0;
+    if (!diff) return -1;
+    return 31 - Math.clz32(diff);
+  }
+  // Sequential accumulation, float32 after every partial.
+  function reduceLeft(a) {
+    var s = 0;
+    for (var i = 0; i < a.length; i++) s = f32(s + a[i]);
+    return s;
+  }
+  // Pairwise tree reduction, float32 after every partial.
+  function reduceTree(a) {
+    var cur = a.slice();
+    while (cur.length > 1) {
+      var next = [];
+      for (var i = 0; i < cur.length; i += 2) {
+        next.push(i + 1 < cur.length ? f32(cur[i] + cur[i + 1]) : cur[i]);
+      }
+      cur = next;
+    }
+    return cur[0];
+  }
+
+  // ==================================================================
+  // Demo A — open loop vs closed loop against one synthetic service
+  // ==================================================================
+  var loopCtx = null;
+  function redrawLoop() { drawLoop(640, 300); }
+  var LOOP = { harness: "closed", load: el("loop-load") };
+
+  // ms-based discrete-event server: 4 workers, 200 ms mean service, log-normal.
+  function loopSim(mode, load, seed) {
+    var m = 4, mean = 200, cv = 0.6, horizon = 40000, timeout = 8000, think = 2000;
+    var r = Guide.seededRandom(seed);
+    function gauss() {
+      var u = 0, v = 0;
+      while (u === 0) u = r();
+      while (v === 0) v = r();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    function ln() {
+      var vN = cv * mean * cv * mean;
+      var mu = Math.log(mean * mean / Math.sqrt(mean * mean + vN));
+      var sg = Math.sqrt(Math.log(1 + vN / (mean * mean)));
+      return Math.exp(mu + sg * gauss());
+    }
+    var free = m, queue = [], events = [], lat = [], done = 0, timeouts = 0;
+    function push(ev) { events.push(ev); events.sort(function (a, b) { return a.t - b.t; }); }
+    if (mode === "open") {
+      var rate = load, tt = 0;
+      while (tt < horizon) {
+        tt += -Math.log(1 - r()) / rate * 1000;
+        if (tt >= horizon) break;
+        push({ t: tt, type: "arrive", arrival: tt });
+      }
+    } else {
+      for (var i = 0; i < load; i++) push({ t: 0, type: "arrive", arrival: 0 });
+    }
+    var guard = 0;
+    while (events.length && guard++ < 300000) {
+      var ev = events.shift();
+      if (ev.t > horizon) break;
+      if (ev.type === "arrive") {
+        if (free > 0) { free--; push({ t: ev.t + ln(), type: "finish", arrival: ev.arrival }); }
+        else queue.push(ev);
+      } else {
+        var lv = ev.t - ev.arrival;
+        lat.push(lv); done++;
+        if (lv > timeout) timeouts++;
+        free++;
+        if (queue.length) {
+          var nx = queue.shift(); free--;
+          push({ t: ev.t + ln(), type: "finish", arrival: nx.arrival });
+        }
+        if (mode === "closed") push({ t: ev.t + think, type: "arrive", arrival: ev.t + think });
+      }
+    }
+    return {
+      lat: lat,
+      p50: ServingSim.percentile(lat, 50),
+      p99: ServingSim.percentile(lat, 99),
+      tp: done / (horizon / 1000),
+      cap: m / mean * 1000,
+      timeouts: timeouts
+    };
+  }
+
+  function drawLoop(W, H) {
+    if (!loopCtx) return;
+    var ctx = loopCtx;
+    var load = parseFloat(LOOP.load.value);
+    var open = loopSim("open", load, 7);
+    var closed = loopSim("closed", load, 7);
+    ctx.clearRect(0, 0, W, H);
+    var padL = 46, padR = 16, padT = 26, padB = 34;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var lo = 100, hi = 1000;
+    var all = open.lat.concat(closed.lat);
+    if (all.length) hi = Math.max(1000, ServingSim.percentile(all, 99) * 1.3);
+    function px(v) { return padL + plotW * (Math.log(Math.max(lo, v) / lo) / Math.log(hi / lo)); }
+    function py(v) { return padT + plotH * (1 - v); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = "10px " + c.font;
+    ctx.textAlign = "center";
+    [100, 300, 1000, 3000, 10000].forEach(function (v) {
+      if (v > hi) return;
+      ctx.fillText(v >= 1000 ? (v / 1000) + "s" : v + "ms", px(v), H - 12);
+    });
+    ctx.textAlign = "left";
+    ctx.fillText("latency (log)", padL, padT - 10);
+    ctx.textAlign = "right";
+    ctx.fillText("1.0", padL - 6, padT + 4);
+    ctx.fillText("0.5", padL - 6, py(0.5) + 4);
+    function cdf(a) {
+      var s = a.slice().sort(function (x, y) { return x - y; });
+      var pts = [];
+      for (var i = 0; i < s.length; i++) pts.push({ x: s[i], y: (i + 1) / s.length });
+      return pts;
+    }
+    function curve(a, color, width, alpha) {
+      var pts = cdf(a);
+      if (!pts.length) return;
+      ctx.strokeStyle = color; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      for (var i = 0; i < pts.length; i++) {
+        var X = px(pts[i].x), Y = py(pts[i].y);
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    var openActive = LOOP.harness === "open";
+    curve(open.lat, c.accent2, openActive ? 2.4 : 1.5, openActive ? 1 : 0.4);
+    curve(closed.lat, c.accent, openActive ? 1.5 : 2.4, openActive ? 0.4 : 1);
+    // p99 markers
+    function mark(sim, color) {
+      var X = px(sim.p99);
+      ctx.strokeStyle = color; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(X, padT); ctx.lineTo(X, padT + plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color; ctx.font = "10px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("p99", X, padT - 3);
+    }
+    mark(open, c.accent2);
+    mark(closed, c.accent);
+    // capacity reference line (vertical at cap -> we draw as note instead)
+    ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("solid = " + (openActive ? "open" : "closed") + " loop · faded = " + (openActive ? "closed" : "open") + " loop", padL + 4, padT + 13);
+
+    var ratio = closed.p99 > 0 ? open.p99 / closed.p99 : 0;
+    var activeP99 = openActive ? open.p99 : closed.p99;
+    var activeTp = openActive ? open.tp : closed.tp;
+    el("loop-readout").innerHTML =
+      '<div><span class="k">open loop</span> p50 ' + Guide.fmtMs(open.p50) + ' · p99 ' + Guide.fmtMs(open.p99) + ' · ' + open.tp.toFixed(1) + ' req/s</div>' +
+      '<div><span class="k">closed loop</span> p50 ' + Guide.fmtMs(closed.p50) + ' · p99 ' + Guide.fmtMs(closed.p99) + ' · ' + closed.tp.toFixed(1) + ' req/s</div>' +
+      '<div><span class="k">server capacity</span> ' + open.cap.toFixed(0) + ' req/s</div>' +
+      '<div class="k">closed-loop p99 is ' + ratio.toFixed(1) + '× better, and its ' + closed.tp.toFixed(1) + ' req/s ceiling is N/(think+latency) — a property of the harness, not the machine.</div>' +
+      '<div class="k">active: ' + (openActive ? "open" : "closed") + ' · p99 ' + Guide.fmtMs(activeP99) + ' · delivered ' + activeTp.toFixed(1) + ' req/s</div>';
+  }
+  Guide.bindSliders([LOOP.load], redrawLoop);
+  el("loop-toggle").addEventListener("click", function () {
+    LOOP.harness = LOOP.harness === "closed" ? "open" : "closed";
+    this.textContent = "Harness: " + LOOP.harness + " loop";
+    this.className = LOOP.harness === "open" ? "" : "g-primary";
+    redrawLoop();
+  });
+
+  // ==================================================================
+  // Demo B — batch non-invariance in real float32
+  // ==================================================================
+  var SUM_TERMS = [1e8, 1, -1e8, 1];
+  var TOK_A = [1e8, -12, 5, -1e8, 5];
+  var TOK_B = [1e8, -11, 4, -1e8, 4];
+  var bitsCtx = null, logitsCtx = null;
+  function redrawBits() { drawBits(640, 210); }
+  function redrawLogits() { drawLogits(640, 240); }
+  var INVARIANT = false;
+
+  function drawBits(W, H) {
+    if (!bitsCtx) return;
+    var ctx = bitsCtx;
+    ctx.clearRect(0, 0, W, H);
+    var leftRes = reduceLeft(SUM_TERMS);
+    var treeRes = reduceTree(SUM_TERMS);
+    var stable = INVARIANT;
+    var r1 = stable ? treeRes : leftRes;
+    var r2 = treeRes;
+    var dbit = firstDiffBit(r1, r2);
+    var b1 = bitArray(r1), b2 = bitArray(r2);
+
+    ctx.fillStyle = c.text; ctx.font = "11.5px " + c.font; ctx.textAlign = "left";
+    ctx.fillText(stable ? "canonical (pairwise) split — same for every batch shape" : "two reduction splits of the same four partial products", 12, 18);
+
+    function row(y, label, bits, x0) {
+      ctx.fillStyle = c.text; ctx.font = "10.5px " + c.mono; ctx.textAlign = "left";
+      ctx.fillText(label, 12, y + 13);
+      for (var i = 0; i < 32; i++) {
+        var bx = x0 + i * 16;
+        ctx.fillStyle = bits[i] ? c.accent500 : "#e9e5df";
+        ctx.fillRect(bx, y, 14, 18);
+        if (i === dbit) {
+          ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+          ctx.strokeRect(bx - 1, y - 1, 16, 20);
+        }
+      }
+    }
+    row(36, stable ? "canonical" : "split A · left", b1, 130);
+    row(66, "split B · tree", b2, 130);
+    var dtext = dbit < 0 ? "no differing bit — bit-identical" : "first differing bit: " + dbit + "  (bit 31 = sign · 30–23 exponent · 22–0 mantissa)";
+    ctx.fillStyle = dbit < 0 ? c.accent700 : c.accent2;
+    ctx.font = "11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText(dtext, 130, 108);
+
+    // long-division style hex rows
+    ctx.font = "13px " + c.mono; ctx.fillStyle = c.text;
+    ctx.fillText("split A " + hex32(r1), 130, 140);
+    ctx.fillText("split B " + hex32(r2), 130, 162);
+    ctx.fillStyle = c.text;
+    ctx.fillText("values  " + r1 + "  vs  " + r2, 130, 184);
+
+    el("bits-readout").innerHTML =
+      '<div><span class="k">bits A</span> ' + hex32(r1) + ' = ' + r1 + '</div>' +
+      '<div><span class="k">bits B</span> ' + (stable ? hex32(r1) + ' = ' + r1 + ' <span class="hi">(forced)</span>' : hex32(r2) + ' = ' + r2) + '</div>' +
+      '<div><span class="k">first differing bit</span> ' + (stable ? '<span class="hi">none — stable</span>' : '<span class="bad">bit ' + dbit + '</span>') + '</div>' +
+      '<div class="k">every partial is rounded with Math.fround (real float32), so the two sums are bitwise different.</div>';
+  }
+
+  function drawLogits(W, H) {
+    if (!logitsCtx) return;
+    var ctx = logitsCtx;
+    ctx.clearRect(0, 0, W, H);
+    var aTree = reduceTree(TOK_A), aLeft = reduceLeft(TOK_A);
+    var bTree = reduceTree(TOK_B), bLeft = reduceLeft(TOK_B);
+    // Non-invariant kernel: token A lands in a pairwise slot, token B in a sequential slot.
+    var logits = INVARIANT ? [aTree, bTree] : [aTree, bLeft];
+    var winner = logits[0] >= logits[1] ? 0 : 1;
+    var labels = ["token A", "token B"];
+    var padL = 60, padT = 30, padB = 34, plotH = H - padT - padB;
+    var maxAbs = Math.max(1, Math.abs(logits[0]), Math.abs(logits[1]), Math.abs(bTree), Math.abs(bLeft)) * 1.25;
+    var zeroY = padT + plotH / 2;
+    function py(v) { return zeroY - (v / maxAbs) * (plotH / 2); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padL, zeroY); ctx.lineTo(W - 16, zeroY); ctx.stroke();
+    var bw = 120;
+    for (var i = 0; i < 2; i++) {
+      var x = padL + 40 + i * 220;
+      var top = Math.min(py(logits[i]), zeroY), hgt = Math.abs(py(logits[i]) - zeroY);
+      ctx.fillStyle = i === winner ? c.accent : c.accent400;
+      ctx.fillRect(x, top, bw, Math.max(2, hgt));
+      ctx.fillStyle = i === winner ? c.accent2 : c.text;
+      ctx.font = "12px " + c.font; ctx.textAlign = "center";
+      ctx.fillText((i === winner ? "▶ " : "") + labels[i], x + bw / 2, padT + plotH + 22);
+      ctx.fillStyle = c.text; ctx.font = "11.5px " + c.mono;
+      ctx.fillText(logits[i] + "  " + hex32(logits[i]), x + bw / 2, top - 6);
+    }
+    ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText(INVARIANT ? "batch-invariant: both logits from the canonical split" : "non-invariant: A pairwise, B sequential", padL + 6, 18);
+
+    el("logits-readout").innerHTML =
+      '<div><span class="k">token A</span> tree ' + aTree + ' (' + hex32(aTree) + ') · left ' + aLeft + '</div>' +
+      '<div><span class="k">token B</span> tree ' + bTree + ' (' + hex32(bTree) + ') · left ' + bLeft + '</div>' +
+      '<div><span class="k">selected</span> <span class="hi">' + labels[winner] + '</span></div>' +
+      '<div class="k">' + (INVARIANT ? 'kernels are batch-invariant: the winner never depends on batch shape.' : 'the winner flips with the reduction split — the same request in a different batch can emit a different token at temperature 0.') + '</div>';
+  }
+  el("inv-toggle").addEventListener("click", function () {
+    INVARIANT = !INVARIANT;
+    this.textContent = "Batch-invariant kernels: " + (INVARIANT ? "ON" : "OFF");
+    this.className = INVARIANT ? "g-primary" : "";
+    redrawBits(); redrawLogits();
+  });
+
+  // ==================================================================
+  // Demo C — SLO dashboard with injectable incidents
+  // ==================================================================
+  var sloCtx = null;
+  function redrawSlo() { drawSlo(680, 300); }
+  var SLO = {
+    baseRate: el("slo-rate"), rateMul: 1, replicas: 4, promptBloat: 1,
+    prefixHit: 0.8, seed: 11, horizon: 16000
+  };
+
+  function sloRun() {
+    var promptMean = Math.max(40, 512 * SLO.promptBloat * (1 - SLO.prefixHit * 0.9));
+    var rate = parseFloat(SLO.baseRate.value) * SLO.rateMul;
+    var w = ServingSim.workload({
+      seed: SLO.seed, rate: rate, promptMean: promptMean,
+      promptCV: SLO.promptBloat > 1 ? 0.4 : 0.7, decodeMean: 200, decodeCV: 0.8, horizon: SLO.horizon
+    });
+    return ServingSim.run({
+      requests: w.requests, policy: "fcfs", capacity: 16 * SLO.replicas,
+      kvBlocks: 1024 * SLO.replicas, blockSize: 16, chunkedPrefill: true,
+      prefillTokBudget: 2048, stepMs: 20, preempt: "recompute", horizon: SLO.horizon
+    });
+  }
+
+  function drawSlo(W, H) {
+    if (!sloCtx) return;
+    var ctx = sloCtx;
+    var r = sloRun();
+    ServingSim.drawGantt(ctx, W, H, r.perReq, { maxLanes: 44, colors: c, t0: 0, t1: SLO.horizon });
+    var st = r.stats;
+    var preempts = 0, maxUsed = 0;
+    Object.keys(r.perReq).forEach(function (k) {
+      preempts += r.perReq[k].preemptions;
+      var used = r.perReq[k].prefilled >= r.perReq[k].promptLen
+        ? r.perReq[k].promptLen + r.perReq[k].decoded : r.perReq[k].prefilled;
+      if (used > maxUsed) maxUsed = used;
+    });
+    var gp = ServingSim.goodput(r.perReq, { ttftSLO: 500, tpotSLO: 50, horizon: SLO.horizon });
+    el("slo-readout").innerHTML =
+      '<div><span class="k">TTFT</span> p50 ' + Guide.fmtMs(st.ttft.p50) + ' · p99 ' + Guide.fmtMs(st.ttft.p99) + '</div>' +
+      '<div><span class="k">TPOT</span> p50 ' + Guide.fmtMs(st.tpot.p50) + ' · p99 ' + Guide.fmtMs(st.tpot.p99) + '</div>' +
+      '<div><span class="k">throughput</span> ' + st.throughput.toFixed(0) + ' tok/s · completed ' + st.completed + '</div>' +
+      '<div><span class="k">goodput</span> ' + (gp.fraction * 100).toFixed(1) + '% meeting both SLOs</div>' +
+      '<div><span class="k">preemptions</span> ' + preempts + ' · <span class="k">peak KV tokens</span> ' + maxUsed + '</div>';
+
+    var sigs = [];
+    if (SLO.rateMul > 1) sigs.push(["Overload / queue saturation", "arrivals up, queue grows, p99 TTFT climbs while throughput flattens"]);
+    if (SLO.replicas < 4) sigs.push(["Capacity loss", "preemption/swap churn, TPOT tail up, KV pressure up"]);
+    if (SLO.promptBloat > 1) sigs.push(["Long-prompt head-of-line blocking", "TTFT p50 jumps, ITL p99 spikes, short requests starve"]);
+    if (SLO.prefixHit === 0) sigs.push(["Prefix-cache thrash", "hit rate → 0, prefill volume and KV pressure rise"]);
+    if (!sigs.length) sigs.push(["Healthy baseline", "all eight signals in band"]);
+    el("slo-sig").innerHTML = sigs.map(function (s) {
+      return '<div><span class="name">' + s[0] + '</span> — <span class="k">' + s[1] + '</span></div>';
+    }).join("");
+  }
+
+  function setInjButtons() {
+    el("inj-traffic").className = SLO.rateMul > 1 ? "active" : "";
+    el("inj-replica").className = SLO.replicas < 4 ? "active" : "";
+    el("inj-long").className = SLO.promptBloat > 1 ? "active" : "";
+    el("inj-cache").className = SLO.prefixHit === 0 ? "active" : "";
+  }
+  el("inj-traffic").addEventListener("click", function () { SLO.rateMul = SLO.rateMul > 1 ? 1 : 3; setInjButtons(); redrawSlo(); });
+  el("inj-replica").addEventListener("click", function () { SLO.replicas = SLO.replicas < 4 ? 4 : 3; setInjButtons(); redrawSlo(); });
+  el("inj-long").addEventListener("click", function () { SLO.promptBloat = SLO.promptBloat > 1 ? 1 : 200; setInjButtons(); redrawSlo(); });
+  el("inj-cache").addEventListener("click", function () { SLO.prefixHit = SLO.prefixHit > 0 ? 0 : 0.8; setInjButtons(); redrawSlo(); });
+  el("slo-reset").addEventListener("click", function () {
+    SLO.rateMul = 1; SLO.replicas = 4; SLO.promptBloat = 1; SLO.prefixHit = 0.8;
+    SLO.baseRate.value = 2; setInjButtons(); redrawSlo();
+  });
+  Guide.bindSliders([SLO.baseRate], redrawSlo);
+  Guide.loop({
+    interval: 900, button: el("slo-play"), playLabel: "▶ Live", pauseLabel: "❚❚ Pause",
+    onStep: function () { SLO.seed = (SLO.seed + 1) % 100000; redrawSlo(); }
+  });
+  setInjButtons();
+
+  // ==================================================================
+  // Demo D — cascade / router frontier with semantic cache
+  // ==================================================================
+  var casCtx = null;
+  function redrawCascade() { drawCascade(640, 360); }
+  var CAS = { cache: el("cas-cache"), thresh: el("cas-thresh") };
+  var COST_CHEAP = 0.2, COST_BIG = 3.0, COST_CACHE = 0.03;
+  var ACC_BIG = 0.95, ACC_CACHE = 0.90;
+
+  function cheapAcc(d) { return 0.55 + 0.32 * (1 - d); }
+  function cascadePoint(tau, h) {
+    var N = 200, sum = 0;
+    for (var i = 0; i < N; i++) { var d = (i + 0.5) / N; if (d < tau) sum += cheapAcc(d); }
+    var accCheap = tau > 0 ? sum / (tau * N) : 0;
+    var acc = tau * accCheap + (1 - tau) * ACC_BIG;
+    var cost = tau * COST_CHEAP + (1 - tau) * COST_BIG;
+    return { cost: h * COST_CACHE + (1 - h) * cost, acc: h * ACC_CACHE + (1 - h) * acc };
+  }
+  function cascadeCurve(h) {
+    var pts = [];
+    for (var i = 0; i <= 60; i++) { var p = cascadePoint(i / 60, h); pts.push({ x: p.cost, y: p.acc }); }
+    return pts;
+  }
+  function drawCascade(W, H) {
+    if (!casCtx) return;
+    var ctx = casCtx;
+    var h = parseFloat(CAS.cache.value) / 100, tau = parseFloat(CAS.thresh.value) / 100;
+    var noCache = cascadeCurve(0), withCache = cascadeCurve(h);
+    ctx.clearRect(0, 0, W, H);
+    var ax = Guide.drawLines(ctx, W, H, [
+      { points: noCache, color: c.accent400, width: 1.6, dashed: true },
+      { points: withCache, color: c.accent, width: 2.6 }
+    ], [0, COST_BIG * 1.05], [0.5, 1.0], { xLabel: "cost per request (relative units)", yLabel: "accuracy" });
+    // operating point
+    var op = cascadePoint(tau, h);
+    ctx.fillStyle = c.accent2;
+    ctx.beginPath(); ctx.arc(ax.px(op.cost), ax.py(op.acc), 6, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText(h > 0 ? "with semantic cache (" + CAS.cache.value + "% hits)" : "no semantic cache", ax.padL + 8, ax.padT + 14);
+    ctx.fillStyle = c.accent400;
+    ctx.fillText("no-cache frontier", ax.padL + 8, ax.padT + 28);
+    el("cascade-readout").innerHTML =
+      '<div><span class="k">operating point</span> accuracy <span class="hi">' + (op.acc * 100).toFixed(1) + '%</span> at cost ' + op.cost.toFixed(2) + '</div>' +
+      '<div><span class="k">cache savings</span> ' + ((1 - op.cost / cascadePoint(tau, 0).cost) * 100).toFixed(0) + '% lower cost at the same threshold</div>' +
+      '<div><span class="k">cache accuracy delta</span> ' + (h > 0 ? ((op.acc - cascadePoint(tau, 0).acc) * 100).toFixed(1) : "0.0") + ' points (positive = cache helps accuracy)</div>' +
+      '<div class="k">the cache shifts the whole curve left; the threshold chooses where on it to sit.</div>';
+  }
+  Guide.bindSliders([CAS.cache, CAS.thresh], redrawCascade);
+
+  // ==================================================================
+  // Demo E — capacity planner: every lever, ranked
+  // ==================================================================
+  var LEVERS = [
+    { key: "mla", label: "GQA → MLA" },
+    { key: "kvQuant", label: "KV quant (FP8)" },
+    { key: "weightQuant", label: "Weight quant (FP8)" },
+    { key: "prefixHit", label: "Prefix caching", slider: true },
+    { key: "chunked", label: "Chunked prefill" },
+    { key: "spec", label: "Speculative decoding" },
+    { key: "disagg", label: "Disaggregation" },
+    { key: "moe", label: "MoE (active params)" }
+  ];
+  var PL = {
+    rps: el("pl-rps"), prompt: el("pl-prompt"), output: el("pl-output"),
+    prefix: el("pl-prefix"), cost: el("pl-cost"), turns: el("pl-turns"), success: el("pl-success"),
+    state: { mla: false, kvQuant: false, weightQuant: false, chunked: false, spec: false, disagg: false, moe: false }
+  };
+  var ACC = { bw: 3.35, peak: 989, util: 0.7 };
+  var plannerCtx = null;
+  function redrawPlanner() { drawPlanner(660, 330); }
+
+  function plannerInputs() {
+    return {
+      rps: parseFloat(PL.rps.value), prompt: parseFloat(PL.prompt.value),
+      output: parseFloat(PL.output.value), prefixHit: parseFloat(PL.prefix.value) / 100
+    };
+  }
+  function planInternal(st, inp) {
+    var paramsB = st.moe ? 37 : 70.6;
+    var bpp = st.weightQuant ? 1 : 2;
+    var batch = st.mla ? 48 : 32;
+    var kvTok = (st.mla ? 70272 : 327680) * (st.kvQuant ? 0.5 : 1);
+    var ctx = inp.prompt + inp.output / 2;
+    var kvB = kvTok * ctx * batch;
+    var step = ServingSim.stepTime({ paramsB: paramsB, bytesPerParam: bpp, kvBytes: kvB, bwTBs: ACC.bw, peakTFLOPs: ACC.peak, batch: batch, flops: 2 * paramsB * 1e9 * batch });
+    var decodeTps = batch / (step.totalMs / 1000);
+    if (st.spec) decodeTps *= 1.4;
+    var prefillTps = (ACC.peak * 1e12 / (2 * paramsB * 1e9)) * 0.6;
+    var sys = 1 * (st.chunked ? 1.08 : 1) * (st.disagg ? 1.25 : 1);
+    var prefillTok = inp.rps * inp.prompt * (1 - inp.prefixHit * 0.95);
+    var decodeTok = inp.rps * inp.output;
+    return (prefillTok / prefillTps + decodeTok / decodeTps) / ACC.util / sys;
+  }
+  function leverSavings() {
+    var out = [];
+    LEVERS.forEach(function (lv) {
+      var on, off;
+      if (lv.key === "prefixHit") {
+        var inp = plannerInputs();
+        var hit = inp.prefixHit;
+        var st = { mla: PL.state.mla, kvQuant: PL.state.kvQuant, weightQuant: PL.state.weightQuant, chunked: PL.state.chunked, spec: PL.state.spec, disagg: PL.state.disagg, moe: PL.state.moe };
+        var inpOff = { rps: inp.rps, prompt: inp.prompt, output: inp.output, prefixHit: 0 };
+        var inpOn = { rps: inp.rps, prompt: inp.prompt, output: inp.output, prefixHit: hit };
+        on = planInternal(st, inpOn);
+        off = planInternal(st, inpOff);
+        if (hit === 0) { out.push({ key: lv.key, label: lv.label, saved: 0, pct: 0, on: false }); return; }
+      } else {
+        var base = { mla: PL.state.mla, kvQuant: PL.state.kvQuant, weightQuant: PL.state.weightQuant, chunked: PL.state.chunked, spec: PL.state.spec, disagg: PL.state.disagg, moe: PL.state.moe };
+        var offS = JSON.parse(JSON.stringify(base)); offS[lv.key] = false;
+        var onS = JSON.parse(JSON.stringify(base)); onS[lv.key] = true;
+        var inp2 = plannerInputs();
+        on = planInternal(onS, inp2);
+        off = planInternal(offS, inp2);
+      }
+      var saved = off - on;
+      out.push({ key: lv.key, label: lv.label, saved: saved, pct: off > 0 ? saved / off * 100 : 0, on: lv.key === "prefixHit" ? plannerInputs().prefixHit > 0 : PL.state[lv.key] });
+    });
+    out.sort(function (a, b) { return b.saved - a.saved; });
+    return out;
+  }
+  function planBound(st) {
+    var inp = plannerInputs();
+    var paramsB = st.moe ? 37 : 70.6, bpp = st.weightQuant ? 1 : 2, batch = st.mla ? 48 : 32;
+    var kvTok = (st.mla ? 70272 : 327680) * (st.kvQuant ? 0.5 : 1);
+    var kvB = kvTok * (inp.prompt + inp.output / 2) * batch;
+    var step = ServingSim.stepTime({ paramsB: paramsB, bytesPerParam: bpp, kvBytes: kvB, bwTBs: ACC.bw, peakTFLOPs: ACC.peak, batch: batch, flops: 2 * paramsB * 1e9 * batch });
+    return step.bound;
+  }
+  function drawPlanner(W, H) {
+    if (!plannerCtx) return;
+    var ctx = plannerCtx;
+    var ranked = leverSavings();
+    ranked.forEach(function (r) {
+      if (leverBtns[r.key]) leverBtns[r.key].textContent = r.label + (r.pct > 0.05 ? "  −" + r.pct.toFixed(0) + "%" : "  —");
+    });
+    var data = ranked.map(function (r) {
+      return { label: r.label, value: Math.max(0, r.pct), valueLabel: (r.pct > 0.05 ? "−" + r.pct.toFixed(0) + "%" : "—") + (r.on ? " ●" : ""), color: r.on ? c.accent : c.accent400 };
+    }).reverse();
+    ctx.clearRect(0, 0, W, H);
+    Guide.drawBars(ctx, W, H, data, { maxV: Math.max.apply(null, data.map(function (d) { return d.value; }).concat([1])) * 1.05, padL: 150, padR: 60, gap: 6, fontSize: 11 });
+    ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+    ctx.fillText("GPUs saved by each lever in isolation (● = currently on)", 12, 14);
+
+    var inp = plannerInputs();
+    var gpus = planInternal(PL.state, inp);
+    var gpuCost = parseFloat(PL.cost.value);
+    var monthly = gpus * gpuCost * 24 * 30;
+    var tokensPerSec = inp.rps * (inp.prompt + inp.output);
+    var tokensPerHour = tokensPerSec * 3600;
+    var costPerM = gpus * gpuCost / (tokensPerHour / 1e6);
+    var turns = parseFloat(PL.turns.value), success = parseFloat(PL.success.value) / 100;
+    var tokensPerTask = turns * (inp.prompt + inp.output);
+    var costPerTask = tokensPerTask / 1e6 * costPerM;
+    var costPerSuccess = costPerTask / Math.max(0.01, success);
+    var apiLine = "";
+    if (NUMBERS && NUMBERS.pricing && NUMBERS.pricing.items && NUMBERS.pricing.items.length) {
+      var it = NUMBERS.pricing.items.find(function (x) { return /DeepSeek/i.test(x.model); }) || NUMBERS.pricing.items[0];
+      apiLine = '<div><span class="k">API comparison</span> ' + it.model + ' output list $' + it.outputPerMUSD.toFixed(2) + '/M (' + (NUMBERS.pricing.as_of || "historical") + ')</div>';
+    }
+    el("planner-readout").innerHTML =
+      '<div><span class="k">GPUs at target</span> <span class="hi">' + gpus.toFixed(1) + '</span> · bound: ' + planBound(PL.state) + '</div>' +
+      '<div><span class="k">cluster cost</span> $' + (gpus * gpuCost).toFixed(0) + '/hr · $' + Guide.fmtNum(Math.round(monthly)) + '/month</div>' +
+      '<div><span class="k">cost</span> <span class="hi">$' + costPerM.toFixed(3) + ' / M tokens</span></div>' +
+      '<div><span class="k">tokens/task</span> ' + tokensPerTask + ' (' + turns + ' turns) · cost $' + costPerTask.toFixed(4) + ' / task</div>' +
+      '<div><span class="k">cost / successful task</span> <span class="hi">$' + costPerSuccess.toFixed(4) + '</span> at ' + PL.success.value + '% success</div>' +
+      apiLine;
+    el("planner-rank").innerHTML = "<div><span class='k'>ranked levers for these inputs</span></div>" + ranked.map(function (r, i) {
+      var wpx = Math.round(Math.min(160, r.pct * 1.6));
+      return '<div>' + (i + 1) + '. ' + r.label + ' <span class="k">' +
+        (r.pct > 0.05 ? '−' + r.pct.toFixed(0) + '% GPUs · −' + r.saved.toFixed(1) + ' GPUs' : 'no effect via this model') +
+        '</span> <span class="bar" style="width:' + wpx + 'px"></span></div>';
+    }).join("");
+  }
+
+  var leverBtns = {};
+  LEVERS.forEach(function (lv) {
+    if (lv.slider) return;
+    var b = document.createElement("button");
+    b.textContent = lv.label;
+    b.setAttribute("data-lever", lv.key);
+    b.addEventListener("click", function () {
+      PL.state[lv.key] = !PL.state[lv.key];
+      b.className = PL.state[lv.key] ? "active" : "";
+      redrawPlanner();
+    });
+    el("pl-levers").appendChild(b);
+    leverBtns[lv.key] = b;
+  });
+  Guide.bindSliders([PL.rps, PL.prompt, PL.output, PL.prefix, PL.cost, PL.turns, PL.success], redrawPlanner);
+
+  // ==================================================================
+  // numbers fetch — fallback renders first
+  // ==================================================================
+  var FALLBACK = {
+    source: "Offline fallback: historical vendor list prices, early-to-mid 2025, USD per 1M tokens; and sourced constants for KV schemes, quantization and speculation from the LLM Serving numbers file.",
+    pricing: {
+      as_of: "2025-02",
+      items: [
+        { model: "GPT-4o", outputPerMUSD: 10.0, note: "Historical." },
+        { model: "Claude 3.5 Sonnet", outputPerMUSD: 15.0, note: "Historical." },
+        { model: "Gemini 2.0 Flash", outputPerMUSD: 0.4, note: "Historical." },
+        { model: "DeepSeek-V3", outputPerMUSD: 1.1, note: "Historical." }
+      ]
+    }
+  };
+  var NUMBERS = FALLBACK;
+  function applyNumbers(data) {
+    NUMBERS = (data && data.pricing) ? data : FALLBACK;
+    var src = (data && data.accelerators && data.accelerators.source) ? data.accelerators.source : FALLBACK.source;
+    el("planner-source").textContent = "Planner constants (H100-class 3.35 TB/s, 989 dense BF16 TFLOP/s, 70% utilisation) follow the series numbers file. " + src;
+    redrawPlanner();
+  }
+
+  loopCtx = Guide.setupCanvas(el("loop-canvas"), 640, 300, redrawLoop).ctx;
+  bitsCtx = Guide.setupCanvas(el("bits-canvas"), 640, 210, redrawBits).ctx;
+  logitsCtx = Guide.setupCanvas(el("logits-canvas"), 640, 240, redrawLogits).ctx;
+  sloCtx = Guide.setupCanvas(el("slo-canvas"), 680, 300, redrawSlo).ctx;
+  casCtx = Guide.setupCanvas(el("cascade-canvas"), 640, 360, redrawCascade).ctx;
+  plannerCtx = Guide.setupCanvas(el("planner-canvas"), 660, 330, redrawPlanner).ctx;
+
+  redrawLoop();
+  redrawBits(); redrawLogits();
+  redrawSlo();
+  redrawCascade();
+  redrawPlanner();
+
+  fetch(window.__SERVING_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(null); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

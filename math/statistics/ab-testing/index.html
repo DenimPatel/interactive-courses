@@ -1,0 +1,356 @@
+---
+title: "Statistics, Interactively — Part 30: Randomization, A/B tests, and peeking"
+description: "A sequential-testing simulator: peek early and often, and watch the false-positive rate climb far past the level you chose."
+permalink: "/math/statistics/ab-testing/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Randomization, A/B tests, and peeking</h1>
+    <p>An A/B test looks like the simplest experiment in the world: show one version to some users, another to others, and see which converts better. What makes the result trustworthy is not the arithmetic but the assignment &mdash; randomisation turns a difference between two groups into a claim about cause. And the moment you watch the dashboard and stop the test when it looks good, that guarantee quietly stops holding. This part builds a sequential-testing simulator: under a true null, with no real difference between A and B, you watch the false-positive rate climb far past the level you chose.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Does B beat A &mdash; and would you believe a p-value you stopped on?</p>
+    <p>You have a baseline experience A and a proposed change B, and you want to know whether B causes more conversions or whether any apparent difference is just the ordinary noise of a finite sample. The standard answer is the A/B test: split traffic at random, measure each arm, and run a two-sample test on the difference.</p>
+    <p>The interesting failure is not in the test but in the watching. A test is designed as a single, pre-declared look at a pre-declared amount of data, but dashboards update continuously and teams check them. Peek every day, stop the moment the p-value dips below your threshold, and report that flattering number &mdash; and the error rate you thought you controlled is no longer the error rate you have. Under the null it does not drift; it climbs fast.</p>
+    <p>This part explains why randomisation, not the formula, licenses a causal claim, treats the A/B test as the two-sample test it is, and then lets you peek. The simulator runs thousands of experiments in which A and B are truly identical and stops as soon as the test is significant, measuring how often it declares a winner that is not there.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> random assignment is the source of causal warrant, why a fixed-horizon p-value is defined only for a horizon fixed in advance, and how optional stopping inflates the false-positive rate &mdash; along with the alpha-spending and always-valid ideas that buy the guarantee back.</span></div>
+    <div class="g-toc">
+      <a href="#randomization">2 · Randomization and causal claims</a>
+      <a href="#ab-test">3 · The A/B test as a two-sample test</a>
+      <a href="#peeking">4 · Peeking and optional stopping</a>
+      <a href="#sequential">5 · Always-valid inference</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="randomization">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Randomization and causal claims</h2></div>
+    <p class="g-eyebrow">Why the coin, not the calculator, does the work</p>
+    <p>Compare users who happened to see the new page with users who happened to see the old one, and any difference is entangled with every other way the groups differ: the page might be served to returning visitors, on faster devices, in one country. Those are <em>confounders</em>, variables that affect the outcome and differ between the groups, and no amount of data cleans them out because most were never measured.</p>
+    <p>Random assignment breaks the entanglement. With each user's arm decided by an independent coin flip, the groups are identical in expectation in every respect except the treatment &mdash; the variables you recorded and the ones you never thought to. That is why randomisation licenses a causal reading: the assignment is the only systematic difference left. It is a statement about the procedure, not about any one user, whose outcome is still a flip in the dark. Randomisation balances confounders on average, not perfectly in every realised split, and that residual imbalance is the sampling wobble the p-value quantifies. Each user also has two potential outcomes, only one of which is observed.</p>
+  </section>
+
+  <section class="g-step" id="ab-test">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The A/B test as a two-sample test</h2></div>
+    <p class="g-eyebrow">One comparison, one horizon</p>
+    <p>Once the groups are comparable, the comparison is a two-sample test. The null says both arms come from the same distribution; the alternative says they differ. For a conversion metric each user contributes a zero or a one, and the natural statistic compares two sample means. The two-sample Welch t-statistic does the job: with means $ \bar x_A, \bar x_B $, variances $ s_A^2, s_B^2 $ and sizes $ n_A, n_B $,</p>
+    <div class="g-math g-katex">$$t = \frac{\bar x_A - \bar x_B}{\sqrt{\dfrac{s_A^2}{n_A} + \dfrac{s_B^2}{n_B}}}$$</div>
+    <p>Under the null the statistic follows a t distribution with Welch's approximate degrees of freedom, and the two-sided p-value is the probability of a difference at least this extreme if A and B were the same. A small p means the data are surprising under the null, and $ \alpha $ is the rate at which you agreed to be surprised when nothing is going on.</p>
+    <p>All of this is defined for a test fixed in advance: the sample size, the metric, and the single point at which you look are part of the design. A p-value is the tail probability of a statistic whose distribution is known only once the rule for reading it is fixed. Power and sample size (Part 13) are the other half of that design, and choosing them beforehand is what makes a significant result mean something.</p>
+  </section>
+
+  <section class="g-step" id="peeking">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Peeking and optional stopping</h2></div>
+    <p class="g-eyebrow">The simulator: watch the false-positive rate climb</p>
+    <p>The temptation is obvious: data arrive continuously, and you open the dashboard every morning. A single look at $ \alpha = 0.05 $ is wrong one time in twenty under the null, but you are taking a sequence of looks and stopping at the first that dips below the line. Were the looks independent, the chance of at least one false positive over $ L $ looks would be $ 1-(1-\alpha)^L $ &mdash; about 40% for ten looks at $ \alpha = 0.05 $. They share data rather than being independent, but the direction is the same, and the simulator measures the real number.</p>
+    <p>Press <b>Run simulation</b> and the canvas does the experiment you cannot do on your dashboard. It generates thousands of worlds in which A and B are identical, streams the data over the number of looks you chose, and declares significance the moment the running p-value falls below $ \alpha $. Nobody is peeking opportunistically; the rule is fixed and mechanical. Optional stopping needs no bad intent, only a stopping time that depends on the data.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="path-canvas" width="640" height="300"></canvas>
+        <canvas id="rate-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Top: the running p-value for six simulated experiments under the null, against the stopping threshold. Bottom: how often the procedure has declared a winner by the time that many looks have been taken, versus the level you chose.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Looks (peeks) <span class="val">10</span></label><input type="range" id="looks-slider" min="2" max="20" step="1" value="10"></div>
+        <div class="g-field"><label>Per-look sample size (per arm) <span class="val">50</span></label><input type="range" id="nper-slider" min="10" max="100" step="10" value="50"></div>
+        <div class="g-field"><label>Significance level α</label><select id="alpha-sel"><option value="0.01">0.01</option><option value="0.05" selected>0.05</option><option value="0.10">0.10</option></select></div>
+        <div class="g-field"><label>Simulated experiments <span class="val">500</span></label><input type="range" id="exp-slider" min="100" max="1500" step="100" value="500"></div>
+        <div class="g-btnrow"><button type="button" id="run-sim" class="g-primary">Run simulation</button></div>
+        <div class="g-readout" id="sim-readout"></div>
+      </div>
+    </div>
+    <p>Read the lines together. The dashed line is $ \alpha $, the rate you think you have. The marker at the right is a single test taken at the very end, with no peeking: it lands near $ \alpha $, the guarantee a fixed-horizon test gives. The rising curve is the peek-every-look procedure &mdash; several times $ \alpha $ at ten looks, and higher the more you look. At any fixed look the p-value is uniform on $ [0,1] $, so each look has chance $ \alpha $ of looking small; but the sequence is a random walk and you are waiting for its minimum to cross a threshold, and the minimum of a random walk is biased downward. The number you report is not the probability of data this extreme under the null; it is the probability of <em>reaching that stopping time</em> with data at least this extreme.</p>
+    <div class="g-warn">⚠ <span><b>A p-value is only as good as the horizon it was computed for.</b> A number that would be a valid tail probability at a pre-declared look is merely the running minimum of a process once the stopping time is data-dependent. Reporting it as if the horizon were fixed is the error, and it is invisible in the output: the screen shows 0.03, just as it would for an honest test.</span></div>
+  </section>
+
+  <section class="g-step" id="sequential">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Always-valid inference</h2></div>
+    <p class="g-eyebrow">Buying the guarantee back, at a price</p>
+    <p>The lesson is not that peeking is forbidden: data stream in whether you look or not, and refusing to look wastes information. The error budget must be <em>spent</em> across the looks rather than re-spent at each one. That is alpha spending &mdash; choose thresholds $ \alpha_1,\dots,\alpha_L $ whose sum is bounded by the level you chose,</p>
+    <div class="g-math g-katex">$$P(\text{any false positive}) \;\le\; \sum_{k=1}^{L} \alpha_k \;\le\; \alpha .$$</div>
+    <p>The crude version is the Bonferroni split $ \alpha_k \approx \alpha / L $, valid but harsher than necessary because the looks are correlated. A <em>spending function</em> spends little early, when evidence is thin, and more later: Pocock uses a roughly constant boundary, while O'Brien&ndash;Fleming is conservative early and approaches the fixed-horizon $ \alpha $ at the end. A group-sequential test builds these boundaries into a two-sample test, holding the family-wise rate at $ \alpha $ while allowing an early stop for a large effect.</p>
+    <p><em>Always-valid</em> inference goes further, giving a confidence sequence whose whole path covers the true effect with probability $ 1-\alpha $ uniformly over time; you may peek whenever you like and the coverage survives. The price is a wider band than a fixed-horizon interval at the same sample size. The connection to multiple comparisons (Part 14) is direct: ten looks is a family of ten tests, inflating the error rate for the same reason testing ten metrics does. Decide the stopping rule before you look, and if you cannot resist peeking, use a method whose guarantee survives it. The red curve's inflation is this same bill seen from the other side.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The same stopping rule, two different dashboards</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI Serving</div>
+        <h3 style="margin:6px 0;">Online A/B tests of serving changes</h3>
+        <p style="margin-bottom:0;">A new quantization level, cache policy, or routing rule is rolled out to a fraction of traffic and judged on latency and error rate. These metrics are watched live, which makes the peeking problem the default rather than the exception. The <a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">serving metrics chapter</a> defines the quantities; when they may be read is this part's stopping rule. If the gate stops at the first significant latency win, its false-positive rate is not the level it was configured with.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI Training</div>
+        <h3 style="margin:6px 0;">Evaluation is a stopping decision</h3>
+        <p style="margin-bottom:0;">Choosing a checkpoint, a prompt, or a reward model by its score on a held-out set is a sequence of comparisons, and taking the best one is optional stopping in another costume. The <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation chapter</a> reports scores on finite test sets; selecting the winner of many trials inflates the apparent gain, exactly as looking many times inflates the false-positive rate. The fix is the same: pre-declare the comparison, or use a method that prices the search.</p>
+      </div>
+    </div>
+    <p>The pattern is general. Anywhere a decision rule adapts to accumulating evidence &mdash; a bandit shifting traffic toward the leader, a dashboard alerting on the first anomaly, a model-selection loop promoting the current best &mdash; the naive reading of the evidence is optimistic, because the rule that chose it was itself chosen from it. Separate the design that generates the data from the rule that stops on it.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below cover the classical sequential-analysis line and the modern always-valid one. Wald founded sequential analysis; Armitage and colleagues showed that repeated significance testing inflates the error rate; Pocock and O'Brien&ndash;Fleming supplied the boundaries trials still use; always-valid inference frees you from fixing the number of looks at all.</p>
+    <ul class="g-refs">
+      <li>Abraham Wald, <em>Sequential Analysis</em>, 1947 &mdash; the original theory of tests that stop on the data.</li>
+      <li>Peter Armitage et al., "Repeated Significance Tests on Accumulating Data", <em>JRSS A</em>, 1969 &mdash; how peeking inflates the error rate.</li>
+      <li>Stuart Pocock, "Group sequential methods in the design and analysis of clinical trials", <em>Biometrika</em>, 1977 &mdash; the constant-boundary design.</li>
+      <li>Peter O'Brien and Thomas Fleming, "A multiple testing procedure for clinical trials", <em>Biometrics</em>, 1979 &mdash; conservative early, near-nominal at the end.</li>
+      <li>Ron Kohavi, Diane Tang, and Ya Xu, <em>Trustworthy Online Controlled Experiments</em>, 2020 &mdash; A/B testing as practised, peeking trap included.</li>
+      <li>Ramesh Johari et al., "Always Valid Inference: Continuous Monitoring of A/B Tests", <em>Operations Research</em>, 2022 &mdash; confidence sequences you can peek at freely.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Randomization</td><td>Independent coin flips assigning units to arms; balances confounders in expectation</td></tr>
+        <tr><td>A/B test</td><td>A two-sample test comparing the arms; for a binary metric, a two-sample Welch $ t $ test</td></tr>
+        <tr><td>Fixed horizon</td><td>A sample size and a single look declared in advance; the setting a classical p-value is defined in</td></tr>
+        <tr><td>Optional stopping</td><td>Choosing when to stop from the data; makes the reported p-value the minimum of a random walk</td></tr>
+        <tr><td>Peeking</td><td>Re-testing as data accumulate; each look re-spends error budget it did not have to spend</td></tr>
+        <tr><td>Alpha spending</td><td>A schedule $ \alpha_1,\dots,\alpha_L $ with $ \sum_k \alpha_k \le \alpha $, so the family-wise rate stays at $ \alpha $</td></tr>
+        <tr><td>Always-valid interval</td><td>A confidence sequence covering the effect uniformly over time, so any stopping rule is safe</td></tr>
+        <tr><td>Family-wise error rate</td><td>Chance of at least one false positive across all looks; what inflates under peeking</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Randomization keeps confounders from creeping in. The next part is about what happens when it is absent &mdash; and how a DAG tells you which variables to adjust for.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) { d = d == null ? 2 : d; var s = x.toFixed(d); if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, ''); return s === '-0' ? '0' : s; }
+  function pct(x) { return (100 * x).toFixed(1) + '%'; }
+
+  var SEED_BASE = 20260914;
+  var P0 = 0.5;
+  var looks = 10;
+  var perLook = 50;
+  var nExperiments = 500;
+  var alpha = 0.05;
+
+  var firstCross = [];
+  var lastP = [];
+  var paths = [];
+  var rateCurve = [];
+  var maxRate = 0;
+  var singleRate = 0;
+  var overallRate = 0;
+
+  var pathPlot = S.plot(el('path-canvas'), {
+    W: 640, H: 300, xRange: [1, looks], yRange: [0, 1],
+    xLabel: 'look (peek number)', yLabel: 'p-value', onResize: drawPaths
+  });
+  var ratePlot = S.plot(el('rate-canvas'), {
+    W: 640, H: 300, xRange: [0.5, looks + 0.5], yRange: [0, 0.6],
+    xLabel: 'number of looks taken', yLabel: 'false-positive rate', onResize: drawRate
+  });
+
+  function simulate() {
+    var E = nExperiments, L = looks, nPer = perLook, al = alpha, showN = 6;
+    firstCross = new Array(E);
+    lastP = new Array(E);
+    paths = [];
+    for (var e = 0; e < E; e++) {
+      var r = S.rng(SEED_BASE + e * 7919 + 11);
+      var A = [], B = [], f = -1, lp = 1;
+      var pts = e < showN ? [] : null;
+      for (var k = 1; k <= L; k++) {
+        for (var i = 0; i < nPer; i++) {
+          A.push(S.sample.bernoulli(r, P0));
+          B.push(S.sample.bernoulli(r, P0));
+        }
+        var p = S.test.welch(A, B).p;
+        if (!isFinite(p)) p = 1;
+        if (pts) pts.push([k, p]);
+        if (f < 0 && p < al) f = k;
+        lp = p;
+      }
+      firstCross[e] = f;
+      lastP[e] = lp;
+      if (pts) paths.push({ points: pts, crossed: f >= 0 });
+    }
+    rateCurve = [];
+    maxRate = 0;
+    for (var k2 = 1; k2 <= L; k2++) {
+      var cnt = 0;
+      for (var e2 = 0; e2 < E; e2++) if (firstCross[e2] >= 1 && firstCross[e2] <= k2) cnt++;
+      var y = cnt / E;
+      rateCurve.push([k2, y]);
+      if (y > maxRate) maxRate = y;
+    }
+    var singleCnt = 0;
+    for (var e3 = 0; e3 < E; e3++) if (lastP[e3] < al) singleCnt++;
+    singleRate = singleCnt / E;
+    overallRate = rateCurve.length ? rateCurve[rateCurve.length - 1][1] : 0;
+  }
+
+  function drawPaths() {
+    if (!pathPlot) return;
+    var c = Guide.colors();
+    pathPlot.clear();
+    pathPlot.xRange[0] = 1;
+    pathPlot.xRange[1] = looks;
+    pathPlot.yRange[0] = 0;
+    pathPlot.yRange[1] = 1;
+    pathPlot.axes({ xLabel: 'look (peek number)', yLabel: 'p-value' });
+    pathPlot.hline(alpha, { color: c.accent, dashed: true, width: 1.6, label: '\u03b1 = ' + fmt(alpha, 2) });
+    for (var i = 0; i < paths.length; i++) {
+      pathPlot.curve(paths[i].points, { color: paths[i].crossed ? c.accent2 : c.accent400, width: paths[i].crossed ? 2.2 : 1.4 });
+    }
+    pathPlot.legend([
+      { label: 'crossed below \u03b1 (false positive)', color: c.accent2 },
+      { label: 'ran to the end', color: c.accent400 },
+      { label: 'chosen level \u03b1', color: c.accent, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function drawRate() {
+    if (!ratePlot) return;
+    var c = Guide.colors();
+    ratePlot.clear();
+    ratePlot.xRange[0] = 0.5;
+    ratePlot.xRange[1] = looks + 0.5;
+    ratePlot.yRange[0] = 0;
+    ratePlot.yRange[1] = Math.max(0.12, maxRate * 1.25);
+    ratePlot.axes({ xLabel: 'number of looks taken', yLabel: 'false-positive rate' });
+    ratePlot.hline(alpha, { color: c.accent, dashed: true, width: 1.4, label: '\u03b1 = ' + fmt(alpha, 2) });
+    if (rateCurve.length) {
+      ratePlot.curve(rateCurve, { color: c.accent2, width: 2.6 });
+      ratePlot.points(rateCurve, { color: c.accent2, r: 2.4 });
+      ratePlot.points([[looks, singleRate]], { color: c.accent700, r: 5, stroke: '#ffffff', width: 1.5 });
+      ratePlot.text('one test at the end', looks, singleRate, { align: 'right', dx: -9, dy: 16, color: c.accent700 });
+    }
+    ratePlot.legend([
+      { label: 'peek every look', color: c.accent2 },
+      { label: 'single test at the end', color: c.accent700 },
+      { label: 'chosen level \u03b1', color: c.accent, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function updateReadout() {
+    var ratio = singleRate > 1e-9 ? overallRate / singleRate : (overallRate > 0 ? Infinity : 1);
+    el('sim-readout').innerHTML =
+      '<div><span class="k">α chosen</span> ' + fmt(alpha, 2) + '</div>' +
+      '<div><span class="k">peek-every-look FPR</span> <span class="bad">' + pct(overallRate) + '</span></div>' +
+      '<div><span class="k">one test at the end</span> <span class="hi">' + pct(singleRate) + '</span></div>' +
+      '<div><span class="k">inflation</span> ' + (isFinite(ratio) ? fmt(ratio, 1) + '\u00d7' : '—') + '</div>' +
+      '<div class="g-mini">' + nExperiments + ' null experiments, ' + looks + ' looks of ' + perLook + ' per arm. The red curve is what optional stopping actually buys you.</div>';
+  }
+
+  function run() { simulate(); drawPaths(); drawRate(); updateReadout(); }
+
+  var runTimer = null;
+  function scheduleRun() {
+    if (runTimer) clearTimeout(runTimer);
+    runTimer = setTimeout(run, 90);
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#looks-slider'), function (sl) {
+    looks = parseInt(sl.value, 10); scheduleRun();
+  });
+  Guide.bindSliders(document.querySelectorAll('#nper-slider'), function (sl) {
+    perLook = parseInt(sl.value, 10); scheduleRun();
+  });
+  Guide.bindSliders(document.querySelectorAll('#exp-slider'), function (sl) {
+    nExperiments = parseInt(sl.value, 10); scheduleRun();
+  });
+  el('alpha-sel').addEventListener('change', function () {
+    alpha = parseFloat(el('alpha-sel').value); scheduleRun();
+  });
+  el('run-sim').addEventListener('click', run);
+
+  run();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'ab-testing-randomization',
+      kind: 'choice',
+      prompt: 'Why does random assignment let an A/B test support a causal claim, rather than only an association?',
+      options: [
+        { label: 'It makes the arms comparable in expectation, including on confounders nobody measured, so the assignment is the only systematic difference left.', correct: true },
+        { label: 'It removes all sampling noise, so any observed difference must be a real effect.', correct: false },
+        { label: 'It guarantees the two groups are identical in every realised experiment, not just on average.', correct: false }
+      ],
+      explanation: 'Randomisation balances confounders in expectation and is the source of the causal reading. It does not eliminate noise, and any single realised split can still be lopsided; that residual imbalance is the sampling wobble the p-value quantifies.'
+    },
+    {
+      id: 'ab-testing-multiple-looks',
+      kind: 'numeric',
+      prompt: 'If you ran ten independent tests, each at α = 0.05, roughly what is the chance (in percent) of at least one false positive? Give the nearest whole percent.',
+      answer: 40,
+      tolerance: 1,
+      explanation: 'The chance of no false positive is 0.95^10 ≈ 0.599, so the chance of at least one is about 0.401, or 40%. The looks in a sequential test are correlated rather than independent, but the same logic drives the inflation, and the simulator measures the real value.'
+    },
+    {
+      id: 'ab-testing-optional-stopping',
+      kind: 'choice',
+      prompt: 'You watch a dashboard and stop the test the first time the p-value drops below 0.05, then report that p-value as 0.03. What is wrong?',
+      options: [
+        { label: 'The stopping time depended on the data, so the reported number is the running minimum of a random walk, not a valid fixed-horizon p-value.', correct: true },
+        { label: 'The arithmetic is wrong; the p-value should be recomputed with a larger sample after stopping.', correct: false },
+        { label: 'Nothing is wrong as long as the test eventually reached the planned sample size.', correct: false }
+      ],
+      explanation: 'A p-value is a tail probability for a statistic whose distribution is known at a horizon fixed in advance. Once you stop at the first crossing, the number is the value of the process at a data-dependent time, and its nominal meaning no longer holds.'
+    },
+    {
+      id: 'ab-testing-alpha-spending',
+      kind: 'choice',
+      prompt: 'How does an alpha-spending or always-valid sequential method restore the guarantee while still allowing you to look?',
+      options: [
+        { label: 'It spends the error budget across the looks with adjusted boundaries (or a confidence sequence), so the family-wise false-positive rate stays at α &mdash; at the cost of wider intervals or slower evidence.', correct: true },
+        { label: 'It keeps the same threshold at every look but averages the p-values across looks to remove the bias.', correct: false },
+        { label: 'It re-runs the experiment whenever a look crosses the threshold, until the result is confirmed.', correct: false }
+      ],
+      explanation: 'The budget must be spent, not re-spent: a spending schedule with sum at most α, or a confidence sequence that covers the effect uniformly over time, keeps the guarantee under any stopping rule. The price is a wider band than a fixed-horizon interval at the same sample size.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

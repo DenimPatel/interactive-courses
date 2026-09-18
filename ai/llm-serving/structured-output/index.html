@@ -1,0 +1,689 @@
+---
+title: "LLM Serving, Interactively — Part 16: Structured output and constrained decoding"
+description: "How a grammar becomes a per-state token mask, why JSON needs a stack, what jump-forward decoding skips, and what the constraint tax really costs at batch."
+permalink: "/ai/llm-serving/structured-output/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .so-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; margin-top: 6px; }
+  .so-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .so-swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; }
+  .so-stack { font-family: var(--font-mono); font-size: 12px; line-height: 1.9; }
+  .so-stack .so-depth { display: inline-block; min-width: 22px; text-align: right; color: var(--color-accent-700); font-weight: 600; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 16 of 20</span>
+    <h1>Structured output and constrained decoding</h1>
+    <p>An agent is only as useful as the program that reads its output. Constrained decoding guarantees the shape of that output by masking the sampler at every step, so an invalid token simply has zero probability. This part follows the machinery from a regular expression to a finite-state machine to the per-state bitmask applied over a 150K-wide vocabulary — and prices what the guarantee costs.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="guarantees">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>What it guarantees and what it does not</h2></div>
+    <p class="g-eyebrow">The contract, precisely stated</p>
+    <p>Constrained decoding guarantees <em>syntactic</em> validity: every emitted token sequence is accepted by a grammar, regex, or schema. It does not guarantee <em>semantic</em> correctness. A model can produce perfectly valid JSON whose numbers are hallucinated, whose enum value is the wrong one, or whose required field is filled with an empty string. It also does not guarantee termination — a grammar that permits unbounded strings can loop — and it does not make the model faster or smarter; it makes an invalid sample impossible.</p>
+    <div class="g-grid2">
+      <div class="g-card reveal"><b>What it does guarantee</b>
+        <ul style="margin:8px 0 0; padding-left:18px; font-size:13.5px; line-height:1.7;">
+          <li>Every prefix parses under the grammar.</li>
+          <li>Required fields and enum sets are respected exactly.</li>
+          <li>Malformed output is unreachable, not merely unlikely.</li>
+          <li>A downstream parser never needs a repair pass.</li>
+        </ul>
+      </div>
+      <div class="g-card reveal"><b>What it does not guarantee</b>
+        <ul style="margin:8px 0 0; padding-left:18px; font-size:13.5px; line-height:1.7;">
+          <li>That the values are true or useful.</li>
+          <li>That generation terminates within your token budget.</li>
+          <li>That quality is unchanged — masking reshapes the distribution.</li>
+          <li>That the tokenizer can express the grammar cleanly.</li>
+        </ul>
+      </div>
+    </div>
+    <p>This is the serving-side partner to <a href="{{ '/ai/llm-training/tools-agents/' | relative_url }}">tool calling and agents</a>: the training guide covers why a model is taught to emit structured calls, and everything below is how the serving stack makes the shape of those calls a hard constraint rather than a hope. It is also the mechanism behind every "JSON mode" and function-calling endpoint you have used.</p>
+  </section>
+
+  <section class="g-step" id="fsm">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Regex to FSM to per-state masks</h2></div>
+    <p class="g-eyebrow">The mask is just the transition set</p>
+    <p>A regular expression compiles to a finite-state machine: states, and transitions labelled with the input that moves between them. At generation time the decoder is in exactly one state, and the allowed next tokens are precisely the tokens that label an outgoing transition. Everything else is masked to negative infinity. The engine does not "understand" the grammar per token — it looks up a precomputed set.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="so-fsm" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Pick a pattern, then step. The highlighted state determines the allowed tokens.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="so-fsm-btns"></div>
+        <div class="g-btnrow">
+          <button id="so-fsm-step" class="g-primary">Take step</button>
+          <button id="so-fsm-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="so-fsm-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Entropy collapse is the whole trick.</b> Before masking the sampler chooses among the whole vocabulary; after masking it chooses among a handful of characters. The readout shows the entropy of the next-token distribution before and after the mask — that is how much probability mass the constraint is discarding, and it is why constrained output is often <em>more</em> predictable than free-form text.</span></div>
+  </section>
+
+  <section class="g-step" id="pda">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Why JSON needs a pushdown automaton</h2></div>
+    <p class="g-eyebrow">A regular expression cannot count</p>
+    <p>JSON is not regular. The set of valid JSON documents requires matching nested braces and brackets to arbitrary depth, and a finite-state machine cannot count unboundedly. The standard fix is a pushdown automaton: an FSM plus a stack, where entering <code>{</code> or <code>[</code> pushes a context and the matching close pops it. The mask at each step depends on both the current parser state <em>and</em> the top of the stack — which is why JSON-schema engines are described as grammar-constrained and not merely regex-constrained.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="so-pda" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Bright cells are tokens the schema permits right now. Take steps and watch the stack grow when an array opens.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="so-pda-step" class="g-primary">Take step</button>
+          <button id="so-pda-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="so-pda-readout"></div>
+      </div>
+    </div>
+    <div class="so-legend">
+      <span><i class="so-swatch" style="background: var(--color-accent);"></i> allowed</span>
+      <span><i class="so-swatch" style="background: #e7ebee;"></i> blocked by state or stack</span>
+    </div>
+  </section>
+
+  <section class="g-step" id="compile">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Compiling a schema and caching the precompute</h2></div>
+    <p class="g-eyebrow">Pay once, not per token</p>
+    <p>The expensive part of constrained decoding is not applying the mask; it is building the parser and the token-indexed transition table. A naive engine runs the grammar over the vocabulary at every step — that is where the 40–150 microsecond overhead band comes from and why early implementations were unusable. Production engines compile the grammar once, then precompute, for each parser state, a bitmask over the vocabulary. Applying a step becomes a lookup plus a boolean AND.</p>
+    <div class="so-stack" id="so-compile-readout"></div>
+    <p class="g-source" id="so-source"></p>
+  </section>
+
+  <section class="g-step" id="bitmask">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Applying a 150K-wide bitmask per token</h2></div>
+    <p class="g-eyebrow">The bandwidth of a boolean</p>
+    <p>The mask is a bit vector as wide as the vocabulary. For a 128K-token vocabulary plus special tokens, that is roughly a 150K-wide mask — about 18 KB in packed form. Masking is a single fused subtraction of a large constant from the logits or an addition of negative infinity, executed on the GPU with the sampling kernel. The arithmetic is trivial; the engineering is alignment. The mask must be generated on the host or in a way that does not force a device synchronization in the middle of the decode loop, because a stall on every token would cost more than the mask itself.</p>
+    <div class="g-math g-katex">$$\text{mask bytes} \;\approx\; \frac{150{,}000\ \text{tokens}}{8\ \text{bits/byte}} \;\approx\; 18.3\ \text{KB per step}$$</div>
+  </section>
+
+  <section class="g-step" id="jump">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Jump-forward decoding</h2></div>
+    <p class="g-eyebrow">When the grammar leaves no choice, skip the forward passes</p>
+    <p>If the current state has exactly one allowed token, the model does not need to run a forward pass to discover it — the grammar already knows. Jump-forward decoding emits the entire deterministic span in one step. Consider a partial key: after <code>{"na</code> the grammar forces <code>me":</code>, so the engine emits that whole chunk at once instead of spending a forward pass per character. The gain is proportional to how much of the schema is deterministic, which is why it is largest for JSON, function calls and templates, and near zero for free-form prose.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="so-jump" width="640" height="280"></canvas>
+        <p class="g-canvas-hint">Each marker is a model forward pass. Jump-forward collapses deterministic runs.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="so-jump-toggle" class="g-primary">Jump-forward: on</button>
+        </div>
+        <div class="g-field"><label>Deterministic fraction of the output <span class="val" id="so-jump-f-val">70%</span></label>
+          <input type="range" id="so-jump-f" min="0" max="95" step="5" value="70">
+        </div>
+        <div class="g-readout" id="so-jump-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="so-jump-source"></p>
+  </section>
+
+  <section class="g-step" id="tax">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>The constraint tax</h2></div>
+    <p class="g-eyebrow">A per-sequence mask does not amortise</p>
+    <p>Here is the subtlety that bites at scale. Engines batch many sequences into one decode step, and almost every other per-sequence cost — the KV read, the attention — is shared or amortised across the batch. A grammar mask is not, because each sequence sits at its own parser state and therefore needs its own bitmask. At batch 1 the mask is a rounding error; at batch 256 the mask work has grown linearly while the step time grew more slowly, so its share of the step rises instead of falling. Some engines claw this back by batching sequences that share a parser state into one mask, but that only helps when states happen to coincide.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="so-tax" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Mask compute as a share of the decode step, per-sequence versus state-shared, across batch size.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Mask cost per sequence <span class="val" id="so-tax-us-val">90 µs</span></label>
+          <input type="range" id="so-tax-us" min="40" max="150" step="5" value="90">
+        </div>
+        <div class="g-field"><label>KV per sequence (context tokens) <span class="val" id="so-tax-t-val">1024</span></label>
+          <input type="range" id="so-tax-t" min="256" max="8192" step="256" value="1024">
+        </div>
+        <div class="g-readout" id="so-tax-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="so-tax-source"></p>
+  </section>
+
+  <section class="g-step" id="tokenizer">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Tokenizer-alignment traps</h2></div>
+    <p class="g-eyebrow">The grammar is over characters; the model emits tokens</p>
+    <p>This is the deepest practical hazard. A grammar is usually defined over characters or bytes, but the model emits tokens that may span several characters and may be partially inside a grammar rule. A correct system must know, for each token, the set of parser states reachable when that token is appended — the mask is a union over all token continuations, not a character-at-a-time check. Get it wrong and you either block valid tokens (a schema that can never complete) or allow invalid ones (a guaranteed-valid claim that is false).</p>
+    <div class="g-grid2">
+      <div class="g-card reveal"><b>Common traps</b>
+        <ul style="margin:8px 0 0; padding-left:18px; font-size:13.5px; line-height:1.7;">
+          <li>A token that contains both a legal and an illegal continuations must be unioned, not judged on its first character.</li>
+          <li>Whitespace inside a JSON string is content; outside it is formatting. A schema that ignores this over-constrains.</li>
+          <li>Escape sequences mean the raw bytes and the parsed characters differ — the grammar must run on one consistent view.</li>
+          <li>Unicode combining marks and multi-byte characters can split across tokens.</li>
+        </ul>
+      </div>
+      <div class="g-card reveal"><b>Mitigations</b>
+        <ul style="margin:8px 0 0; padding-left:18px; font-size:13.5px; line-height:1.7;">
+          <li>Precompute a token-to-state-transition table at compile time, over bytes, once.</li>
+          <li>Use byte-level grammars so tokenization cannot hide a byte.</li>
+          <li>Test every schema against the actual tokenizer before shipping, not just against the regex.</li>
+          <li>Keep a validated fallback parser for the rare path where the grammar cannot terminate.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="engines">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Outlines, XGrammar, LLGuidance</h2></div>
+    <p class="g-eyebrow">The current engine landscape</p>
+    <p><b>Outlines</b> introduced the finite-state-machine indexing approach that made guided generation cheap enough to use in practice, and jump-forward decoding follows from it. <b>XGrammar</b> is the context-free-grammar engine built for production throughput; its paper reports up to 100&times; acceleration over prior solutions and near-zero end-to-end overhead when mask generation is overlapped with GPU execution, which is the property that lets vLLM and SGLang expose structured output as a default rather than a penalty. <b>LLGuidance</b> is the newer Rust implementation oriented at low-latency JSON-schema and grammar constraints. The trends are consistent: push the per-token work off the critical path, compile aggressively, and cache the state-indexed masks.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="so-engines" width="640" height="250"></canvas>
+        <p class="g-canvas-hint">Relative per-token mask cost, normalised to the naive re-derive-every-step baseline.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="so-engines-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="failures">
+    <h2>Failure gallery</h2>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Failure</th><th>What goes wrong</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Schema that can never complete</td><td>Current prefix plus every vocabulary token leads to a dead state; sampler has no legal move and emits EOS or garbage.</td><td>Validate reachability at compile time; raise, do not silently unconstrain.</td></tr>
+        <tr><td>Tokenizer-boundary escape</td><td>A multi-character token jumps over a required character, so the mask admits a token that invalidates the parse.</td><td>Union transitions over all token continuations; prefer byte-level grammars.</td></tr>
+        <tr><td>Over-constrained JSON</td><td>Whitespace and key ordering forced to one canonical form; model quality drops because the natural distribution is masked away.</td><td>Permit whitespace and optional keys; constrain structure, not style.</td></tr>
+        <tr><td>Infinite string</td><td>Grammar allows an unbounded string; generation never terminates and never hits EOS.</td><td>Add max length or a stop condition in the grammar, and enforce an output-token budget.</td></tr>
+        <tr><td>Recursive schema stack growth</td><td>Self-referential schema with unbounded nesting grows the PDA stack without limit.</td><td>Depth-limit the recursion in the compiled grammar.</td></tr>
+        <tr><td>oneOf ambiguity</td><td>A union of subschemas splits the mask so thinly that the model's preferred continuation is excluded.</td><td>Flatten to a discriminated union with a literal tag; avoid overlapping branches.</td></tr>
+        <tr><td>Mask/logits device sync</td><td>Host-side mask generation forces a synchronize every token, adding latency and draining the pipeline.</td><td>Generate masks on-device or overlap with the previous step; batch by parser state.</td></tr>
+        <tr><td>Unsatisfiable required field</td><td>Required field is unreachable given the model's tokenizer or the prompt; output loops trying.</td><td>Validate the schema against the tokenizer at deploy time; test with real prompts.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Willard &amp; Louf, <a href="https://arxiv.org/abs/2307.09702">"Efficient Guided Generation for Large Language Models"</a> (2023) — Outlines and FSM indexing.</li>
+      <li>Dong et al., <a href="https://arxiv.org/abs/2411.15100">"XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models"</a> (MLSys 2025).</li>
+      <li>Beurer-Kellner et al., <a href="https://arxiv.org/abs/2402.10909">"Guiding LLMs The Right Way: Fast, Non-Invasive Constrained Generation"</a> (2024).</li>
+      <li>Microsoft, <a href="https://github.com/guidance-ai/llguidance">LLGuidance</a> (open source).</li>
+      <li>Geng et al., <a href="https://arxiv.org/abs/2407.10299">"Grammar-Aligned Decoding"</a> (NeurIPS 2024) — the quality cost of masking.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Structured calls need many tenants sharing one base model — the next part is LoRA, quotas and noisy neighbours.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.SO_JSON_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var FALLBACK = {
+    structured_output: {
+      source: "XGrammar (Dong et al., MLSys 2025, arXiv:2411.15100) accelerates context-free-grammar constrained decoding up to 100x over prior solutions and reports near-zero end-to-end overhead when overlapped with GPU execution. Outlines (Willard & Louf, arXiv:2307.09702) introduces the finite-state-machine indexing approach. The 40-150 microsecond mask-overhead band and the 1.6x jump-forward speedup are illustrative approximations, not exact published constants.",
+      maskOverheadUs: [40, 150],
+      jumpForwardSpeedup: 1.6,
+      engines: ["Outlines", "XGrammar", "LLGuidance"]
+    }
+  };
+  var DATA = FALLBACK;
+  var renders = [];
+  function refresh() { renders.forEach(function (fn) { try { fn(); } catch (e) { if (window.console) console.warn("demo:", e.message); } }); }
+  function overhead() {
+    var v = DATA.structured_output && DATA.structured_output.maskOverheadUs;
+    return v && v.length === 2 ? v : FALLBACK.structured_output.maskOverheadUs;
+  }
+
+  // ---------------------------------------------------------------- demo A: FSM walker
+  (function () {
+    var canvas = document.getElementById("so-fsm");
+    var btnWrap = document.getElementById("so-fsm-btns");
+    var stepBtn = document.getElementById("so-fsm-step");
+    var resetBtn = document.getElementById("so-fsm-reset");
+    var readout = document.getElementById("so-fsm-readout");
+    var W = 640, H = 300, setup = null;
+
+    var DIGITS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    var HEX = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"];
+
+    function phone() {
+      var edges = [], labels = ["0-9", "0-9", "0-9", "-", "0-9", "0-9", "0-9"];
+      for (var i = 0; i < 7; i++) edges.push({ from: i, to: i + 1, label: labels[i], tokens: i === 3 ? ["-"] : DIGITS });
+      return { name: "Phone ###-####", states: ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7"], accept: [7], edges: edges, vocab: DIGITS.concat(["-", "A", "12", " "]) };
+    }
+    function boolean() {
+      return { name: "Boolean literal", states: ["S0", "true", "false"], accept: [1, 2], edges: [
+        { from: 0, to: 1, label: "true", tokens: ["true"] },
+        { from: 0, to: 2, label: "false", tokens: ["false"] }
+      ], vocab: ["true", "false", "tru", "maybe", "1", " "] };
+    }
+    function hex() {
+      var edges = [{ from: 0, to: 1, label: "#", tokens: ["#"] }];
+      for (var i = 1; i < 7; i++) edges.push({ from: i, to: i + 1, label: "0-9a-f", tokens: HEX });
+      return { name: "Hex colour #RRGGBB", states: ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7"], accept: [7], edges: edges, vocab: ["#"].concat(HEX, ["g", "Z", " "]) };
+    }
+    var PRESETS = [phone(), boolean(), hex()];
+    var cur = 0, preset = PRESETS[0], state = 0;
+
+    function allowedTokens() {
+      var out = [];
+      preset.edges.forEach(function (e) { if (e.from === state) out = out.concat(e.tokens); });
+      return out;
+    }
+    function logitFor(tok) {
+      var h = 0;
+      for (var i = 0; i < tok.length; i++) h = (h * 31 + tok.charCodeAt(i)) % 997;
+      return Math.cos(h * 0.37) * 2.2;
+    }
+    function entropyOf(probs) {
+      var H = 0;
+      probs.forEach(function (x) { if (x > 1e-9) H -= x * Math.log(x); });
+      return H;
+    }
+    PRESETS.forEach(function (p, i) {
+      var b = document.createElement("button");
+      b.textContent = p.name;
+      if (i === cur) b.className = "g-primary";
+      b.addEventListener("click", function () {
+        cur = i; preset = PRESETS[i]; state = 0;
+        Array.prototype.forEach.call(btnWrap.children, function (x) { x.className = ""; });
+        b.className = "g-primary"; drawFSM();
+      });
+      btnWrap.appendChild(b);
+    });
+    function drawFSM() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      ctx.clearRect(0, 0, W, H);
+      var n = preset.states.length, marginX = 70;
+      var spacing = n > 1 ? (W - 2 * marginX) / (n - 1) : 0;
+      var y = 96, r = 20;
+      function sx(i) { return marginX + spacing * i; }
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1.4;
+      preset.edges.forEach(function (e) {
+        if (e.to < e.from) return;
+        var nonAdj = (e.to - e.from) > 1;
+        var x1 = sx(e.from), x2 = sx(e.to);
+        ctx.beginPath();
+        if (nonAdj) {
+          var apexY = y - r - 42;
+          ctx.moveTo(x1 + r * 0.7, y - r * 0.7);
+          ctx.quadraticCurveTo((x1 + x2) / 2, apexY, x2 - r * 0.7, y - r * 0.7);
+        } else {
+          ctx.moveTo(x1 + r, y); ctx.lineTo(x2 - r, y);
+        }
+        ctx.stroke();
+        var mx = (x1 + x2) / 2, my = nonAdj ? (y - r - 30) : (y - 5);
+        ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "center";
+        ctx.fillText(e.label, mx, my);
+      });
+      preset.states.forEach(function (s, i) {
+        ctx.beginPath(); ctx.arc(sx(i), y, r, 0, 2 * Math.PI);
+        var accepting = preset.accept.indexOf(i) >= 0;
+        ctx.fillStyle = (i === state) ? c.accent : (accepting ? "rgba(214,0,108,0.12)" : "rgba(43,95,255,0.10)");
+        ctx.fill();
+        ctx.strokeStyle = (i === state) ? c.accent : (accepting ? c.accent2 : c.divider);
+        ctx.lineWidth = (i === state) ? 2.2 : 1.4; ctx.stroke();
+        ctx.fillStyle = (i === state) ? "#fff" : c.text;
+        ctx.font = "10px " + c.font; ctx.textAlign = "center"; ctx.fillText(s, sx(i), y + 3);
+        if (accepting) { ctx.fillStyle = c.accent2; ctx.font = "9px " + c.font; ctx.fillText("accept", sx(i), y + r + 13); }
+      });
+      // allowed chips
+      var allowed = allowedTokens();
+      var logits = preset.vocab.map(logitFor);
+      var p0 = Guide.softmax(logits, 1);
+      var H_before = entropyOf(p0);
+      var pm = Guide.softmax(logits.map(function (l, i) { return allowed.indexOf(preset.vocab[i]) >= 0 ? l : -1e9; }), 1);
+      var H_after = entropyOf(pm);
+      var chipY = H - 60;
+      ctx.font = "10px " + c.font; ctx.textAlign = "left"; ctx.fillStyle = c.text;
+      ctx.fillText("allowed next tokens at this state:", 30, chipY - 8);
+      var x = 30;
+      (allowed.length ? allowed : ["(none — emitting a terminator)"]).forEach(function (tk) {
+        var w = Math.max(26, ctx.measureText(tk).width + 14);
+        ctx.fillStyle = allowed.length ? c.accent : c.divider;
+        ctx.globalAlpha = allowed.length ? 1 : 0.5;
+        ctx.fillRect(x, chipY, w, 22); ctx.globalAlpha = 1;
+        ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.font = "11px " + c.font;
+        ctx.fillText(tk, x + w / 2, chipY + 15);
+        x += w + 6;
+      });
+      readout.innerHTML =
+        '<div><span class="k">pattern:</span> <span class="hi">' + preset.name + '</span></div>' +
+        '<div><span class="k">state:</span> ' + preset.states[state] + ' · <span class="k">allowed:</span> ' + allowed.length + ' of ' + preset.vocab.length + ' tokens</div>' +
+        '<div><span class="k">entropy before mask:</span> ' + H_before.toFixed(2) + ' nats</div>' +
+        '<div><span class="k">entropy after mask:</span> ' + H_after.toFixed(2) + ' nats (' + (H_after < 0.02 ? "deterministic" : "still a choice") + ')</div>' +
+        '<div><span class="k">information discarded:</span> ' + (H_before - H_after).toFixed(2) + ' nats/token</div>';
+    }
+    stepBtn.addEventListener("click", function () {
+      var allowed = allowedTokens();
+      if (!allowed.length) return;
+      var best = allowed[0], bestL = -Infinity;
+      allowed.forEach(function (tk) { var l = logitFor(tk); if (l > bestL) { bestL = l; best = tk; } });
+      var moved = false;
+      preset.edges.forEach(function (e) { if (!moved && e.from === state && e.tokens.indexOf(best) >= 0) { state = e.to; moved = true; } });
+      drawFSM();
+    });
+    resetBtn.addEventListener("click", function () { state = 0; drawFSM(); });
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawFSM(); });
+    drawFSM();
+    renders.push(drawFSM);
+  })();
+
+  // ---------------------------------------------------------------- demo B: schema -> PDA mask
+  (function () {
+    var canvas = document.getElementById("so-pda");
+    var stepBtn = document.getElementById("so-pda-step");
+    var resetBtn = document.getElementById("so-pda-reset");
+    var readout = document.getElementById("so-pda-readout");
+    var W = 640, H = 300, setup = null;
+    var STOK = ["{", "}", "[", "]", "\"name\"", "\"age\"", "\"tags\"", ":", ",", "Alice", "42", "a", "b", "!", "null", " "];
+    var state, stack, key, used;
+    function reset() { state = "objStart"; stack = []; key = null; used = {}; }
+    function allowed() {
+      switch (state) {
+        case "objStart": return ["{"];
+        case "keyOrEnd": return ["\"name\"", "\"age\"", "\"tags\"", "}"];
+        case "colon": return [":"];
+        case "valueName": return ["Alice"];
+        case "valueAge": return ["42"];
+        case "valueTags": return ["["];
+        case "afterValue": return [",", "}"];
+        case "arrVal": return ["a", "b"];
+        case "arrAfter": return [",", "]"];
+        default: return [];
+      }
+    }
+    function choose(al) {
+      if (state === "keyOrEnd") {
+        var order = ["\"name\"", "\"tags\"", "\"age\"", "}"];
+        for (var i = 0; i < order.length; i++) {
+          if (al.indexOf(order[i]) >= 0 && (order[i] === "}" || !used[order[i]])) return order[i];
+        }
+        return al[0];
+      }
+      var pref = ["{", ":", "Alice", ",", "[", "a", ",", "b", "]", "42", "}", "]"];
+      for (var k = 0; k < pref.length; k++) if (al.indexOf(pref[k]) >= 0) return pref[k];
+      return al[0];
+    }
+    function take() {
+      var al = allowed();
+      if (!al.length) return;
+      var best = choose(al);
+      // advance the machine
+      if (state === "objStart" && best === "{") { stack.push("obj"); state = "keyOrEnd"; }
+      else if (state === "keyOrEnd") {
+        if (best === "}") { pop(); state = stack.length ? "afterValue" : "end"; }
+        else { key = best.replace(/"/g, ""); used[best] = true; state = "colon"; }
+      } else if (state === "colon" && best === ":") { state = key === "name" ? "valueName" : key === "age" ? "valueAge" : "valueTags"; }
+      else if (state === "valueName") { state = "afterValue"; }
+      else if (state === "valueAge") { state = "afterValue"; }
+      else if (state === "valueTags" && best === "[") { stack.push("arr"); state = "arrVal"; }
+      else if (state === "arrVal") { state = "arrAfter"; }
+      else if (state === "arrAfter") { if (best === ",") state = "arrVal"; else { pop(); state = "afterValue"; } }
+      else if (state === "afterValue") { if (best === ",") state = "keyOrEnd"; else { pop(); state = "end"; } }
+    }
+    function pop() { stack.pop(); }
+    function drawPDA() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      ctx.clearRect(0, 0, W, H);
+      var al = allowed();
+      var n = STOK.length, pad = 20, gap = 6;
+      var cellW = (W - 2 * pad - (n - 1) * gap) / n;
+      var y = 46, cellH = 40;
+      ctx.font = "10px " + c.font; ctx.textAlign = "left"; ctx.fillStyle = c.text;
+      ctx.fillText("vocabulary — " + al.length + " of " + n + " allowed at this parser state", pad, 26);
+      for (var i = 0; i < n; i++) {
+        var x = pad + i * (cellW + gap), on = al.indexOf(STOK[i]) >= 0;
+        ctx.fillStyle = on ? c.accent : "#e7ebee";
+        ctx.fillRect(x, y, cellW, cellH);
+        ctx.fillStyle = on ? "#fff" : "#9aa4ab";
+        ctx.textAlign = "center"; ctx.font = (cellW < 34 ? "9px " : "10.5px ") + c.font;
+        ctx.fillText(STOK[i].length > 5 ? STOK[i].slice(0, 5) : STOK[i], x + cellW / 2, y + 24);
+      }
+      // stack
+      var sx = pad, sy = 140, barW = 40, maxD = 4;
+      ctx.textAlign = "left"; ctx.fillStyle = c.text; ctx.font = "600 11px " + c.font;
+      ctx.fillText("PDA stack depth: " + stack.length, sx, sy - 20);
+      for (var d = 0; d < maxD; d++) {
+        var yy = sy + (maxD - 1 - d) * 26;
+        ctx.fillStyle = d < stack.length ? c.accent : "#eef1f3";
+        ctx.fillRect(sx, yy, barW, 22);
+        if (d < stack.length) { ctx.fillStyle = "#fff"; ctx.font = "10px " + c.font; ctx.textAlign = "center"; ctx.fillText(stack[d], sx + barW / 2, yy + 15); }
+      }
+      // state + next token
+      var tx = sx + barW + 30;
+      ctx.textAlign = "left"; ctx.fillStyle = c.text; ctx.font = "11.5px " + c.font;
+      ctx.fillText("parser state: " + state + (key ? "   (key = " + key + ")" : ""), tx, sy + 4);
+      ctx.fillText("grammar-forced continuation: " + (al.length === 1 ? "yes — could jump-forward" : "no — model must sample"), tx, sy + 26);
+      readout.innerHTML =
+        '<div><span class="k">allowed now:</span> ' + (al.length ? al.join("  ") : "none — document complete") + '</div>' +
+        '<div><span class="k">stack:</span> <span class="so-depth">' + stack.length + '</span> ' + (stack.join(" → ") || "(empty)") + '</div>' +
+        '<div><span class="k">blocked this step:</span> ' + (n - al.length) + ' tokens</div>';
+    }
+    stepBtn.addEventListener("click", function () { take(); drawPDA(); });
+    resetBtn.addEventListener("click", function () { reset(); drawPDA(); });
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawPDA(); });
+    reset(); drawPDA();
+    renders.push(function () { reset(); drawPDA(); });
+  })();
+
+  // ---------------------------------------------------------------- demo C: jump-forward
+  (function () {
+    var canvas = document.getElementById("so-jump");
+    var toggle = document.getElementById("so-jump-toggle");
+    var fSlider = document.getElementById("so-jump-f");
+    var fVal = document.getElementById("so-jump-f-val");
+    var readout = document.getElementById("so-jump-readout");
+    var W = 640, H = 280, setup = null;
+    var on = true;
+    var cells = ["{", "\"na", "me", "\"", ":", "\"", "Alice", "\"", ",", "\"", "ci", "ty", "\"", ":", "\"", "Paris", "\"", ",", "\"", "ok", "\"", ":", "true", "}"];
+    var promptN = 2; // cells 0..1 are prompt, rest generated
+    function forcedFraction() { return parseFloat(fSlider.value) / 100; }
+    function drawJump() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      fVal.textContent = Math.round(forcedFraction() * 100) + "%";
+      var f = forcedFraction();
+      var gen = cells.slice(promptN);
+      // decide forced flags deterministically: first few after prompt forced, then branch points
+      var forced = gen.map(function (_, i) {
+        var ratio = i / gen.length;
+        return ratio < f; // leading deterministic run, then choices
+      });
+      // build passes
+      var passes = [];
+      if (on) {
+        var i = 0;
+        while (i < gen.length) {
+          var start = i, forcedRun = forced[i];
+          if (forcedRun) { while (i < gen.length && forced[i]) i++; passes.push({ start: start, end: i, n: i - start, jump: true }); }
+          else { passes.push({ start: i, end: i + 1, n: 1, jump: false }); i++; }
+        }
+      } else { gen.forEach(function (_, k) { passes.push({ start: k, end: k + 1, n: 1, jump: false }); }); }
+      ctx.clearRect(0, 0, W, H);
+      var pad = 30, rowH = 40, pitch = 24;
+      function drawCells(rowY, label) {
+        ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(label, pad, rowY - 10);
+        var x = pad, cw = pitch - 3;
+        cells.forEach(function (tk, i) {
+          var isPrompt = i < promptN;
+          ctx.fillStyle = isPrompt ? "#cdd5da" : c.accent400;
+          ctx.globalAlpha = 0.9;
+          ctx.fillRect(x, rowY, cw, 26); ctx.globalAlpha = 1;
+          ctx.fillStyle = isPrompt ? "#4a545b" : "#08343f"; ctx.font = "9px " + c.font; ctx.textAlign = "center";
+          ctx.fillText(tk, x + cw / 2, rowY + 17);
+          x += pitch;
+        });
+      }
+      drawCells(60, "token stream (grey = prompt)");
+      function drawPasses(rowY, label, list) {
+        ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+        ctx.fillText(label, pad, rowY - 10);
+        var x = pad + promptN * pitch;
+        list.forEach(function (p) {
+          var w = p.n * pitch;
+          ctx.fillStyle = p.jump ? c.accent2 : c.accent;
+          ctx.fillRect(x, rowY, Math.max(6, w - 3), 26);
+          ctx.fillStyle = "#fff"; ctx.font = "9.5px " + c.font; ctx.textAlign = "center";
+          ctx.fillText(p.jump ? p.n + " tok" : "", x + w / 2, rowY + 17);
+          x += w;
+        });
+      }
+      drawPasses(130, "forward passes (" + passes.length + ")", passes);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      ctx.strokeRect(pad + 2 * pitch - 2, 52, 3 * pitch, 34);
+      ctx.fillStyle = c.accent2; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      ctx.fillText('after {"na the grammar forces me": — one pass', pad + 2 * pitch, 50);
+      var baseline = gen.length, saved = Math.max(0, baseline - passes.length);
+      var sp = passes.length ? baseline / passes.length : 1;
+      readout.innerHTML =
+        '<div><span class="k">mode:</span> ' + (on ? "jump-forward on" : "baseline, one token per pass") + '</div>' +
+        '<div><span class="k">generated tokens:</span> ' + baseline + '</div>' +
+        '<div><span class="k">forward passes:</span> <span class="hi">' + passes.length + '</span> (baseline ' + baseline + ')</div>' +
+        '<div><span class="k">passes saved:</span> ' + saved + ' · <span class="k">speedup:</span> ' + sp.toFixed(2) + '×</div>' +
+        '<div><span class="k">paper-order gain for JSON:</span> ~' + (DATA.structured_output && DATA.structured_output.jumpForwardSpeedup || 1.6) + '×</div>';
+    }
+    toggle.addEventListener("click", function () { on = !on; toggle.textContent = "Jump-forward: " + (on ? "on" : "off"); toggle.className = on ? "g-primary" : ""; drawJump(); });
+    Guide.bindSliders([fSlider], drawJump);
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawJump(); });
+    drawJump();
+    renders.push(drawJump);
+  })();
+
+  // ---------------------------------------------------------------- demo D: constraint tax
+  (function () {
+    var canvas = document.getElementById("so-tax");
+    var usSlider = document.getElementById("so-tax-us");
+    var tSlider = document.getElementById("so-tax-t");
+    var usVal = document.getElementById("so-tax-us-val");
+    var tVal = document.getElementById("so-tax-t-val");
+    var readout = document.getElementById("so-tax-readout");
+    var W = 640, H = 320, setup = null;
+    function stepMs(kvPerSeq, batch) {
+      return ServingSim.stepTime({ paramsB: 8.03, bytesPerParam: 2, kvBytes: kvPerSeq * batch, bwTBs: 3.35, peakTFLOPs: 989, batch: batch }).memMs;
+    }
+    function kvPerSeq(T) { return ServingSim.kvBytes({ layers: 32, kvHeads: 8, headDim: 128, tokens: T, bytesPerElem: 2, batch: 1 }); }
+    function drawTax() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var us = parseFloat(usSlider.value), T = parseFloat(tSlider.value);
+      usVal.textContent = us + " µs"; tVal.textContent = T;
+      var kv = kvPerSeq(T), maskMs = us / 1000;
+      var series = [], ptsPer = [], ptsShared = [];
+      for (var i = 0; i <= 60; i++) {
+        var B = Math.pow(2, i * 8 / 60); // 1 .. 256
+        var st = stepMs(kv, B);
+        ptsPer.push({ x: Math.log10(B), y: Math.min(1, (maskMs * B) / st) });
+        ptsShared.push({ x: Math.log10(B), y: Math.min(1, maskMs / st) });
+      }
+      series.push({ points: ptsPer, color: c.accent2, width: 2.4 });
+      series.push({ points: ptsShared, color: c.accent, width: 2.4 });
+      Guide.drawLines(ctx, W, H, series, [0, Math.log10(256)], [0, 1], {
+        xLabel: "batch size (log) — 1, 4, 16, 64, 256", yLabel: "mask share of step", padL: 52, padB: 30, padT: 16
+      });
+      ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      var ticks = [1, 4, 16, 64, 256];
+      ctx.fillStyle = c.text;
+      ticks.forEach(function (B) {
+        var X = 52 + (W - 68) * (Math.log10(B) / Math.log10(256));
+        ctx.fillText(String(B), X - 4, H - 14);
+      });
+      ctx.fillStyle = c.accent2; ctx.fillText("per-sequence mask", 60, 30);
+      ctx.fillStyle = c.accent; ctx.fillText("state-shared mask", 60, 44);
+      var s1 = Math.min(1, maskMs / stepMs(kv, 1)), raw256 = maskMs * 256 / stepMs(kv, 256);
+      var shared256 = Math.min(1, maskMs / stepMs(kv, 256));
+      var perTxt = raw256 > 1 ? (raw256 * 100).toFixed(0) + "% (masks exceed the step)" : (raw256 * 100).toFixed(1) + "%";
+      readout.innerHTML =
+        '<div><span class="k">mask cost:</span> ' + us + ' µs/sequence</div>' +
+        '<div><span class="k">B=1:</span> ' + (s1 * 100).toFixed(1) + '% of step (' + stepMs(kv, 1).toFixed(1) + ' ms)</div>' +
+        '<div><span class="k">B=256, per-sequence:</span> <span class="bad">' + perTxt + '</span> (' + (maskMs * 256).toFixed(1) + ' ms of masks)</div>' +
+        '<div><span class="k">B=256, state-shared:</span> ' + (shared256 * 100).toFixed(1) + '%</div>' +
+        '<div><span class="k">takeaway:</span> per-sequence masks grow with B; batch by parser state to amortise</div>';
+    }
+    Guide.bindSliders([usSlider, tSlider], drawTax);
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawTax(); });
+    drawTax();
+    renders.push(drawTax);
+  })();
+
+  // ---------------------------------------------------------------- demo E: engine landscape
+  (function () {
+    var canvas = document.getElementById("so-engines");
+    var readout = document.getElementById("so-engines-readout");
+    var W = 640, H = 250, setup = null;
+    var ENG = [
+      { name: "Naive re-derive/step", value: 100, color: "#b0552d" },
+      { name: "Outlines FSM index", value: 28, color: "#c9a227" },
+      { name: "XGrammar (overlapped)", value: 3, color: "#2b5fff" },
+      { name: "LLGuidance", value: 5, color: "#93aefe" }
+    ];
+    function drawEng() {
+      if (!setup) return;
+      var ctx = setup.ctx, c = Guide.colors();
+      var data = ENG.map(function (e) { return { label: e.name, value: e.value, valueLabel: e.value + "%", color: e.color }; });
+      Guide.drawBars(ctx, W, H, data, { maxV: 100, padL: 170, padR: 44, gap: 14, fontSize: 12 });
+      readout.innerHTML =
+        '<div><span class="k">relative per-token mask cost</span> (naive = 100%)</div>' +
+        '<div>Outlines made FSM indexing cheap; XGrammar overlaps mask work with GPU execution and reports up to 100&times; over prior solutions and near-zero end-to-end overhead; LLGuidance is a low-latency Rust implementation.</div>' +
+        '<div><span class="k">engines in the numbers file:</span> ' + ((DATA.structured_output && DATA.structured_output.engines) || FALLBACK.structured_output.engines).join(", ") + '</div>';
+    }
+    setup = Guide.setupCanvas(canvas, W, H, function () { if (setup) drawEng(); });
+    drawEng();
+    renders.push(drawEng);
+  })();
+
+  // ---------------------------------------------------------------- static readouts / sources
+  function setStatic() {
+    var so = DATA.structured_output || FALLBACK.structured_output;
+    var us = so.maskOverheadUs || [40, 150];
+    var el = document.getElementById("so-compile-readout");
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">compile once:</span> regex/schema → grammar → per-state transition table</div>' +
+        '<div><span class="k">precompute:</span> state → vocabulary bitmask (18.3 KB per state, shared across sequences in that state)</div>' +
+        '<div><span class="k">per token:</span> look up the mask for the current state, AND it into the logits, sample</div>' +
+        '<div><span class="k">uncompiled cost:</span> ' + us[0] + '–' + us[1] + ' µs per sequence per step (illustrative band)</div>';
+    }
+    var e2 = document.getElementById("so-source");
+    if (e2) e2.textContent = so.source;
+    var e3 = document.getElementById("so-jump-source");
+    if (e3) e3.textContent = so.source;
+    var e4 = document.getElementById("so-tax-source");
+    if (e4) e4.textContent = "Mask overhead band " + us[0] + "–" + us[1] + " µs from the numbers file; step time modelled as (weights + KV×B)/3.35 TB/s for Llama 3.1 8B at 989 TFLOP/s. Illustrative, not a vendor benchmark.";
+  }
+  renders.push(setStatic);
+
+  refresh();
+  fetch(window.SO_JSON_URL).then(function (r) { return r.json(); }).then(function (d) { DATA = d; refresh(); }).catch(function () { /* fallback already rendered */ });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

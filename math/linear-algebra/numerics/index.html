@@ -1,0 +1,525 @@
+---
+title: "Linear Algebra, Interactively — Part 19: Conditioning, stability, and cost"
+description: "A tiny change in the right-hand side can move the solution a long way, and the ratio of singular values tells you exactly how far and which algorithm to trust."
+permalink: "/math/linear-algebra/numerics/"
+section: "math"
+series: "linear_algebra"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .nu-note { font-size: 12.5px; opacity: 0.78; line-height: 1.55; margin: 4px 0 0; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.linear_algebra %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Linear algebra</span>
+    <h1>Conditioning, stability, and cost</h1>
+    <p>Every result so far has been exact: a matrix either has an inverse or it does not, a system either has a solution or it does not. Real computation does not get that luxury. Entries are stored to a finite number of digits, the right-hand side is measured rather than dictated, and the answer is only as trustworthy as the ratio of the largest stretch to the smallest. This part is about that ratio. It is called the condition number, and it decides both how wrong a solution can be and which decomposition you should pay for.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">When the data wobbles, how much does the answer wobble?</p>
+    <p>Solving <var>A x = b</var> is a map in two directions. Forward, <var>A</var> takes an input <var>x</var> and produces an output <var>b</var>; if <var>A</var> squashes some direction almost to nothing, then different inputs can produce nearly the same output, and the map is hard to read backwards. Backward, we invert: <var>x = A<sup>−1</sup>b</var>. The same squashing now becomes a huge stretching, so a small error in <var>b</var> arrives at <var>x</var> magnified. Conditioning is the size of that magnification.</p>
+    <p>This is not a defect of any particular algorithm. Even if you could solve the system exactly, an uncertainty of one part in a thousand in <var>b</var> would still come out as an uncertainty in <var>x</var> that the matrix controls, not the method. What an algorithm can and cannot change is the extra error it introduces on top of that floor. A stable algorithm leaves the floor alone; an unstable route, or a careless rearrangement like the normal equations, raises the floor by orders of magnitude. The two ideas &mdash; how badly conditioned the problem is, and how faithfully a method solves it &mdash; are the whole of numerical linear algebra, and keeping them apart is the point of this part.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the single number <var>&kappa;(A) = &sigma;<sub>max</sub>/&sigma;<sub>min</sub></var> predicts how far a small change in <var>b</var> can move <var>x</var>, why forming <var>A<sup>ᵀ</sup>A</var> squares it, and why the cost table for LU, Cholesky, QR, eigen and SVD is really a table of which deceptions you are allowed to get away with.</span></div>
+    <div class="g-toc">
+      <a href="#amplify">2 · The magnification</a>
+      <a href="#condition">3 · The condition number</a>
+      <a href="#normal">4 · Squared by the normal equations</a>
+      <a href="#cost">5 · What each decomposition costs</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="amplify">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>A small change with a large echo</h2></div>
+    <p class="g-eyebrow">Watch one perturbation get amplified</p>
+    <p>Here is the effect in a single picture. The faint ellipse is the image of the unit circle under <var>A<sup>−1</sup></var>: the set of all answers <var>x = A<sup>−1</sup>b</var> as <var>b</var> runs around the unit circle. Its long semi-axis is <var>1/&sigma;<sub>min</sub></var> and its short semi-axis is <var>1/&sigma;<sub>max</sub></var>, so the more lopsided the ellipse, the more the inverse can amplify. The two dashed spokes are those axes. Drag the conditioning slider toward zero and watch the ellipse stretch into a needle: the matrix is collapsing one direction in the output, and the inverse is doing the opposite.</p>
+    <p>The two solid arrows make the warning concrete. Start with a target <var>b</var>, solve for the exact <var>x</var>, then nudge <var>b</var> by a small amount <var>&Delta;b</var> and solve again. The move from <var>x</var> to <var>x + &Delta;x</var> is the dashed arrow, and the readout compares its relative size to the relative size of the nudge. The perturbation is deliberately aimed along the direction the matrix squeezes hardest, which is where the amplification is worst. Edit the entries of <var>A</var> if you like; the picture recomputes the ellipse and the answers from scratch.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="nu-amp-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">A small change <var>&Delta;b</var> (aimed along the weakest direction) produces the dashed jump <var>&Delta;x</var>. The ellipse is the unit circle seen through <var>A<sup>−1</sup></var>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Conditioning family <var>A</var> = <var>R</var>·diag(1, <var>t</var>)·<var>R</var><sup>ᵀ</sup> <span class="val">0.15</span></label><input type="range" id="nu-t" min="0.05" max="1" step="0.01" value="0.15"></div>
+        <div class="g-field"><label>Matrix <var>A</var></label><div id="nu-A"></div></div>
+        <div class="g-field"><label>Relative nudge in <var>b</var> <span class="val">0.02</span></label><input type="range" id="nu-eps" min="0.001" max="0.1" step="0.001" value="0.02"></div>
+        <div class="g-readout" id="nu-amp-readout"></div>
+      </div>
+    </div>
+    <p>The rule the demo is checking is the standard error bound. If <var>&Delta;b</var> is the only uncertainty, then up to a term that vanishes when <var>&Delta;b</var> is truly small,</p>
+    <div class="g-math g-katex">$$\frac{\lVert \Delta x\rVert}{\lVert x\rVert}\;\le\;\kappa(A)\,\frac{\lVert \Delta b\rVert}{\lVert b\rVert}.$$</div>
+    <p>Push the conditioning slider to its extreme and the observed amplification in the readout approaches the condition number. That is the sense in which <var>&kappa;(A)</var> is the worst case: for most perturbations you get less, but for one special direction <var>&Delta;b</var> you get exactly the bound. There is a mirror bound for a perturbation of the matrix itself, and it scales the same way.</p>
+  </section>
+
+  <section class="g-step" id="condition">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The condition number</h2></div>
+    <p class="g-eyebrow">One ratio, read straight off the SVD</p>
+    <p>The ellipses of <a href="{{ '/math/linear-algebra/svd/' | relative_url }}">Part 16</a> already contain the answer. Every matrix sends the unit circle to an ellipse whose semi-axes are the singular values <var>&sigma;<sub>1</sub> &ge; &sigma;<sub>2</sub> &ge; &hellip; &ge; &sigma;<sub>n</sub> &ge; 0</var>, and those numbers describe the largest and smallest stretches the matrix can apply. The condition number is their ratio:</p>
+    <div class="g-math g-katex">$$\kappa(A)=\frac{\sigma_{\max}}{\sigma_{\min}}=\lVert A\rVert_2\,\lVert A^{-1}\rVert_2 .$$</div>
+    <p>Read it as a statement about directions. The matrix can stretch some input direction by <var>&sigma;<sub>max</sub></var> and another by only <var>&sigma;<sub>min</sub></var>, so the inverse must divide by <var>&sigma;<sub>min</sub></var> and therefore multiplies by at least <var>1/&sigma;<sub>min</sub></var>. A condition number of one is the best possible: rotations and reflections change nothing about lengths, so their ellipses are circles and the inverse is as tame as the map. The identity has <var>&kappa; = 1</var>. As <var>&sigma;<sub>min</sub> &rarr; 0</var> the ellipse flattens and <var>&kappa; &rarr; &infin;</var> exactly as <var>A</var> becomes singular.</p>
+    <p>Three properties make <var>&kappa;</var> the right summary. It is scale invariant, because doubling every entry of <var>A</var> doubles the numerator and the denominator together. It is the exact worst-case amplification above, so it is a fact about the matrix and not about any solver. And it is the number of digits you lose. In floating point with about sixteen decimal digits, a solve whose condition number is <var>10<sup>k</sup></var> can surrender up to <var>k</var> of them, leaving roughly <var>16 &minus; k</var> trustworthy digits in <var>x</var>. A perfectly stable algorithm still pays that toll; a careless one can pay twice.</p>
+    <p>That distinction is worth naming precisely, because the two failure modes get blamed on each other. <strong>Backward error</strong> asks how much you would have to change the input to make your computed answer exact for the changed input. A stable algorithm keeps that change at the level of rounding, regardless of <var>&kappa;</var>. <strong>Forward error</strong> asks how far your answer is from the true one, and it is bounded by the backward error times the condition number. So the condition number is a property of the problem, stability is a property of the algorithm, and the forward error is the product. QR and LU are backward stable; forming <var>A<sup>ᵀ</sup>A</var> is not, and the next demo shows what it costs.</p>
+  </section>
+
+  <section class="g-step" id="normal">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Squared by the normal equations</h2></div>
+    <p class="g-eyebrow">The one rearrangement you should never make</p>
+    <p>When <var>A x = b</var> has no exact solution, <a href="{{ '/math/linear-algebra/least-squares/' | relative_url }}">Part 10</a> turned the problem into a projection and wrote down the normal equations <var>A<sup>ᵀ</sup>A x = A<sup>ᵀ</sup>b</var>. Algebraically they are perfect. Numerically they are a trap, and the reason is one line from the SVD: squaring the matrix squares the singular values, so the condition number squares too.</p>
+    <div class="g-math g-katex">$$\kappa(A^{\mathsf T}A)=\frac{\sigma_{\max}^2}{\sigma_{\min}^2}=\kappa(A)^2 .$$</div>
+    <p>If <var>A</var> has <var>&kappa; = 10<sup>4</sup></var> &mdash; a mild loss of about four digits on its own &mdash; then <var>A<sup>ᵀ</sup>A</var> has <var>&kappa; = 10<sup>8</sup></var> before you have solved anything at all. The QR route of <a href="{{ '/math/linear-algebra/orthogonality/' | relative_url }}">Part 9</a> never forms that product. It factors <var>A = Q R</var> with <var>Q</var> orthogonal, solves <var>R x = Q<sup>ᵀ</sup>b</var>, and keeps the condition number at <var>&kappa;(A)</var> instead of <var>&kappa;(A)<sup>2</sup></var>.</p>
+    <p>The chart below checks the claim numerically. It builds matrices whose conditioning exponent <var>p</var> means <var>&kappa;(A) = 10<sup>p</sup></var>, then measures the relative error of two solves: <code>solve(A, b)</code> against the normal equations <code>solve(AᵀA, Aᵀb)</code>. On log&ndash;log axes a straight line means a power law, and the slope is the exponent. The stable line climbs with slope one; the normal-equations line climbs with slope two, then leaves the top of the plot. The vertical axis is the true computed error, so its position is not fixed &mdash; but its slope is, and the slope is the lesson.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="nu-ne-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Relative error of <var>x</var> against the conditioning exponent <var>p</var>, where <var>&kappa;(A) = 10<sup>p</sup></var>. Slope one is the stable solve; slope two is the normal equations.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Conditioning exponent <var>p</var> <span class="val">4</span></label><input type="range" id="nu-p" min="0" max="8" step="0.25" value="4"></div>
+        <div class="g-readout" id="nu-ne-readout"></div>
+      </div>
+    </div>
+    <p>Two practical corollaries follow. First, if you must use the normal equations because <var>A<sup>ᵀ</sup>A</var> is all you can afford to form &mdash; which happens constantly in large sparse problems &mdash; then at least solve the resulting symmetric positive-definite system with Cholesky and never invert it. You have already paid the condition-number tax; do not pay an instability tax as well. Second, the same squaring is why ridge regularisation works: adding <var>&lambda;<sup>2</sup>I</var> lifts every squared singular value by <var>&lambda;<sup>2</sup></var>, capping the condition number at <var>&sigma;<sub>max</sub><sup>2</sup>/&lambda;<sup>2</sup></var> and buying back the digits at the cost of a little bias, as <a href="{{ '/math/linear-algebra/pseudoinverse/' | relative_url }}">Part 18</a> showed.</p>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>What each decomposition costs</h2></div>
+    <p class="g-eyebrow">Accuracy is not free, and neither is robustness</p>
+    <p>Conditioning tells you which algorithms are trustworthy. Cost tells you which ones you can afford. For an <var>n &times; n</var> dense matrix the leading term of every classical method is proportional to <var>n<sup>3</sup></var>, and the differences live entirely in the constant. LU elimination is about <var>2n<sup>3</sup>/3</var> operations; if the matrix is symmetric positive definite, Cholesky halves that to <var>n<sup>3</sup>/3</var>. A Householder QR is about <var>2n<sup>3</sup></var>. A symmetric eigendecomposition runs to roughly <var>9n<sup>3</sup></var> once eigenvectors are included, and a full SVD to something like <var>12n<sup>3</sup></var>, which is why you compute one only when the singular values themselves are the point.</p>
+    <p>Those constants are why the choice of method is a choice about structure, not just speed. Drag the slider to change <var>n</var> and read the counts off the chart. Because everything scales as <var>n<sup>3</sup></var>, the lines are parallel on log&ndash;log axes and their vertical gaps are the ratios of the constants: Cholesky is roughly thirty-six times cheaper than a full SVD, QR about three times more expensive than LU. Structure is the only thing that breaks the pattern; a banded or sparse matrix can drop below <var>n<sup>3</sup></var> entirely, which is exactly why the applications below care.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="nu-cost-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Leading-order operation counts as functions of <var>n = 2<sup>p</sup></var>, on log&ndash;log axes. The marker follows the slider.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Size exponent <var>p</var>, <var>n = 2<sup>p</sup></var> <span class="val">10</span></label><input type="range" id="nu-n" min="2" max="13" step="1" value="10"></div>
+        <div class="g-readout" id="nu-cost-readout"></div>
+      </div>
+    </div>
+    <div class="g-table-wrap">
+    <table class="g-cheat" style="margin-top:18px;">
+      <thead><tr><th>Decomposition</th><th>Use it when</th><th>Leading cost</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td>Cholesky</td><td><var>A</var> is symmetric positive definite &mdash; including a well-conditioned <var>A<sup>ᵀ</sup>A</var></td><td><var>n<sup>3</sup>/3</var></td><td>Fails at once if <var>A</var> is not positive definite; squares <var>&kappa;</var> when applied to a Gram matrix.</td></tr>
+        <tr><td>LU (with pivoting)</td><td>A general square nonsingular system, or repeated solves with the same <var>A</var></td><td><var>2n<sup>3</sup>/3</var></td><td>Partial pivoting is essential; near-singular pivots are the visible symptom of conditioning.</td></tr>
+        <tr><td>QR</td><td>Rectangular or least-squares problems; any time you would otherwise form <var>A<sup>ᵀ</sup>A</var></td><td><var>2n<sup>3</sup></var></td><td>Keeps the condition number of <var>A</var>, not its square &mdash; the safe default for least squares.</td></tr>
+        <tr><td>Symmetric eigen</td><td>Quadratic forms, covariance matrices, PCA, vibration modes</td><td><var>~9n<sup>3</sup></var></td><td>Only for symmetric matrices; eigenvectors cost more than eigenvalues alone.</td></tr>
+        <tr><td>SVD</td><td>Conditioning, rank, pseudoinverse, low-rank approximation &mdash; when the singular values are wanted</td><td><var>~12n<sup>3</sup></var></td><td>The most robust and the most expensive; use one-sided iteration near singularity, never <var>eig(A<sup>ᵀ</sup>A)</var>.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="nu-note">Costs are leading-order flop counts for dense square matrices and the constants vary with the implementation; the ordering, not the third digit, is the thing to remember.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One ratio, two worlds</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Why bundle adjustment avoids the normal equations</h3>
+        <p style="margin-bottom:0;">A structure-from-motion problem has one camera block that is nearly singular whenever a camera has little parallax, so the reduced system <var>J<sup>ᵀ</sup>J</var> is exactly the squared-condition-number trap. Practical solvers either factor the sparse Jacobian with QR or run Cholesky on the reduced system with careful damping, and they always keep a trust region so the step stays finite. The <a href="{{ '/vision/nonlinear-optimization/pose-graph/' | relative_url }}">pose-graph part</a> of the optimization guide works through the same reduced system and its gauge freedom.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Mixed precision and ill-conditioned layers</h3>
+        <p style="margin-bottom:0;">Low-precision matrix multiplies are only safe while the matrices stay well-conditioned; when a weight matrix or an attention block is nearly low-rank, the rounding that mixed precision tolerates quietly becomes a large forward error, and the loss curve spikes. That is why large training runs keep sensitive reductions in higher precision and monitor scale factors, and why quantisation of an ill-conditioned layer is where accuracy is lost first &mdash; see <a href="{{ '/ai/llm-training/scaling/' | relative_url }}">training at scale</a> and <a href="{{ '/ai/llm-serving/quantization/' | relative_url }}">quantisation</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <ul class="g-refs">
+      <li>Grant Sanderson, <a href="https://www.youtube.com/watch?v=P5mlg91as1c">"Singular value decomposition"</a>, <em>Essence of Linear Algebra</em>, 3Blue1Brown &mdash; the ellipse whose axes become <var>&sigma;<sub>max</sub></var> and <var>&sigma;<sub>min</sub></var>, and therefore <var>&kappa;(A)</var>.</li>
+      <li>Gilbert Strang, <a href="https://ocw.mit.edu/courses/18-06-linear-algebra-spring-2010/">18.06 Linear Algebra</a>, MIT OpenCourseWare &mdash; Lecture 12 on graphs and networks, and Lectures 29&ndash;30 on the SVD and its numerical behaviour.</li>
+      <li>Lloyd N. Trefethen and David Bau III, <em>Numerical Linear Algebra</em>, Lectures 12 and 15 &mdash; condition numbers and the conditioning of least-squares problems, including the normal-equations warning.</li>
+      <li>Cleve Moler, <em>Numerical Computing with MATLAB</em>, chapter 2 &mdash; a short, practical account of roundoff, pivoting and why the condition number predicts lost digits.</li>
+      <li>Denim Patel, <a href="{{ 'https://denimpatel.github.io/AI/vision/notes/linear-algebra/' | relative_url }}">Linear Algebra</a> &mdash; the original link-only note that led to this series.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A ratio tells you how far a small error can travel &mdash; but the maps that never amplify it at all are the ones built from length-preserving rotations.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.linear_algebra teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var LA = LinAlg;
+
+  function el(id) { return document.getElementById(id); }
+  function fx(x, d) {
+    if (x == null || isNaN(x) || !isFinite(x)) return '∞';
+    d = d == null ? 3 : d;
+    var v = Math.abs(x) < 1e-12 ? 0 : x;
+    var s = v.toFixed(d);
+    if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s;
+  }
+  function sci(x) {
+    if (x == null || !isFinite(x)) return '∞';
+    if (x === 0) return '0';
+    var e = Math.floor(Math.log10(Math.abs(x)));
+    var m = x / Math.pow(10, e);
+    return m.toFixed(1) + '×10' + sup(e);
+  }
+  function sup(e) {
+    var map = { '-': '⁻', '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹' };
+    return String(e).split('').map(function (ch) { return map[ch] || ch; }).join('');
+  }
+  function fmtVec(v) {
+    if (!v) return '—';
+    return '(' + v.map(function (x) { return fx(x, 3); }).join(', ') + ')';
+  }
+  function relErr(x, xt) {
+    if (!x || x.some(function (q) { return !isFinite(q); })) return Infinity;
+    return LA.vnorm(LA.vsub(x, xt)) / (LA.vnorm(xt) || 1);
+  }
+  function safeLog(x) {
+    if (!isFinite(x)) return 1;
+    return Math.log10(Math.max(1e-17, x));
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — error amplification, and the ellipse of the inverse
+  // ------------------------------------------------------------------
+  var TH = 0.6, CT = Math.cos(TH), ST = Math.sin(TH);
+  function famA(t) {
+    return [[CT * CT + t * ST * ST, CT * ST * (1 - t)],
+            [CT * ST * (1 - t),     ST * ST + t * CT * CT]];
+  }
+  var A = famA(0.15);
+  var XTRUE = [0.8, 1.1];
+  var bVec = LA.mat.mulVec(A, XTRUE);
+  var relb = 0.02;
+  var ampPlane = null, ampInput = null;
+
+  function syncB() { bVec = LA.mat.mulVec(A, XTRUE); }
+
+  function ampState() {
+    var inv = LA.mat.inverse(A);
+    var kappa = LA.mat.cond(A);
+    var sv = LA.mat.svd(A);
+    var k = sv.S.length;
+    var uMin = null;
+    if (k) uMin = sv.U.map(function (row) { return row[k - 1]; });
+    var nb = LA.vnorm(bVec) || 1;
+    var db = uMin ? LA.vscale(uMin, relb * nb) : [0, 0];
+    var xNew = LA.mat.solve(A, LA.vadd(bVec, db));
+    var dx = xNew ? LA.vsub(xNew, XTRUE) : null;
+    return { inv: inv, kappa: kappa, db: db, xNew: xNew, dx: dx, sv: sv };
+  }
+
+  function drawAmp() {
+    if (!ampPlane) return;
+    var st = ampState();
+    ampPlane.clear();
+    ampPlane.grid(null, { step: 1 });
+    ampPlane.axes();
+
+    if (st.inv) {
+      ampPlane.ellipse(st.inv, { color: c.accent400, width: 1.8, fill: 'rgba(93,133,253,0.08)', samples: 220 });
+      var kk = st.sv.S.length;
+      if (kk) {
+        var vMax = st.sv.V.map(function (row) { return row[0]; });
+        var vMin = st.sv.V.map(function (row) { return row[kk - 1]; });
+        var sMax = st.sv.S[0] || 1, sMin = st.sv.S[kk - 1];
+        ampPlane.vector(LA.vscale(vMax, 1 / sMax), { color: 'rgba(32,30,29,0.35)', width: 1.3, dashed: true, head: 6 });
+        if (sMin > 1e-12) {
+          ampPlane.vector(LA.vscale(vMin, 1 / sMin), { color: 'rgba(214,0,108,0.45)', width: 1.5, dashed: true, head: 6, label: '1/σmin' });
+        }
+      }
+    }
+
+    ampPlane.vector(XTRUE, { color: c.accent, label: 'x', width: 2.6 });
+    if (st.xNew) {
+      ampPlane.vector(st.xNew, { color: c.accent2, label: 'x + Δx', width: 3 });
+      ampPlane.vector(st.dx, { from: XTRUE, color: c.accent700, width: 2, dashed: true, head: 8 });
+    }
+
+    var re = st.xNew ? relErr(st.xNew, XTRUE) : Infinity;
+    var bound = st.kappa * relb;
+    var kappaTxt = isFinite(st.kappa) ? fx(st.kappa, 2) : '∞ (singular)';
+    el('nu-amp-readout').innerHTML =
+      '<div><span class="k">κ(A)</span> <span class="hi">' + kappaTxt + '</span></div>' +
+      '<div><span class="k">‖Δb‖ / ‖b‖</span> ' + fx(relb, 3) + '</div>' +
+      '<div><span class="k">‖Δx‖ / ‖x‖</span> <span class="hi">' + (st.xNew ? fx(re, 4) : '∞') + '</span></div>' +
+      '<div><span class="k">bound κ·‖Δb‖/‖b‖</span> ' + (isFinite(bound) ? fx(bound, 4) : '∞') + '</div>' +
+      '<div><span class="k">observed amplification</span> ' + (st.xNew ? fx(re / relb, 2) : '∞') + '×</div>' +
+      '<div style="margin-top:6px;">' + LA.matrixHTML([[bVec[0]], [bVec[1]]], { digits: 3, label: 'b =' }) + '</div>' +
+      (!st.inv ? '<div class="bad">A is singular here — the inverse ellipse and Δx are undefined.</div>' : '');
+  }
+
+  ampPlane = LA.plane(el('nu-amp-canvas'), { xRange: [-10, 10], yRange: [-5.6, 5.6], W: 640, H: 360, onResize: drawAmp });
+  ampInput = LA.matrixInput(el('nu-A'), A, function () { syncB(); drawAmp(); }, { digits: 3, step: '0.05' });
+
+  Guide.bindSliders([el('nu-t')], function (s) {
+    A = famA(parseFloat(s.value));
+    ampInput.set(A); ampInput.rebuild();
+    syncB(); drawAmp();
+  });
+  Guide.bindSliders([el('nu-eps')], function (s) { relb = parseFloat(s.value); drawAmp(); });
+  syncB();
+  drawAmp();
+
+  // ------------------------------------------------------------------
+  // Demo B — normal equations square the condition number
+  // ------------------------------------------------------------------
+  var BCT = Math.cos(TH), BST = Math.sin(TH);
+  function famB(p) {
+    var t = Math.pow(10, -p);
+    return [[BCT * BCT + t * BST * BST, BCT * BST * (1 - t)],
+            [BCT * BST * (1 - t),       BST * BST + t * BCT * BCT]];
+  }
+  var bExp = 4;
+  var neCtx = null;
+
+  function neModel(p) {
+    var M = famB(p);
+    var xt = [1, 1];
+    var b = LA.mat.mulVec(M, xt);
+    var xDir = LA.mat.solve(M, b);
+    var At = LA.mat.transpose(M);
+    var N = LA.mat.mul(At, M);
+    var rhs = LA.mat.mulVec(At, b);
+    var xNorm = LA.mat.solve(N, rhs);
+    return {
+      M: M, N: N,
+      kappa: LA.mat.cond(M),
+      condN: LA.mat.cond(N),
+      eDir: relErr(xDir, xt),
+      eNorm: relErr(xNorm, xt),
+      xDir: xDir, xNorm: xNorm, b: b
+    };
+  }
+
+  function drawNE() {
+    if (!neCtx) return;
+    var xr = [0, 8], yr = [-17, 1];
+    var ptsD = [], ptsN = [];
+    for (var p = 0; p <= 8.001; p += 0.25) {
+      var m = neModel(p);
+      var ed = Math.max(1e-17, m.eDir), en = Math.max(1e-17, m.eNorm);
+      ptsD.push({ x: p, y: Math.log10(isFinite(ed) ? ed : 1) });
+      ptsN.push({ x: p, y: Math.log10(isFinite(en) ? en : 1) });
+    }
+    var out = Guide.drawLines(neCtx, 640, 340, [
+      { points: ptsN, color: c.accent2, width: 2.6 },
+      { points: ptsD, color: c.accent, width: 2.6 }
+    ], xr, yr, { xLabel: 'conditioning exponent p   (κ(A) = 10ᵖ)', yLabel: 'log₁₀ relative error' });
+
+    // reference slopes through the roundoff floor
+    var ctx = neCtx;
+    function guide(slope, color, label) {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.1; ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      for (var i = 0; i <= 40; i++) {
+        var p = xr[0] + (xr[1] - xr[0]) * i / 40;
+        var y = -16 + slope * p;
+        if (y < yr[0] || y > yr[1]) { ctx.stroke(); ctx.beginPath(); continue; }
+        var X = out.px(p), Y = out.py(y);
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.stroke(); ctx.setLineDash([]);
+      var lx = 5.6, ly = -16 + slope * lx;
+      if (ly >= yr[0] && ly <= yr[1]) {
+        ctx.fillStyle = color; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(label, out.px(lx) + 4, out.py(ly) - 4);
+      }
+    }
+    guide(1, 'rgba(43,95,255,0.35)', 'slope 1');
+    guide(2, 'rgba(214,0,108,0.35)', 'slope 2');
+
+    var cur = neModel(bExp);
+    var X = out.px(bExp);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.22; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(X, out.py(yr[1])); ctx.lineTo(X, out.py(yr[0])); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(X, out.py(Math.max(yr[0], safeLog(cur.eDir))), 4.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(X, out.py(Math.max(yr[0], safeLog(cur.eNorm))), 4.5, 0, 2 * Math.PI); ctx.fill();
+
+    // legend
+    ctx.font = '11.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.fillRect(out.padL + 10, out.padT + 14, 16, 3);
+    ctx.fillStyle = c.text; ctx.fillText('stable solve(A, b)', out.padL + 32, out.padT + 20);
+    ctx.fillStyle = c.accent2; ctx.fillRect(out.padL + 10, out.padT + 32, 16, 3);
+    ctx.fillStyle = c.text; ctx.fillText('normal equations solve(AᵀA, Aᵀb)', out.padL + 32, out.padT + 38);
+
+    var ratio = (isFinite(cur.condN) && isFinite(cur.kappa)) ? cur.condN / (cur.kappa * cur.kappa) : NaN;
+    el('nu-ne-readout').innerHTML =
+      '<div><span class="k">κ(A)</span> ' + sci(cur.kappa) + ' &nbsp; <span class="k">κ(AᵀA)</span> <span class="hi">' + sci(cur.condN) + '</span></div>' +
+      '<div><span class="k">κ(AᵀA) / κ(A)²</span> ' + (isFinite(ratio) ? fx(ratio, 2) : '—') + '</div>' +
+      '<div><span class="k">rel. error, solve(A, b)</span> <span class="hi">' + fx(cur.eDir, 4) + '</span></div>' +
+      '<div><span class="k">rel. error, normal equations</span> <span class="bad">' + fx(cur.eNorm, 4) + '</span></div>' +
+      '<div><span class="k">error ratio</span> ' + (cur.eDir > 0 && isFinite(cur.eNorm) ? fx(cur.eNorm / cur.eDir, 1) + '×' : '—') + '</div>';
+  }
+
+  var neSetup = Guide.setupCanvas(el('nu-ne-canvas'), 640, 340, drawNE);
+  neCtx = neSetup.ctx;
+  Guide.bindSliders([el('nu-p')], function (s) { bExp = parseFloat(s.value); drawNE(); });
+  drawNE();
+
+  // ------------------------------------------------------------------
+  // Demo C — leading-order operation counts
+  // ------------------------------------------------------------------
+  var costCtx = null, nExp = 10;
+  var METHODS = [
+    { key: 'chol', label: 'Cholesky', coef: 1 / 3, color: '#5f8a3a' },
+    { key: 'lu',   label: 'LU',       coef: 2 / 3, color: c.accent },
+    { key: 'qr',   label: 'QR',       coef: 2,     color: c.accent400 },
+    { key: 'eig',  label: 'Sym. eigen', coef: 9,   color: c.accent700 },
+    { key: 'svd',  label: 'SVD',      coef: 12,    color: c.accent2 }
+  ];
+  function costAt(coef, n) { return coef * n * n * n; }
+
+  function drawCost() {
+    if (!costCtx) return;
+    var ctx = costCtx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 54, padR = 18, padT = 16, padB = 40;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var pMin = 2, pMax = 13, yMin = 1, yMax = 14;
+    function PX(p) { return padL + plotW * (p - pMin) / (pMax - pMin); }
+    function PY(l) { return padT + plotH * (1 - (l - yMin) / (yMax - yMin)); }
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.mono;
+    for (var p = 2; p <= 13; p++) {
+      var X = PX(p);
+      ctx.strokeStyle = 'rgba(32,30,29,0.07)';
+      ctx.beginPath(); ctx.moveTo(X, padT); ctx.lineTo(X, padT + plotH); ctx.stroke();
+      ctx.textAlign = 'center';
+      ctx.fillText('2' + sup(p), X, padT + plotH + 14);
+    }
+    ctx.textAlign = 'center'; ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.fillText('n = 2ᵖ', padL + plotW / 2, H - 4);
+    ctx.save(); ctx.translate(12, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center'; ctx.fillText('operations (flops)', 0, 0); ctx.restore();
+
+    METHODS.forEach(function (mth) {
+      ctx.strokeStyle = mth.color; ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      for (var i = 0; i <= 60; i++) {
+        var pp = pMin + (pMax - pMin) * i / 60;
+        var l = Math.log10(costAt(mth.coef, Math.pow(2, pp)));
+        var X = PX(pp), Y = PY(Math.max(yMin, Math.min(yMax, l)));
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.stroke();
+    });
+
+    var n = Math.pow(2, nExp), Xc = PX(nExp);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.22; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(Xc, padT); ctx.lineTo(Xc, padT + plotH); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    METHODS.forEach(function (mth) {
+      var y = costAt(mth.coef, n);
+      var Y = PY(Math.max(yMin, Math.min(yMax, Math.log10(y))));
+      ctx.fillStyle = mth.color; ctx.beginPath(); ctx.arc(Xc, Y, 4, 0, 2 * Math.PI); ctx.fill();
+    });
+
+    // legend box
+    var lx = padL + 10, ly = padT + 12;
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    METHODS.forEach(function (mth, i) {
+      var yy = ly + i * 15;
+      ctx.fillStyle = mth.color; ctx.fillRect(lx, yy - 4, 14, 3);
+      ctx.fillStyle = c.text; ctx.fillText(mth.label, lx + 20, yy);
+    });
+
+    var rows = METHODS.map(function (mth) {
+      var y = costAt(mth.coef, n);
+      return '<div><span class="k">' + mth.label + '</span> ' + sci(y) + ' flops</div>';
+    }).join('');
+    var svdChol = costAt(12, n) / costAt(1 / 3, n);
+    var qrLu = costAt(2, n) / costAt(2 / 3, n);
+    el('nu-cost-readout').innerHTML =
+      '<div><span class="k">n = 2<sup>' + nExp + '</sup></span> <span class="hi">' + Guide.fmtNum(n) + '</span></div>' +
+      rows +
+      '<div style="margin-top:6px;"><span class="k">QR / LU</span> ' + fx(qrLu, 1) + '× &nbsp; <span class="k">SVD / Cholesky</span> ' + fx(svdChol, 0) + '×</div>';
+  }
+
+  var costSetup = Guide.setupCanvas(el('nu-cost-canvas'), 640, 340, drawCost);
+  costCtx = costSetup.ctx;
+  Guide.bindSliders([el('nu-n')], function (s) { nExp = parseInt(s.value, 10); drawCost(); });
+  drawCost();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'num-backward-stable',
+      kind: 'choice',
+      prompt: 'A "backward stable" algorithm solves <var>Ax = b</var>. What does that guarantee, and what does it NOT guarantee?',
+      options: [
+        { label: 'It keeps the extra error it introduces at the level of rounding, but the forward error can still be large if κ(A) itself is large — that floor is a property of the problem, not the algorithm.', correct: true },
+        { label: 'It guarantees the computed x is close to the true x no matter how ill-conditioned A is.', correct: false },
+        { label: 'It guarantees κ(A) = 1 for every matrix it is applied to.', correct: false }
+      ],
+      explanation: 'Backward error asks how much you would have to perturb the input to make your computed answer exact for that perturbed input; a stable algorithm keeps that at rounding level regardless of κ(A). Forward error is bounded by backward error times κ(A), so even a perfectly stable algorithm can have a large forward error on an ill-conditioned problem — that error floor is a property of the problem, not the method.'
+    },
+    {
+      id: 'num-normal-danger',
+      kind: 'choice',
+      prompt: 'Why does the page call forming <var>A&#7488;A</var> to solve least squares "the one rearrangement you should never make"?',
+      options: [
+        { label: 'Squaring the matrix squares its condition number, κ(AᵀA) = κ(A)², so a mild loss of digits in A becomes a severe one in AᵀA before you have even solved anything.', correct: true },
+        { label: 'AᵀA is not symmetric, so standard solvers cannot be applied to it at all.', correct: false },
+        { label: 'Forming AᵀA is mathematically incorrect — the normal equations do not actually characterize the least-squares solution.', correct: false }
+      ],
+      explanation: 'κ(AᵀA) = σ_max²/σ_min² = κ(A)². A matrix with κ(A) = 10⁴ — already a four-digit loss — becomes κ(AᵀA) = 10⁸ once squared. QR avoids this entirely by factoring A directly and never forming the product, which is why it is the safe default for least squares.'
+    },
+    {
+      id: 'num-kappa-squared',
+      kind: 'numeric',
+      prompt: 'If a matrix <var>A</var> has condition number <var>&kappa;(A) = 10&#8308;</var>, what is <var>&kappa;(A&#7488;A)</var>, using <var>&kappa;(A&#7488;A) = &kappa;(A)&sup2;</var>?',
+      answer: 100000000,
+      relativeTolerance: 0.001,
+      explanation: 'κ(AᵀA) = (10⁴)² = 10⁸ = 100,000,000. Squaring the matrix squares every singular value, so the ratio σ_max²/σ_min² is the square of the original ratio — a direct numerical illustration of why the normal equations are dangerous.'
+    },
+    {
+      id: 'num-cholesky-svd-ratio',
+      kind: 'numeric',
+      prompt: 'For an n×n dense matrix, Cholesky costs about <var>n&sup3;/3</var> operations and a full SVD costs about <var>12n&sup3;</var>. Using those leading terms, about how many times more expensive is the SVD than Cholesky?',
+      answer: 36,
+      tolerance: 1,
+      explanation: '12n³ divided by n³/3 is 12 × 3 = 36 — matching the text’s claim that "Cholesky is roughly thirty-six times cheaper than a full SVD." That gap is why you reach for Cholesky whenever the matrix is symmetric positive definite and save the SVD for when you specifically need the singular values.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

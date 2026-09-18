@@ -1,0 +1,336 @@
+---
+title: "Statistics, Interactively — Part 17: Conjugacy and Gaussian fusion"
+description: "A prior and an observation, both Gaussian, fuse into a posterior whose precision is the sum of theirs — the scalar seed of the Kalman filter."
+permalink: "/math/statistics/conjugacy-fusion/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-wrap canvas { background: var(--color-neutral-100); }
+  .g-big { font-family: var(--font-mono); font-size: 17px; font-weight: 600; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Conjugacy and Gaussian fusion</h1>
+    <p>You hold a belief about a single unknown number, and you summarise it with a Gaussian: a mean and a variance. A sensor returns a reading about that same number, uncertain in the same way, and also summarised by a Gaussian. You now have two descriptions of one quantity and need one description that uses both. The rule that combines them is short, and it is not a compromise &mdash; it is a precision-weighted average. This part lets you drag the two Gaussians and watch them fuse, then points at the filter they grow into.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">How should a belief and a measurement be combined?</p>
+    <p>Statistics usually hands you a sample and asks for a parameter. Bayesian inference hands you two distributions and asks for a third: start from a prior over an unknown, multiply by the likelihood of the data, normalise, and read off the posterior. For an arbitrary prior and an arbitrary likelihood that multiplication can be an intractable integral. But there is a special case where everything stays closed-form, and it happens to be the case that runs the machinery of robotics, tracking, and sensor fusion.</p>
+    <p>Take a single unknown number <var>&mu;</var>. Before seeing anything, you describe it with a Gaussian <var>N(&mu;<sub>0</sub>, &sigma;<sub>0</sub><sup>2</sup>)</var>. An observation arrives as a number <var>x</var>, and the sensor's error is Gaussian with variance <var>&sigma;<sup>2</sup></var>, so the likelihood of <var>x</var> given <var>&mu;</var> is a Gaussian centred at <var>&mu;</var>. Equivalently, the observation itself is a Gaussian centred at <var>x</var>. Bayes' rule multiplies the two curves point by point, then rescales so the area is one.</p>
+    <p>A Gaussian times a Gaussian is a Gaussian. The posterior is therefore again in the family you started from: a Gaussian. This self-reproducing property is called <em>conjugacy</em>, and it is what makes the arithmetic on this page possible without a single numerical integral.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the posterior precision is the sum of the prior and observation precisions, why the more precise source dominates the blend, and why doing this once and then again is exactly the recursive update a Kalman filter runs forever.</span></div>
+    <div class="g-toc">
+      <a href="#conjugacy">2 · Same family in, same family out</a>
+      <a href="#precision">3 · Precision is the currency</a>
+      <a href="#fuse">4 · Fuse two Gaussians</a>
+      <a href="#recursive">5 · Updating again is just updating</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="conjugacy">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Same family in, same family out</h2></div>
+    <p class="g-eyebrow">Why the posterior stays Gaussian</p>
+    <p>Conjugacy is a promise about the shape of the answer. If your prior and your likelihood are both Gaussian, the posterior is Gaussian; you never leave the family. The prior contributes a curve that falls off like <var>exp(&minus;(&mu;&minus;&mu;<sub>0</sub>)<sup>2</sup>/2&sigma;<sub>0</sub><sup>2</sup>)</var>, the likelihood contributes one that falls off like <var>exp(&minus;(x&minus;&mu;)<sup>2</sup>/2&sigma;<sup>2</sup>)</var>, and multiplying adds their exponents. The result is a quadratic in <var>&mu;</var>, and a quadratic exponent is precisely a Gaussian. Completing the square gives both the new centre and the new width at once:</p>
+    <div class="g-math g-katex">$$\mu_{\text{post}} = \frac{\mu_0 \tau_0 + x \tau}{\tau_0 + \tau}, \qquad \tau_{\text{post}} = \tau_0 + \tau, \qquad \tau_0 = \frac{1}{\sigma_0^2}, \quad \tau = \frac{1}{\sigma^2}$$</div>
+    <p>Read the second expression first, because it is the clean one: the posterior precision is the sum of the prior precision and the observation precision. The first expression then says the posterior mean is the average of the two centres, weighted by those same precisions. There is no approximation here; this is the exact posterior under the stated model.</p>
+    <p>Conjugacy is a convenience, not a law of nature. Change the likelihood to something non-Gaussian, or put a hard constraint on the parameter, and the multiplication no longer closes; you are pushed toward the numerical methods of the MCMC part of this series. The Gaussian&ndash;Gaussian pair is the one case where the algebra is simple enough to reason about by eye, and it happens to be the case that matters most in practice. It is the same algebra that appears whenever independent Gaussian errors are added, as in the <a href="{{ '/math/calculus-in-motion/probability/' | relative_url }}">probability guide</a>: adding variances there is adding reciprocals of precisions here.</p>
+    <p>The formula also makes clear what the prior is for. It is not a mystical extra ingredient; it is one more Gaussian observation, carrying its own precision. A vague prior carries little precision and is quickly overwhelmed. A confident prior carries a lot and resists a noisy measurement. Everything in the next section follows from that single reading.</p>
+  </section>
+
+  <section class="g-step" id="precision">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Precision is the currency</h2></div>
+    <p class="g-eyebrow">Why the sharper source wins</p>
+    <p>Rewrite the update in terms of precision, <var>&tau; = 1/&sigma;<sup>2</sup></var>. Variance is the error you carry; precision is the information you have. The update says the posteriors add their information, and the mean becomes a weighted average whose weights are the precisions themselves:</p>
+    <div class="g-math g-katex">$$\mu_{\text{post}} = \frac{\tau_0}{\tau_0 + \tau}\,\mu_0 + \frac{\tau}{\tau_0 + \tau}\,x$$</div>
+    <p>Two consequences follow immediately, and both are visible in the demo below. First, the answer is always sharper than either input: precisions are positive, so the sum exceeds each one, and the posterior variance is smaller than both <var>&sigma;<sub>0</sub><sup>2</sup></var> and <var>&sigma;<sup>2</sup></var>. Fusing independent information can never make you less certain. Second, the blend leans toward whichever source has the larger precision. If the sensor is ten times more precise than your prior, it receives roughly ten elevenths of the weight.</p>
+    <p>Push the limits and the formula becomes a statement about humility. Let the observation variance go to infinity &mdash; a useless sensor &mdash; and <var>&tau; &rarr; 0</var>; the posterior collapses onto the prior. Let the prior variance go to infinity &mdash; you knew nothing &mdash; and <var>&tau;<sub>0</sub> &rarr; 0</var>; the posterior collapses onto the observation. A flat prior is the formal way of saying "I have no opinion", and with it the Gaussian update reduces to "believe the data".</p>
+    <p>Independence is doing real work in the word "add". If two readings share a calibration error, adding their precisions double-counts the same information and you will be overconfident. That failure, not the arithmetic, is what breaks sensor fusion in practice, and it is the reason an engineer spends more time on error models than on the update equation.</p>
+  </section>
+
+  <section class="g-step" id="fuse">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Fuse two Gaussians</h2></div>
+    <p class="g-eyebrow">The signature interaction</p>
+    <p>The panel draws a prior (blue) and an observation (pink), both Gaussian. Drag either handle along the axis to move its mean; use the sliders to change each width. Press <em>Merge</em> and the posterior (dark) animates in, drawn from the same formula the text derived. Watch the posterior: it sits between the means, nearer the sharper curve, and it is always narrower than both.</p>
+    <p>Try dragging the observation far from the prior. If the observation is narrow, the posterior follows it almost completely; widen the observation and the prior pulls the answer back. Set the two widths equal and the posterior lands exactly halfway between the means, because equal variance means equal precision. Every movement recomputes the posterior from the precision formula; nothing is cached and nothing is approximated.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fuse-canvas" width="660" height="380"></canvas>
+        <p class="g-canvas-hint">Prior, observation, and the posterior they fuse into. Drag the two handles to move the means; the sliders set the widths.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prior standard deviation &sigma;<sub>0</sub> <span class="val">2</span></label><input type="range" id="prior-sd" min="0.3" max="4" step="0.05" value="2"></div>
+        <div class="g-field"><label>Observation standard deviation &sigma; <span class="val">0.9</span></label><input type="range" id="obs-sd" min="0.2" max="4" step="0.05" value="0.9"></div>
+        <div class="g-btnrow">
+          <button type="button" id="merge-btn" class="g-primary">Merge ↦</button>
+          <button type="button" id="reset-btn">Reset</button>
+        </div>
+        <div class="g-readout" id="fuse-readout"></div>
+      </div>
+    </div>
+    <p>The readout also computes the same update the Kalman filter will use later in this series. In one dimension, with <var>H = 1</var> and measurement noise <var>R = &sigma;<sup>2</sup></var>, the filter forms the gain <var>K = &sigma;<sub>0</sub><sup>2</sup>/(&sigma;<sub>0</sub><sup>2</sup>+&sigma;<sup>2</sup>)</var>, then <var>&mu;&prime; = &mu;<sub>0</sub> + K(x &minus; &mu;<sub>0</sub>)</var> and <var>&sigma;&prime;<sup>2</sup> = (1&minus;K)&sigma;<sub>0</sub><sup>2</sup></var>. Substitute <var>K</var>, simplify once, and you get the precision formula exactly. The page runs the Kalman update on your current numbers, and the readout confirms it lands on the same mean and variance to machine precision. The scalar Kalman update is not an analogy for Gaussian fusion; it is the same equation rearranged.</p>
+    <div class="g-warn">⚠ <span><b>Fusion sharpens, but only under the model.</b> The posterior variance is always below both inputs, which looks like a free lunch. It is not. That guarantee is conditional on the prior mean, the observation mean and both variances being what you say they are. A sensor with a bias violates the model silently, and the fused estimate becomes confidently wrong.</span></div>
+  </section>
+
+  <section class="g-step" id="recursive">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Updating again is just updating</h2></div>
+    <p class="g-eyebrow">From one fusion to a recursive estimator</p>
+    <p>One fusion is an event. The interesting behaviour starts when you repeat it. The posterior is a Gaussian, so it can play the role of the prior in the next fusion. Feed in a second observation and its precision is added to the posterior precision; a third adds again. After <var>n</var> independent observations of the same quantity, each with precision <var>&tau;</var>, the total is <var>&tau;<sub>0</sub> + n&tau;</var> and the variance falls like <var>1/(&tau;<sub>0</sub> + n&tau;)</var>. The mean drifts toward the data, more and more slowly, as the accumulated precision grows.</p>
+    <p>That is a <em>recursive estimator</em>: a running summary &mdash; here just a mean and a variance &mdash; that you update in place as each measurement arrives, without storing the measurements themselves. The prior is not a fixed thing; it is whatever you believed a moment ago. This is why the Gaussian pair is the natural language of tracking. The full Kalman filter adds a prediction step between updates: it lets the state move, which inflates the variance, and then the measurement update sharpens it again. Predict, update, predict, update &mdash; the Gaussian fusion on this page, run forever, with a motion model stretched between the steps.</p>
+    <p>Sequential and batch updating agree. Fuse observations one at a time or all at once and the final posterior is identical, because precision addition does not care about order. That equivalence is what lets an online filter produce exactly the answer a statistician would get by keeping every measurement and fitting at the end. It is also what makes the filter computationally cheap: each step costs the same, regardless of how long the system has been running. When the hidden state is a full vector with a covariance matrix, the scalar reciprocal becomes a matrix inverse and the precision sum becomes a matrix sum, but the shape of the idea &mdash; add information, reweight, sharpen &mdash; is unchanged. The <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/kinematics/' | relative_url }}">navigation guide</a> develops the geometry of those state variables.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One update, two worlds</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Wheel odometry meets a sensor</h3>
+        <p style="margin-bottom:0;">A robot has a motion model that predicts where it should be and a wheel encoder that reports how far it thinks it went; both are uncertain, and both are summarised by Gaussians. The <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry chapter</a> runs exactly this fusion: the model supplies a prior, the encoder supplies a measurement, and the precision-weighted average is the position estimate. Repeat it every timestep and the recursion above becomes a localization filter.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision &amp; Geometry</div>
+        <h3 style="margin:6px 0;">Beliefs in a SLAM system</h3>
+        <p style="margin-bottom:0;">A SLAM backend holds a Gaussian belief over poses and landmarks and folds in every camera observation as a measurement. The <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM chapter</a> replaces the single unknown here with a large vector and the scalar precision with an information matrix, but the operation on each new measurement is still the fusion on this page &mdash; a weighted merge in which sharper constraints dominate the result.</p>
+      </div>
+    </div>
+    <p>The pattern is not particular to robots. Any pipeline that maintains a running estimate and folds in a stream of noisy measurements is doing Gaussian fusion somewhere: inertial navigation, satellite positioning, radar tracking, camera calibration, and the state estimate inside a visual odometry front end. The precision-weighted average, written once, is the whole idea.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below treat conjugate updates as the analytic core of Bayesian inference rather than a special trick. If you take away one thing, take away the picture of two precision bars stacking into a taller one while the mean settles between them.</p>
+    <ul class="g-refs">
+      <li>Christopher Bishop, <em>Pattern Recognition and Machine Learning</em>, &sect;2.3.3 &mdash; the Gaussian product derived by completing the square, exactly as above.</li>
+      <li>Kevin Murphy, <em>Machine Learning: A Probabilistic Perspective</em>, &sect;4.2.2 and &sect;18.3 &mdash; conjugate Gaussian updates and their continuation into the Kalman filter.</li>
+      <li>Andrew Gelman et al., <em>Bayesian Data Analysis</em>, chapter 2 &mdash; conjugate priors as the analytic starting point for posterior reasoning.</li>
+      <li>3Blue1Brown, <a href="https://www.youtube.com/watch?v=HZGCoVF3YvM">"Bayes theorem, the geometry of changing beliefs"</a> &mdash; the geometric reading of prior times likelihood that motivates the fusion picture.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Conjugacy</td><td>Prior and posterior lie in the same family, so the update stays closed-form</td></tr>
+        <tr><td>Precision</td><td><var>&tau; = 1/&sigma;<sup>2</sup></var>; the information a Gaussian carries</td></tr>
+        <tr><td>Fusion</td><td>Multiplying prior and likelihood; precisions add, means blend</td></tr>
+        <tr><td>Posterior mean</td><td><var>(&mu;<sub>0</sub>&tau;<sub>0</sub> + x&tau;)/(&tau;<sub>0</sub>+&tau;)</var> &mdash; a precision-weighted average</td></tr>
+        <tr><td>Posterior precision</td><td><var>&tau;<sub>0</sub> + &tau;</var>; always larger than either input, so the posterior is always sharper</td></tr>
+        <tr><td>Dominance</td><td>The source with larger precision receives the larger weight</td></tr>
+        <tr><td>Recursive update</td><td>Yesterday's posterior becomes today's prior; variance falls like <var>1/(&tau;<sub>0</sub>+n&tau;)</var></td></tr>
+        <tr><td>Kalman link</td><td>With <var>H=1</var>, the scalar Kalman update is this formula rearranged</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The posterior is a distribution, not a decision. The next part turns it into an interval you can report and a number you should act on.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) {
+    d = d == null ? 2 : d;
+    var s = x.toFixed(d);
+    if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s === '-0' ? '0' : s;
+  }
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+  var XR = [-9, 9];
+  var pMu = -2.0, pSd = 2.0;   // prior N(mu0, sd0^2)
+  var oMu = 2.5, oSd = 0.9;    // observation N(x, sd^2)
+  var mergeT = 1;              // 0 = prior+obs only, 1 = posterior fully merged
+  var animId = null;
+
+  var plot = S.plot(el('fuse-canvas'), {
+    W: 660, H: 380, xRange: XR, yRange: [0, 1],
+    xLabel: 'value  x', yLabel: 'density', onResize: draw
+  });
+
+  function priorPdf(x) { return S.dist.normal.pdf(x, pMu, pSd); }
+  function obsPdf(x) { return S.dist.normal.pdf(x, oMu, oSd); }
+  function postResult() { return S.bayes.normalNormal(pMu, pSd * pSd, oMu, oSd * oSd); }
+  function postPdf(x) { var p = postResult(); return S.dist.normal.pdf(x, p.mu, p.sigma); }
+
+  var drag = plot.handles(function () {
+    return [
+      { id: 'prior', x: pMu, y: priorPdf(pMu), color: c.accent, r: 8, label: 'prior' },
+      { id: 'obs', x: oMu, y: obsPdf(oMu), color: c.accent2, r: 8, label: 'obs' }
+    ];
+  }, function (id, x) {
+    if (id === 'prior') pMu = clamp(x, XR[0] + 0.5, XR[1] - 0.5);
+    else if (id === 'obs') oMu = clamp(x, XR[0] + 0.5, XR[1] - 0.5);
+    draw();
+  });
+
+  function draw() {
+    if (!plot) return;
+    var p = postResult();
+    var yTop = Math.max(priorPdf(pMu), obsPdf(oMu), postPdf(p.mu)) * 1.4;
+    if (!isFinite(yTop) || yTop <= 0) yTop = 1;
+    plot.yRange[0] = 0;
+    plot.yRange[1] = yTop;
+    plot.clear();
+    plot.grid();
+    plot.axes({ xLabel: 'value  x', yLabel: 'density' });
+
+    var aSources = 1 - 0.45 * mergeT;
+
+    plot.raw(function (ctx) {
+      ctx.globalAlpha = aSources;
+      plot.area(priorPdf, XR[0], XR[1], { color: 'rgba(43,95,255,0.16)' });
+      plot.curve(priorPdf, { color: c.accent, width: 2.2 });
+      ctx.globalAlpha = aSources;
+      plot.area(obsPdf, XR[0], XR[1], { color: 'rgba(214,0,108,0.14)' });
+      plot.curve(obsPdf, { color: c.accent2, width: 2.2, dashed: true });
+    });
+
+    if (mergeT > 0.01) {
+      plot.raw(function (ctx) {
+        ctx.globalAlpha = Math.min(1, mergeT);
+        plot.area(postPdf, XR[0], XR[1], { color: 'rgba(11,60,208,0.22)' });
+        plot.curve(postPdf, { color: c.accent700, width: 3 });
+        plot.vline(p.mu, { color: c.accent700, width: 1.6 });
+      });
+    }
+
+    plot.vline(pMu, { color: c.accent, dashed: true, width: 1.3 });
+    plot.vline(oMu, { color: c.accent2, dashed: true, width: 1.3 });
+
+    plot.legend([
+      { label: 'prior  N(\u03BC\u2080, \u03C3\u2080\u00B2)', color: c.accent },
+      { label: 'observation  N(x, \u03C3\u00B2)', color: c.accent2, dashed: true },
+      { label: 'posterior  N(\u03BC, \u03C3\u00B2)', color: c.accent700 }
+    ], { dy: 8 });
+
+    if (drag) drag.draw();
+    updateReadout(p);
+  }
+
+  function updateReadout(p) {
+    var v0 = pSd * pSd, v = oSd * oSd;
+    var prec0 = 1 / v0, precO = 1 / v, prec = prec0 + precO;
+    var w0 = prec0 / prec, wO = precO / prec;
+    var k = S.filter.kalman.update([pMu], [[v0]], [oMu], [[1]], [[v]]);
+    var match = Math.abs(k.mu[0] - p.mu) < 1e-9 && Math.abs(k.Sigma[0][0] - p.var) < 1e-9;
+    el('fuse-readout').innerHTML =
+      '<div><span class="k">prior</span> N(' + fmt(pMu, 2) + ', ' + fmt(v0, 2) + ') <span class="k">prec</span> ' + fmt(prec0, 3) + '</div>' +
+      '<div><span class="k">obs</span> &nbsp;&nbsp;N(' + fmt(oMu, 2) + ', ' + fmt(v, 2) + ') <span class="k">prec</span> ' + fmt(precO, 3) + '</div>' +
+      '<div><span class="k">posterior</span> <span class="g-big hi">N(' + fmt(p.mu, 3) + ', ' + fmt(p.var, 3) + ')</span></div>' +
+      '<div><span class="k">precision</span> ' + fmt(prec0, 3) + ' + ' + fmt(precO, 3) + ' = <span class="hi">' + fmt(prec, 3) + '</span></div>' +
+      '<div class="g-mini">weights: prior ' + fmt(w0 * 100, 1) + '% &middot; obs ' + fmt(wO * 100, 1) + '% &mdash; ' +
+        (wO > w0 ? 'the sharper source dominates' : 'the prior dominates') + '</div>' +
+      '<div class="g-mini">Kalman update matches: ' + (match ? 'yes' : 'no') +
+        ' &rarr; \u03BC = ' + fmt(k.mu[0], 3) + ', \u03A3 = ' + fmt(k.Sigma[0][0], 3) + '</div>';
+  }
+
+  function stopAnim() {
+    if (animId != null) { window.cancelAnimationFrame(animId); animId = null; }
+  }
+  function animateMerge() {
+    stopAnim();
+    mergeT = 0;
+    var t0 = null;
+    function step(ts) {
+      if (t0 == null) t0 = ts;
+      mergeT = Math.min(1, (ts - t0) / 650);
+      draw();
+      if (mergeT < 1) animId = window.requestAnimationFrame(step);
+      else animId = null;
+    }
+    animId = window.requestAnimationFrame(step);
+  }
+
+  Guide.bindSliders([el('prior-sd'), el('obs-sd')], function () {
+    pSd = parseFloat(el('prior-sd').value);
+    oSd = parseFloat(el('obs-sd').value);
+    draw();
+  });
+
+  el('merge-btn').addEventListener('click', animateMerge);
+  el('reset-btn').addEventListener('click', function () { stopAnim(); mergeT = 0; draw(); });
+
+  draw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'conjugacy-fusion-posterior-mean',
+      kind: 'numeric',
+      prompt: 'A prior is N(0, 4) and an observation is N(6, 2). Using precisions, what is the posterior mean?',
+      answer: 4,
+      tolerance: 0.01,
+      explanation: 'Precisions are 1/4 = 0.25 and 1/2 = 0.5. The posterior mean is (0&middot;0.25 + 6&middot;0.5)/(0.25 + 0.5) = 3/0.75 = 4. The posterior variance is 1/0.75 = 4/3.'
+    },
+    {
+      id: 'conjugacy-fusion-same-family',
+      kind: 'choice',
+      prompt: 'What does it mean that a Gaussian prior is conjugate to a Gaussian likelihood?',
+      options: [
+        { label: 'The posterior is again Gaussian, so the update stays in closed form.', correct: true },
+        { label: 'The posterior is uniform whenever the prior is Gaussian.', correct: false },
+        { label: 'The prior mean must equal the observation, or the update fails.', correct: false }
+      ],
+      explanation: 'Conjugacy means prior and posterior share a family. A Gaussian prior times a Gaussian likelihood is a Gaussian, so no numerical integration is needed and the update is a pair of algebraic formulas.'
+    },
+    {
+      id: 'conjugacy-fusion-precision-weight',
+      kind: 'choice',
+      prompt: 'The prior has variance 4 and the observation has variance 1. How does the posterior mean combine the two centres?',
+      options: [
+        { label: 'It is an average weighted toward the observation, because the observation has higher precision.', correct: true },
+        { label: 'It is exactly halfway between them, because both are Gaussians.', correct: false },
+        { label: 'It equals the prior mean, because the prior is processed first.', correct: false }
+      ],
+      explanation: 'Precisions are 0.25 for the prior and 1 for the observation, so the observation receives 1/1.25 = 80% of the weight and the prior 20%. The more precise source dominates the blend.'
+    },
+    {
+      id: 'conjugacy-fusion-recursive',
+      kind: 'numeric',
+      prompt: 'You fuse two independent observations of the same quantity, each N(0, 4), starting from a flat (zero-precision) prior. What is the posterior variance?',
+      answer: 2,
+      tolerance: 0.01,
+      explanation: 'Each observation has precision 1/4 = 0.25. The precisions add to 0.25 + 0.25 = 0.5, so the posterior variance is 1/0.5 = 2. A flat prior contributes no precision, so the two measurements simply average their information.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

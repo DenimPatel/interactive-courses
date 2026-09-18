@@ -1,0 +1,697 @@
+---
+title: "Agents in Action, Interactively — Part 16: Architectural defenses, guardrails and red-teaming"
+description: "Prompt injection is a systems problem, so the defenses are architectural: the six design patterns, capability-based information flow and dual-LLM quarantine; rails and classifiers as defence in depth; PII redaction before logging; and GCG, PAIR and AgentDojo in CI."
+permalink: "/ai/agents-in-action/defenses/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Architectural defenses, guardrails and red-teaming</h1>
+    <p>The previous part showed that an agent with private data, untrusted content and an exfiltration channel is one retrieved document away from being someone else's tool. The temptation is to look for the sentence that stops it — a better system prompt, a cleverer filter. There is no such sentence, because prompt injection is not a text problem. It is a systems problem in which untrusted text and privileged capability share one context, and the fix is to change who is allowed to influence what. This part lays out the six design patterns, shows honestly which attacks each one misses, and ends with the practice that keeps a release honest: red-teaming in CI.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="patterns">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The six design patterns</h2></div>
+    <p class="g-eyebrow">An architectural answer to a systems problem</p>
+    <p>Because the failure is a systems failure, the defenses that survive contact with reality are the ones that change the system around the model rather than the words given to it. Six patterns recur, roughly in order of how much they cost to build and how much they buy.</p>
+    <ul>
+      <li><strong>No defense.</strong> Untrusted text and privileged tools share one context. This is the default, and it is a pattern only in the sense that doing nothing is a choice.</li>
+      <li><strong>Prompt hardening.</strong> The system prompt instructs the model to ignore embedded instructions and to treat retrieved text as data. It raises the bar and it is nearly free, but it is a request to a probabilistic function, not a boundary.</li>
+      <li><strong>Rails and classifiers.</strong> Input and output filters flag known payload shapes and known exfiltration channels. They are cheap, they run outside the model, and they are defeated by a novel encoding they have not seen.</li>
+      <li><strong>Dual-LLM quarantine.</strong> A second, unprivileged model reads the untrusted content and may only emit a narrow structured result — a summary, a field extraction — to the privileged model, which never sees the raw text.</li>
+      <li><strong>Least privilege.</strong> Break the Lethal Trifecta: never put private data, untrusted content and a live exfiltration path in the same context. Remove the network tool, scope the credentials, or keep the untrusted content out of the privileged turn entirely.</li>
+      <li><strong>Capability-based information flow.</strong> Tag values with a capability — where they came from and what they may influence — and let the runtime decide whether a value may flow into an action, independent of the text that carries it. This is the strongest single control, and it is the one non-obvious idea on the list.</li>
+    </ul>
+    <p>The sandbox below is the whole lesson. It puts all six patterns against the same bank of eight attack variants and shows, cell by cell, which ones each stops — and, more importantly, which ones it does not. Step through the defenses and watch the red cells move; no row is clean.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="inject-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Rows are defenses, columns are attack variants. Blue means stopped, red means it gets through — the misses are the point.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Defense under test <span class="val">5</span></label><input type="range" id="inject-defense" min="0" max="5" step="1" value="5"></div>
+        <div class="g-btnrow">
+          <button id="inject-play">Play down the defenses</button>
+        </div>
+        <div class="g-readout" id="inject-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="defenses-security-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> every single pattern is partial. Prompt hardening stops one variant of eight; the strongest single control stops seven. The defense is the <b>union</b> of layered controls, not the best one — which is exactly what <em>defence in depth</em> means when the adversary is a stream of text.</span></div>
+  </section>
+
+  <section class="g-step" id="flow">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Capability information flow, and why text filters cannot do it</h2></div>
+    <p class="g-eyebrow">Let provenance decide permission, not the words</p>
+    <p>Every content filter is asking the same question: <em>does this text look like an instruction?</em> That is the wrong question, because the payload can be made to not look like one — encoded, split across turns, hidden in a homoglyph, or wearing the uniform of a trusted tool result. The right question is structural: <em>where did this value come from, and is its provenance allowed to influence this action?</em></p>
+    <p>Capability-based information flow, as implemented in CaMeL, attaches that answer to the value rather than the sentence. Content read from a document is tagged untrusted. Any value derived from it inherits that tag. A privileged tool — send an email, make a payment, call an endpoint — declares which capabilities its arguments must satisfy, and the runtime refuses the call when a tagged value reaches it, no matter how convincing the surrounding prose is. The payload can say anything at all; it still cannot authorise the send.</p>
+    <div class="g-code"><span class="k">// capability tokens: provenance decides permission, not the text</span>
+read(doc)                 -&gt; "…"                        <span class="k"># tagged untrusted</span>
+summarise(value:untrusted) -&gt; "…"                        <span class="k"># derived values inherit the tag</span>
+send_email(to, body:untrusted) -&gt; <span class="s">REFUSED</span>             <span class="k"># untrusted may not authorise a send</span>
+send_email(to, body:user)      -&gt; allowed               <span class="k"># the user's own intent is authorised</span>
+</div>
+    <p>The diagram below shows the flow two ways. With capability control off, the hidden instruction rides through the privileged model and reaches the action. With it on, the same value is stopped at the gate because of where it came from — the text never gets a vote. Press play to animate the packet.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="flow-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Untrusted content → quarantined model → capability gate → privileged action. The gate reads the tag, not the prose.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="flow-play" class="g-primary">Animate flow</button>
+          <button id="flow-toggle" class="g-primary">Capability control: on</button>
+        </div>
+        <div class="g-readout" id="flow-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="defenses-mcp-source"></p>
+    <div class="g-warn">⚠️ <span><b>Capability control does not stop an authorised direct instruction.</b> If the user themselves asks the agent to send the email, that is not an injection — the user is the authority. Capability tokens govern <em>untrusted influence</em>, and they leave the user's own intent deliberately unconstrained. That is why the direct-override column stays red even for the strongest pattern.</span></div>
+  </section>
+
+  <section class="g-step" id="rails">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Rails, classifiers, and never logging the secret</h2></div>
+    <p class="g-eyebrow">Defence in depth, and the copy you forgot you made</p>
+    <p>Rails and classifiers are the layer you keep even though it is bypassable, for the same reason a lock is worth having even though a determined thief can pick it: it stops the cheap attack, it buys detection signal, and it costs almost nothing per call. An input classifier scores the payload shape; an output classifier scores the response for an exfiltration channel — a markdown image with a private value in the URL, an outbound HTTP call with a customer record in the body. The failure mode is precise and must be stated in the threat model: a <strong>novel encoding</strong> that the classifier has never seen passes. So rails are defence in depth, never the defence.</p>
+    <p>The companion habit is smaller and easier to get wrong. The moment you add "do not reveal the customer's email" to a system prompt, that email is now in a prompt, and prompts get logged. An agent that refuses to say a secret out loud while writing it into a trace, a debug log, or a vendor's dashboard has not protected anything — it has just moved the leak somewhere less watched. Redact <strong>before</strong> the write, not on the way out of the log viewer.</p>
+    <p>The pipeline below logs a seeded stream of events twice: raw, and with the redactor in front. Turn the redactor off, or turn its coverage down, and watch the leak counter — the number of secrets that reached the log store — climb.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pii-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: what the application held. Right: what the log store kept. Anything that is not redacted before the write is a leak.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Redactor coverage <span class="val">100</span></label><input type="range" id="pii-coverage" min="0" max="100" step="5" value="100"></div>
+        <div class="g-btnrow">
+          <button id="pii-toggle" class="g-primary">Redact before logging: on</button>
+        </div>
+        <div class="g-readout" id="pii-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> never log the secret you are trying to protect. A prompt is a log line waiting to happen, and a redactor that runs at read time is a promise, not a control. Redact at the boundary where the value would be persisted.</span></div>
+  </section>
+
+  <section class="g-step" id="redteam">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Red-teaming in CI</h2></div>
+    <p class="g-eyebrow">Measure attack-success rate, then gate the release on it</p>
+    <p>You cannot know whether a defense works until you attack it, and a one-off audit tells you about the day it ran. The durable practice is a bank of attack variants that runs on every change, scoring the agent's <strong>attack-success rate</strong> — the fraction of attacks that achieve their goal — and gating the release on it, exactly like a test suite gates a merge. Three families of attack make a useful bank.</p>
+    <ul>
+      <li><strong>GCG</strong> (Greedy Coordinate Gradient) search finds adversarial suffixes — token sequences optimised to make a model comply. They transfer between models more often than intuition suggests, so a suffix found against an open model is worth trying against yours.</li>
+      <li><strong>PAIR</strong> uses a second model as an attacker, iteratively refining a prompt against the target in a handful of queries. It is cheap, black-box, and it finds the semantic attacks a static list misses.</li>
+      <li><strong>AgentDojo</strong> supplies the missing piece for agents: a dynamic environment where the attack rides in on real tool results, and where the score is whether the agent's <em>end state</em> was compromised, not whether a string was emitted.</li>
+    </ul>
+    <p>Run the bank against every candidate prompt and model. If the attack-success rate rises — a new model regresses on a defense the old one passed, a prompt change opens a channel — block the release. The chart below compares a team that does not red-team in CI with one that does, across ten releases, against a gate you can move.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rt-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Attack-success rate per release. The dashed line is the release gate; releases above it do not ship.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Release gate (attack-success rate) <span class="val">3</span></label><input type="range" id="rt-gate" min="1" max="12" step="1" value="3"></div>
+        <div class="g-readout" id="rt-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> a defense is a claim, and a red-team suite is the experiment that tests it. Gating on attack-success rate turns injection from an argument into a number that can regress — which is the only kind of control that survives a fast-moving model upgrade.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>Is prompt injection a text or a systems problem?</td><td>Systems. Untrusted text and privileged capability sharing one context is the defect; no sentence fixes it.</td></tr>
+        <tr><td>What are the six patterns?</td><td>None, prompt hardening, rails/classifiers, dual-LLM quarantine, least privilege, capability information flow.</td></tr>
+        <tr><td>Which single pattern is strongest?</td><td>Capability information flow — it stops seven of the eight variants, gating actions on a value's provenance rather than its words.</td></tr>
+        <tr><td>What does capability control not stop?</td><td>An authorised direct instruction. The user is the authority; capability tokens govern untrusted influence.</td></tr>
+        <tr><td>Why keep rails if they are bypassable?</td><td>They stop the cheap attack and buy detection signal; a novel encoding defeats them, so they are depth, not the defense.</td></tr>
+        <tr><td>What is the dual-LLM pattern?</td><td>A quarantined model reads untrusted content and may only emit structured data to the privileged model.</td></tr>
+        <tr><td>What is least privilege here?</td><td>Break the Lethal Trifecta: private data, untrusted content and a live exfiltration path never share a context.</td></tr>
+        <tr><td>Where should PII be redacted?</td><td>Before it is written, not when it is read. A prompt is a future log line.</td></tr>
+        <tr><td>What do GCG, PAIR and AgentDojo cover?</td><td>Adversarial suffixes, iterative black-box attacks, and end-state compromise inside a tool-using environment.</td></tr>
+        <tr><td>How do you gate a release?</td><td>Run the attack bank in CI and block when attack-success rate exceeds the threshold.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Greshake et al., <a href="https://arxiv.org/abs/2302.12173">"Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection"</a>, 2023 — the paper that named indirect injection and demonstrated it in real systems.</li>
+      <li>Debenedetti et al., <a href="https://arxiv.org/abs/2503.18813">"Defeating Prompt Injections by Design"</a> (CaMeL), 2025 — capability-based information-flow control, the pattern this part calls the strongest single control.</li>
+      <li>Zou et al., <a href="https://arxiv.org/abs/2307.15043">"Universal and Transferable Adversarial Attacks on Aligned Language Models"</a>, 2023 — GCG adversarial suffixes and their transferability.</li>
+      <li>Chao et al., <a href="https://arxiv.org/abs/2310.08419">"Jailbreaking Black Box Large Language Models in Twenty Queries"</a> (PAIR), 2023 — the attacker-model loop that makes a black-box red-team cheap.</li>
+      <li>Debenedetti et al., <a href="https://arxiv.org/abs/2406.13352">"AgentDojo: A Dynamic Environment to Evaluate Attacks and Defenses for LLM Agents"</a>, 2024 — end-state attack success inside a tool-using agent.</li>
+      <li>Simon Willison, <a href="https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/">"The lethal trifecta for AI agents"</a>, 16 June 2025 — the framing that makes least privilege operational.</li>
+      <li>OWASP, <a href="https://genai.owasp.org/llmrisk/llm01-prompt-injection/">"LLM01: Prompt Injection"</a>, OWASP Top 10 for LLM Applications — injection as the first entry, with the systems framing.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Defenses decide what must never happen. The next question is what happens on an ordinary bad day — a slow dependency, a retry storm, a bill that grew while you were not looking. Next: reliability, cost and latency engineering.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    security: {
+      source: "Indirect prompt injection named and demonstrated by Greshake et al., arXiv:2302.12173 (2023). The 'lethal trifecta' framing (private data + untrusted content + an exfiltration channel) is Simon Willison (2025-06). Dual-LLM pattern: Willison (2023). CaMeL, capability-based information-flow control for agents: Debenedetti et al., arXiv:2503.18813 (2025). GCG adversarial suffixes: Zou et al., arXiv:2307.15043 (2023); PAIR: Chao et al., arXiv:2310.08419 (2023); AgentDojo: Debenedetti et al., arXiv:2406.13352 (2024). OWASP Top 10 for LLM Applications lists prompt injection as LLM01. Offline fallback constants.",
+      trifecta: ["access to private data", "exposure to untrusted content", "an exfiltration channel"],
+      attackVariants: 8
+    },
+    mcp: {
+      source: "Model Context Protocol, introduced by Anthropic 2024-11-25 and donated to the Linux Foundation; spec revisions are dated (2024-11-05, 2025-03-26, 2025-06-18). The 2026 revision streamlines the core toward a stateless request/response model with explicit session handles. Treat the specific revision and its date as checkable against modelcontextprotocol.io. Offline fallback constants.",
+      specRevisions: ["2024-11-05", "2025-03-26", "2025-06-18", "2026 (stateless core)"],
+      skillStages: ["metadata (name + description, always in context)", "instructions (SKILL.md body, loaded when the skill is invoked)", "resources (scripts and files, loaded on demand)"]
+    }
+  };
+
+  var ATTACK_SHORT = {
+    'direct-override': 'direct',
+    'indirect-document': 'document',
+    'encoded-payload': 'encoded',
+    'tool-result': 'tool result',
+    'exfil-image': 'image exfil',
+    'exfil-http': 'http exfil',
+    'sleeper': 'sleeper',
+    'homoglyph': 'homoglyph'
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — the injection sandbox: six defenses × eight attacks
+  // ------------------------------------------------------------------
+  var A = { sel: el('inject-defense') };
+  var MATRIX = AppSim.injectionMatrix();
+  var setupA = Guide.setupCanvas(el('inject-canvas'), 640, 380, drawA);
+
+  function attackLabel(id) {
+    var a = AppSim.INJECTION_ATTACKS.filter(function (x) { return x.id === id; })[0];
+    return a ? a.label : id;
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var idx = parseInt(A.sel.value, 10);
+    if (!isFinite(idx) || idx < 0 || idx >= MATRIX.length) idx = MATRIX.length - 1;
+    var attacks = AppSim.INJECTION_ATTACKS;
+    var padL = 172, padR = 12, padT = 96, padB = 40;
+    var cellW = (W - padL - padR) / attacks.length;
+    var cellH = (H - padT - padB) / MATRIX.length;
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('defense (rows) × attack variant (columns)', 14, 18);
+    ctx.font = '10px ' + c.font;
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('blue = stopped · red = gets through — the misses are the honest part', 14, 34);
+
+    attacks.forEach(function (a, i) {
+      var x = padL + i * cellW + cellW / 2;
+      ctx.save();
+      ctx.translate(x, padT - 10);
+      ctx.rotate(-Math.PI / 4);
+      ctx.fillStyle = c.text; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(ATTACK_SHORT[a.id] || a.id, 0, 0);
+      ctx.restore();
+    });
+
+    MATRIX.forEach(function (row, r) {
+      var y = padT + r * cellH;
+      var selected = r === idx;
+      ctx.fillStyle = selected ? c.accent700 : c.text;
+      ctx.font = (selected ? '600 ' : '') + '10.5px ' + c.font;
+      ctx.textAlign = 'right';
+      ctx.fillText(row.label, padL - 8, y + cellH / 2 + 3);
+      row.stops.forEach(function (s, ci) {
+        var x = padL + ci * cellW;
+        if (s.stopped) {
+          ctx.globalAlpha = selected ? 1 : 0.5;
+          ctx.fillStyle = c.accent;
+          ctx.fillRect(x + 3, y + 3, cellW - 6, cellH - 6);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#fff';
+          ctx.font = '600 ' + Math.round(cellH * 0.5) + 'px ' + c.font;
+          ctx.textAlign = 'center';
+          ctx.fillText('\u2713', x + cellW / 2, y + cellH / 2 + 4);
+        } else {
+          ctx.fillStyle = 'rgba(214,0,108,0.10)';
+          ctx.fillRect(x + 3, y + 3, cellW - 6, cellH - 6);
+          ctx.strokeStyle = 'rgba(214,0,108,0.45)'; ctx.lineWidth = 1;
+          ctx.strokeRect(x + 3.5, y + 3.5, cellW - 7, cellH - 7);
+          ctx.fillStyle = c.accent2;
+          ctx.font = '600 ' + Math.round(cellH * 0.45) + 'px ' + c.font;
+          ctx.textAlign = 'center';
+          ctx.fillText('\u2717', x + cellW / 2, y + cellH / 2 + 4);
+        }
+      });
+      if (selected) {
+        ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+        ctx.strokeRect(padL - 2, y + 1, W - padL - padR + 4, cellH - 2);
+      }
+    });
+
+    var sel = MATRIX[idx];
+    var missed = sel.stops.filter(function (s) { return !s.stopped; });
+    var caveat = AppSim.injectionSim(sel.defense, 'direct-override').caveat;
+    var union = {};
+    MATRIX.forEach(function (row) {
+      row.stops.forEach(function (s) { if (s.stopped) union[s.attack] = true; });
+    });
+    var unionCount = Object.keys(union).length;
+
+    el('inject-readout').innerHTML =
+      '<div><span class="k">defense</span> <span class="hi">' + sel.label + '</span> ' +
+      '&nbsp; <span class="k">stops</span> <span class="hi">' + sel.score + '</span> of ' + attacks.length + '</div>' +
+      '<div><span class="k">misses</span> ' +
+      (missed.length ? '<span class="bad">' + missed.map(function (s) { return attackLabel(s.attack); }).join(', ') + '</span>'
+        : '<span class="hi">none</span>') + '</div>' +
+      (caveat ? '<div class="bad">' + caveat + '</div>' : '') +
+      '<div><span class="k">union of all six patterns</span> <span class="hi">' + unionCount + '/' + attacks.length + '</span>' +
+      ' · any single pattern covers at most ' + Math.max.apply(null, MATRIX.map(function (r) { return r.score; })) + '</div>' +
+      '<div class="k">' + sel.note + '</div>';
+  }
+  Guide.bindSliders([A.sel], drawA);
+  Guide.loop({
+    onStep: function () {
+      var v = parseInt(A.sel.value, 10);
+      A.sel.value = (v >= 5) ? 0 : v + 1;
+      if (A.sel.parentElement) {
+        var valEl = A.sel.parentElement.querySelector('.val');
+        if (valEl) valEl.textContent = A.sel.value;
+      }
+      drawA();
+    },
+    button: el('inject-play'), interval: 900, playLabel: 'Play down the defenses', pauseLabel: 'Pause'
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — dual-LLM / capability data-flow: blocked vs allowed
+  // ------------------------------------------------------------------
+  var B = { caps: true, t: 0.42 };
+  var setupB = Guide.setupCanvas(el('flow-canvas'), 640, 340, drawB);
+  var FLOW = [
+    { x: 18, w: 132, title: 'untrusted content', sub: 'a retrieved doc' },
+    { x: 168, w: 138, title: 'quarantined LLM', sub: 'may only emit fields' },
+    { x: 324, w: 128, title: 'capability gate', sub: 'reads the tag' },
+    { x: 470, w: 152, title: 'privileged action', sub: 'send / fetch / pay' }
+  ];
+  function boxCenter(i) { return FLOW[i].x + FLOW[i].w / 2; }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var yTop = 96, boxH = 84;
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('capability-based information flow', 14, 20);
+    ctx.font = '10px ' + c.font;
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('the payload can say anything; the tag on the value decides the action', 14, 36);
+
+    FLOW.forEach(function (b, i) {
+      var active = true;
+      if (i === 3 && B.caps) active = false;
+      ctx.fillStyle = active ? 'rgba(43,95,255,0.08)' : 'rgba(120,120,120,0.07)';
+      ctx.fillRect(b.x, yTop, b.w, boxH);
+      ctx.strokeStyle = i === 2 ? c.accent700 : c.divider; ctx.lineWidth = i === 2 ? 2 : 1;
+      ctx.strokeRect(b.x + 0.5, yTop + 0.5, b.w - 1, boxH - 1);
+      ctx.fillStyle = c.text; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(b.title, b.x + b.w / 2, yTop + 26);
+      ctx.fillStyle = c.accent700; ctx.font = '9.5px ' + c.font;
+      ctx.fillText(b.sub, b.x + b.w / 2, yTop + 44);
+      if (i < FLOW.length - 1) {
+        Guide.drawArrow(ctx, b.x + b.w + 2, yTop + boxH / 2, FLOW[i + 1].x - 2, yTop + boxH / 2, {
+          color: c.divider, width: 1.6, head: 7
+        });
+      }
+    });
+
+    // the travelling packet: four hops across the chain
+    var hop = Math.min(3.999, Math.max(0, B.t * 4));
+    var seg = Math.floor(hop), frac = hop - seg;
+    var x0 = boxCenter(seg), x1 = boxCenter(Math.min(3, seg + 1));
+    var px = x0 + (x1 - x0) * frac;
+    var py = yTop + boxH / 2;
+    var blocked = B.caps && px > FLOW[2].x + 8;
+    if (blocked) px = FLOW[2].x + 8;
+    ctx.fillStyle = blocked ? c.accent2 : c.accent;
+    ctx.beginPath(); ctx.arc(px, py, 8, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '600 9px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('v', px, py + 3);
+
+    if (B.caps) {
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(FLOW[2].x + 8, py, 13, -Math.PI / 2, Math.PI / 2);
+      ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('blocked: value is tagged untrusted', FLOW[2].x + 22, py - 18);
+      ctx.strokeStyle = 'rgba(214,0,108,0.35)'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(FLOW[2].x + FLOW[2].w, py); ctx.lineTo(FLOW[3].x + FLOW[3].w, py); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('never reaches the action', FLOW[3].x + FLOW[3].w / 2, py + 22);
+    } else {
+      ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('allowed: no tag, so nothing stops the flow', FLOW[2].x - 60, py - 18);
+      ctx.fillStyle = c.accent2; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('secret → attacker endpoint', FLOW[3].x + FLOW[3].w / 2, py + 22);
+    }
+
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('derived values inherit the tag, so a summary of untrusted text is still untrusted', 18, 236);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('a privileged tool declares which capabilities its arguments must satisfy', 18, 254);
+    ctx.fillStyle = c.text;
+    ctx.fillText('the check runs outside the model, on the value, not on the prose', 18, 272);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('direct-override stays red: a user who authorises the send is not an injection', 18, 296);
+
+    el('flow-readout').innerHTML =
+      '<div><span class="k">capability control</span> ' +
+      (B.caps ? '<span class="hi">on</span> — untrusted values cannot authorise a privileged action' : '<span class="bad">off</span> — the hidden instruction rides through') + '</div>' +
+      '<div><span class="k">quarantine</span> the privileged model never reads raw untrusted text, only structured fields</div>' +
+      '<div><span class="k">outcome</span> ' +
+      (B.caps ? '<span class="hi">exfiltration refused</span> at the gate' : '<span class="bad">exfiltration succeeds</span> — data leaves with the action') + '</div>' +
+      '<div class="k">the gate is a check on provenance, so novel phrasing, encodings and homoglyphs do not change its answer</div>';
+  }
+  el('flow-toggle').addEventListener('click', function () {
+    B.caps = !B.caps;
+    this.className = B.caps ? 'g-primary' : '';
+    this.textContent = B.caps ? 'Capability control: on' : 'Capability control: off';
+    drawB();
+  });
+  Guide.loop({
+    onStep: function () { B.t += 0.018; if (B.t > 1) B.t = 0; drawB(); },
+    button: el('flow-play'), interval: 40, playLabel: 'Animate flow', pauseLabel: 'Pause'
+  });
+
+  // ------------------------------------------------------------------
+  // Demo C — redact before logging
+  // ------------------------------------------------------------------
+  var C = { redact: true, coverage: el('pii-coverage') };
+  var setupC = Guide.setupCanvas(el('pii-canvas'), 640, 340, drawC);
+  var PII_KINDS = [
+    { type: 'email', mask: '[EMAIL]', color: c.accent },
+    { type: 'phone', mask: '[PHONE]', color: c.accent400 },
+    { type: 'card', mask: '[CARD]', color: c.accent2 },
+    { type: 'api key', mask: '[API_KEY]', color: '#7a5c9e' },
+    { type: 'address', mask: '[ADDRESS]', color: '#c9a227' }
+  ];
+  var PII_VALUES = {
+    email: 'ada@example.com',
+    phone: '+1 415 555 0142',
+    card: '4242 4242 4242 4242',
+    'api key': 'sk-live-9f3a2c',
+    address: '12 Rue Linois, Paris'
+  };
+  var PII_TEMPLATES = [
+    'user asked about billing; contact',
+    'tool result: profile loaded for',
+    'debug: auth header contained',
+    'retrieved doc mentions customer',
+    'error: webhook payload included',
+    'trace: session bound to',
+    'audit: consent recorded for',
+    'cache key derived from'
+  ];
+  function piiEvents() {
+    // One seeded stream, generated the same way on every repaint.
+    var r = AppSim.rng(41);
+    var out = [];
+    for (var i = 0; i < 8; i++) {
+      var hasPii = r() < 0.8;
+      var kindIdx = Math.floor(r() * PII_KINDS.length) % PII_KINDS.length;
+      var tplIdx = Math.floor(r() * PII_TEMPLATES.length) % PII_TEMPLATES.length;
+      out.push({ i: i, hasPii: hasPii, kind: PII_KINDS[kindIdx], value: PII_VALUES[PII_KINDS[kindIdx].type], tpl: PII_TEMPLATES[tplIdx] });
+    }
+    return out;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var coverage = parseInt(C.coverage.value, 10) / 100;
+    if (!isFinite(coverage)) coverage = 1;
+    var events = piiEvents();
+    var dimX = 420;
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('what the application held', 14, 18);
+    ctx.fillText('what the log store kept', dimX + 12, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('before the write', 14, 34);
+    ctx.fillText('after the write', dimX + 12, 34);
+
+    var leaks = 0, redactedCount = 0, piiTotal = 0;
+    var rowY = 52, rowH = 33;
+    events.forEach(function (ev, i) {
+      var y = rowY + i * rowH;
+      if (!ev.hasPii) {
+        ctx.fillStyle = 'rgba(120,120,120,0.05)'; ctx.fillRect(14, y, W - 28, rowH - 6);
+        ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText('trace: no personal data in this turn', 22, y + 15);
+        ctx.fillStyle = c.text; ctx.fillText('trace: no personal data in this turn', dimX + 22, y + 15);
+        return;
+      }
+      piiTotal++;
+      var caught = C.redact && (AppSim.rng(i * 97 + 3)() < coverage);
+      if (caught) redactedCount++;
+      ctx.fillStyle = 'rgba(43,95,255,0.06)'; ctx.fillRect(14, y, dimX - 28, rowH - 6);
+      ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(ev.tpl, 22, y + 15);
+      ctx.fillStyle = ev.kind.color; ctx.font = '600 10.5px ' + c.font;
+      ctx.fillText(ev.value, 22 + ctx.measureText(ev.tpl).width + 8, y + 15);
+
+      ctx.fillStyle = caught ? 'rgba(43,95,255,0.06)' : 'rgba(214,0,108,0.08)';
+      ctx.fillRect(dimX + 12, y, W - dimX - 26, rowH - 6);
+      ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.font;
+      ctx.fillText(ev.tpl, dimX + 22, y + 15);
+      if (caught) {
+        ctx.fillStyle = c.accent700; ctx.font = '600 10.5px ' + c.font;
+        ctx.fillText(ev.kind.mask, dimX + 22 + ctx.measureText(ev.tpl).width + 8, y + 15);
+      } else {
+        leaks++;
+        ctx.fillStyle = c.accent2; ctx.font = '600 10.5px ' + c.font;
+        ctx.fillText(ev.value + '  ← leaked', dimX + 22 + ctx.measureText(ev.tpl).width + 8, y + 15);
+      }
+    });
+
+    el('pii-readout').innerHTML =
+      '<div><span class="k">redact before logging</span> ' +
+      (C.redact ? '<span class="hi">on</span> at ' + Math.round(coverage * 100) + '% coverage' : '<span class="bad">off</span> — raw values are persisted') + '</div>' +
+      '<div><span class="k">events with PII</span> ' + piiTotal +
+      ' &nbsp; <span class="k">redacted</span> <span class="hi">' + redactedCount + '</span>' +
+      ' &nbsp; <span class="k">leaked to the log store</span> <span class="' + (leaks ? 'bad' : 'hi') + '">' + leaks + '</span></div>' +
+      '<div class="k">' + (leaks === 0
+        ? 'nothing sensitive reached the store — the secret stayed where you could still protect it'
+        : 'a redactor at read time would show clean text in the viewer while the raw value sits in storage and in every replica') + '</div>';
+  }
+  Guide.bindSliders([C.coverage], drawC);
+  el('pii-toggle').addEventListener('click', function () {
+    C.redact = !C.redact;
+    this.className = C.redact ? 'g-primary' : '';
+    this.textContent = C.redact ? 'Redact before logging: on' : 'Redact before logging: off';
+    drawC();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — red-teaming in CI vs no red-teaming
+  // ------------------------------------------------------------------
+  var D = { gate: el('rt-gate') };
+  var setupD = Guide.setupCanvas(el('rt-canvas'), 640, 320, drawD);
+  var RELEASES = 10;
+  function redteamSeries() {
+    var r = AppSim.rng(53);
+    var noCi = [], ci = [];
+    for (var i = 0; i < RELEASES; i++) {
+      var jitterA = (r() - 0.5) * 0.018;
+      var jitterB = (r() - 0.5) * 0.010;
+      noCi.push(Math.max(0.005, 0.092 + jitterA + (i < 2 ? 0.010 : 0)));
+      ci.push(Math.max(0.004, 0.108 * Math.pow(0.70, i) + jitterB));
+    }
+    return { noCi: noCi, ci: ci };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var gate = parseInt(D.gate.value, 10) / 100;
+    if (!isFinite(gate)) gate = 0.03;
+    var s = redteamSeries();
+
+    var xr = [1, RELEASES], yr = [0, 0.16];
+    var series = [
+      { points: s.noCi.map(function (v, i) { return { x: i + 1, y: v }; }), color: c.accent2, width: 2.4 },
+      { points: s.ci.map(function (v, i) { return { x: i + 1, y: v }; }), color: c.accent, width: 2.6 }
+    ];
+    var axes = Guide.drawLines(ctx, W, H, series, xr, yr, {
+      xLabel: 'release', yLabel: 'attack-success rate', padL: 52, padB: 34
+    });
+    // the release gate
+    var gy = axes.py(gate);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(axes.padL, gy); ctx.lineTo(624, gy); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('release gate ' + (gate * 100).toFixed(0) + '%', axes.padL + 4, gy - 4);
+
+    // points, and a marker where a release would be blocked
+    var blockedNoCi = 0, blockedCi = 0;
+    for (var i = 0; i < RELEASES; i++) {
+      [[s.noCi[i], c.accent2, false], [s.ci[i], c.accent, true]].forEach(function (pair) {
+        var v = pair[0], col = pair[1], isCi = pair[2];
+        var x = axes.px(i + 1), y = axes.py(v);
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fill();
+        if (v > gate) {
+          ctx.strokeStyle = col; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.moveTo(x - 6, y - 6); ctx.lineTo(x + 6, y + 6);
+          ctx.moveTo(x + 6, y - 6); ctx.lineTo(x - 6, y + 6); ctx.stroke();
+          if (isCi) blockedCi++; else blockedNoCi++;
+        }
+      });
+    }
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('no red-teaming', axes.padL + 10, 22);
+    ctx.fillStyle = c.accent;
+    ctx.fillText('GCG + PAIR + AgentDojo in CI', axes.padL + 110, 22);
+
+    var lastNo = s.noCi[RELEASES - 1], lastCi = s.ci[RELEASES - 1];
+    el('rt-readout').innerHTML =
+      '<div><span class="k">gate</span> block any release above <span class="hi">' + (gate * 100).toFixed(0) + '%</span></div>' +
+      '<div><span class="k">without CI</span> latest <span class="bad">' + (lastNo * 100).toFixed(1) + '%</span>' +
+      ' · releases blocked <span class="bad">' + blockedNoCi + '/' + RELEASES + '</span></div>' +
+      '<div><span class="k">with CI</span> latest <span class="hi">' + (lastCi * 100).toFixed(1) + '%</span>' +
+      ' · releases blocked ' + blockedCi + '/' + RELEASES + '</div>' +
+      '<div class="k">' + (blockedCi > 0
+        ? 'the gate catches the early regressions and lets the later, hardened releases through — a claim about defenses becomes a number that can regress'
+        : 'at this gate even the hardened releases clear it; lower the threshold to see the gate start blocking') + '</div>';
+  }
+  Guide.bindSliders([D.gate], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var security = (data && data.security) || FALLBACK.security;
+    var mcp = (data && data.mcp) || FALLBACK.mcp;
+    var trifecta = (security.trifecta || FALLBACK.security.trifecta);
+    el('defenses-security-source').textContent = security.source +
+      (trifecta.length ? ' The trifecta, on this page: ' + trifecta.join(' + ') + '.' : '');
+    el('defenses-mcp-source').textContent = mcp.source +
+      (mcp.specRevisions && mcp.specRevisions.length ? ' MCP spec revisions so far: ' + mcp.specRevisions.join(', ') + '.' : '');
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'defenses-architecture',
+      kind: 'choice',
+      prompt: 'Why are the durable injection defenses architectural rather than textual?',
+      options: [
+        { label: 'Untrusted text and privileged capability sharing one context is the defect; a boundary or a capability check fixes it, a sentence does not.', correct: true },
+        { label: 'Because system prompts are too short to hold a real policy.', correct: false },
+        { label: 'Because classifiers are illegal in most jurisdictions.', correct: false },
+        { label: 'Because parameters are frozen and cannot encode instructions.', correct: false }
+      ],
+      explanation: 'Prompt hardening is a request to a probabilistic function. The failure is a systems failure — untrusted content influencing privileged actions — so the fix changes the system: break the trifecta, quarantine the untrusted read, or gate the action on a value capability.'
+    },
+    {
+      id: 'defenses-matrix-numeric',
+      kind: 'numeric',
+      prompt: 'In the sandbox, how many of the eight attack variants does the least-privilege pattern stop?',
+      answer: 5,
+      unit: "variants",
+      tolerance: 0,
+      explanation: 'Least privilege removes the exfiltration channel and keeps private data out of the untrusted turn. It stops the poisoned document, tool-result injection, the sleeper, and both exfiltration variants — five of eight. Encoding, homoglyph and direct-override are unaffected.'
+    },
+    {
+      id: 'defenses-capability-direct',
+      kind: 'choice',
+      prompt: 'Capability-based information flow stops seven of the eight variants. Which one does it not stop, and why?',
+      options: [
+        { label: 'A direct override in which the user themselves authorises the action — capability control governs untrusted influence, not authorised intent.', correct: true },
+        { label: 'The encoded payload, because base64 is opaque to the runtime.', correct: false },
+        { label: 'The sleeper, because it activates many turns later.', correct: false },
+        { label: 'Homoglyphs, because the tag is compared as text.', correct: false }
+      ],
+      explanation: 'The capability gate asks whether a value may influence an action, based on provenance. When the user is the instruction source there is no untrusted influence to block, so the direct-override column stays red even for the strongest pattern. That is why the patterns are layered.'
+    },
+    {
+      id: 'defenses-pii',
+      kind: 'choice',
+      prompt: 'What is the correct place to redact personal data in an agent system?',
+      options: [
+        { label: 'Before the value is written anywhere — a prompt is a future log line, and storage keeps copies you never see.', correct: true },
+        { label: 'At the log viewer, so operators never read raw PII.', correct: false },
+        { label: 'In the output classifier, after the model responds.', correct: false },
+        { label: 'Never; the model is instructed not to repeat it.', correct: false }
+      ],
+      explanation: 'A redactor at read time leaves the raw value in storage, in replicas, and in vendor dashboards. Redact at the boundary where the value would be persisted, including the prompt and the trace.'
+    },
+    {
+      id: 'defenses-redteam',
+      kind: 'choice',
+      prompt: 'What are GCG, PAIR and AgentDojo for, in a release pipeline?',
+      options: [
+        { label: 'They attack the agent — optimised suffixes, iterative black-box prompts, and tool-level end-state compromise — so attack-success rate can gate a release.', correct: true },
+        { label: 'They are three model providers to route traffic between.', correct: false },
+        { label: 'They are caching layers that reduce injection risk.', correct: false },
+        { label: 'They are supervised fine-tuning recipes for refusal behaviour.', correct: false }
+      ],
+      explanation: 'GCG finds transferable adversarial suffixes, PAIR refines semantic attacks in a handful of black-box queries, and AgentDojo grades whether the agent\'s end state was compromised inside a tool-using environment. Run the bank on every change and block the release when attack-success rate exceeds the threshold.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

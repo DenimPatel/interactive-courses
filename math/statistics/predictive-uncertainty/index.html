@@ -1,0 +1,551 @@
+---
+title: "Statistics, Interactively — Part 25: Predictive uncertainty"
+description: "Ensembles, MC dropout and split conformal prediction: the coverage guarantee demonstrated, then broken by distribution shift."
+permalink: "/math/statistics/predictive-uncertainty/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-coverbar { height: 10px; border-radius: 999px; background: color-mix(in srgb, var(--color-text) 10%, transparent); overflow: hidden; margin: 4px 0 2px; }
+  .g-coverbar > i { display: block; height: 100%; background: var(--color-accent); }
+  .g-coverbar.bad > i { background: var(--color-accent-2); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Predictive uncertainty</h1>
+    <p>A model that returns a single number is telling you only half the story. It has not said how much to trust that number, whether a different training sample would have moved it, or how wide a range of outcomes is still consistent with what it knows. This part is about turning a point prediction into a statement you can act on: a mean, a band around it, and a coverage number you can check. We build the band two ways &mdash; from the spread of an ensemble of fits, and from split conformal prediction, which comes with a finite-sample guarantee &mdash; and then we do the instructive thing: break that guarantee by shifting the data and watch the coverage fall away from the level it promised.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">How uncertain is this prediction, and can you prove it?</p>
+    <p>Regression and classification models are trained to be right on average, and a point prediction is the whole of their output. But a prediction of $2.4$ for some outcome is worthless without an idea of how far off it might be: a band of $\pm 0.1$ and a band of $\pm 3$ are entirely different claims, even though both are centred on the same number. The task of this part is to attach such a band, and then to attach a <em>guarantee</em> &mdash; a statement about how often new outcomes actually land inside it.</p>
+    <p>There are two genuinely different things that can make a prediction uncertain, and mixing them up is the most common mistake in the subject. One is the irreducible randomness of the world: even if you knew the true relationship exactly, new observations would still scatter around it. The other is your ignorance of that relationship: you have seen finitely many data points, so you do not know the function, and where data are sparse that ignorance is large. The first does not shrink when you collect more careful data; the second does. The first is called <em>aleatoric</em> uncertainty, the second <em>epistemic</em>, and the two demos on this page are built to keep them apart.</p>
+    <p>Alongside them runs a separate idea that is easy to confuse with uncertainty itself: <em>confidence</em>. A confidence statement is a property of a procedure, evaluated over repeated samples, and says nothing about any particular case. Coverage of a prediction interval is in that family. Keeping "how uncertain is this outcome" and "how often does my recipe cover" in separate mental boxes is most of what makes the second half of this page clear.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> an ensemble's spread estimates epistemic uncertainty, why a conformal interval calibrated on held-out data covers at the rate you asked for, and why that promise is conditional on exchangeability &mdash; the assumption a shifted test set quietly violates.</span></div>
+    <div class="g-toc">
+      <a href="#two-kinds">2 · Aleatoric and epistemic</a>
+      <a href="#ensemble">3 · An ensemble of fits</a>
+      <a href="#conformal">4 · Conformal prediction</a>
+      <a href="#shift">5 · When the guarantee breaks</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="two-kinds">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Aleatoric and epistemic</h2></div>
+    <p class="g-eyebrow">Two sources, two behaviours</p>
+    <p>Write the data-generating process as</p>
+    <div class="g-math g-katex">$$y = f(x) + \varepsilon, \qquad \varepsilon \sim \mathcal{N}\!\left(0, \sigma^2(x)\right).$$</div>
+    <p>The function $f$ is the signal you are trying to learn; the noise $\varepsilon$ is everything the input $x$ does not explain. In most real problems the noise is <em>heteroscedastic</em>: its spread depends on $x$. A sensor reads position precisely near its rest point and sloppily at range; a language model's next token is nearly deterministic after a formula and wide open after an ambiguous prompt. The demo data here have exactly that property: the noise grows with $x$, so the points fan out as you read left to right.</p>
+    <p>That noise is the aleatoric part, and no amount of extra data at the same $x$ removes it. The epistemic part is different. You never observe $f$ itself; you observe a finite sample and fit a model $\hat f$. Two different samples give two different fits, so $\hat f$ has a distribution of its own. Where data are dense every reasonable fit agrees and that distribution is narrow; where data are sparse &mdash; a gap in the design, or the region beyond the last observation &mdash; the fits diverge. Adding data in the sparse region shrinks it: epistemic uncertainty is reducible, aleatoric is not.</p>
+    <p>For a squared-error model the two add up in the predictive variance:</p>
+    <div class="g-math g-katex">$$\operatorname{Var}(y \mid x) \;\approx\; \underbrace{\sigma^2(x)}_{\text{aleatoric}} \;+\; \underbrace{\operatorname{Var}\!\left(\hat f(x)\right)}_{\text{epistemic}}.$$</div>
+    <p>You almost never know $\sigma^2(x)$, so in practice both terms are estimated. Quantile regression attacks the first directly, an ensemble or a Bayesian posterior estimates the second, and the two can be combined. Part 16 built the Bayesian version &mdash; a posterior over the parameters that induces a posterior over $f$ &mdash; and Part 24 worried about whether predicted probabilities match observed frequencies. This part is the decision-facing companion: not just "how sure is the model", but "what range will contain the next outcome, and how often".</p>
+    <p>One caution before the demos. Epistemic uncertainty measured by a model's own spread is an artefact of that model class: a single cubic fit has no spread at all, and an ensemble can only be as diverse as the perturbations you feed it. If the true relationship lies outside every member's reach, the ensemble will agree confidently on the wrong answer. Conformal prediction avoids this by measuring the model's limits from held-out data instead of asking the model to know them.</p>
+  </section>
+
+  <section class="g-step" id="ensemble">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>An ensemble of fits</h2></div>
+    <p class="g-eyebrow">A band you get for free from resampling</p>
+    <p>The simplest way to see epistemic uncertainty is to stop pretending there is only one fit. Take the training data, make many slightly different training sets from it, fit one model on each, and treat the spread of their predictions as the uncertainty. The classical construction is the <em>bootstrap</em>: each member is fit on a resample of the original points, drawn with replacement, so every member sees a slightly different dataset. Where the data pin the curve down all the members agree; where they do not, the members fan apart. MC dropout is the same idea inside a neural network &mdash; each pass drops a random subset of units, giving a different function &mdash; and deep ensembles, trained from different initialisations, are a third variant.</p>
+    <p>The demo below fits a cubic polynomial to a deliberately awkward sample: dense at both ends, sparse in the middle, with noise that grows to the right. Each faint curve is one bootstrap member; the solid curve is their average, and the shaded region spans the middle ninety percent of the members' predictions at each $x$. The band is not the noise: the true aleatoric band, drawn faintly from the true noise level, tracks the fan of the data, while the ensemble band pinches where points crowd and balloons across the gap in the middle, precisely where the model has been given nothing to go on.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="ens-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Faint curves: bootstrap members. Solid: ensemble mean. Shaded: middle 90% of members (epistemic). Dashed: the true function, with its aleatoric band behind.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Ensemble size <span class="val" id="ens-b-val">80</span></label><input type="range" id="ens-b" min="10" max="150" step="5" value="80"></div>
+        <div class="g-btnrow">
+          <button type="button" id="ens-new" class="g-primary">New training sample</button>
+        </div>
+        <div class="g-readout" id="ens-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>An ensemble's spread is not a guarantee.</b> It measures disagreement <em>within the model class you chose</em>, under the perturbations you gave it. It can be too narrow (members agree on a shared mistake) or too wide (members differ for irrelevant reasons), and nothing in the construction bounds how often a new observation falls inside the band. Quantifying that is a different job, and it is the next section's.</span></div>
+  </section>
+
+  <section class="g-step" id="conformal">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Conformal prediction</h2></div>
+    <p class="g-eyebrow">A coverage promise you can count</p>
+    <p>Split conformal prediction takes any point predictor &mdash; here, the average of the ensemble &mdash; and wraps it in an interval with a guarantee, using only a held-out set of data it is allowed to look at. The recipe has four steps and no assumptions about the model. Split the data into three parts. Fit the predictor on the <em>training</em> set. On a separate <em>calibration</em> set, compute a nonconformity score for each point, most simply the absolute residual $s_i = |y_i - \hat f(x_i)|$. Sort those scores and pick the $k$-th smallest, where</p>
+    <div class="g-math g-katex">$$k = \left\lceil (n+1)(1-\alpha) \right\rceil, \qquad q = s_{(k)}.$$</div>
+    <p>Then for any new input the interval is $C(x) = [\hat f(x) - q,\; \hat f(x) + q]$, a band of constant width $q$. The surprising part is what that buy purchase: if the calibration points and the new point are <em>exchangeable</em> &mdash; roughly, if their joint distribution is symmetric so no point is special &mdash; then</p>
+    <div class="g-math g-katex">$$1-\alpha \;\le\; \mathbb{P}\!\left(y_{\text{new}} \in C(x_{\text{new}})\right) \;\le\; 1-\alpha + \frac{1}{n+1}.$$</div>
+    <p>The upper bound is the finite-sample exactness. Coverage is not approximately $1-\alpha$ in some large-sample limit; it is pinned to that value from above and below by the size of the calibration set, and the interval is valid for <em>any</em> predictor, however badly specified. A biased model simply gets a wider $q$; the width absorbs the model, so the coverage stays honest. That is a very different kind of promise from the ensemble spread, which had none.</p>
+    <p>The demo shows the promise being kept. Calibration and test sets are drawn from the same distribution as the training data, the interval is calibrated on the former, and the empirical coverage on the latter &mdash; the fraction of test points inside the band &mdash; tracks the nominal level as you move the slider. Notice too that the interval is the same width everywhere. Conditional on $x$, coverage is poor: where the noise is small the band is wider than it needs to be, and where the noise is large it is too narrow. The guarantee is <em>marginal</em>, averaged over the distribution of inputs, not conditional on each one. That gap is the most important thing to understand about conformal prediction, and it matters in the next section.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="conf-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Solid: predictor. Shaded band: conformal interval $\hat f(x) \pm q$. Dots: test points, green inside the band and pink outside.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Nominal coverage <span class="val" id="conf-nom-val">90%</span></label><input type="range" id="conf-nom" min="0.80" max="0.95" step="0.01" value="0.90"></div>
+        <div class="g-field"><label>Test-set shift <span class="val" id="conf-shift-val">0.0</span></label><input type="range" id="conf-shift" min="0" max="2.4" step="0.05" value="0"></div>
+        <div class="g-btnrow">
+          <button type="button" id="conf-new" class="g-primary">New calibration &amp; test sets</button>
+        </div>
+        <div class="g-readout" id="conf-readout"></div>
+      </div>
+    </div>
+    <p>The order statistic is what makes the guarantee exact rather than asymptotic. With $n = 99$ calibration points and a nominal $90\%$, $k = \lceil 100 \times 0.9 \rceil = 90$, so $q$ is the ninetieth smallest of ninety-nine residuals: you deliberately keep the largest $10\%$ of residuals outside the band, and the finite-sample correction nudges the count to be slightly conservative. A larger calibration set tightens the guarantee toward exactly $1-\alpha$.</p>
+  </section>
+
+  <section class="g-step" id="shift">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>When the guarantee breaks</h2></div>
+    <p class="g-eyebrow">Exchangeability is doing all the work</p>
+    <p>The conformal guarantee rests on a single assumption, and it is not about the model at all. It is exchangeability: the calibration points and the new test point must be drawn in a way that makes their order irrelevant. If the data are i.i.d., they are exchangeable. If the test set has quietly drifted &mdash; a new sensor, a new user population, a season later, a different prompt distribution &mdash; then calibration and test are no longer interchangeable, the order statistic $q$ was computed for a distribution that no longer applies, and the guarantee evaporates. Nothing in the formula warns you. The interval is still printed, still looks like an interval, and still covers less often than it promised.</p>
+    <p>Drag the shift slider in the demo above. It slides the whole test set to the right, out of the region the training data covered and into a region where both the model's epistemic uncertainty and the world's noise are larger. At zero shift the empirical coverage sits on the nominal line, as the guarantee says it should. As the shift grows, coverage falls away from nominal &mdash; at the extreme, far below it. The calibrated width $q$ is frozen, because it was measured on a world that no longer exists, while the residuals it is supposed to bound have grown. This is the precise sense in which a coverage guarantee can be simultaneously true and useless: true under the exchangeability you assumed, void under the shift you did not check for.</p>
+    <p>There are principled repairs. Weighted conformal prediction reweights the calibration scores by how likely each point was under the test distribution, restoring a guarantee when that distribution is known. Adaptive methods recompute the score quantile on a rolling window of recent data, which works if drift is slow and labels eventually arrive. Conformal intervals can also be made conditionally sharper, with widths that vary with $x$, though full conditional coverage is impossible in general without further assumptions. None escape the fundamental point: an uncertainty statement is only as good as the assumption about where tomorrow's data come from, and distribution shift is the assumption that fails most often and most silently.</p>
+    <p>This is the uncertainty/confidence distinction made concrete. The model's own spread said one thing, the calibration guarantee said another, and the shifted data settled it. A prediction system that reports an interval must therefore say which world it is calibrated for &mdash; and monitor whether that world is still the one arriving at the door.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Two places a band changes the decision</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Abstaining when the band is wide</h3>
+        <p style="margin-bottom:0;">A deployed assistant should say "I don't know" rather than guess, and the trigger for abstention is a predictive interval that is too wide to act on. The <a href="{{ '/ai/llm-training/guardrails/' | relative_url }}">guardrails chapter</a> builds exactly these thresholds. Strong calibration on the evaluation set is also where the <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation chapter's</a> held-out numbers meet this part's machinery: a benchmark score is a point estimate, and a conformal interval is how you report its uncertainty honestly.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Covariance that drives the filter</h3>
+        <p style="margin-bottom:0;">Odometry and <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">visual-inertial navigation</a> fuse noisy measurements into a state estimate whose covariance is the epistemic uncertainty &mdash; the same object as the ensemble band here. The <a href="{{ '/math/linear-algebra/numerics/' | relative_url }}">numerics part</a> is the cautionary half: an overconfident covariance, like a conformal interval calibrated on the wrong world, is worse than an honest wide one because the planner trusts it.</p>
+      </div>
+    </div>
+    <p>The same picture recurs wherever a number drives a decision. Serving systems report latency quantiles, which are conformal-style statements about a tail; the <a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">serving metrics chapter</a> lives on them, and a workload shift that changes the request mix is exactly the distribution shift that invalidates a previously calibrated threshold. The probability course's <a href="{{ '/math/calculus-in-motion/probability/' | relative_url }}">random-variable chapter</a> supplies the distributions these bands are built from. Whether uncertainty is modelled explicitly, as in an ensemble or a Kalman covariance, or measured empirically, as in conformal calibration, a prediction without its uncertainty is an incomplete answer, and an uncertainty without its assumptions is a trap.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below are ordered from the guarantee to its application. If you take away one thing, take away the split-conformal recipe and the exchangeability assumption it stands on &mdash; the rest is elaboration.</p>
+    <p>Vovk and coauthors introduced conformal prediction and prove the finite-sample coverage bound; Angelopoulos and Bates write the readable modern tutorial the page follows. Lakshminarayanan and coauthors give the deep-ensembles recipe, and Gal and Ghahramani show that dropout at test time is an approximate Bayesian model, which is the cleanest bridge from ensembles to the Bayesian part of this series.</p>
+    <ul class="g-refs">
+      <li>Vladimir Vovk, Alex Gammerman and Glenn Shafer, <em>Algorithmic Learning in a Random World</em>, 2005 &mdash; the origin of conformal prediction and its exchangeability-based guarantee.</li>
+      <li>Anastasios Angelopoulos and Stephen Bates, <a href="https://arxiv.org/abs/2107.07511">"A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification"</a>, 2021 &mdash; the tutorial this page's recipe follows.</li>
+      <li>Balaji Lakshminarayanan, Alexander Pritzel and Charles Blundell, <a href="https://arxiv.org/abs/1612.01474">"Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles"</a>, 2017 &mdash; ensembling as a practical epistemic estimator.</li>
+      <li>Yarin Gal and Zoubin Ghahramani, <a href="https://arxiv.org/abs/1506.02142">"Dropout as a Bayesian Approximation"</a>, 2016 &mdash; MC dropout as approximate posterior uncertainty.</li>
+      <li>Larry Wasserman, <em>All of Statistics</em>, chapters 11&ndash;13 &mdash; the confidence-interval and resampling background this part builds on.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Aleatoric uncertainty</td><td>The noise $\varepsilon$ in $y = f(x) + \varepsilon$; irreducible, often heteroscedastic</td></tr>
+        <tr><td>Epistemic uncertainty</td><td>Uncertainty about $f$ itself; shrinks as data accumulate, grows in sparse regions</td></tr>
+        <tr><td>Ensemble / MC dropout</td><td>A spread of fits whose disagreement estimates the epistemic term</td></tr>
+        <tr><td>Nonconformity score</td><td>How badly a calibration point fits; here the absolute residual $|y_i - \hat f(x_i)|$</td></tr>
+        <tr><td>Conformal quantile</td><td>$s_{(k)}$ with $k = \lceil (n+1)(1-\alpha)\rceil$, the finite-sample-corrected order statistic</td></tr>
+        <tr><td>Coverage guarantee</td><td>$1-\alpha \le \mathbb{P}(y_{\text{new}} \in C) \le 1-\alpha + 1/(n+1)$ under exchangeability</td></tr>
+        <tr><td>Exchangeability</td><td>The assumption that calibration and test points are order-interchangeable; i.i.d. implies it</td></tr>
+        <tr><td>Marginal vs conditional</td><td>Coverage averaged over inputs, not guaranteed per input &mdash; hence constant width can be locally wrong</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A band around one prediction generalises to a distribution over many coupled predictions. The next part makes that joint structure the object of study.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  // ------------------------------------------------------------------
+  // The data-generating process: a smooth signal with noise that grows
+  // with x. The training design is dense at both ends and sparse in the
+  // middle, so an ensemble's spread has somewhere to fan out.
+  // ------------------------------------------------------------------
+  function ftrue(x) { return 1.2 + 0.8 * Math.sin(0.7 * x) + 0.12 * x; }
+  function noiseSd(x) { return 0.15 + 0.10 * x; }
+  function zof(x) { return (x - 5) / 5; }
+  function design(x) { var z = zof(x); return [1, z, z * z, z * z * z]; }
+  function poly(beta, x) {
+    var z = zof(x);
+    return beta[0] + beta[1] * z + beta[2] * z * z + beta[3] * z * z * z;
+  }
+
+  var XMIN = -0.5, XMAX = 10.5;              // ensemble demo domain
+  var CONF_X0 = -0.5, CONF_X1 = 12.5;        // conformal demo domain (room for shift)
+  var ALPHA0 = 0.10;
+
+  var yMin = Infinity, yMax = -Infinity;
+  (function () {
+    for (var x = 0; x <= 10.0001; x += 0.1) {
+      var lo = ftrue(x) - 3 * noiseSd(x), hi = ftrue(x) + 3 * noiseSd(x);
+      if (lo < yMin) yMin = lo;
+      if (hi > yMax) yMax = hi;
+    }
+    yMin = Math.floor(yMin) - 0.4;
+    yMax = Math.ceil(yMax) + 0.4;
+  })();
+
+  // ------------------------------------------------------------------
+  // Training data, and the two ensembles (one for demo A, one fixed
+  // ensemble used as the conformal predictor).
+  // ------------------------------------------------------------------
+  var trainSeed = 20260914 + 4100;
+  var ensSeed = 20260914 + 4200;
+  var predSeed = 20260914 + 4300;
+  var ensB = 80;
+  var train = [];
+  var ensBetas = [];
+  var predBetas = [];
+
+  function buildTrain(seed) {
+    var r = S.rng(seed);
+    train = [];
+    function add(x) { train.push([x, ftrue(x) + S.sample.normal(r, 0, noiseSd(x))]); }
+    for (var i = 0; i < 9; i++) add(0.3 + 2.4 * r());
+    for (i = 0; i < 9; i++) add(6.9 + 2.9 * r());
+    add(4.0 + 0.3 * r());
+  }
+
+  function fitEnsemble(seed, B) {
+    var r = S.rng(seed), out = [];
+    for (var b = 0; b < B; b++) {
+      var X = [], y = [];
+      for (var i = 0; i < train.length; i++) {
+        var j = Math.floor(r() * train.length);
+        X.push(design(train[j][0]));
+        y.push(train[j][1]);
+      }
+      var f = S.est.ols(X, y);
+      if (f && f.beta) out.push(f.beta);
+    }
+    return out;
+  }
+
+  function meanPred(x) {
+    if (!predBetas.length) return 0;
+    var s = 0;
+    for (var b = 0; b < predBetas.length; b++) s += poly(predBetas[b], x);
+    return s / predBetas.length;
+  }
+
+  // Grid of ensemble predictions: mean curve plus the 5th/95th percentile band.
+  var grid = [], meanPts = [], ensLoPts = [], ensHiPts = [];
+
+  function rebuildEnsGrid() {
+    grid = []; meanPts = []; ensLoPts = []; ensHiPts = [];
+    if (!ensBetas.length) return;
+    var NG = 150;
+    for (var g = 0; g < NG; g++) {
+      var x = XMIN + (XMAX - XMIN) * g / (NG - 1);
+      grid.push(x);
+      var arr = [];
+      for (var b = 0; b < ensBetas.length; b++) arr.push(poly(ensBetas[b], x));
+      meanPts.push([x, S.summary.mean(arr)]);
+      ensLoPts.push([x, S.summary.quantile(arr, 0.05)]);
+      ensHiPts.push([x, S.summary.quantile(arr, 0.95)]);
+    }
+  }
+
+  function ensBandAt(x) {
+    var arr = [];
+    for (var b = 0; b < ensBetas.length; b++) arr.push(poly(ensBetas[b], x));
+    return [S.summary.quantile(arr, 0.05), S.summary.quantile(arr, 0.95)];
+  }
+
+  // ------------------------------------------------------------------
+  // Split conformal: calibration and test sets, score quantile, coverage.
+  // ------------------------------------------------------------------
+  var calSeed = 20260914 + 4400;
+  var testSeed = 20260914 + 4500;
+  var cal = [], testBase = [], qConf = 0;
+  var nominal = 0.90, shift = 0;
+  var CAL_N = 120, TEST_N = 120;
+
+  function buildConformal() {
+    var r = S.rng(calSeed);
+    cal = [];
+    for (var i = 0; i < CAL_N; i++) {
+      var x = 0.3 + 9.4 * r();
+      cal.push([x, ftrue(x) + S.sample.normal(r, 0, noiseSd(x))]);
+    }
+    var r2 = S.rng(testSeed);
+    testBase = [];
+    for (i = 0; i < TEST_N; i++) {
+      var x2 = 0.3 + 9.4 * r2();
+      testBase.push([x2, ftrue(x2) + S.sample.normal(r2, 0, noiseSd(x2))]);
+    }
+    computeQ();
+  }
+
+  function computeQ() {
+    var scores = [];
+    for (var i = 0; i < cal.length; i++) scores.push(Math.abs(cal[i][1] - meanPred(cal[i][0])));
+    qConf = S.metric.conformalQuantile(scores, 1 - nominal);
+  }
+
+  function coverageNow() {
+    var inside = 0;
+    for (var i = 0; i < testBase.length; i++) {
+      var xt = testBase[i][0] + shift;
+      if (Math.abs(testBase[i][1] - meanPred(xt)) <= qConf) inside++;
+    }
+    return inside / testBase.length;
+  }
+
+  // ------------------------------------------------------------------
+  // Plot A — the ensemble band.
+  // ------------------------------------------------------------------
+  var ensPlot = null;
+
+  function redrawEns() {
+    if (!ensPlot) return;
+    ensPlot.clear();
+    ensPlot.axes({ xLabel: 'x', yLabel: 'y' });
+
+    // true aleatoric band and true signal (unknown in practice)
+    ensPlot.band(
+      function (x) { return ftrue(x) - 1.96 * noiseSd(x); },
+      function (x) { return ftrue(x) + 1.96 * noiseSd(x); },
+      { a: XMIN, b: XMAX, samples: 200, color: 'rgba(32,30,29,0.07)' }
+    );
+    ensPlot.curve(ftrue, { color: c.text, dashed: true, width: 1.3 });
+
+    // ensemble epistemic band
+    if (ensLoPts.length) ensPlot.band(ensLoPts, ensHiPts, { color: 'rgba(43,95,255,0.17)' });
+
+    // individual bootstrap members
+    if (ensBetas.length) {
+      var stride = Math.max(1, Math.floor(ensBetas.length / 18));
+      for (var b = 0; b < ensBetas.length; b += stride) {
+        var pts = [];
+        for (var g = 0; g < grid.length; g++) pts.push([grid[g], poly(ensBetas[b], grid[g])]);
+        ensPlot.curve(pts, { color: 'rgba(43,95,255,0.20)', width: 1 });
+      }
+    }
+
+    if (meanPts.length) ensPlot.curve(meanPts, { color: c.accent, width: 2.4 });
+    ensPlot.points(train.map(function (p) { return [p[0], p[1]]; }), { color: c.accent700, r: 3.2 });
+
+    ensPlot.legend([
+      { label: 'ensemble mean', color: c.accent },
+      { label: 'ensemble band (epistemic)', color: 'rgba(43,95,255,0.45)', fill: true },
+      { label: 'true f(x) (unknown)', color: c.text, dashed: true },
+      { label: 'aleatoric band \u00b11.96\u03c3(x)', color: 'rgba(32,30,29,0.30)', fill: true },
+      { label: 'training data', color: c.accent700 }
+    ], { dy: 6 });
+
+    var w1 = 0, w5 = 0, w9 = 0;
+    if (ensBetas.length) {
+      var b1 = ensBandAt(1), b5 = ensBandAt(5), b9 = ensBandAt(9);
+      w1 = b1[1] - b1[0]; w5 = b5[1] - b5[0]; w9 = b9[1] - b9[0];
+    }
+    document.getElementById('ens-readout').innerHTML =
+      '<div><span class="k">models</span> ' + ensBetas.length + ' of ' + ensB + '</div>' +
+      '<div><span class="k">band width at x=1</span> ' + w1.toFixed(2) + '</div>' +
+      '<div><span class="k">band width at x=5 (sparse)</span> <span class="hi">' + w5.toFixed(2) + '</span></div>' +
+      '<div><span class="k">band width at x=9</span> ' + w9.toFixed(2) + '</div>' +
+      '<div class="g-mini">The band pinches where points crowd and balloons across the gap.</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Plot B — the conformal interval, with the test set shifted.
+  // ------------------------------------------------------------------
+  var confPlot = null;
+
+  function redrawConf() {
+    if (!confPlot) return;
+    confPlot.clear();
+    confPlot.axes({ xLabel: 'x', yLabel: 'y' });
+
+    confPlot.band(
+      function (x) { return meanPred(x) - qConf; },
+      function (x) { return meanPred(x) + qConf; },
+      { a: CONF_X0, b: CONF_X1, samples: 220, color: 'rgba(214,0,108,0.13)' }
+    );
+    confPlot.curve(meanPred, { color: c.accent, width: 2.2, samples: 260 });
+
+    // calibration points as a rug along the floor
+    confPlot.rug(cal.map(function (p) { return p[0]; }),
+      { base: yMin, len: 0.05 * (yMax - yMin), color: c.text, alpha: 0.28 });
+
+    // shifted test points, coloured by whether they fall inside the band
+    var pts = [], cols = [], inside = 0;
+    for (var i = 0; i < testBase.length; i++) {
+      var xt = testBase[i][0] + shift, yt = testBase[i][1];
+      var ok = Math.abs(yt - meanPred(xt)) <= qConf;
+      if (ok) inside++;
+      pts.push([xt, yt]);
+      cols.push(ok ? c.accent700 : c.accent2);
+    }
+    confPlot.points(pts, { colors: cols, r: 3.1 });
+
+    confPlot.legend([
+      { label: 'predictor \u0192\u0302(x)', color: c.accent },
+      { label: (nominal * 100).toFixed(0) + '% conformal band', color: 'rgba(214,0,108,0.35)', fill: true },
+      { label: 'inside (covered)', color: c.accent700 },
+      { label: 'outside (missed)', color: c.accent2 }
+    ], { dy: 6 });
+
+    var cov = inside / testBase.length;
+    var delta = cov - nominal;
+    var bad = Math.abs(delta) > 0.045;
+    document.getElementById('conf-readout').innerHTML =
+      '<div><span class="k">nominal</span> ' + (nominal * 100).toFixed(0) + '%</div>' +
+      '<div><span class="k">interval half-width q</span> ' + qConf.toFixed(3) + '</div>' +
+      '<div><span class="k">empirical coverage</span> <span class="' + (bad ? 'bad' : 'hi') + '">' + (cov * 100).toFixed(1) + '%</span></div>' +
+      '<div class="g-coverbar' + (bad ? ' bad' : '') + '"><i style="width:' + Math.max(0, Math.min(1, cov)) * 100 + '%"></i></div>' +
+      '<div><span class="k">test points</span> ' + inside + ' / ' + testBase.length + '</div>' +
+      '<div><span class="k">test shift</span> ' + shift.toFixed(2) + '</div>' +
+      '<div class="g-mini">' + (bad
+        ? 'Shift has moved the test set out of the calibration world: coverage is below nominal.'
+        : 'Calibration and test are exchangeable, so coverage tracks the nominal level.') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Initialise data before creating the plots (their onResize callbacks
+  // guard on the plot handle being assigned).
+  // ------------------------------------------------------------------
+  function refitAll(seedTrain) {
+    if (seedTrain) trainSeed = seedTrain;
+    buildTrain(trainSeed);
+    ensBetas = fitEnsemble(ensSeed, ensB);
+    predBetas = fitEnsemble(predSeed, 80);
+    rebuildEnsGrid();
+    buildConformal();
+  }
+
+  refitAll();
+  ensPlot = S.plot(document.getElementById('ens-canvas'), {
+    W: 640, H: 360, xRange: [XMIN, XMAX], yRange: [yMin, yMax],
+    xLabel: 'x', yLabel: 'y', onResize: redrawEns
+  });
+  confPlot = S.plot(document.getElementById('conf-canvas'), {
+    W: 640, H: 360, xRange: [CONF_X0, CONF_X1], yRange: [yMin, yMax],
+    xLabel: 'x', yLabel: 'y', onResize: redrawConf
+  });
+  redrawEns();
+  redrawConf();
+
+  // ------------------------------------------------------------------
+  // Controls
+  // ------------------------------------------------------------------
+  Guide.bindSliders(document.querySelectorAll('#ens-b'), function (el) {
+    ensB = parseInt(el.value, 10);
+    document.getElementById('ens-b-val').textContent = ensB;
+    ensBetas = fitEnsemble(ensSeed, ensB);
+    rebuildEnsGrid();
+    redrawEns();
+  });
+
+  document.getElementById('ens-new').addEventListener('click', function () {
+    trainSeed += 977;
+    buildTrain(trainSeed);
+    ensBetas = fitEnsemble(ensSeed, ensB);
+    predBetas = fitEnsemble(predSeed, 80);
+    rebuildEnsGrid();
+    buildConformal();
+    redrawEns();
+    redrawConf();
+  });
+
+  Guide.bindSliders(document.querySelectorAll('#conf-nom'), function (el) {
+    nominal = parseFloat(el.value);
+    document.getElementById('conf-nom-val').textContent = (nominal * 100).toFixed(0) + '%';
+    computeQ();
+    redrawConf();
+  });
+
+  Guide.bindSliders(document.querySelectorAll('#conf-shift'), function (el) {
+    shift = parseFloat(el.value);
+    document.getElementById('conf-shift-val').textContent = shift.toFixed(1);
+    redrawConf();
+  });
+
+  document.getElementById('conf-new').addEventListener('click', function () {
+    calSeed += 613;
+    testSeed += 811;
+    buildConformal();
+    redrawConf();
+  });
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'predictive-uncertainty-aleatoric',
+      kind: 'choice',
+      prompt: 'A dataset is generated by $y = f(x) + \\varepsilon$ with $\\varepsilon \\sim \\mathcal{N}(0, \\sigma^2(x))$, and you collect far more data at every $x$. Which part of the predictive uncertainty does the extra data reduce?',
+      options: [
+        { label: 'Only the epistemic part &mdash; uncertainty about $f$. The aleatoric noise $\\varepsilon$ stays, because more data describes it but cannot remove it.', correct: true },
+        { label: 'Only the aleatoric part &mdash; the noise shrinks once enough data are averaged.', correct: false },
+        { label: 'Both parts shrink at the same rate as the sample grows.', correct: false }
+      ],
+      explanation: 'More data at the same inputs pins down $f$ better, shrinking the ensemble spread, but the conditional noise $\\sigma^2(x)$ is a property of the world and does not move. That is exactly why the demo draws the true aleatoric band separately from the ensemble band.'
+    },
+    {
+      id: 'predictive-uncertainty-conformal-index',
+      kind: 'numeric',
+      prompt: 'In split conformal prediction with $n = 99$ calibration scores and a nominal coverage of $90\\%$, the width $q$ is the $k$-th smallest score with $k = \\lceil (n+1)(1-\\alpha)\\rceil$. What is $k$? (Enter the 1-indexed order statistic.)',
+      answer: 90,
+      tolerance: 0.001,
+      explanation: 'With $\\alpha = 0.1$, $k = \\lceil 100 \\times 0.9 \\rceil = 90$. The interval keeps the largest 10% of calibration residuals outside the band, which is why about 10% of future points fall outside.'
+    },
+    {
+      id: 'predictive-uncertainty-exchangeability',
+      kind: 'choice',
+      prompt: 'A 90% conformal interval is calibrated on data from one population, then deployed on a test set drawn from a slightly different population. What happens, and why?',
+      options: [
+        { label: 'Coverage drops below 90%: the calibration and test points are no longer exchangeable, so the order statistic $q$ no longer applies.', correct: true },
+        { label: 'Coverage stays at 90% because conformal prediction assumes nothing about the data.', correct: false },
+        { label: 'Coverage rises above 90% because the interval was already conservative.', correct: false }
+      ],
+      explanation: 'Conformal validity needs exchangeability, not a model assumption. Under distribution shift the frozen width $q$ was measured for a world the test data no longer come from, so the empirical coverage falls below nominal — the collapse the shift slider demonstrates.'
+    },
+    {
+      id: 'predictive-uncertainty-marginal',
+      kind: 'choice',
+      prompt: 'A conformal interval has constant width and achieves 90% marginal coverage. What does that guarantee about the coverage conditionally, at each individual $x$?',
+      options: [
+        { label: 'Nothing: coverage is averaged over the input distribution, so at some $x$ the band is too narrow and at others far too wide.', correct: true },
+        { label: 'It guarantees 90% coverage at every value of $x$ as well.', correct: false },
+        { label: 'It guarantees at least 90% at every $x$, because the width was chosen conservatively.', correct: false }
+      ],
+      explanation: 'The conformal bound is marginal: it averages over inputs. A constant-width interval can be locally over- or under-covering even when the overall rate is exactly nominal, which is why conditionally valid intervals need extra assumptions or varying width.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

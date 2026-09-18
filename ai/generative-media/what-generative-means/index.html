@@ -1,0 +1,443 @@
+---
+title: "What a generative model actually is"
+description: "Sampling from a distribution you never see - a two-dimensional dataset you draw with the mouse, and the difference between memorising it and modelling it."
+permalink: "/ai/generative-media/what-generative-means/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>What a generative model actually is</h1>
+    <p>Everything in this guide &mdash; diffusion, flow matching, latent models, image and audio synthesis &mdash; is built on one idea that is easy to say and surprisingly hard to feel: a generative model is a probability distribution you never get to see, and sampling from it means producing a brand-new point that the data never contained. This part makes that idea concrete with a dataset you draw yourself, a model fitted to it in front of you, and a single slider that walks the line between copying the data and learning the shape of the data. Nothing here needs a neural network yet; the next four parts add the machinery that makes the same picture work in dimensions where you cannot draw it by hand.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="distribution">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A distribution you never see</h2></div>
+    <p class="g-eyebrow">There is a density behind the data, and the data do not contain it</p>
+    <p>Suppose the world can produce an image, a sentence, or a song. Whatever the medium, there is a set of possible outputs and some notion of how likely each one is &mdash; a <em>distribution</em> $p(x)$ over everything the process could make. A photograph of a specific cat on a specific sofa is not stored anywhere; it is one point that a generator, if it were the right one, would assign some density to. In the probability volume the distribution is handed to you. In generative modelling it is the thing you are trying to reconstruct from examples, and you never see it directly.</p>
+    <p>A <em>dataset</em> is a finite set of samples from $p(x)$. It is a handful of points, not the distribution. This is the whole difficulty in one sentence: a dataset is sparse, and a distribution is everywhere. Two datasets of a hundred images can differ completely while coming from the same distribution, and a model that merely stores the hundred images has learned almost nothing about the process that made them.</p>
+    <p>The goal of a generative model is therefore not to compress the dataset. It is to fit a distribution $p_\theta(x)$ close enough to the true $p(x)$ that when you draw new points from $p_\theta$, they are plausible in the same way that fresh data would be &mdash; sometimes close to a training point, sometimes in the gaps between them, but always in places where the true process could plausibly have put a point.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> state what a generative model is as a distribution you never see, build a dataset by hand, sample from a fitted version of it, and explain why a model that can only reproduce its training data has failed even when every lookup is exactly right.</span></div>
+    <p>Hold onto one image before the demo: data are dots, the distribution is the terrain the dots sit on, and modelling means recovering the terrain rather than the dots.</p>
+    <div class="g-toc">
+      <a href="#draw">2 · A dataset you draw</a>
+      <a href="#sample">3 · Sampling from the model</a>
+      <a href="#overfit">4 · Memorising versus modelling</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="draw">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>A dataset you draw</h2></div>
+    <p class="g-eyebrow">Click on the plane to place points</p>
+    <p>Below is a two-dimensional plane, which is the smallest space in which a distribution is still something you can look at. Every click adds a data point at that location. Two buttons drop in a preset shape &mdash; two clusters or a ring &mdash; and Undo and Clear let you sculpt a dataset by hand. The grey cloud starts as two clusters because that is the easiest shape to reason about; try the ring afterwards, because a ring has a hole in the middle, and the hole is where the interesting question lives.</p>
+    <p>Once you have a dataset, ask yourself a question that has no obvious answer: <em>where is the distribution?</em> Not the points &mdash; the process that would produce points like these. If I asked you to draw three more points that belong, where would you put them? That judgment is a model, and it is the judgment we are about to hand to an algorithm.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="p1-data-canvas" width="520" height="400"></canvas>
+        <p class="g-canvas-hint">Click anywhere in the frame to add a point. The dataset is whatever is on screen &mdash; there is no hidden truth here, only the points you place.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="p1-two" class="g-primary">Two clusters</button>
+          <button type="button" id="p1-ring">Ring</button>
+          <button type="button" id="p1-undo">Undo</button>
+          <button type="button" id="p1-clear">Clear</button>
+        </div>
+        <div class="g-readout" id="p1-data-readout"></div>
+        <p class="g-mini">The two-cluster preset is the default because a mixture of two blobs is the simplest distribution whose shape is not just "a blob".</p>
+      </div>
+    </div>
+    <p>Two properties of a dataset matter everywhere in this guide. The first is its <em>spacing</em>: how far apart neighbouring points are. Spacing is a proxy for how much of the plane the data actually cover, and it sets the natural scale at which a model should invent new points. The second is its <em>shape</em>: a cluster, a ring, a curve, several separate modes. A model that captures the shape but not the spacing overfits; one that captures the spacing but not the shape is too smooth. The demo in the next step uses both.</p>
+  </section>
+
+  <section class="g-step" id="sample">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Sampling from the model</h2></div>
+    <p class="g-eyebrow">New points, not the ones you drew</p>
+    <p>Here is the simplest honest model of the dataset you just made: put a small bump of probability at every data point, then draw new points from the union of those bumps. This is a <em>kernel density estimate</em> &mdash; the histogram's smoother cousin &mdash; and it is a real generative model, fitted to your points, from which we can sample. Each sample picks one data point at random, then wanders a short distance from it. Press <em>Draw 240 samples</em> and the blue points appear over the grey data.</p>
+    <p>The key readout is <em>novelty</em>: the typical distance from a model sample to the nearest data point, measured in units of the dataset's own spacing. If that number is zero, the model has learned to copy. If it is comfortably above zero, the model is putting points where the data are not but easily could have been.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="p1-model-canvas" width="520" height="400"></canvas>
+        <p class="g-canvas-hint">Grey: your data. Blue: 240 fresh samples from the fitted kernel-density model. No sample is a data point unless the jitter is zero.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Jitter (temperature) <span class="val">0.55</span></label>
+          <input type="range" id="p1-tau" min="0" max="2" step="0.01" value="0.55">
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="p1-sample" class="g-primary">Draw 240 samples</button>
+        </div>
+        <div class="g-readout" id="p1-readout"></div>
+        <p class="g-mini">Sampling is random, but this page is seeded: the same slider value always produces the same 240 points, so you can compare settings fairly.</p>
+      </div>
+    </div>
+    <p>Notice what sampling buys you. The model has a compact description &mdash; the dataset plus one bandwidth &mdash; and from that it can emit as many points as you like. The samples are not memorised outputs; they are draws from a distribution that was fitted to the data. That is the entire contract of a generative model, and the rest of this guide is about doing it in spaces where "put a bump at every point" is hopeless: a million-dimensional image, where a bump per training example is not a model, it is a lookup table.</p>
+  </section>
+
+  <section class="g-step" id="overfit">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Memorising versus modelling</h2></div>
+    <p class="g-eyebrow">The jitter slider is the difference, and it is one number</p>
+    <p>Drag the jitter slider to zero and press the button again. Every sample lands exactly on a data point. The model has become a copy machine: it can only ever return one of the inputs, so it cannot produce anything the dataset did not already contain. Now drag the slider up. The samples spread out, following the shape of the data &mdash; the clusters stay clustered, the ring stays a ring &mdash; and the novelty readout climbs. Some samples fall in the gaps between points. That is generalisation, made visible.</p>
+    <p>Push it too far and the model breaks in the opposite direction: the bumps swell until clusters merge, the hole in the ring fills in, and the samples stop looking like the data at all. So there is a sweet spot, and finding it is what every training algorithm in this guide does &mdash; not by one slider, but by fitting millions of parameters so that the implied distribution matches the data without collapsing onto it. In diffusion the equivalent knob is the noise schedule and the amount of training; too little and the model memorises, too much and it over-smooths.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="p1-curve-canvas" width="520" height="260"></canvas>
+        <p class="g-canvas-hint">Novelty against jitter, computed from the current dataset. The dashed line is where the slider is right now.</p>
+      </div>
+      <div class="g-controls">
+        <p>At jitter zero the curve sits exactly on the axis: every sample is a training point. It rises steeply at first &mdash; the first bit of jitter is what breaks the copy machine &mdash; and then flattens, because past a certain spread the nearest data point is no closer than the spacing between arbitrary points in the plane.</p>
+        <p class="g-mini">Change the dataset on the previous canvas and this curve is recomputed: a ring and a pair of clusters have different spacing, so the same jitter means different things.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Exact outputs are not the goal.</b> A model that reproduces its training set perfectly would score zero on any honest test of novelty, yet it is trivially easy to build &mdash; it is the dataset itself. Everything that makes a generative model useful happens in the space <em>between</em> the training points, and that space is exactly where there is no data to check against.</span></div>
+    <p>The same tension is the reason this guide spends four more parts on noise. Adding noise to an image is a way of moving it off the data manifold into that between-space, and training a network to remove the noise is a way of forcing it to model the between-space rather than the points. The forward process is next.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The same picture, in higher dimensions</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Probability</div>
+        <h3 style="margin:6px 0;">Densities and conditionals</h3>
+        <p style="margin-bottom:0;">The <a href="{{ '/math/probability/' | relative_url }}">probability guide</a> supplies the language this part uses informally: densities, mixtures, and the conditional Gaussian that the forward process will lean on. The <a href="{{ '/math/probability-in-action/probabilistic-ml/' | relative_url }}">probabilistic machine-learning chapter</a> walks the same "fit a distribution to points" picture and ends at the one-page diffusion on-ramp.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Multimodal</div>
+        <h3 style="margin:6px 0;">Reading as well as making</h3>
+        <p style="margin-bottom:0;">The sibling volume <a href="{{ '/ai/multimodal/' | relative_url }}">Multimodal Models, Interactively</a> takes the same distributions and conditions them on text, images and audio. The joint distribution you sketch here becomes a conditional one there: instead of $p(x)$, a model learns $p(x \mid \text{prompt})$.</p>
+      </div>
+    </div>
+    <p>In the next part the points stop being two-dimensional dots and become pixels. A 64&times;64 image is a point in 12,288 dimensions, which is far too many to plot but exactly the same idea &mdash; a dataset of points, a distribution behind them, and a model that must learn the terrain rather than the dots. The machinery that makes it work is a procedure that destroys a data point with noise, one small step at a time, until nothing but the distribution remains.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below are the canonical treatments of generative models as density estimation, in increasing order of machinery. If you take one idea away, take the separation between a dataset and the distribution behind it; almost every confusion later in this volume comes from collapsing those two.</p>
+    <p>Bishop's chapter on density estimation is the cleanest introduction to kernels and mixtures; Goodfellow's tutorial and Kingma and Welling's VAE paper are where the modern framing of "sample from a learned distribution" begins; and the DDPM paper is the point at which this guide's next four parts start. 3Blue1Brown's videos are the visual reference for the style of the demos here.</p>
+    <ul class="g-refs">
+      <li>Christopher Bishop, <em>Pattern Recognition and Machine Learning</em>, chapter 2 &mdash; binary and multinomial distributions, the Gaussian, and kernel density estimation.</li>
+      <li>Ian Goodfellow, <a href="https://arxiv.org/abs/1701.00160">"NIPS 2016 Tutorial: Generative Adversarial Networks"</a> &mdash; the taxonomy of generative models as density estimation, explicit and implicit.</li>
+      <li>Diederik Kingma and Max Welling, <a href="https://arxiv.org/abs/1312.6114">"Auto-Encoding Variational Bayes"</a>, 2013 &mdash; the latent-variable view of a generative model and the reparameterisation trick.</li>
+      <li>Jonathan Ho, Ajay Jain and Pieter Abbeel, <a href="https://arxiv.org/abs/2006.11239">"Denoising Diffusion Probabilistic Models"</a>, 2020 &mdash; the model the next part begins to take apart.</li>
+      <li>3Blue1Brown, <a href="https://www.youtube.com/watch?v=wvsE8jm1GzE">"But what is a diffusion model?"</a> &mdash; the visual intuition for adding and removing noise.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Distribution $p(x)$</td><td>The process that generates data; never observed, only inferred</td></tr>
+        <tr><td>Dataset</td><td>A finite set of samples; sparse, and not the distribution</td></tr>
+        <tr><td>Generative model</td><td>A fitted distribution $p_\theta(x)$ you can sample from</td></tr>
+        <tr><td>Sample</td><td>One draw from the model; ideally novel, not a copied input</td></tr>
+        <tr><td>Memorisation</td><td>Outputs confined to the training points; zero novelty</td></tr>
+        <tr><td>Generalisation</td><td>Outputs that respect the shape of the data but fill the gaps</td></tr>
+        <tr><td>Kernel density estimate</td><td>A bump at every data point; the simplest real generative model</td></tr>
+        <tr><td>Jitter / temperature</td><td>The width of those bumps; the dial between copying and inventing</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The model you just built works because a plane is small enough to cover with bumps. In 12,288 dimensions it is hopeless, so the next part replaces the bumps with a process that first destroys the data with noise.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia;
+  var c = Guide.colors();
+  var RANGE = [-3.4, 3.4];
+  var DATA_SEED = 4242;
+  var data = [];
+  var samples = [];
+  var tau = 0.55;
+  var sampleRun = 0;
+  var curveTaus = [];
+  var curveVals = [];
+
+  var dataPlot = GM.plot(document.getElementById('p1-data-canvas'), {
+    W: 520, H: 400, xRange: RANGE.slice(), yRange: RANGE.slice(),
+    xLabel: 'x', yLabel: 'y', onResize: redrawData
+  });
+  var modelPlot = GM.plot(document.getElementById('p1-model-canvas'), {
+    W: 520, H: 400, xRange: RANGE.slice(), yRange: RANGE.slice(),
+    xLabel: 'x', yLabel: 'y', onResize: redrawModel
+  });
+  var curvePlot = GM.plot(document.getElementById('p1-curve-canvas'), {
+    W: 520, H: 260, xRange: [0, 2], yRange: [0, 1.2],
+    xLabel: 'jitter (temperature)', yLabel: 'novelty (spacing units)',
+    onResize: redrawCurve
+  });
+
+  function preset(kind) {
+    var out = [], i;
+    if (kind === 'ring') {
+      var rr = GM.rng(DATA_SEED + 991);
+      for (i = 0; i < 90; i++) {
+        var a = 2 * Math.PI * i / 90 + 0.12 * GM.gauss(rr);
+        var rad = 1.8 + 0.22 * GM.gauss(rr);
+        out.push([rad * Math.cos(a), rad * Math.sin(a)]);
+      }
+    } else {
+      var r = GM.rng(DATA_SEED + 17);
+      var cs = [[-1.5, -1.0], [1.4, 1.0]];
+      for (i = 0; i < 110; i++) {
+        var cc = cs[i % 2];
+        var g = GM.gauss2(r);
+        out.push([cc[0] + 0.5 * g[0], cc[1] + 0.5 * g[1]]);
+      }
+    }
+    return out;
+  }
+
+  function medianNN(pts) {
+    if (pts.length < 2) return 0.5;
+    var ds = [], i, j;
+    for (i = 0; i < pts.length; i++) {
+      var best = Infinity;
+      for (j = 0; j < pts.length; j++) {
+        if (i === j) continue;
+        var d = Math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]);
+        if (d < best) best = d;
+      }
+      ds.push(best);
+    }
+    ds.sort(function (a, b) { return a - b; });
+    var m = ds[Math.floor(ds.length / 2)];
+    return (isFinite(m) && m > 0) ? m : 0.5;
+  }
+
+  function modelSample(tt, count, seed) {
+    if (!data.length) return [];
+    var h = medianNN(data);
+    var spread = Math.max(0, tt) * h * 1.15;
+    var r = GM.rng(seed);
+    var out = [], i;
+    for (i = 0; i < count; i++) {
+      var j = Math.floor(r() * data.length);
+      if (j >= data.length) j = data.length - 1;
+      if (j < 0) j = 0;
+      var base = data[j];
+      var g = GM.gauss2(r);
+      out.push([base[0] + spread * g[0], base[1] + spread * g[1]]);
+    }
+    return out;
+  }
+
+  function novelty(pts, h) {
+    if (!pts.length || !data.length) return 0;
+    var total = 0, i, j;
+    for (i = 0; i < pts.length; i++) {
+      var best = Infinity;
+      for (j = 0; j < data.length; j++) {
+        var d = Math.hypot(pts[i][0] - data[j][0], pts[i][1] - data[j][1]);
+        if (d < best) best = d;
+      }
+      total += best;
+    }
+    return (total / pts.length) / (h || 1);
+  }
+
+  function rebuildCurve() {
+    curveTaus = []; curveVals = [];
+    if (!data.length) return;
+    var h = medianNN(data);
+    var k;
+    for (k = 0; k <= 24; k++) {
+      var tt = 2 * k / 24;
+      var pts = modelSample(tt, 60, 5000 + k * 13);
+      curveTaus.push(tt);
+      curveVals.push(novelty(pts, h));
+    }
+  }
+
+  function redrawData() {
+    if (!dataPlot) return;
+    dataPlot.clear();
+    dataPlot.axes({ xLabel: 'x', yLabel: 'y' });
+    dataPlot.points(data, { color: c.accent400, r: 3.2 });
+    dataPlot.legend([{ label: 'your data (' + data.length + ' points)', color: c.accent400 }], { dy: 6 });
+  }
+
+  function redrawModel() {
+    if (!modelPlot) return;
+    modelPlot.clear();
+    modelPlot.axes({ xLabel: 'x', yLabel: 'y' });
+    modelPlot.points(data, { color: 'rgba(120,124,130,0.4)', r: 2 });
+    modelPlot.points(samples, { color: c.accent, r: 2.6 });
+    modelPlot.legend([
+      { label: 'data (given)', color: '#9a9a9a', fill: true },
+      { label: 'fresh samples', color: c.accent }
+    ], { dy: 6 });
+  }
+
+  function redrawCurve() {
+    if (!curvePlot) return;
+    curvePlot.clear();
+    var maxV = 0, i;
+    for (i = 0; i < curveVals.length; i++) if (curveVals[i] > maxV) maxV = curveVals[i];
+    curvePlot.yRange[0] = 0;
+    curvePlot.yRange[1] = Math.max(0.5, maxV * 1.2);
+    curvePlot.axes({ xLabel: 'jitter (temperature)', yLabel: 'novelty (spacing units)' });
+    if (curveTaus.length) {
+      curvePlot.curve(curveTaus.map(function (t, k) { return [t, curveVals[k]]; }), { color: c.accent2, width: 2 });
+      curvePlot.vline(tau, { color: c.text, dashed: true, width: 1.4 });
+      curvePlot.text('τ = ' + tau.toFixed(2), tau, curvePlot.yRange[1] * 0.92, { align: 'left', dx: 6, color: c.text });
+    }
+  }
+
+  function redrawDataReadout() {
+    var el = document.getElementById('p1-data-readout');
+    if (!el) return;
+    var h = data.length > 1 ? medianNN(data) : 0;
+    el.innerHTML =
+      '<div><span class="k">points placed</span> <span class="hi">' + data.length + '</span></div>' +
+      '<div><span class="k">typical spacing</span> ' + h.toFixed(3) + '</div>' +
+      '<div class="g-mini">Spacing is the scale the model will use when it decides how far a new point may wander.</div>';
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('p1-readout');
+    if (!el) return;
+    var h = medianNN(data);
+    var nov = novelty(samples, h);
+    el.innerHTML =
+      '<div><span class="k">data points</span> ' + data.length + '</div>' +
+      '<div><span class="k">samples drawn</span> <span class="hi">' + samples.length + '</span></div>' +
+      '<div><span class="k">jitter τ</span> ' + tau.toFixed(2) + '</div>' +
+      '<div><span class="k">novelty</span> <span class="hi">' + nov.toFixed(3) + '×</span> spacing</div>' +
+      '<div class="g-mini">' + (nov < 0.05 ? 'Near-copying: every sample sits on a data point.' : 'Novel points: samples land between the data, following its shape.') + '</div>';
+  }
+
+  function refresh() {
+    rebuildCurve();
+    samples = modelSample(tau, 240, 9000 + sampleRun * 131);
+    redrawData();
+    redrawModel();
+    redrawCurve();
+    redrawDataReadout();
+    redrawReadout();
+  }
+
+  var dataCanvas = document.getElementById('p1-data-canvas');
+  if (dataCanvas) {
+    dataCanvas.addEventListener('click', function (ev) {
+      if (!dataPlot) return;
+      var p = Guide.hitTest(dataCanvas, ev);
+      var x = dataPlot.wx(p.x), y = dataPlot.wy(p.y);
+      if (x < RANGE[0] || x > RANGE[1] || y < RANGE[0] || y > RANGE[1]) return;
+      data.push([x, y]);
+      refresh();
+    });
+  }
+
+  var twoBtn = document.getElementById('p1-two');
+  if (twoBtn) twoBtn.addEventListener('click', function () { data = preset('two'); refresh(); });
+  var ringBtn = document.getElementById('p1-ring');
+  if (ringBtn) ringBtn.addEventListener('click', function () { data = preset('ring'); refresh(); });
+  var undoBtn = document.getElementById('p1-undo');
+  if (undoBtn) undoBtn.addEventListener('click', function () { data.pop(); refresh(); });
+  var clearBtn = document.getElementById('p1-clear');
+  if (clearBtn) clearBtn.addEventListener('click', function () { data = []; refresh(); });
+  var sampleBtn = document.getElementById('p1-sample');
+  if (sampleBtn) sampleBtn.addEventListener('click', function () {
+    sampleRun++;
+    samples = modelSample(tau, 240, 9000 + sampleRun * 131);
+    redrawModel();
+    redrawReadout();
+  });
+
+  Guide.bindSliders(document.querySelectorAll('#p1-tau'), function (el) {
+    tau = parseFloat(el.value);
+    samples = modelSample(tau, 240, 9000 + sampleRun * 131);
+    redrawModel();
+    redrawCurve();
+    redrawReadout();
+  });
+
+  data = preset('two');
+  refresh();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'genmedia-what-a-model-is',
+      kind: 'choice',
+      prompt: 'What is a generative model, in this part\u2019s framing?',
+      options: [
+        { label: 'A distribution fitted to the data that you can sample from, standing in for the unseen true distribution.', correct: true },
+        { label: 'A compressed copy of the training set that returns stored examples.', correct: false },
+        { label: 'A function that maps a label to the single most likely data point.', correct: false }
+      ],
+      explanation: 'The model is $p_\\theta(x)$, a distribution you can draw new points from. It is not the dataset and not a lookup table; its job is to place probability where the true process would, including in the gaps between training points.'
+    },
+    {
+      id: 'genmedia-memorise-count',
+      kind: 'numeric',
+      prompt: 'A dataset has 8 distinct points. A model that has memorised the dataset is asked for 200 samples at zero jitter. At most how many distinct locations can those samples occupy?',
+      answer: 8,
+      tolerance: 0.001,
+      explanation: 'At zero jitter every sample is an exact copy of a training point, so the outputs can only land on the 8 positions the data occupy \u2014 however many samples you ask for. This is why novelty, not fidelity to the data, is the test of a generative model.'
+    },
+    {
+      id: 'genmedia-jitter',
+      kind: 'choice',
+      prompt: 'You slide the jitter from 0 up to a moderate value. What happens to the samples?',
+      options: [
+        { label: 'They spread off the data points while keeping the data\u2019s shape, and novelty rises from zero.', correct: true },
+        { label: 'They become identical again but at the dataset mean.', correct: false },
+        { label: 'They move away in a fixed direction, because the jitter is a bias.', correct: false }
+      ],
+      explanation: 'A little jitter breaks the copy machine: samples leave the training points but still follow the clusters or ring, so they are novel yet plausible. Past the sweet spot the bumps merge and the shape is lost.'
+    },
+    {
+      id: 'genmedia-why-diffusion',
+      kind: 'choice',
+      prompt: 'Why can\u2019t the kernel-density trick of this part be used directly on a 64&times;64 image?',
+      options: [
+        { label: 'Putting a bump at every training image is a lookup table, not a model \u2014 it cannot cover the enormous space of possible images.', correct: true },
+        { label: 'Because images are not random variables and have no distribution.', correct: false },
+        { label: 'Because 12,288 is an odd number of dimensions.', correct: false }
+      ],
+      explanation: 'A 64&times;64 colour image is a point in 12,288 dimensions. Bumps at the training points cover a vanishing fraction of that space, so a useful model must learn the terrain \u2014 which is what the forward noising process and a denoiser are built to do.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

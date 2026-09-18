@@ -1,0 +1,525 @@
+---
+title: "Bolting an encoder onto a language model"
+description: "Linear and MLP projectors, the Q-Former and cross-attention bridges, where image tokens sit in the sequence, and what each option trains."
+permalink: "/ai/multimodal/adapters/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-btnrow { margin: 6px 0 14px; }
+  .g-note { font-size: 12px; opacity: 0.72; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Bolting an encoder onto a language model</h1>
+    <p>A vision encoder produces a stack of patch vectors; a language model expects token embeddings of its own width. To keep the vocabulary straight: a <em>tower</em> is one of the two large sub-networks in the pair &mdash; here the vision encoder that reads pixels and the language model that reads and writes words &mdash; and each tower was trained on its own kind of data, so each has its own idea of what a vector should look like. A language model, for instance, only knows how to consume vectors of one particular width, the size of its own embedding space, and it has no reason to expect a patch vector to already have that width, that scale, or that internal arrangement of meaning. Nothing about either tower guarantees that these two things live in the same vector space, and no amount of contrastive pretraining forces the pair to line up dimension by dimension. A <em>bridge</em> has to sit between them. It is a small, deliberately unglamorous piece of engineering, and it is where almost every trainable parameter in a vision-language model lives. This part is about the four bridge designs you will meet, what each of them trains, and where the image ends up in the token sequence.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="interface">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The interface between towers</h2></div>
+    <p class="g-eyebrow">Two frozen spaces and one learned adapter</p>
+    <p>A vision-language model starts from two pretrained parts that were trained separately. <em>Pretrained</em> means someone already spent the compute and the data to train each part on its own task &mdash; one to recognise images, one to predict text &mdash; and we get to reuse the result instead of starting over. The vision tower is a patch transformer &mdash; <a href="{{ '/ai/multimodal/vit/' | relative_url }}">the encoder of the previous parts</a> &mdash; and it emits one vector per patch at a width of, say, $1024$. <em>Width</em> here means how many numbers are packed into each vector. The language model expects vectors of width $4096$, and it will only accept them as the same input channel it uses for text. The bridge is whatever maps one to the other, and it has to do so for a whole grid of patch vectors at once, because the vision tower hands over every patch rather than one summary of the image. Here is the important structural choice, and it is worth pausing on because it explains almost everything else in this part: the two towers are usually frozen, or nearly so, during training, and only the bridge between them is updated. <em>Frozen</em> means a tower's weights are held fixed &mdash; they are read but never changed &mdash; so no training signal flows back into it. Why does that matter? Training a vision encoder from scratch, or a language model from scratch, takes enormous compute and enormous data &mdash; that is exactly why pretrained versions of each already exist and are reused here. If you unfroze both towers and trained everything jointly, you would be re-paying that entire cost just to teach the pair to talk to each other. Freezing them instead means you only ever have to train the (comparatively tiny) bridge &mdash; a translator that has to learn to speak two already-fluent languages to each other, not learn either language from scratch. That is the single fact that makes vision-language training affordable at all.</p>
+    <p>Four designs account for nearly everything in the literature. A <em>linear projector</em> is a single learned matrix, cheap and surprisingly strong; it is called linear because all it can do is a weighted sum, with no bend or curve in the mapping. An <em>MLP projector</em> adds a hidden layer and a nonlinearity, which is what LLaVA settled on. A <em>hidden layer</em> is an extra stage of computation between the input vector and the output vector, and a <em>nonlinearity</em> is a function that lets that stage bend its input rather than only rescale it &mdash; without one, stacking layers would collapse back into a single matrix. A <em>Q-Former</em>, from BLIP-2, uses a small transformer with a fixed set of learned query tokens that read from the image, which compresses hundreds of patches into a handful of vectors; a <em>query token</em> here is a learned vector that asks a question of the image features, much as a search term asks a question of a database. <em>Gated cross-attention</em>, from Flamingo, inserts attention layers into the language model itself so the text can look at the image without any image tokens entering the sequence at all. <em>Cross-attention</em> is attention in which the queries come from one stream, here the text, and the keys and values come from another, here the image, so one stream can read the other without the two being merged into a single sequence. The <em>gate</em> is a learned multiplier that starts at zero, which means each inserted layer is switched off at the beginning and only turns on as training finds it useful.</p>
+    <p>Everything else in this part hangs off that menu. The demo below prices the bridges: pick a design and a vision tower, and watch the trainable parameter count move. Parameter count is a rough proxy for two things at once, how much memory the bridge needs and how much data it will take to train, which is why it is the number people usually quote first. The gap between the cheapest and the most expensive option is two orders of magnitude, and that gap is the reason the choices are made the way they are &mdash; a team with a modest compute budget and a team with a large one will not reach the same conclusion from the same menu, and both can be right for their setting.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> name the four bridge designs, estimate what each trains, say why a Q-Former compresses a variable number of patches into a fixed number of tokens, explain how gated cross-attention keeps the language sequence free of image tokens, and say where each option puts the image in the sequence. Underneath all five is one recurring question: which parts move during training, and which stay frozen.</span></div>
+    <div class="g-toc">
+      <a href="#projectors">2 · Projectors, linear and otherwise</a>
+      <a href="#qformer">3 · Querying the image with a Q-Former</a>
+      <a href="#cross">4 · Cross-attention instead</a>
+      <a href="#sequence">5 · Where the image tokens go</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="projectors">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Projectors, linear and otherwise</h2></div>
+    <p class="g-eyebrow">The smallest thing that could possibly work</p>
+    <p>The linear projector is a single matrix $W$ that takes a vision vector of width $d_v$ to a language vector of width $d_l$. It has $d_v \cdot d_l$ parameters, it is trained on image-caption or instruction data, and it is applied to every patch token independently. That is the whole idea. What makes it work is that the vision tower has already been aligned to language by a contrastive objective, so the geometry is roughly right and the matrix only has to rotate and rescale it. In other words, the contrastive stage already pushed image vectors and word vectors into comparable positions, so the projector's job is closer to translation than to re-invention: it moves the vectors to the right place without having to decide afresh what they mean. Adding a hidden layer &mdash; an MLP with a nonlinearity, the LLaVA design &mdash; costs another $d_l^2$ parameters and buys a slightly more expressive map. A <em>hidden layer</em> is an intermediate vector the network computes before the output, and a <em>nonlinearity</em> is a bending or squashing function applied to it; together they let the projector fit a curved mapping rather than only a straight one, which is the sense in which it is more <em>expressive</em>. The MLP is worth its cost at $d_l = 4096$ and is not worth much more than that; three-layer projectors have been tried and rarely win.</p>
+    <p>Each of these options is applied per token, so the number of trainable parameters does not depend on how many patches the image produces. That is the property to hold on to: a projector's parameter count is set by the two widths, while its <em>token</em> count is set by the patch grid. The two budgets are separate levers. A taller image or a finer patch size will hand the language model more rows to read, but it will not add a single trainable weight to the projector, because the same small matrix is reused on every row. This is why the rest of the part can discuss a parameter budget and a token budget almost independently: one is fixed by the widths you chose, the other by the resolution you feed in.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="adapter-params-canvas" width="460" height="300"></canvas>
+        <p class="g-canvas-hint">Trainable parameters for each bridge at the selected vision tower, drawn with <code>Guide.drawBars</code>. The highlighted bar is the current choice; the language model itself is assumed frozen.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Vision tower <span class="val">ViT-L/14</span></label><input type="range" id="adapter-tower" min="0" max="3" step="1" value="1"></div>
+        <div class="g-btnrow" id="adapter-arch-row">
+          <button type="button" data-arch="linear">Linear projector</button>
+          <button type="button" data-arch="mlp" class="active">MLP projector</button>
+          <button type="button" data-arch="qformer">Q-Former</button>
+          <button type="button" data-arch="cross">Cross-attention</button>
+        </div>
+        <div class="g-readout" id="adapter-params-readout"></div>
+        <p class="g-mini">Estimates for a 4096-wide language model and a 768-wide Q-Former; the cross-attention bar counts four inserted gated layers. Treat them as orders of magnitude, not exact counts.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Parameter count is not the only cost.</b> The projector's parameters are tiny next to the towers, but its <em>activations</em> are not: one image becomes hundreds or thousands of tokens, and every one of them is a row of the language model's attention. <em>Activations</em> are the intermediate vectors a network computes as it runs, held in memory so gradients can be computed; they scale with the number of tokens, not with the number of weights. The next part is about that token budget, which usually dominates the parameter budget in practice.</span></div>
+  </section>
+
+  <section class="g-step" id="qformer">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Querying the image with a Q-Former</h2></div>
+    <p class="g-eyebrow">A fixed number of queries, however big the image</p>
+    <p>BLIP-2's Q-Former is a small transformer with a fixed set of learned query tokens &mdash; typically $32$ of them &mdash; that cross-attend to the vision tower's patch features. <em>Cross-attention</em> means the queries come from one place and the keys and values from another: here the queries are the learned tokens and the keys and values are the patches. The queries do not depend on the image; they are parameters. What depends on the image is the attention, so each query ends up pulling a different weighted average of the patches, and the $32$ output vectors become the $32$ image tokens the language model sees. Picture a panel of $32$ specialists, each with a fixed interest, all reading the same page of patches: one tracks colour, another tracks shapes on the left, and each reports the average of whatever caught its attention. The trick is that the number $32$ is chosen by the designer, not by the resolution: a Q-Former turns an image of any size into the same short summary, which keeps the language model's context budget predictable and makes the whole system resolution-agnostic at the interface. The <em>context budget</em> is the number of tokens the language model can hold at once; because it is fixed, a bridge that always emits the same number of image tokens fits a fixed budget no matter how large the picture is.</p>
+    <p>The cost is that a summary is lossy. Thirty-two vectors have to carry everything the language model will ever know about the picture, and fine spatial detail &mdash; the serial number on a label, the position of a small object &mdash; is exactly what a soft average of patches destroys. The reason is that averaging is a smoothing operation: if one patch holds a tiny, unique mark and its neighbours hold background, the weighted average keeps the background and washes the mark out. The heatmap below shows the query-to-patch attention: each row is a query, each column a patch, and a sharp row is a query that has found something specific to report. The temperature slider controls how sharply each query commits; a low temperature concentrates a row onto a few patches, and a high temperature spreads it across the whole image.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="adapter-qformer-canvas" width="400" height="320"></canvas>
+        <p class="g-canvas-hint">Query-to-patch attention, softmaxed per row. Rows are the 32 learned queries, columns are image patches; the matrix comes from a seeded stream, so it is the same on every load.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query temperature <span class="val">0.5</span></label><input type="range" id="adapter-query-temp" min="0" max="4" step="1" value="2"></div>
+        <div class="g-readout" id="adapter-qformer-readout"></div>
+        <p class="g-mini">A fixed query set means a fixed token count. That is the point of the design and also its ceiling.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Resampling is compression with a knob.</b> The Q-Former's query count is a dial between "cheap, short context" and "expressive, long context", and it is the ancestor of the perceiver-resampler used by later models; turning the dial up keeps more detail and costs more context, and turning it down does the reverse. When you see a multimodal model advertise a fixed number of visual tokens regardless of image size, this is usually the mechanism.</span></div>
+  </section>
+
+  <section class="g-step" id="cross">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Cross-attention instead</h2></div>
+    <p class="g-eyebrow">Leave the language sequence alone</p>
+    <p>Flamingo took a different route. Rather than converting patches into tokens that sit in the language model's input, it inserted new cross-attention layers into the frozen language model's blocks, so that the text tokens can attend to the image features at several depths. There are no image tokens in the sequence at all: the text is generated exactly as before, except that every so often it is allowed to look at a set of image features that never enter the self-attention. Each inserted layer carries a learnable gate initialised at zero, so training starts from the frozen model's behaviour and gradually opens the tap &mdash; a stabiliser that matters when the rest of the network is frozen and the new layers see gradients for the first time. <em>Gradients</em> are the signals training uses to nudge each weight; a fresh, randomly initialised layer produces large and noisy ones, and if those signals could flow back into the pretrained text model they would disturb abilities that already work. Starting the gate at zero means the new layer contributes nothing at first, so the model's outputs are unchanged and the gradients stay small until the gate has learned something worth adding.</p>
+    <p>The advantage is that the language model's sequence length is untouched, so nothing in its positional or context story has to change, and the frozen text ability is protected. That matters because a language model has a fixed maximum sequence length and a fixed sense of where each position sits; adding hundreds of image tokens pushes against both, and a bridge that inserts nothing avoids the problem entirely. The disadvantage is that you now have trainable layers inside the language model rather than beside it, which is a larger and more intrusive edit: you are modifying the model's own blocks, so the bridge has to be built for that specific architecture rather than attached from outside. The heatmap below is text-token attention over image tokens with the gate applied; drag the gate down and the image contribution fades toward the frozen text-only model.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="adapter-cross-canvas" width="420" height="300"></canvas>
+        <p class="g-canvas-hint">Effective cross-attention of text tokens (rows) over image tokens (columns), scaled by the gate. At gate zero the inserted layers are transparent and the model falls back to its text-only behaviour.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Gate tanh(g) <span class="val">0.70</span></label><input type="range" id="adapter-gate" min="0" max="10" step="1" value="7"></div>
+        <div class="g-readout" id="adapter-cross-readout"></div>
+        <p class="g-mini">The gate starts at zero and is learned. It is the standard answer to "how do I add a new pathway to a frozen model without wrecking it".</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="sequence">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where the image tokens go</h2></div>
+    <p class="g-eyebrow">One prefix, one bridge, no free lunch</p>
+    <p>Once a bridge is chosen, the resulting image representation has to be spliced into the language model's input, and where it lands is a design decision with consequences. LLaVA concatenates the projected image tokens into the sequence before the instruction text, so the language model sees a row of vectors that stand for the picture followed by the words. That chunk of image vectors sitting at the front of the input is called a <em>prefix</em>, and the model has no way to tell it apart from ordinary text except by where it sits and what it contains; the words come after it and attend to it like any other token. The image tokens then attend to the text and the text to the image, both through the ordinary self-attention of the frozen language model, and the number of extra positions is exactly the number of image tokens. A Q-Former inserts its fixed query set at the same place, in the same way, just far fewer of them. Gated cross-attention inserts nothing: the image is a side channel, delivered to the text through the inserted layers instead of handed to it as part of the sequence.</p>
+    <p>The diagram below draws the sequence for the current bridge. The slider sets how many patch tokens the vision tower contributes; the sequence for the projector and Q-Former designs grows with it, while the cross-attention sequence is flat because the image never enters it. Watch the left-to-right length rather than the contents: for the first two designs every extra patch is another box the language model has to attend over, whereas the cross-attention row stays exactly as long as the text. That difference is the whole argument of the part in one picture.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="adapter-seq-canvas" width="560" height="190"></canvas>
+        <p class="g-canvas-hint">The language model's input sequence for the selected bridge: instruction text (blue), image or query tokens (pink), and the reply prompt (blue). Drawn with <code>Guide.setupCanvas</code>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Patch tokens N <span class="val">576</span></label><input type="range" id="adapter-seq-n" min="16" max="1024" step="16" value="576"></div>
+        <div class="g-readout" id="adapter-seq-readout"></div>
+        <p class="g-mini">Text tokens are fixed at a handful either side of the image; the image is the variable.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Prepending image tokens is the default for a reason.</b> It needs no change to the language model at all, so the same recipe works for any frozen checkpoint. The cost is that every image token is a full row of every attention matrix, so the sequence length &mdash; and with it the prefill cost and the KV cache &mdash; is paid at the input, not hidden in a side channel. <em>Prefill</em> is the first pass in which the model reads the whole prompt before it generates anything, and the <em>KV cache</em> is the running notebook of keys and values it keeps from that pass so it does not have to reread the prompt for every new word; both grow with the prompt length, which is why a long image prefix is expensive.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The bridge names the model</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Projectors</div>
+        <h3 style="margin:6px 0;">LLaVA and the instruction-tuned family</h3>
+        <p style="margin-bottom:0;">LLaVA pairs a CLIP vision tower with a Vicuna language model and trains a two-layer MLP between them, then fine-tunes on generated visual instructions. The simplicity of the bridge is the reason the recipe reproduces on almost any pair of open checkpoints, which is why there are so many descendants. Because the projector is small and self-contained, swapping in a different vision encoder or a different language model costs mostly the price of retraining that one module, and the rest of the system carries over unchanged.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Resamplers</div>
+        <h3 style="margin:6px 0;">BLIP-2, InstructBLIP and the query school</h3>
+        <p style="margin-bottom:0;">BLIP-2 trains a Q-Former between a frozen vision encoder and a frozen language model, and makes the queries the interface. Because the token count is fixed, the same Q-Former can feed different language models, which is exactly the modularity the design was aiming for. Once the Q-Former has turned any image into the same 32 vectors, those vectors are just a short piece of context, and a second language model only has to learn to read them rather than deal with the image at all.</p>
+      </div>
+    </div>
+    <p>Flamingo's gated cross-attention sits at the other end of the spectrum and is the ancestor of the open interleaved models that followed, where text and images arrive in the same conversation and the model reads them in order. The thing to notice is that all four designs answer the same question &mdash; how does one modality's vectors become another's tokens &mdash; and that the answer is always a small module between two large frozen ones. The names differ, the parameter counts differ by two orders of magnitude, and the sequence diagrams look nothing alike, but the structural bet is identical: leave the expensive pretrained parts alone and train only the cheap part that lets them cooperate. The token budget that the bridge implies is the subject of <a href="{{ '/ai/multimodal/resolution/' | relative_url }}">the next part</a>.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers define the four bridges and the training recipes that make them work. Read them together and the design space is small: one projector, one resampler, one fusion layer, and a lot of data. The order below roughly tracks the ideas &mdash; a resampler that reads an image with learned queries, a projector that translates patch vectors into word vectors, and an attention layer that feeds image features into a frozen language model &mdash; and seeing them side by side makes it clear how little of a vision-language model is actually about vision.</p>
+    <ul class="g-refs">
+      <li>Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc and coauthors, <a href="https://arxiv.org/abs/2204.14198">"Flamingo: a Visual Language Model for Few-Shot Learning"</a>, 2022 &mdash; the perceiver resampler and gated cross-attention layers inserted into a frozen language model.</li>
+      <li>Junnan Li, Dongxu Li, Silvio Savarese and Steven Hoi, <a href="https://arxiv.org/abs/2301.12597">"BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models"</a>, 2023 &mdash; the Q-Former and its fixed query set.</li>
+      <li>Haotian Liu, Chunyuan Li, Qingyang Wu and Yong Jae Lee, <a href="https://arxiv.org/abs/2304.08485">"Visual Instruction Tuning"</a>, 2023 &mdash; LLaVA, the MLP projector and machine-generated multimodal instructions.</li>
+      <li>Andrew Jaegle, Felix Gimeno, Andrew Brock and coauthors, <a href="https://arxiv.org/abs/2103.03206">"Perceiver: General Perception with Iterative Attention"</a>, 2021 &mdash; the latent-query resampling that both the Q-Former and Flamingo's resampler inherit.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Bridge / adapter</td><td>The trainable module between a frozen vision tower and a frozen language model</td></tr>
+        <tr><td>Linear projector</td><td>One matrix $d_v \times d_l$; applied per patch, cheapest possible map</td></tr>
+        <tr><td>MLP projector</td><td>A projector with a hidden layer and nonlinearity; the LLaVA choice</td></tr>
+        <tr><td>Q-Former</td><td>A transformer with a fixed set of learned queries that read the image into that many tokens</td></tr>
+        <tr><td>Perceiver resampler</td><td>The same latent-query idea, used inside Flamingo to shrink a variable patch set</td></tr>
+        <tr><td>Gated cross-attention</td><td>New attention layers in the language model, gated from zero, so image tokens never enter the sequence</td></tr>
+        <tr><td>Trainable parameters</td><td>Almost always the bridge and nothing else in the first stage; the towers stay frozen</td></tr>
+        <tr><td>Token budget</td><td>Separate from the parameter budget: set by the patch grid or by the query count</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The bridge decides how image vectors become tokens. The next part is about how many of those tokens there are, what resolution buys, and what the prefill bill looks like when an image joins the prompt. A bridge that looks cheap in parameters can turn out to be expensive in sequence length, and that trade is where much of the practical engineering happens.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var D_LLM = 4096;
+  var TOWERS = [
+    { label: 'ViT-B/16', dv: 768, frozen: 86e6 },
+    { label: 'ViT-L/14', dv: 1024, frozen: 304e6 },
+    { label: 'SigLIP-so400m', dv: 1152, frozen: 400e6 },
+    { label: 'ViT-H/14', dv: 1280, frozen: 632e6 }
+  ];
+  var ARCHS = [
+    { id: 'linear', label: 'Linear projector', color: c.accent },
+    { id: 'mlp', label: 'MLP projector', color: c.accent400 },
+    { id: 'qformer', label: 'Q-Former', color: c.accent2 },
+    { id: 'cross', label: 'Cross-attention', color: c.accent700 }
+  ];
+  var QUERY_TEMPS = [0.1, 0.2, 0.5, 1.0, 2.0];
+  var queryTempIdx = 2;
+  var GATES = [0, 0.1, 0.2, 0.35, 0.5, 0.7, 0.85, 1, 1, 1, 1];
+  var gateIdx = 5;
+  var SEQ_N = 576;
+
+  var towerIdx = 1, archIdx = 1;
+
+  function tower() { return TOWERS[towerIdx]; }
+  function arch() { return ARCHS[archIdx]; }
+  function dv() { return tower().dv; }
+
+  function params(id) {
+    var d = dv();
+    if (id === 'linear') return d * D_LLM;
+    if (id === 'mlp') return d * D_LLM + D_LLM * D_LLM;
+    if (id === 'qformer') {
+      var dq = 768, ff = 3072;
+      return 12 * (4 * dq * dq + 2 * dq * ff) + 32 * dq + d * dq + dq * D_LLM;
+    }
+    var insert = 4;
+    return insert * (4 * D_LLM * D_LLM + 2 * D_LLM * d);
+  }
+
+  function fmtM(v) {
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + ' B';
+    if (v >= 1e7) return (v / 1e6).toFixed(0) + ' M';
+    return (v / 1e6).toFixed(1) + ' M';
+  }
+
+  // ---- 2. parameter bars ---------------------------------------------------
+  var paramsSetup = Guide.setupCanvas(document.getElementById('adapter-params-canvas'), 460, 300, function () { drawParams(); });
+
+  function drawParams() {
+    if (!paramsSetup) return;
+    var sel = arch().id;
+    var rows = ARCHS.map(function (a) {
+      var v = params(a.id);
+      return {
+        label: a.label,
+        value: v,
+        valueLabel: fmtM(v),
+        color: a.id === sel ? a.color : 'rgba(120,120,120,0.35)'
+      };
+    });
+    var maxV = Math.max.apply(null, rows.map(function (r) { return r.value; })) * 1.12;
+    Guide.drawBars(paramsSetup.ctx, 460, 300, rows, { padL: 120, padR: 70, padT: 34, padB: 12, maxV: maxV, fontSize: 12 });
+    var ctx = paramsSetup.ctx;
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('trainable parameters · ' + tower().label + ' (d = ' + dv() + ')', 56, 14);
+    ctx.restore();
+    var el = document.getElementById('adapter-params-readout');
+    if (el) {
+      var ratio = params(sel) / params('linear');
+      el.innerHTML =
+        '<div><span class="k">bridge</span> <span class="hi">' + arch().label + '</span></div>' +
+        '<div><span class="k">vision tower</span> ' + tower().label + ' (d_v ' + dv() + ')</div>' +
+        '<div><span class="k">tower params</span> ' + fmtM(tower().frozen) + ' frozen</div>' +
+        '<div><span class="k">trainable</span> <span class="hi">' + fmtM(params(sel)) + '</span></div>' +
+        '<div><span class="k">vs linear</span> ' + ratio.toFixed(1) + '×</div>' +
+        '<div class="g-mini">Linear and MLP projectors scale with d_v · d_l; the Q-Former is dominated by its own 12 layers; cross-attention scales with d_l² per inserted layer.</div>';
+    }
+  }
+
+  var archRow = document.getElementById('adapter-arch-row');
+  function syncArchButtons() {
+    if (!archRow) return;
+    Array.prototype.forEach.call(archRow.querySelectorAll('button'), function (b) {
+      b.classList.toggle('active', b.getAttribute('data-arch') === arch().id);
+    });
+  }
+  if (archRow) {
+    Array.prototype.forEach.call(archRow.querySelectorAll('button'), function (b) {
+      b.addEventListener('click', function () {
+        var id = b.getAttribute('data-arch');
+        for (var i = 0; i < ARCHS.length; i++) if (ARCHS[i].id === id) archIdx = i;
+        redraw();
+      });
+    });
+  }
+
+  // ---- 3. Q-Former query attention ----------------------------------------
+  var qfSetup = Guide.setupCanvas(document.getElementById('adapter-qformer-canvas'), 400, 320, function () { drawQFormer(); });
+
+  function qformerMatrix() {
+    var Q = 32, P = 64, r = GM.rng(31337), logits = [];
+    for (var q = 0; q < Q; q++) {
+      var pref = (q * 29) % P;
+      var row = [];
+      for (var p = 0; p < P; p++) {
+        var dist = Math.min(Math.abs(p - pref), P - Math.abs(p - pref));
+        row.push(-0.45 * dist + 0.5 * GM.gauss(r));
+      }
+      logits.push(row);
+    }
+    return logits;
+  }
+
+  function drawQFormer() {
+    if (!qfSetup) return;
+    var t = QUERY_TEMPS[queryTempIdx];
+    var logits = qformerMatrix();
+    var weights = logits.map(function (row) { return Guide.softmax(row, t); });
+    var maxW = 0, meanMax = 0;
+    weights.forEach(function (row) {
+      var m = Math.max.apply(null, row);
+      maxW = Math.max(maxW, m);
+      meanMax += m;
+    });
+    meanMax = meanMax / weights.length;
+    Guide.drawHeatmap(qfSetup.ctx, 400, 320, weights, {
+      min: 0, max: maxW || 1, colorLow: [234, 240, 255], colorHigh: [214, 0, 108],
+      rowLabels: null, colLabels: null, fontSize: 9
+    });
+    var el = document.getElementById('adapter-qformer-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">queries</span> 32 learned tokens</div>' +
+        '<div><span class="k">patches read</span> 64</div>' +
+        '<div><span class="k">temperature</span> ' + t.toFixed(2) + '</div>' +
+        '<div><span class="k">mean top weight</span> <span class="hi">' + Guide.fmtPct(meanMax, 1) + '</span></div>' +
+        '<div class="g-mini">A sharp row is a query that has found something specific; a flat row is a query averaging the whole image. The output width is 32 no matter how many patches there are.</div>';
+    }
+  }
+
+  // ---- 4. gated cross-attention -------------------------------------------
+  var crossSetup = Guide.setupCanvas(document.getElementById('adapter-cross-canvas'), 420, 300, function () { drawCross(); });
+
+  function crossMatrix() {
+    var T = 14, P = 64, gate = GATES[gateIdx], r = GM.rng(9091), out = [];
+    for (var t = 0; t < T; t++) {
+      var pref = (t * 5 + 3) % P;
+      var row = [];
+      for (var p = 0; p < P; p++) {
+        var dist = Math.min(Math.abs(p - pref), P - Math.abs(p - pref));
+        row.push(Math.exp(-dist * dist / 20) + 0.1 * Math.abs(GM.gauss(r)));
+      }
+      var sm = Guide.softmax(row, 1);
+      out.push(sm.map(function (v) { return v * gate; }));
+    }
+    return out;
+  }
+
+  function drawCross() {
+    if (!crossSetup) return;
+    var m = crossMatrix();
+    var maxV = 0;
+    m.forEach(function (row) { maxV = Math.max(maxV, Math.max.apply(null, row)); });
+    Guide.drawHeatmap(crossSetup.ctx, 420, 300, m, {
+      min: 0, max: maxV || 1, colorLow: [234, 240, 255], colorHigh: [43, 95, 255], fontSize: 9
+    });
+    var ctx = crossSetup.ctx;
+    ctx.save();
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, 419, 299);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('text tokens × image tokens · gate = ' + GATES[gateIdx].toFixed(2), 8, 14);
+    ctx.restore();
+    var el = document.getElementById('adapter-cross-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">inserted layers</span> 4 gated cross-attn</div>' +
+        '<div><span class="k">image tokens in sequence</span> <span class="hi">0</span></div>' +
+        '<div><span class="k">gate</span> ' + GATES[gateIdx].toFixed(2) + '</div>' +
+        '<div><span class="k">image influence</span> ' + Guide.fmtPct(GATES[gateIdx], 0) + '</div>' +
+        '<div class="g-mini">The gate multiplies the cross-attention output, not the attention weights. At gate zero the model is exactly the frozen text model.</div>';
+    }
+  }
+
+  // ---- 5. sequence diagram -------------------------------------------------
+  var seqSetup = Guide.setupCanvas(document.getElementById('adapter-seq-canvas'), 560, 190, function () { drawSeq(); });
+
+  function drawTokenRow(ctx, x, y, w, h, count, color, label) {
+    ctx.save();
+    for (var i = 0; i < count; i++) {
+      ctx.fillStyle = color;
+      ctx.fillRect(x + i * (w + 2), y, w, h);
+    }
+    if (label) {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(label, x + (count * (w + 2) - 2) / 2, y + h + 14);
+    }
+    ctx.restore();
+    return count * (w + 2) - 2;
+  }
+
+  function drawSeq() {
+    if (!seqSetup) return;
+    var ctx = seqSetup.ctx, W = 560, H = 190;
+    ctx.clearRect(0, 0, W, H);
+    var id = arch().id;
+    var y = 52, h = 34, tw = 9;
+    var textN = 6;
+    var imgCount = (id === 'qformer') ? 32 : (id === 'cross' ? 0 : Math.min(SEQ_N, 32));
+    var imgLabel = (id === 'qformer') ? '32 query tokens' : (id === 'cross' ? '' : imgCount + ' image tokens');
+    var note = '';
+    var x = 26;
+    var w1 = drawTokenRow(ctx, x, y, tw, h, textN, c.accent, 'instruction');
+    x += w1 + 10;
+    if (id === 'cross') {
+      ctx.save();
+      ctx.fillStyle = c.accent400; ctx.font = '12px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('language model sequence: text only', W / 2, y + h + 46);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(30, 150); ctx.lineTo(W - 30, 150); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.font = '11px ' + c.font;
+      ctx.fillText('image features arrive through gated cross-attention', W / 2, 168);
+      ctx.restore();
+      note = 'flat sequence';
+    } else {
+      var w2 = drawTokenRow(ctx, x, y, tw, h, imgCount, c.accent2, imgLabel);
+      x += w2 + 10;
+      drawTokenRow(ctx, x, y, tw, h, textN, c.accent, 'reply');
+      if (SEQ_N > 32 && id !== 'qformer') {
+        ctx.save();
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText('+ ' + (SEQ_N - 32) + ' more image tokens not drawn', 30, 124);
+        ctx.restore();
+      }
+      note = (id === 'qformer' ? '32 image tokens' : SEQ_N + ' image tokens') + ' in the sequence';
+    }
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(arch().label + ' — where the image enters', 26, 24);
+    ctx.restore();
+    var el = document.getElementById('adapter-seq-readout');
+    if (el) {
+      var seqTokens = id === 'cross' ? (textN * 2) : (textN * 2 + (id === 'qformer' ? 32 : SEQ_N));
+      el.innerHTML =
+        '<div><span class="k">bridge</span> <span class="hi">' + arch().label + '</span></div>' +
+        '<div><span class="k">image tokens in sequence</span> ' + (id === 'cross' ? '0' : (id === 'qformer' ? '32' : SEQ_N)) + '</div>' +
+        '<div><span class="k">sequence length added</span> ' + (id === 'cross' ? '0' : '+ ' + (id === 'qformer' ? 32 : SEQ_N)) + '</div>' +
+        '<div><span class="k">' + note + '</span></div>' +
+        '<div class="g-mini">Self-attention needs one row per token, so a prefix of image tokens lengthens every attention matrix in the language model. Cross-attention is the only design here that does not.</div>';
+    }
+  }
+
+  function redraw() {
+    syncArchButtons();
+    drawParams();
+    drawQFormer();
+    drawCross();
+    drawSeq();
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#adapter-tower'), function (el) {
+    towerIdx = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = tower().label;
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#adapter-query-temp'), function (el) {
+    queryTempIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#adapter-gate'), function (el) {
+    gateIdx = Math.min(GATES.length - 1, Math.max(0, parseInt(el.value, 10)));
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#adapter-seq-n'), function (el) {
+    SEQ_N = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'adapters-llava',
+      kind: 'choice',
+      prompt: 'LLaVA connects its vision tower to its language model with which bridge?',
+      options: [
+        { label: 'A two-layer MLP projector applied to each patch token.', correct: true },
+        { label: 'A Q-Former with 32 learned query tokens.', correct: false },
+        { label: 'Gated cross-attention layers inserted into every language model block.', correct: false }
+      ],
+      explanation: 'LLaVA projects each vision patch with a small MLP into the language model width, then trains on visual instruction data. The Q-Former belongs to BLIP-2 and gated cross-attention to Flamingo.'
+    },
+    {
+      id: 'adapters-linear-params',
+      kind: 'numeric',
+      prompt: 'A linear projector maps a 1024-dimensional vision vector to a 4096-dimensional language embedding. How many parameters is that, in millions (enter a number like 4.2)?',
+      answer: 4.2,
+      tolerance: 0.2,
+      unit: 'million',
+      explanation: 'A linear map has d_v · d_l = 1024 × 4096 = 4,194,304 parameters, about 4.2 million. That is the entire trainable bridge.'
+    },
+    {
+      id: 'adapters-qformer',
+      kind: 'choice',
+      prompt: 'What does a Q-Former buy you over a per-token projector?',
+      options: [
+        { label: 'A fixed number of image tokens regardless of the image resolution.', correct: true },
+        { label: 'A larger number of image tokens, so more spatial detail survives.', correct: false },
+        { label: 'No trainable parameters at all, since the queries are frozen.', correct: false }
+      ],
+      explanation: 'The query set has a designer-chosen size, so a Q-Former maps any number of patches to that many tokens. It compresses, which makes the language context budget predictable and loses fine detail.'
+    },
+    {
+      id: 'adapters-cross',
+      kind: 'choice',
+      prompt: 'In Flamingo-style gated cross-attention, what happens to the language model\u2019s token sequence?',
+      options: [
+        { label: 'Nothing — no image tokens are added; the text attends to image features from new layers.', correct: true },
+        { label: 'One image token is inserted for each patch, as in LLaVA.', correct: false },
+        { label: 'The sequence is shortened because image tokens replace text tokens.', correct: false }
+      ],
+      explanation: 'The image is a side channel. Gated cross-attention layers let text tokens read image features at several depths, so the sequence length is unchanged and the frozen text behaviour is protected by gates initialised at zero.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

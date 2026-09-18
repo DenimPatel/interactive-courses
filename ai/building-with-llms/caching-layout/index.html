@@ -1,0 +1,633 @@
+---
+title: "Building with LLMs, Interactively — Part 11: Caching-aware prompt layout"
+description: "Prefix caching is a longest-common-prefix match, so prompt layout is a cost decision: stable content first, volatile content last, and the silent invalidators that quietly cost you every request."
+permalink: "/ai/building-with-llms/caching-layout/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Caching-aware prompt layout</h1>
+    <p>Every turn resends the whole prompt, and the provider charges for what it can recompute versus what it can reuse. Prefix caching is what lets it reuse, but the cache is keyed on the <em>exact bytes at the front</em> of your prompt. That makes layout — the order of the blocks you assemble — a cost and latency decision on the same footing as retrieval or model choice. This part is a puzzle: you reorder a real prompt, and 100 simulated requests tell you what it cost.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="mechanics">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A hit is a longest-common-prefix match</h2></div>
+    <p class="g-eyebrow">The provider matches from the front, byte for byte</p>
+    <p>Prefill turns prompt tokens into key/value vectors, and it is the compute-heavy half of inference. When a provider offers prompt caching, it stores those vectors for a prefix it has already seen and lets the next request reuse them. The matching is not semantic: the provider hashes the prompt's leading blocks and looks for a byte-identical chain. The moment a block differs — a single character, a reordered JSON key, a new timestamp — the match stops, and every token after that point is recomputed at full price.</p>
+    <p>That is the whole lesson in one sentence: <strong>a cache hit is a longest-common-prefix match, so the reusable part of your prompt is whatever is byte-identical from the very first byte.</strong> Position matters more than content. A block that is stable but placed after a volatile block is worth nothing.</p>
+    <div class="g-code"><span class="k">// the layout that hits</span>
+system prompt        <span class="s">// stable, identical every call</span>
+tool definitions     <span class="s">// stable, identical every call</span>
+few-shot examples    <span class="s">// stable, identical every call</span>
+──────────────────── <span class="k">← cache breakpoint: everything above is reused</span>
+retrieved documents  <span class="s">// volatile: changes with the query</span>
+conversation history <span class="s">// volatile: grows every turn</span>
+timestamp            <span class="s">// volatile: datetime.now()</span>
+user question        <span class="s">// volatile: different every call</span></div>
+    <div class="g-goal">💡 <span><b>The rule:</b> stable content first, volatile content last. The reusable prefix is worth the most when it is long, and it is cheap to make long — system instructions, tool schemas and few-shot examples are exactly the blocks you control.</span></div>
+    <p>Anthropic's cache reads bill at <strong>0.1×</strong> the base input rate and cache writes at <strong>1.25×</strong>, with a <strong>5-minute</strong> time-to-live by default; OpenAI's automatic cache reports it as <code>cached_tokens</code> at a <strong>0.5×</strong> input rate and only engages once a prompt is over 1,024 tokens. The multipliers differ by vendor. What does not differ is the mechanism: the hit rate is a property of your layout, not of the vendor.</p>
+    <p class="g-source" id="cache-src-prompt"></p>
+    <div class="g-warn">⚠️ <span><b>The silent invalidators:</b> a <code>datetime.now()</code> in the system block, a tool schema serialised with non-deterministic key order, a few-shot set shuffled into a different order each request, a stray trailing newline. None of them changes the answer. Every one of them resets the matched prefix to zero.</span></div>
+  </section>
+
+  <section class="g-step" id="puzzle">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Reorder the prompt, watch 100 requests</h2></div>
+    <p class="g-eyebrow">The load-bearing demo — click a block, then move it</p>
+    <p>Below is a seven-block prompt, started in the worst possible order: the timestamp sits at the very top. Move the blocks with the ▲/▼ arrows on each row (click the row first to select it), and toggle the two silent invalidators. Every change re-runs the same 100 simulated requests through <code>AppSim.cacheSim</code> with a 64-block prefix cache, and the strip along the bottom shows each request: the reused tokens in blue, the recomputed tokens in red, the pale remainder in grey.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cache-puzzle-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Top: the prompt block stack, in send order. Bottom: 100 requests left to right; blue = cache read, red = recomputed after the first mismatch.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="cache-a-ts">Timestamp: clock (volatile)</button>
+          <button id="cache-a-tools">Tool order: fixed (stable)</button>
+        </div>
+        <div class="g-btnrow">
+          <button id="cache-a-best" class="g-primary">Best layout</button>
+          <button id="cache-a-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="cache-a-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>What to watch:</b> with the timestamp on top the hit rate is <b>0%</b>, because the first byte differs on every call. Move the three stable blocks to the front and it jumps to <b>99%</b> — the same content, rearranged, with a large real cost difference.</span></div>
+  </section>
+
+  <section class="g-step" id="bytes">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>What one byte-identical change costs</h2></div>
+    <p class="g-eyebrow">A reordered key, a newline, a timestamp</p>
+    <p>The failure mode is not a bad prompt — it is a prompt that is <em>almost</em> identical to yesterday's. The bar below shows the matched prefix length for the same 7,460-token prompt under five scenarios. Every row keeps the same content; only the bytes at the boundary change. The matched prefix is everything the provider can reuse, and it collapses from the point of the first difference onward.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cache-byte-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Solid = reused prefix, pale = recomputed at full price. The prompt is identical in every row; only the byte at the boundary changes.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="cache-b-sort" class="g-primary">Sort tool keys</button>
+        </div>
+        <div class="g-readout" id="cache-b-readout"></div>
+      </div>
+    </div>
+    <p>The fix is unglamorous: serialise tool schemas with sorted keys, strip volatile fields out of cached blocks, pin a literal example order, and put anything time-dependent at the end. Cache breakpoints are explicit markers you can place to say "everything above this is stable"; the provider stores up to a few of them per request, so you can cache a shared system-plus-tools prefix and a per-user stable head without caching the volatile tail.</p>
+    <p class="g-source" id="cache-src-cost"></p>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Write once, read many</h2></div>
+    <p class="g-eyebrow">Why the write premium is not a reason to skip caching</p>
+    <p>A cache write costs <strong>1.25×</strong> the input rate and a cache read costs <strong>0.1×</strong>, so the first request that populates the cache is slightly more expensive than no cache at all. The question is how many times the prefix is reused before the 5-minute TTL expires. If your system prefix is reused even twice, you are ahead — this is arithmetic, not judgement.</p>
+    <p>Drag the turns and the per-turn growth. The solid line is no cache; the dashed line is a warm cache that only pays read prices; the dotted line is the honest one, including the one-off write premium on the first turn.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cache-cost-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Cumulative cost across turns, in USD. Solid = cold every turn, dashed = read-price only, dotted = with the 1.25× write premium included.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Turns <span class="val">12</span></label><input type="range" id="cache-c-turns" min="1" max="60" step="1" value="12"></div>
+        <div class="g-field"><label>New tokens per turn <span class="val">400</span></label><input type="range" id="cache-c-growth" min="0" max="1500" step="50" value="400"></div>
+        <div class="g-readout" id="cache-c-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cache-src-pricing"></p>
+  </section>
+
+  <section class="g-step" id="measure">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Measure <code>cache_read_input_tokens</code>, not vibes</h2></div>
+    <p class="g-eyebrow">If you cannot see the metric, you are paying for it</p>
+    <p>Every provider that caches exposes what actually happened. Anthropic returns <code>cache_read_input_tokens</code> and <code>cache_creation_input_tokens</code>; OpenAI returns <code>cached_tokens</code> inside the usage object. Those fields, not a dashboard's aggregate hit rate, are the ground truth for a single request — and the running sum of the read-price savings is the number you report to whoever pays the bill. The log below is twelve consecutive calls: the first four still had the timestamp on top, then the layout was fixed. The clicks are visible in the bill.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cache-log-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">One column per call = cache_read_input_tokens. The dashed line marks the deploy that moved the timestamp to the tail; the light line is cumulative savings at the read price.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="cache-d-next" class="g-primary">Next call →</button>
+          <button id="cache-d-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="cache-d-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The instrument rule:</b> log the per-call cache fields next to the prompt layout hash. A hit rate that drops is almost always a layout change or a TTL gap — not the model, and not the users.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>What does a prefix cache match?</td><td>The longest byte-identical prefix, from the first byte. A semantic near-match is a miss.</td></tr>
+        <tr><td>How should the prompt be ordered?</td><td>Stable content first (system, tools, examples), volatile content last (retrieval, history, timestamp, question).</td></tr>
+        <tr><td>What is a cache breakpoint?</td><td>An explicit marker that caches everything above it. You can have several per request.</td></tr>
+        <tr><td>What is the default TTL?</td><td>About 5 minutes at Anthropic; provider-specific. A gap longer than the TTL is a cold start.</td></tr>
+        <tr><td>What do read and write cost?</td><td>Read ≈ 0.1× base input; write ≈ 1.25×. Two reuses of a prefix already beat no caching.</td></tr>
+        <tr><td>What breaks the prefix?</td><td>A timestamp, a reordered JSON key, a shuffled example order, a stray newline — anything non-deterministic at the top.</td></tr>
+        <tr><td>What do I measure?</td><td><code>cache_read_input_tokens</code> / <code>cached_tokens</code> per call, plus the running savings. Not a vibe.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Prompt caching</a> — the cache-write 1.25× and cache-read 0.1× multipliers, the 5-minute TTL, and the <code>cache_read_input_tokens</code> usage fields this part instruments.</li>
+      <li>OpenAI, <a href="https://platform.openai.com/docs/guides/prompt-caching">Prompt caching</a>, October 2024 — automatic prefix matching over 1,024 tokens and the <code>cached_tokens</code> usage field.</li>
+      <li>DeepSeek, <a href="https://api-docs.deepseek.com/guides/kv_cache">Context caching</a> — a disk-based prefix cache with published cache-hit and cache-miss prices, showing the multipliers are a vendor policy, not a law.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — where a stable prefix sits in the write/select/compress/isolate taxonomy.</li>
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">"Efficient Memory Management for Large Language Model Serving with PagedAttention"</a>, SOSP 2023 — the block-level KV manager that makes provider prefix caching possible.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Caching rewards a stable prefix, which raises the question of what belongs in the prefix at all. Next: the real reasons to retrieve — freshness, provenance, access control and cost — and why BM25 is still the brutal baseline to beat.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    prompt_cache: {
+      source: "Anthropic prompt-caching docs (2024-08; 5-minute TTL, cache read 0.1x base input, cache write 1.25x) and OpenAI prompt-caching docs (2024-10; automatic above 1,024 tokens, cached input 0.5x, reported in cached_tokens). Offline fallback constants.",
+      anthropicCacheReadMultiplier: 0.1,
+      anthropicCacheWriteMultiplier: 1.25,
+      openaiCachedInputMultiplier: 0.5,
+      minCacheableTokens: 1024
+    },
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD). Offline fallback constants.",
+      as_of: "2025-02",
+      items: [
+        { model: "Claude 3.7 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 }
+      ]
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Cache discounts are vendor-specific (see prompt_cache). Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    }
+  };
+  var NUM = FALLBACK;
+
+  function priceRow() {
+    var items = (NUM.pricing && NUM.pricing.items) || [];
+    var row = null;
+    for (var i = 0; i < items.length; i++) { if (/Claude 3\.7/.test(items[i].model)) row = items[i]; }
+    if (!row) row = items[0];
+    return {
+      inputPerM: row ? row.inputPerMUSD : 3,
+      outputPerM: row ? row.outputPerMUSD : 15,
+      cachedPerM: row ? row.cachedInputPerMUSD : 0.3
+    };
+  }
+  function cacheReadMult() {
+    return (NUM.prompt_cache && NUM.prompt_cache.anthropicCacheReadMultiplier) || 0.1;
+  }
+  function cacheWriteMult() {
+    return (NUM.prompt_cache && NUM.prompt_cache.anthropicCacheWriteMultiplier) || 1.25;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the cache-layout puzzle
+  // ------------------------------------------------------------------
+  var BLOCKS = [
+    { id: 'system', label: 'system prompt', tok: 900 },
+    { id: 'tools', label: 'tool definitions', tok: 1400 },
+    { id: 'fewshot', label: 'few-shot examples', tok: 1200 },
+    { id: 'retrieved', label: 'retrieved documents', tok: 1800 },
+    { id: 'timestamp', label: 'timestamp — datetime.now()', tok: 40 },
+    { id: 'history', label: 'conversation history', tok: 2000 },
+    { id: 'question', label: 'user question', tok: 120 }
+  ];
+  var SIZES = {};
+  BLOCKS.forEach(function (b) { SIZES[b.id] = b.tok; });
+  var TOTAL = BLOCKS.reduce(function (a, b) { return a + b.tok; }, 0);
+  function blockById(id) { for (var i = 0; i < BLOCKS.length; i++) { if (BLOCKS[i].id === id) return BLOCKS[i]; } return null; }
+  var SHORT = { system: 'system', tools: 'tools', fewshot: 'few-shot', retrieved: 'retrieved', timestamp: 'timestamp', history: 'history', question: 'question' };
+
+  var P = {
+    order: ['timestamp', 'system', 'tools', 'fewshot', 'retrieved', 'history', 'question'],
+    sel: 'timestamp',
+    tsStable: false,
+    toolsShuffled: false
+  };
+  var setupA = Guide.setupCanvas(el('cache-puzzle-canvas'), 640, 380, drawA);
+  var A = { rows: [] };
+
+  function isStableNow(id) {
+    if (id === 'tools') return !P.toolsShuffled;
+    if (id === 'timestamp') return P.tsStable;
+    return id === 'system' || id === 'fewshot';
+  }
+  function keyOf(id, i) {
+    if (id === 'system') return 'system';
+    if (id === 'tools') return P.toolsShuffled ? ('tools#' + (i % 5)) : 'tools';
+    if (id === 'fewshot') return 'fewshot';
+    if (id === 'retrieved') return 'docs#' + i;
+    if (id === 'timestamp') return P.tsStable ? 'ts' : ('ts#' + i);
+    if (id === 'history') return 'hist#' + i;
+    if (id === 'question') return 'q#' + i;
+    return id;
+  }
+  function simulate() {
+    var reqs = [];
+    for (var i = 0; i < 100; i++) {
+      var blocks = P.order.map(function (id) { return keyOf(id, i); });
+      reqs.push({ id: i, blocks: blocks });
+    }
+    var res = AppSim.cacheSim(reqs, { type: 'prefix', capacityBlocks: 64 });
+    var reusePerReq = res.perRequest.map(function (pr) {
+      var s = 0;
+      for (var m = 0; m < pr.matchedBlocks; m++) s += SIZES[P.order[m]];
+      return s;
+    });
+    var reuse = reusePerReq.reduce(function (a, b) { return a + b; }, 0);
+    return { res: res, reusePerReq: reusePerReq, reuse: reuse, total: 100 * TOTAL };
+  }
+  function cost100(reuseTotal) {
+    var p = priceRow();
+    var prices = { inputPerM: p.inputPerM, outputPerM: p.outputPerM, cachedPerM: p.cachedPerM };
+    var opts = { inputTokens: TOTAL, outputTokens: 250, calls: 100, prices: prices };
+    var no = AppSim.costModel(opts);
+    var withC = AppSim.costModel({ inputTokens: TOTAL, cachedInputTokens: reuseTotal / 100, outputTokens: 250, calls: 100, prices: prices });
+    return { no: no.total, wi: withC.total };
+  }
+  function tri(ctx, x, y, r, dir) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - dir * r);
+    ctx.lineTo(x - r, y + dir * r * 0.7);
+    ctx.lineTo(x + r, y + dir * r * 0.7);
+    ctx.closePath();
+    ctx.fill();
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    var sim = simulate();
+    var hitCol = c.accent, missCol = c.accent2;
+    var columns = sim.res.perRequest.map(function (pr, i) {
+      var reused = sim.reusePerReq[i];
+      return {
+        label: String(i + 1),
+        segments: [
+          { value: reused, color: pr.hit ? hitCol : missCol, name: 'cache read' },
+          { value: TOTAL - reused, color: pr.hit ? 'rgba(43,95,255,0.16)' : 'rgba(214,0,108,0.16)', name: 'recomputed' }
+        ]
+      };
+    });
+    Guide.drawStackedColumns(ctx, W, H, columns, {
+      maxTotal: TOTAL, padT: 222, padB: 34, padL: 30, padR: 14, gap: 1, labelEvery: 10
+    });
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.text;
+    ctx.fillText('100 simulated requests — blue = hit, red = first-byte miss', 30, 216);
+
+    // the reorderable block stack
+    var TOP = 26, ROWH = 25, BX = 14, BW = 580;
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.text;
+    ctx.fillText('prompt block order (click a row, then ▲ / ▼)', BX, 16);
+    A.rows = [];
+    P.order.forEach(function (id, idx) {
+      var y = TOP + idx * ROWH, h = 21;
+      var isSel = id === P.sel;
+      var b = blockById(id);
+      ctx.fillStyle = isSel ? c.accent : 'rgba(0,0,0,0.05)';
+      ctx.fillRect(BX, y, BW, h);
+      if (!isSel) { ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(BX, y, BW, h); }
+      ctx.fillStyle = isSel ? '#fff' : c.text;
+      ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText((idx + 1) + '.  ' + b.label, BX + 10, y + 14);
+      var stable = isStableNow(id);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = isSel ? 'rgba(255,255,255,0.85)' : c.accent700;
+      ctx.fillText(b.tok + ' tok', BX + BW - 46, y + 14);
+      ctx.fillStyle = isSel ? '#fff' : (stable ? c.accent700 : missCol);
+      ctx.fillText(stable ? 'stable' : 'volatile', BX + BW - 8, y + 14);
+      var ax = BX + BW + 14;
+      ctx.fillStyle = isSel ? c.accent : c.accent700;
+      tri(ctx, ax, y + 5, 6, -1);
+      ctx.fillStyle = isSel ? c.accent : c.accent700;
+      tri(ctx, ax, y + h - 5, 6, 1);
+      A.rows.push({ id: id, idx: idx, x: BX, y: y, w: BW, h: h, upX: ax, upY: y + 5, downX: ax, downY: y + h - 5 });
+    });
+
+    var cost = cost100(sim.reuse);
+    var savedPct = cost.no > 0 ? ((cost.no - cost.wi) / cost.no * 100) : 0;
+    el('cache-a-readout').innerHTML =
+      '<div><span class="k">layout</span> ' + P.order.map(function (id) { return SHORT[id]; }).join(' → ') + '</div>' +
+      '<div><span class="k">request hit rate</span> <span class="hi">' + Math.round(sim.res.hitRate * 100) + '%</span> (' + sim.res.hits + '/' + sim.res.total + ')</div>' +
+      '<div><span class="k">cache_read_input_tokens</span> <span class="hi">' + Guide.fmtNum(sim.reuse) + '</span> of ' + Guide.fmtNum(sim.total) + ' (' + (sim.reuse / sim.total * 100).toFixed(0) + '%)</div>' +
+      '<div><span class="k">100 calls</span> $' + cost.no.toFixed(2) + ' cold → <span class="hi">$' + cost.wi.toFixed(2) + '</span> cached · saves ' + savedPct.toFixed(0) + '%</div>';
+  }
+  function moveBlock(idx, dir) {
+    var j = idx + dir;
+    if (j < 0 || j >= P.order.length) return;
+    var t = P.order[idx]; P.order[idx] = P.order[j]; P.order[j] = t;
+    P.sel = t;
+    drawA();
+  }
+  (function () {
+    var cv = el('cache-puzzle-canvas');
+    cv.addEventListener('pointerdown', function (ev) {
+      var p = Guide.hitTest(cv, ev);
+      var rows = A.rows || [];
+      for (var i = 0; i < rows.length; i++) {
+        if (Math.hypot(p.x - rows[i].upX, p.y - rows[i].upY) < 13) { moveBlock(rows[i].idx, -1); return; }
+        if (Math.hypot(p.x - rows[i].downX, p.y - rows[i].downY) < 13) { moveBlock(rows[i].idx, 1); return; }
+      }
+      for (var j = 0; j < rows.length; j++) {
+        var r = rows[j];
+        if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) { P.sel = r.id; drawA(); return; }
+      }
+    });
+  })();
+  function syncA() {
+    el('cache-a-ts').textContent = 'Timestamp: ' + (P.tsStable ? 'frozen (stable)' : 'clock (volatile)');
+    el('cache-a-ts').className = P.tsStable ? 'g-primary' : '';
+    el('cache-a-tools').textContent = 'Tool order: ' + (P.toolsShuffled ? 'shuffled (volatile)' : 'fixed (stable)');
+    el('cache-a-tools').className = P.toolsShuffled ? 'g-primary' : '';
+  }
+  el('cache-a-ts').addEventListener('click', function () { P.tsStable = !P.tsStable; syncA(); drawA(); });
+  el('cache-a-tools').addEventListener('click', function () { P.toolsShuffled = !P.toolsShuffled; syncA(); drawA(); });
+  el('cache-a-best').addEventListener('click', function () {
+    P.order = ['system', 'tools', 'fewshot', 'retrieved', 'history', 'timestamp', 'question'];
+    P.sel = 'system'; P.tsStable = false; P.toolsShuffled = false; syncA(); drawA();
+  });
+  el('cache-a-reset').addEventListener('click', function () {
+    P.order = ['timestamp', 'system', 'tools', 'fewshot', 'retrieved', 'history', 'question'];
+    P.sel = 'timestamp'; P.tsStable = false; P.toolsShuffled = false; syncA(); drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — one byte-identical change
+  // ------------------------------------------------------------------
+  var setupB = Guide.setupCanvas(el('cache-byte-canvas'), 640, 300, drawB);
+  var B = { sorted: false };
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 300;
+    var keyRow = B.sorted
+      ? { label: 'tool keys sorted (a→z)', matched: 3500 }
+      : { label: 'tool keys reordered', matched: 900 };
+    var rows = [
+      { label: 'stable prefix first', matched: 3500 },
+      { label: 'few-shot order shuffled', matched: 2300 },
+      { label: keyRow.label, matched: keyRow.matched },
+      { label: 'one extra newline', matched: 0 },
+      { label: 'timestamp on top', matched: 0 }
+    ];
+    var pale = 'rgba(0,0,0,0.09)';
+    var geo = Guide.drawStacked(ctx, W, H, rows.map(function (r) {
+      return { label: r.label, segments: [
+        { value: r.matched, color: c.accent, name: 'matched' },
+        { value: TOTAL - r.matched, color: pale, name: 'recomputed' }
+      ] };
+    }), { maxTotal: TOTAL, padL: 176, padR: 92, padT: 22, padB: 22, gap: 14 });
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    var plotW = W - 176 - 92;
+    rows.forEach(function (r, i) {
+      var y = geo.padT + i * (geo.barH + 14);
+      var x = 176 + plotW * (r.matched / TOTAL) + 6;
+      ctx.fillStyle = c.accent700;
+      ctx.fillText(Guide.fmtNum(r.matched) + ' tok (' + (r.matched / TOTAL * 100).toFixed(0) + '%)', Math.min(x, W - 88), y + geo.barH * 0.72);
+    });
+    var lines = rows.map(function (r) {
+      return '<div><span class="k">' + r.label + '</span> ' + Guide.fmtNum(r.matched) + ' matched (' + (r.matched / TOTAL * 100).toFixed(0) + '%)</div>';
+    }).join('');
+    el('cache-b-readout').innerHTML =
+      '<div><span class="k">prompt length</span> ' + Guide.fmtNum(TOTAL) + ' tokens · a single difference resets everything after it</div>' + lines;
+  }
+  el('cache-b-sort').addEventListener('click', function () {
+    B.sorted = !B.sorted;
+    this.textContent = B.sorted ? 'Sort tool keys: on' : 'Sort tool keys: off';
+    this.className = B.sorted ? 'g-primary' : '';
+    drawB();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo C — cost across turns
+  // ------------------------------------------------------------------
+  var C = { turns: el('cache-c-turns'), growth: el('cache-c-growth') };
+  var setupC = Guide.setupCanvas(el('cache-cost-canvas'), 640, 320, drawC);
+  var STABLE = 3500, VOLATILE = 1960, OUT_PER_TURN = 250;
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    var N = parseInt(C.turns.value, 10), g = parseInt(C.growth.value, 10);
+    var p = priceRow(), readM = cacheReadMult(), writeM = cacheWriteMult();
+    function turnCost(prompt, cached) {
+      var uncached = prompt - cached;
+      return uncached / 1e6 * p.inputPerM + cached / 1e6 * p.cachedPerM + OUT_PER_TURN / 1e6 * p.outputPerM;
+    }
+    var cold = [], readOnly = [], honest = [];
+    var cc = 0, ro = 0, ho = 0;
+    var writePremium = STABLE / 1e6 * p.inputPerM * (writeM - 1);
+    for (var t = 1; t <= N; t++) {
+      var prompt = STABLE + VOLATILE + t * g;
+      cc += turnCost(prompt, 0);
+      ro += turnCost(prompt, STABLE);
+      ho += turnCost(prompt, STABLE) + (t === 1 ? writePremium : 0);
+      cold.push({ x: t, y: cc });
+      readOnly.push({ x: t, y: ro });
+      honest.push({ x: t, y: ho });
+    }
+    var maxY = cc || 1;
+    var axes = Guide.drawLines(ctx, W, H, [
+      { points: cold, color: c.accent2, width: 2.4 },
+      { points: readOnly, color: c.accent400, width: 2.2, dashed: true },
+      { points: honest, color: c.accent, width: 2.4 }
+    ], [1, Math.max(2, N)], [0, maxY * 1.06],
+      { xLabel: 'turn', yLabel: 'cumulative USD', padL: 58, padB: 30 });
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent2; ctx.fillText('no cache', axes.padL + 8, axes.padT + 12);
+    ctx.fillStyle = c.accent400; ctx.fillText('read price only', axes.padL + 8, axes.padT + 25);
+    ctx.fillStyle = c.accent; ctx.fillText('with 1.25× write premium', axes.padL + 8, axes.padT + 38);
+    var perTurnSave = STABLE / 1e6 * (p.inputPerM - p.cachedPerM);
+    var breakeven = perTurnSave > 0 ? writePremium / perTurnSave : Infinity;
+    var savedPct = cc > 0 ? ((cc - ho) / cc * 100) : 0;
+    el('cache-c-readout').innerHTML =
+      '<div><span class="k">@ ' + N + ' turns</span> cold $' + cc.toFixed(3) + ' → warm <span class="hi">$' + ho.toFixed(3) + '</span> · saves ' + savedPct.toFixed(0) + '%</div>' +
+      '<div><span class="k">write premium</span> $' + writePremium.toFixed(4) + ' once · repaid after <span class="hi">' + (breakeven <= 1 ? 'the first reuse' : breakeven.toFixed(1) + ' turns') + '</span></div>' +
+      '<div><span class="k">read multiplier</span> ' + readM + '× · write ' + writeM + '× · outputs are ' + Guide.fmtNum(OUT_PER_TURN) + ' tok/turn</div>';
+  }
+  Guide.bindSliders([C.turns, C.growth], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — the instrumented request log
+  // ------------------------------------------------------------------
+  var setupD = Guide.setupCanvas(el('cache-log-canvas'), 640, 300, drawD);
+  var CALLS = 12, CUTOVER = 4;
+  var D = { sel: 5 };
+  function cacheRead(i) { return i < CUTOVER ? 0 : STABLE; }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 300;
+    var p = priceRow();
+    var data = [];
+    for (var i = 0; i < CALLS; i++) {
+      data.push({ x: i + 1, y: cacheRead(i), color: i < CUTOVER ? c.accent2 : c.accent });
+    }
+    var geo = Guide.drawColumns(ctx, W, H, data, {
+      xRange: [0.5, CALLS + 0.5], yRange: [0, 4200],
+      padL: 56, padR: 46, padT: 28, padB: 34, xLabel: 'call'
+    });
+    // cutover marker
+    var cx = geo.px(CUTOVER + 0.5);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(cx, geo.padT); ctx.lineTo(cx, geo.padT + geo.plotH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('timestamp moved to tail', cx + 4, geo.padT + 11);
+    // cumulative savings line, scaled into the column axis
+    var cum = 0, cumPts = [], maxCum = 0;
+    for (var k = 0; k < CALLS; k++) {
+      cum += cacheRead(k) / 1e6 * (p.inputPerM - p.cachedPerM);
+      maxCum = Math.max(maxCum, cum);
+    }
+    cum = 0;
+    for (var k2 = 0; k2 < CALLS; k2++) {
+      cum += cacheRead(k2) / 1e6 * (p.inputPerM - p.cachedPerM);
+      cumPts.push({ x: k2 + 1, y: maxCum ? (cum / maxCum) * 3800 : 0 });
+    }
+    ctx.strokeStyle = c.accent400; ctx.lineWidth = 1.6; ctx.beginPath();
+    cumPts.forEach(function (pt, i) { var X = geo.px(pt.x), Y = geo.py(pt.y); if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y); });
+    ctx.stroke();
+    // highlight the selected call
+    var sx = geo.px(D.sel + 1);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx, geo.padT); ctx.lineTo(sx, geo.padT + geo.plotH); ctx.stroke();
+
+    var runSave = 0;
+    for (var q = 0; q <= D.sel; q++) runSave += cacheRead(q) / 1e6 * (p.inputPerM - p.cachedPerM);
+    var billed = TOTAL - cacheRead(D.sel);
+    var log = [];
+    for (var z = 0; z < CALLS; z++) log.push((z === D.sel ? '[' : '') + cacheRead(z) + (z === D.sel ? ']' : ''));
+    el('cache-d-readout').innerHTML =
+      '<div><span class="k">call</span> <span class="hi">' + (D.sel + 1) + '</span> / ' + CALLS + ' · cache_read_input_tokens <span class="hi">' + Guide.fmtNum(cacheRead(D.sel)) + '</span></div>' +
+      '<div><span class="k">billed input</span> ' + Guide.fmtNum(billed) + ' tok · at read $' + p.cachedPerM + '/M, input $' + p.inputPerM + '/M</div>' +
+      '<div><span class="k">running savings</span> <span class="hi">$' + runSave.toFixed(4) + '</span> across ' + (D.sel + 1) + ' calls</div>' +
+      '<div><span class="k">per-call reads</span> [' + log.join(', ') + ']</div>';
+  }
+  el('cache-d-next').addEventListener('click', function () { D.sel = (D.sel + 1) % CALLS; drawD(); });
+  el('cache-d-reset').addEventListener('click', function () { D.sel = 5; drawD(); });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var srcP = el('cache-src-prompt'), srcC = el('cache-src-cost'), srcPr = el('cache-src-pricing');
+    if (srcP) srcP.textContent = (NUM.prompt_cache && NUM.prompt_cache.source) || FALLBACK.prompt_cache.source;
+    if (srcC) srcC.textContent = (NUM.cost_latency && NUM.cost_latency.source) || FALLBACK.cost_latency.source;
+    if (srcPr) srcPr.textContent = (NUM.pricing && NUM.pricing.source) || FALLBACK.pricing.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'caching-layout-prefix',
+      kind: 'choice',
+      prompt: 'What exactly does a provider prefix cache match against a previous request?',
+      options: [
+        { label: 'The longest prefix that is byte-identical, scanned from the first byte.', correct: true },
+        { label: 'Any block anywhere in the prompt whose text is similar in meaning.' },
+        { label: 'The whole prompt, and only if it is identical end to end.' },
+        { label: 'The system prompt alone, regardless of position.' }
+      ],
+      explanation: 'The cache is a longest-common-prefix match over blocks, from the very front. A difference anywhere stops the match at that point, and everything after is recomputed.'
+    },
+    {
+      id: 'caching-layout-order',
+      kind: 'choice',
+      prompt: 'You have a 3,000-token system prompt and a 1,800-token retrieved-docs block. Which order gives the largest reusable prefix?',
+      options: [
+        { label: 'System prompt first, retrieved docs last.', correct: true },
+        { label: 'Retrieved docs first, system prompt last, because the docs change most.' },
+        { label: 'Order does not matter; the provider finds shared text anywhere.' },
+        { label: 'Interleave them so the volatile parts break up the stable ones.' }
+      ],
+      explanation: 'Stable content must come first for the prefix match to reach it. Retrieved documents are query-dependent and volatile, so they belong after every stable block.'
+    },
+    {
+      id: 'caching-layout-hitrate',
+      kind: 'numeric',
+      prompt: 'A prompt is 5,000 tokens. A stable prefix of 2,250 tokens is byte-identical across requests. To the nearest percent, what share of the input tokens are cache reads?',
+      answer: 45,
+      unit: '%',
+      tolerance: 1,
+      explanation: '2,250 ÷ 5,000 = 0.45, so 45% of input tokens are billed at the cache-read rate. The rest is recomputed at the full input rate.'
+    },
+    {
+      id: 'caching-layout-cost',
+      kind: 'numeric',
+      prompt: '1,000 calls each send 10,000 input tokens, of which 8,000 are a cached prefix. Input is $3 per 1M tokens and cache reads are $0.30 per 1M (ignore output). What is the total input cost in USD?',
+      answer: 8.4,
+      unit: 'USD',
+      tolerance: 0.1,
+      explanation: 'Uncached: 2,000 × 1,000 = 2,000,000 tokens at $3/M = $6.00. Cached: 8,000 × 1,000 = 8,000,000 tokens at $0.30/M = $2.40. Total $8.40.'
+    },
+    {
+      id: 'caching-layout-invalidator',
+      kind: 'choice',
+      prompt: 'A service inserts `datetime.now()` into the first line of its system prompt. What happens to the prefix cache?',
+      options: [
+        { label: 'Every request misses from the first block, so the whole prompt is recomputed.', correct: true },
+        { label: 'Nothing; the provider normalises timestamps before hashing.' },
+        { label: 'Only the timestamp block is recomputed; the rest still hits.' },
+        { label: 'It improves the cache, because the timestamp makes each prompt unique.' }
+      ],
+      explanation: 'A volatile value at the top changes the first bytes of the prompt, so the longest matching prefix is zero. The fix is to move any time-dependent text to the end, out of the cached prefix.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

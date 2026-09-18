@@ -1,0 +1,497 @@
+---
+title: "Building with LLMs, Interactively — Part 1: What you're actually building on"
+description: "The model is a stateless text function; every 'memory' your app appears to have is your own code resending text, and the context window is the budget that governs it."
+permalink: "/ai/building-with-llms/stateless-function/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>What you're actually building on</h1>
+    <p>Before any prompt, any retrieval, any agent, there is one fact that reorganises everything else: the model is a stateless function of the text you hand it. It does not remember your last request, it has no session, and it cannot see your database. Everything that looks like memory is your own code deciding what to resend. This part fixes that picture, and the context window that follows from it, before the rest of the two volumes build on top.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="stateless">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A stateless text function</h2></div>
+    <p class="g-eyebrow">In, out, and nothing in between</p>
+    <p>Strip away the framing and an LLM API call is a pure function: text in, text out. You send a list of messages; you get one completion back. The provider keeps no model-side state between your requests, so a "conversation" is not a conversation at all — it is a sequence of independent calls, each one re-sending everything the model is allowed to know.</p>
+    <p>That has an immediate consequence you can see in the request body. On turn three, the model is not recalling turns one and two; your application is pasting them back in. The transcript, the retrieved documents, the tool results, the system instructions — all of it is assembled fresh on every call, by your code, and priced as input tokens every time.</p>
+    <div class="g-code"><span class="k">// what actually goes over the wire on turn 3</span>
+{ <span class="s">"messages"</span>: [
+    { <span class="s">"role"</span>: "system",    <span class="s">"content"</span>: "You are a docs assistant…" },
+    { <span class="s">"role"</span>: "user",      <span class="s">"content"</span>: "What is the KV cache?" },
+    { <span class="s">"role"</span>: "assistant", <span class="s">"content"</span>: "It caches keys and values…" },
+    { <span class="s">"role"</span>: "user",      <span class="s">"content"</span>: "And why does it grow?" }
+] }</div>
+    <div class="g-goal">💡 <span><b>The whole series in one sentence:</b> the unit of engineering is not the prompt, it is the <b>context window and the loop around it</b> — the smallest set of high-signal tokens that produces the outcome, reassembled on every turn.</span></div>
+    <p>Step the turn counter below and watch the request body grow. The model's contribution never changes; the transcript is entirely yours.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="request-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">One call per turn. Each call re-sends the entire transcript — the pale blocks are history the app pastes back in.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Turn <span class="val">3</span></label><input type="range" id="request-turn" min="1" max="10" step="1" value="3"></div>
+        <div class="g-btnrow">
+          <button id="request-play">Play turns</button>
+        </div>
+        <div class="g-readout" id="request-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="memory">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Where the “memory” actually lives</h2></div>
+    <p class="g-eyebrow">Three lanes, one of them yours</p>
+    <p>It helps to draw the system as three lanes. Your application is a stateful program: it owns a database, a transcript, a session store. The API in the middle is a stateless transport. The model is a stateless function. Only the leftmost lane accumulates anything between turns, and that is why every product decision about memory — what to keep, what to summarise, what to retrieve — is a decision your code makes, not the model's.</p>
+    <p>The picture below advances one turn at a time. The application lane gains a row each turn; the API and model lanes are redrawn from scratch every time.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lanes-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Steady-state boxes on the right are transient; the growing column on the left is your state.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="lanes-step" class="g-primary">Next turn</button>
+          <button id="lanes-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="lanes-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Corollary:</b> if your app “forgets”, the bug is in your state management, not the model. If your app “remembers something it should not”, the leak is in what your code chose to resend.</span></div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The context window is a budget</h2></div>
+    <p class="g-eyebrow">Not a bucket you fill until it breaks</p>
+    <p>The context window is the maximum number of tokens the model can attend to in one call — prompt plus completion. Everything the model knows about your request has to fit, and everything you put in competes for that space: instructions, examples, the transcript, retrieved documents, tool definitions, and the answer itself. The engineering move is to treat it as a budget with named line items, and to reserve room for the output before you spend the rest.</p>
+    <p>Drag the line items below. The bars are a single prompt's token composition against a fixed window; the readout says how much is left and warns before you overrun.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="budget-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">One stacked column per configuration. Hover the readout to see which line item is the largest.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Context window (tokens) <span class="val">128000</span></label><input type="range" id="budget-window" min="8000" max="200000" step="1000" value="128000"></div>
+        <div class="g-field"><label>System instructions <span class="val">500</span></label><input type="range" id="budget-system" min="0" max="4000" step="50" value="500"></div>
+        <div class="g-field"><label>Few-shot examples <span class="val">1200</span></label><input type="range" id="budget-examples" min="0" max="8000" step="100" value="1200"></div>
+        <div class="g-field"><label>Retrieved documents <span class="val">3000</span></label><input type="range" id="budget-retrieved" min="0" max="20000" step="250" value="3000"></div>
+        <div class="g-field"><label>Conversation history <span class="val">2000</span></label><input type="range" id="budget-history" min="0" max="40000" step="250" value="2000"></div>
+        <div class="g-field"><label>Reserved for output <span class="val">1000</span></label><input type="range" id="budget-output" min="0" max="16000" step="250" value="1000"></div>
+        <div class="g-readout" id="budget-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="resend">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Resending is quadratic, and caching is the brake</h2></div>
+    <p class="g-eyebrow">Why a long conversation gets expensive fast</p>
+    <p>Because every turn re-sends the whole transcript, the input tokens a provider sees are not linear in the number of turns — they are triangular. Ten turns of a growing conversation are not ten requests' worth of input; they are the sum of ten growing prefixes. Let each turn add <var>h</var> tokens and a conversation of <var>N</var> turns costs roughly <var>h·N(N+1)/2</var> input tokens, before any retrieval or tool output. This is the arithmetic that makes agent loops expensive, and the reason prompt caching matters so much: if the prefix is byte-identical, a provider can reuse the cached computation and bill the repeat at a fraction of the input price.</p>
+    <p>The chart below shows cumulative billed input tokens over twenty turns, with and without prefix caching. Toggle caching and move the per-turn growth to see the gap widen.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="resend-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Cumulative input tokens across 20 turns. Dashed = with a warm prefix cache; solid = cold every turn.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>New tokens per turn <span class="val">400</span></label><input type="range" id="resend-growth" min="50" max="2000" step="50" value="400"></div>
+        <div class="g-btnrow">
+          <button id="resend-cache" class="g-primary">Prefix caching on</button>
+        </div>
+        <div class="g-readout" id="resend-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> Parts 4 and 11 make the cost and cache story quantitative. Here it is enough to see that a loop over a growing transcript is the default, and that it is <b>quadratic in turns</b> unless something reuses the prefix.</span></div>
+  </section>
+
+  <section class="g-step" id="map">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Map of the two volumes</h2></div>
+    <p class="g-eyebrow">Where each remaining part fits</p>
+    <p>This volume takes the stateless function and builds upward: tokens and budgets (Part 2), sampling (3), cost and latency (4), and an eval harness you can run from the start (5). Act II is prompting and context design; Act III is retrieval. The companion volume, <a href="{{ '/ai/agents-in-action/' | relative_url }}">Agents in Action</a>, continues from an agent that can search and read, through evaluation, fine-tuning and production. Where a topic belongs to the training or serving layer, both volumes link out rather than re-teach.</p>
+    <div class="g-grid3" style="margin-top:14px;">
+      {% for part in site.data.series.building_with_llms.parts %}
+      <a class="g-card reveal" href="{{ part.permalink | relative_url }}" style="text-decoration:none;color:inherit;">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">{{ part.short }}</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.35;">{{ part.title }}</div>
+      </a>
+      {% endfor %}
+      {% for extra in site.data.series.building_with_llms.appendix %}
+      <a class="g-card reveal" href="{{ extra.permalink | relative_url }}" style="text-decoration:none;color:inherit;">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">Reference</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.35;">{{ extra.title }}</div>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes everything</th></tr></thead>
+      <tbody>
+        <tr><td>Does the model remember my last call?</td><td>No. It is a function of the text in this one call.</td></tr>
+        <tr><td>Where is the conversation stored?</td><td>In your application. You assemble and re-send it every turn.</td></tr>
+        <tr><td>What is the context window?</td><td>Prompt + completion, in tokens. A budget with line items, not a bucket.</td></tr>
+        <tr><td>What should I reserve first?</td><td>Room for the output, before spending the rest on input.</td></tr>
+        <tr><td>Why does a long chat get expensive?</td><td>Each turn re-sends the whole history: input cost is triangular in turns.</td></tr>
+        <tr><td>What slows that down?</td><td>A byte-identical prefix across calls, so the provider can cache and bill it cheaper.</td></tr>
+        <tr><td>What is the unit of engineering?</td><td>The context window and the loop around it — not the prompt.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">"Building effective agents"</a>, December 2024 — the workflow-versus-agent split and why the simplest thing that works is usually right.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — the write/select/compress/isolate taxonomy this series restates as its first thesis.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2307.03172">"Lost in the Middle: How Language Models Use Long Contexts"</a>, TACL 2024 — the U-shaped accuracy curve behind Part 10's argument about context rot.</li>
+      <li>OpenAI, <a href="https://platform.openai.com/docs/guides/prompt-caching">Prompt caching guide</a>, October 2024 — how prefix reuse is billed and why prompt layout is a cost decision.</li>
+      <li>Anthropic, <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Prompt caching</a> — cache-write and cache-read multipliers, and the 5-minute TTL that shapes Part 11.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Tokens are the currency of the budget. Next: how text becomes tokens, why a token is not a word, and how to spend the window deliberately.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    context_windows: {
+      source: "Vendor model cards, retrieved 2026-09. Offline fallback constants.",
+      items: [{ model: "GPT-4o", tokens: 128000 }, { model: "Claude 3.7 Sonnet / 4.x", tokens: 200000 }]
+    },
+    prompt_cache: {
+      source: "Provider prompt-caching docs, 2024. Offline fallback constants.",
+      anthropicCacheReadMultiplier: 0.1, minCacheableTokens: 1024
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — the request body grows
+  // ------------------------------------------------------------------
+  var A = { turn: el('request-turn') };
+  var setupA = Guide.setupCanvas(el('request-canvas'), 640, 340, drawA);
+  var SYSTEM = 240, EXAMPLE_TURN = 130, USER_TURN = 90, ASSIST_TURN = 220;
+
+  function turnTokens(t) {
+    return SYSTEM + EXAMPLE_TURN + t * (USER_TURN + ASSIST_TURN);
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    var turns = parseInt(A.turn.value, 10);
+    ctx.clearRect(0, 0, W, H);
+    var padL = 18, padT = 30, blockH = 22, gap = 6;
+    var rows = [{ role: 'system', tokens: SYSTEM, fresh: true }];
+    for (var t = 1; t <= turns; t++) {
+      rows.push({ role: 'user ' + t, tokens: USER_TURN, fresh: t === turns });
+      rows.push({ role: 'assistant ' + t, tokens: ASSIST_TURN, fresh: t === turns });
+    }
+    var maxTok = Math.max.apply(null, rows.map(function (r) { return r.tokens; }));
+    var barX = 150, barW = 400;
+    ctx.font = '11px ' + c.font;
+    ctx.fillStyle = c.text; ctx.textAlign = 'left';
+    ctx.fillText('request body sent on turn ' + turns, padL, 16);
+    rows.forEach(function (r, i) {
+      var y = padT + i * (blockH + gap);
+      if (y > H - blockH - 8) return;
+      ctx.fillStyle = r.role === 'system' ? c.accent700 : (r.fresh ? c.accent : c.accent400);
+      ctx.globalAlpha = r.fresh ? 1 : 0.45;
+      ctx.fillRect(barX, y, barW * (r.tokens / maxTok), blockH);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.textAlign = 'right';
+      ctx.fillText(r.role, barX - 8, y + 15);
+      ctx.textAlign = 'left';
+      ctx.fillText(r.tokens + ' tok', barX + barW * (r.tokens / maxTok) + 6, y + 15);
+    });
+    var total = rows.reduce(function (a, r) { return a + r.tokens; }, 0);
+    el('request-readout').innerHTML =
+      '<div><span class="k">messages sent</span> <span class="hi">' + rows.length + '</span></div>' +
+      '<div><span class="k">input tokens</span> <span class="hi">' + Guide.fmtNum(total) + '</span></div>' +
+      '<div><span class="k">of which new this turn</span> ' + (USER_TURN + ASSIST_TURN) + '</div>' +
+      '<div class="k">the other ' + Guide.fmtNum(total - USER_TURN - ASSIST_TURN) + ' are re-sent history</div>';
+  }
+  Guide.bindSliders([A.turn], drawA);
+  Guide.loop({
+    onStep: function () {
+      var v = parseInt(A.turn.value, 10);
+      if (v >= 10) { A.turn.value = 1; } else { A.turn.value = v + 1; }
+      drawA();
+    },
+    button: el('request-play'), interval: 700, playLabel: 'Play turns', pauseLabel: 'Pause'
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — three lanes, one stateful
+  // ------------------------------------------------------------------
+  var B = { turn: 1 };
+  var setupB = Guide.setupCanvas(el('lanes-canvas'), 640, 300, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var lanes = [
+      { x: 20, w: 190, title: 'Your application', sub: 'stateful' },
+      { x: 228, w: 180, title: 'API', sub: 'stateless transport' },
+      { x: 426, w: 194, title: 'Model', sub: 'stateless function' }
+    ];
+    lanes.forEach(function (l) {
+      ctx.fillStyle = c.accent100 || 'rgba(43,95,255,0.08)';
+      ctx.fillRect(l.x, 26, l.w, H - 60);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(l.x, 26, l.w, H - 60);
+      ctx.fillStyle = c.text; ctx.font = '600 13px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(l.title, l.x + 10, 18);
+      ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+      ctx.fillText(l.sub, l.x + 10, 44);
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    // app lane: transcript rows
+    for (var t = 1; t <= B.turn; t++) {
+      var y = 58 + (t - 1) * 22;
+      if (y > H - 60) break;
+      ctx.fillStyle = c.accent400; ctx.globalAlpha = t === B.turn ? 1 : 0.5;
+      ctx.fillRect(32, y, 166, 16);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.textAlign = 'left';
+      ctx.fillText('turn ' + t, 38, y + 12);
+    }
+    // api lane: one transient request/response
+    ctx.textAlign = 'center';
+    ctx.fillStyle = c.accent; ctx.fillRect(248, 80, 140, 30);
+    ctx.fillStyle = '#fff'; ctx.fillText('request →', 318, 100);
+    ctx.fillStyle = c.accent700; ctx.fillRect(248, 130, 140, 30);
+    ctx.fillStyle = '#fff'; ctx.fillText('← response', 318, 150);
+    // model lane
+    ctx.fillStyle = c.accent2; ctx.globalAlpha = 0.85;
+    ctx.fillRect(446, 80, 154, 80); ctx.globalAlpha = 1;
+    ctx.fillStyle = '#fff'; ctx.font = '12px ' + c.font;
+    ctx.fillText('f(prompt)', 523, 112);
+    ctx.font = '10px ' + c.font;
+    ctx.fillText('no retained state', 523, 132);
+    el('lanes-readout').innerHTML =
+      '<div><span class="k">turns so far</span> <span class="hi">' + B.turn + '</span></div>' +
+      '<div><span class="k">rows your app holds</span> ' + B.turn + '</div>' +
+      '<div class="k">the API and model columns are redrawn, not accumulated</div>';
+  }
+  el('lanes-step').addEventListener('click', function () { B.turn = Math.min(8, B.turn + 1); drawB(); });
+  el('lanes-reset').addEventListener('click', function () { B.turn = 1; drawB(); });
+
+  // ------------------------------------------------------------------
+  // Demo C — the context budget
+  // ------------------------------------------------------------------
+  var C = {
+    window: el('budget-window'), system: el('budget-system'), examples: el('budget-examples'),
+    retrieved: el('budget-retrieved'), history: el('budget-history'), output: el('budget-output')
+  };
+  var setupC = Guide.setupCanvas(el('budget-canvas'), 640, 380, drawC);
+  function cVals() {
+    return {
+      window: +C.window.value, system: +C.system.value, examples: +C.examples.value,
+      retrieved: +C.retrieved.value, history: +C.history.value, output: +C.output.value
+    };
+  }
+  function drawC() {
+    if (!setupC) return;
+    var v = cVals();
+    var items = [
+      { name: 'system', tokens: v.system },
+      { name: 'examples', tokens: v.examples },
+      { name: 'retrieved', tokens: v.retrieved },
+      { name: 'history', tokens: v.history },
+      { name: 'output (reserved)', tokens: v.output }
+    ];
+    var b = AppSim.ctxBudget({ window: v.window, reserveOutput: v.output, segments: items });
+    // one stacked column plus a reference line at the window size
+    var colours = [c.accent, c.accent400, '#c9a227', c.accent2, c.accent700];
+    var columns = [{
+      label: 'this prompt',
+      segments: items.map(function (it, i) { return { value: it.tokens, color: colours[i], name: it.name }; })
+    }];
+    var geo = Guide.drawStackedColumns(setupC.ctx, 640, 380, columns, {
+      maxTotal: Math.max(v.window, b.used), padL: 60, padR: 20, padT: 20, padB: 40
+    });
+    var ctx = setupC.ctx;
+    // window ceiling
+    var cy = geo.py(v.window);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(geo.padL, cy); ctx.lineTo(620, cy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('context window ' + Guide.fmtNum(v.window), geo.padL + 2, cy - 4);
+    var bx = geo.padL + 4, by = 30;
+    ctx.font = '11px ' + c.font;
+    items.forEach(function (it, i) {
+      ctx.fillStyle = colours[i]; ctx.fillRect(bx, by + i * 16, 10, 10);
+      ctx.fillStyle = c.text; ctx.textAlign = 'left';
+      ctx.fillText(it.name + '  ' + Guide.fmtNum(it.tokens), bx + 16, by + 9 + i * 16);
+    });
+    var pct = (b.used / b.window * 100);
+    el('budget-readout').innerHTML =
+      '<div><span class="k">input used</span> <span class="hi">' + Guide.fmtNum(b.used) + '</span> tok (' + pct.toFixed(0) + '% of window)</div>' +
+      '<div><span class="k">output reserve</span> ' + Guide.fmtNum(v.output) + ' tok</div>' +
+      '<div><span class="k">remaining</span> <span class="' + (b.over ? 'bad' : 'hi') + '">' + Guide.fmtNum(b.remaining) + '</span> tok</div>' +
+      (b.over ? '<div class="bad">over budget by ' + Guide.fmtNum(b.overflow) + ' tokens — the call fails or gets truncated</div>'
+              : '<div class="k">within budget · the largest line item decides what to cut first</div>');
+  }
+  Guide.bindSliders([C.window, C.system, C.examples, C.retrieved, C.history, C.output], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — resending is quadratic, caching is the brake
+  // ------------------------------------------------------------------
+  var D = { growth: el('resend-growth'), cache: true };
+  var setupD = Guide.setupCanvas(el('resend-canvas'), 640, 320, drawD);
+  var FIXED = 700; // system + tool defs etc.
+  function drawD() {
+    if (!setupD) return;
+    var g = +D.growth.value, N = 20;
+    var cold = [], warm = [];
+    var cumCold = 0, cumWarm = 0;
+    for (var n = 1; n <= N; n++) {
+      var perTurn = FIXED + n * g;
+      cumCold += perTurn;
+      // warm: only the newly appended block is billed at full price; the rest is cached
+      var cachedPortion = FIXED + (n - 1) * g;
+      var billed = FIXED + g + (D.cache ? cachedPortion * 0.1 : cachedPortion);
+      cumWarm += billed;
+      cold.push({ x: n, y: cumCold });
+      warm.push({ x: n, y: cumWarm });
+    }
+    var maxY = cold[N - 1];
+    var axes = Guide.drawLines(setupD.ctx, 640, 320,
+      [
+        { points: cold, color: c.accent, width: 2.4 },
+        { points: warm, color: c.accent2, width: 2.4, dashed: true }
+      ],
+      [0, N], [0, maxY * 1.06],
+      { xLabel: 'turn', yLabel: 'cumulative input tokens', padL: 62, padB: 30 });
+    var ctx = setupD.ctx;
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent; ctx.fillText('cold every turn', axes.padL + 8, axes.padT + 14);
+    ctx.fillStyle = c.accent2; ctx.fillText('warm prefix cache', axes.padL + 8, axes.padT + 28);
+    var saved = cumCold - cumWarm;
+    el('resend-readout').innerHTML =
+      '<div><span class="k">cumulative @ 20 turns</span> cold <span class="hi">' + Guide.fmtNum(cumCold) + '</span> · warm ' + Guide.fmtNum(cumWarm) + '</div>' +
+      '<div><span class="k">tokens saved</span> <span class="hi">' + Guide.fmtNum(saved) + '</span> (' + (100 * saved / cumCold).toFixed(0) + '%)</div>' +
+      '<div><span class="k">growth</span> ' + (cumCold / Math.max(1, FIXED + g)) .toFixed(1) + '× a single turn · quadratic in turns</div>';
+  }
+  Guide.bindSliders([D.growth], drawD);
+  el('resend-cache').addEventListener('click', function () {
+    D.cache = !D.cache;
+    this.className = D.cache ? 'g-primary' : '';
+    this.textContent = D.cache ? 'Prefix caching on' : 'Prefix caching off';
+    drawD();
+  });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    // This part cites only the window figures and the cache multipliers; the
+    // demos are parameterised by sliders, so the fetched values set defaults.
+    if (data && data.context_windows && data.context_windows.items && data.context_windows.items.length) {
+      var first = data.context_windows.items[0];
+      C.window.value = first.tokens;
+    }
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'stateless-function-stateless',
+      kind: 'choice',
+      prompt: 'Between two API calls, what does the model retain about the first one?',
+      options: [
+        { label: 'Nothing — each call is an independent function of the text it receives.' },
+        { label: 'The previous messages, for a short session window.' },
+        { label: 'Only the system prompt.' },
+        { label: 'A server-side pointer to the conversation.' }
+      ],
+      explanation: 'The model is stateless. Any appearance of memory comes from your application re-sending the prior text; there is no session on the model side.'
+    },
+    {
+      id: 'stateless-function-quadratic',
+      kind: 'choice',
+      prompt: 'A chat adds about 400 tokens of history each turn. Roughly how do cumulative input tokens grow with the number of turns?',
+      options: [
+        { label: 'Linearly — one extra turn is one extra chunk.' },
+        { label: 'Quadratically — each turn re-sends the whole growing prefix.' },
+        { label: 'Logarithmically — the provider compresses history.' },
+        { label: 'Constant — caching makes it free.' }
+      ],
+      explanation: 'Every turn re-sends the accumulated transcript, so the total is the sum of growing prefixes: roughly h·N(N+1)/2, i.e. quadratic in turns. Caching reduces the constant, not the shape, unless the prefix is reused exactly.'
+    },
+    {
+      id: 'stateless-function-budget',
+      kind: 'numeric',
+      prompt: 'A prompt uses 88,000 input tokens and reserves 4,000 tokens for the output. How many tokens remain before the 128,000-token window is reached?',
+      answer: 36000,
+      unit: 'tokens',
+      tolerance: 1,
+      explanation: 'The window bounds prompt + completion, so the usable budget is 128,000 − 4,000 = 124,000. With 88,000 spent on the prompt, 124,000 − 88,000 = 36,000 remain.'
+    },
+    {
+      id: 'stateless-function-unit',
+      kind: 'choice',
+      prompt: 'According to this series, what is the unit of engineering?',
+      options: [
+        { label: 'The prompt.' },
+        { label: 'The model checkpoint.' },
+        { label: 'The context window and the loop around it.' },
+        { label: 'The temperature setting.' }
+      ],
+      explanation: 'The organising thesis: curate the smallest set of high-signal tokens that produces the outcome, across many turns. Prompts are one line item inside that budget.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

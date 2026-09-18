@@ -1,0 +1,844 @@
+---
+title: "LLM Serving, Interactively — Part 2: The machine: HBM, interconnect and the accelerator zoo"
+description: "HBM bandwidth as the number that sets decode speed, capacity as the constraint that forces sharding, the all-reduce tax, rack-scale NVLink, SRAM and TPU alternatives, and joules per token."
+permalink: "/ai/llm-serving/hardware/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .chiprow { display: flex; flex-wrap: wrap; gap: 6px; }
+  .accel-chip {
+    font-family: var(--font-mono); font-size: 12px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 6px 10px; border-radius: var(--radius-md);
+  }
+  .accel-chip:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .accel-chip.on { background: var(--color-accent-100); border-color: var(--color-accent); color: var(--color-accent-800); }
+  .hw-sub { font-size: 12.5px; opacity: 0.7; margin: 0 0 8px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 2 of 20</span>
+    <h1>The machine: HBM, interconnect and the accelerator zoo</h1>
+    <p>Part 1 turned serving into a bandwidth problem: a decode step reads the weights once and writes one token. This part makes that concrete. We rank the accelerators by the numbers that actually decide tokens per second, watch models fail to fit, put a price on the network a tensor-parallel step has to cross, and end with joules per token — the number that eventually shows up on the electricity bill.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="hbm">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>HBM bandwidth is the headline number</h2></div>
+    <p class="g-eyebrow">Why spec sheets lead with TB/s, not TFLOP/s</p>
+    <p>A prefill pass multiplies a whole prompt against the weights at once, so it saturates the tensor cores and is <strong>compute-bound</strong>. A decode step multiplies one token against the same weights, so it is <strong>memory-bandwidth-bound</strong>: the arithmetic intensity is roughly one to two FLOPs per byte read, far below the ridge point of any modern accelerator. The practical decode step time is therefore set by how fast HBM can stream the weights in, not by how many FLOPs the chip can issue.</p>
+    <div class="g-math g-katex">$$t_{\text{step}} \approx \max\!\left(\frac{\text{weight bytes} + \text{KV bytes}}{\text{HBM BW}},\ \frac{2\,N_{\text{active}}}{\text{peak FLOP/s}}\right)$$</div>
+    <p>The first term barely changes with batch size — the weights are read once per step regardless of how many sequences share that step — which is exactly why batching lifts throughput without a matching latency cost. The second term grows linearly with batch, and where the two cross is the point at which a decode step flips from memory-bound to compute-bound. H100 SXM sits at 3.35&nbsp;TB/s of HBM and 989 dense BF16 TFLOP/s; B200 doubles the bandwidth to 8&nbsp;TB/s and the dense throughput to 2,250 BF16 TFLOP/s. The bandwidth doubling is the part that matters for decode.</p>
+    <div class="g-goal">💡 <span><b>The rule of thumb:</b> tokens per second per sequence at batch 1 is roughly HBM bandwidth divided by model bytes. A 70B model in BF16 (≈141&nbsp;GB) on an H100 (3.35&nbsp;TB/s) tops out near 24 tokens/s; the same model on a B200 (8&nbsp;TB/s) is closer to 57. Nothing else on the spec sheet moves that number as much.</span></div>
+  </section>
+
+  <section class="g-step" id="zoo">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The accelerator zoo</h2></div>
+    <p class="g-eyebrow">Pick up to four; switch the metric</p>
+    <p>The comparison below uses dense (non-sparse) throughput where vendors quote sparsity, because serving without 2:4 sparsity runs at the dense rate. Switch the metric and the ranking rearranges violently: NVIDIA leads on HBM bandwidth and NVLink, AMD leads on HBM <em>capacity</em> per dollar-tier, and the TPUs and Trainium trade peak FLOPs for cost and integration inside their own clouds. The decode estimate reads the model's active parameters once per token on each chip, so a 671B-parameter MoE with 37B active looks cheap per token — you pay for the active slice, not the whole file.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-compare" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Dense figures. Bars are normalized to the largest selected value.</p>
+      </div>
+      <div class="g-controls">
+        <p class="hw-sub">Select up to four accelerators</p>
+        <div class="chiprow" id="hw-accel-list"></div>
+        <div class="g-btnrow" id="hw-metric-row">
+          <button data-metric="bw" class="g-primary">HBM TB/s</button>
+          <button data-metric="hbm">HBM GB</button>
+          <button data-metric="bf16">BF16 TFLOP/s</button>
+          <button data-metric="fp8">FP8 TFLOP/s</button>
+          <button data-metric="nvlink">Link GB/s</button>
+          <button data-metric="tdp">TDP W</button>
+          <button data-metric="decode">Decode tok/s</button>
+        </div>
+        <div class="g-field" id="hw-decode-field">
+          <label>Decode model <span class="val">active params</span></label>
+          <select id="hw-decode-model"></select>
+        </div>
+        <div class="g-readout" id="hw-compare-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="hw-src-accel"></p>
+  </section>
+
+  <section class="g-step" id="capacity">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Capacity, and what it forces</h2></div>
+    <p class="g-eyebrow">Weights + KV + activations versus one HBM budget</p>
+    <p>Bandwidth decides how fast a step runs; capacity decides whether it runs at all. A single GPU must hold the sharded weights, the KV cache for every resident sequence, and a working set of activations. The weights scale with parameter count and precision, the KV cache scales with context length, concurrency and the attention scheme (Part 4 sizes it properly), and activations scale with batch and hidden width. The moment the stack crosses the HBM capacity the engine has to shard, quantize, or cut context — there is no third option.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-fit" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">The horizontal line is the accelerator's HBM capacity.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Model <span class="val" id="hw-fit-model-val">Llama 3.1 70B</span></label>
+          <select id="hw-fit-model"></select>
+        </div>
+        <div class="g-field"><label>Context length <span class="val">8192</span></label><input type="range" id="hw-fit-ctx" min="1024" max="131072" step="1024" value="8192"></div>
+        <div class="g-field"><label>Concurrent sequences <span class="val">8</span></label><input type="range" id="hw-fit-batch" min="1" max="64" step="1" value="8"></div>
+        <div class="g-field"><label>Tensor-parallel degree <span class="val">1</span></label><input type="range" id="hw-fit-tp" min="1" max="16" step="1" value="1"></div>
+        <div class="g-field">
+          <label>Accelerator (per GPU) <span class="val" id="hw-fit-accel-val">H100 80 GB</span></label>
+          <select id="hw-fit-accel"></select>
+        </div>
+        <div class="g-btnrow" id="hw-fit-wrow">
+          <button data-w="2" class="g-primary">Weights BF16</button>
+          <button data-w="1">FP8</button>
+          <button data-w="0.5">INT4</button>
+        </div>
+        <div class="g-btnrow" id="hw-fit-krow">
+          <button data-k="2" class="g-primary">KV FP16</button>
+          <button data-k="1">KV FP8</button>
+        </div>
+        <div class="g-readout" id="hw-fit-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="nvlink">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>NVLink and the all-reduce tax</h2></div>
+    <p class="g-eyebrow">Tensor parallelism is a network decision</p>
+    <p>Tensor parallelism splits a matrix multiply across GPUs, but every layer's partial sums have to be combined before the next layer can start. That is two all-reduces per transformer layer — one after attention, one after the MLP — and each one moves the full activation tensor across the link. On a fast NVLink domain the collective hides under the compute, and the tax is invisible. Move the same shard to PCIe or Ethernet and communication dominates: the link stops hiding it, and adding GPUs can make each step <em>slower</em>. This is why tensor parallelism essentially never leaves NVLink, while pipeline and expert parallelism tolerate slower fabrics.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-ar" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Added latency per decode step versus tensor-parallel degree.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Tensor-parallel degree <span class="val">8</span></label><input type="range" id="hw-ar-tp" min="1" max="32" step="1" value="8"></div>
+        <div class="g-field"><label>Link bandwidth (GB/s) <span class="val">50</span></label><input type="range" id="hw-ar-link" min="10" max="1800" step="10" value="50"></div>
+        <div class="g-field"><label>Batch size (sequences per step) <span class="val">256</span></label><input type="range" id="hw-ar-batch" min="1" max="256" step="1" value="256"></div>
+        <div class="g-btnrow" id="hw-ar-presets">
+          <button data-link="900">NVLink4 900</button>
+          <button data-link="1800">NVLink5 1800</button>
+          <button data-link="50">IB NDR 50</button>
+          <button data-link="64">PCIe5 64</button>
+          <button data-link="25">25 GbE 3</button>
+        </div>
+        <div class="g-readout" id="hw-ar-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The crossover:</b> the link stops hiding communication when the time to all-reduce an activation tensor exceeds the time to compute and stream the layer. Below that bandwidth, tensor parallelism still buys capacity but costs latency — and the penalty grows with the tensor-parallel degree because every additional participant adds traffic and one more synchronization point per collective.</span></div>
+  </section>
+
+  <section class="g-step" id="fabric">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>InfiniBand, RoCE and Ethernet</h2></div>
+    <p class="g-eyebrow">The fabric between nodes</p>
+    <p>Inside a node, NVLink carries tensor-parallel collectives. Between nodes, the options are InfiniBand (NDR at 400&nbsp;Gb/s ≈ 50&nbsp;GB/s per port, XDR at 800&nbsp;Gb/s), RoCEv2 (RDMA over Converged Ethernet, which is what most cloud fleets actually run), and plain Ethernet. Their job in serving is different from training: they carry KV transfers between disaggregated prefill and decode pools, expert-parallel all-to-all traffic for MoE, and cache-fetch traffic from a remote KV tier. Two things matter. First, a single KV transfer is a latency-sensitive burst, so RDMA (IB or RoCE) beats TCP/IP by a wide margin. Second, expert all-to-all is bandwidth-bound and scales with the rack's aggregate fabric, which is why NVLink-based racks exist at all.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-fabric" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Relative time to move 1 GB of KV between two nodes.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>KV bytes to transfer (GB) <span class="val">1</span></label><input type="range" id="hw-fabric-gb" min="0.1" max="8" step="0.1" value="1"></div>
+        <div class="g-readout" id="hw-fabric-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="nvl72">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>GB200 NVL72 as one big GPU</h2></div>
+    <p class="g-eyebrow">A 130 TB/s single NVLink domain</p>
+    <p>GB200 NVL72 wires 72 Blackwell GPUs into one NVLink domain: 1.8&nbsp;TB/s per GPU, roughly 130&nbsp;TB/s aggregate, across a liquid-cooled rack drawing on the order of 120&nbsp;kW. The aggregate is what lets a 671B-parameter model run tensor-parallel and expert-parallel without ever touching Ethernet — the model is effectively one compute unit with 13.4&nbsp;TB of HBM3e at 576&nbsp;TB/s aggregate. For serving, that transforms the sharding question: instead of fitting a model onto one 80&nbsp;GB GPU, you fit it onto a rack and treat the rack as the allocation unit. The cost is that you cannot scale to zero and you pay for the whole rack's power whether it is busy or not.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-nvl" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Per-GPU versus per-rack HBM and bandwidth.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>GPUs in the domain <span class="val">72</span></label><input type="range" id="hw-nvl-n" min="1" max="72" step="1" value="72"></div>
+        <div class="g-readout" id="hw-nvl-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="sram">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Groq and Cerebras: SRAM architectures</h2></div>
+    <p class="g-eyebrow">When the weights live on-die</p>
+    <p>The memory wall exists because HBM is off-chip. A different answer is to put the weights in on-die SRAM and give up on scaling a single model: the Groq LPU keeps on the order of 230&nbsp;MB of SRAM per chip with an on-chip fabric measured in tens of TB/s, and the Cerebras WSE-3 keeps about 44&nbsp;GB of SRAM across roughly 900,000 cores at a reported tens-of-petabytes-per-second aggregate bandwidth. That is one to two orders of magnitude more bandwidth per byte than HBM, which crushes decode latency for a model small enough to fit. The catch is capacity: a single 70B model does not fit on one LPU or one wafer, so these systems span a model across many chips and pay the interconnect cost instead. They are compelling for small-to-medium models, low-latency decoding and speculative drafting; they are not a general replacement for an HBM GPU running a 400B model.</p>
+    <div class="g-goal">💡 <span><b>The trade in one line:</b> SRAM buys bandwidth at the cost of capacity, HBM buys capacity at the cost of bandwidth. Serving economics is the art of picking which one your workload is short of.</span></div>
+  </section>
+
+  <section class="g-step" id="tpu">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>TPU and Trainium</h2></div>
+    <p class="g-eyebrow">The non-NVIDIA column</p>
+    <p>Google's TPU v5e is a small, cheap serving chip: 16&nbsp;GB of HBM at 0.8&nbsp;TB/s, 197 dense BF16 TFLOP/s, and a 400&nbsp;GB/s bidirectional ICI link — bandwidth-starved per chip, so it is deployed in slices where the ICI fabric carries the sharding. TPU v5p is the opposite: 95&nbsp;GB at 2.765&nbsp;TB/s, 459 TFLOP/s BF16, and 1,200&nbsp;GB/s of ICI. AWS Trainium2 sits in between per chip — 96&nbsp;GB HBM3 at about 2.9&nbsp;TB/s and roughly 650 dense BF16 TFLOP/s, with a 16-chip trn2.48xlarge presenting 20.8 FP8 PFLOPS and 1.5&nbsp;TB of HBM. Treat the interconnect names as the important detail: ICI and NeuronLink are not NVLink, and whether your tensor-parallel group fits inside one ICI domain is the single biggest performance decision on these stacks.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-tpu" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Bytes of weights that fit in HBM, at the selected precision.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="hw-tpu-prow">
+          <button data-p="2" class="g-primary">BF16 (2 B)</button>
+          <button data-p="1">FP8 (1 B)</button>
+          <button data-p="0.5">INT4 (0.5 B)</button>
+        </div>
+        <div class="g-readout" id="hw-tpu-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="energy">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Energy per token</h2></div>
+    <p class="g-eyebrow">Joules, the number the invoice is written in</p>
+    <p>Energy per token is the accelerator's power draw multiplied by the step time, divided by the number of tokens the step produced. At batch 1 a decode step is bandwidth-bound and its time is fixed, so energy per token is at its worst: you pay for a full weight sweep to produce a single token. As the batch grows the step time is nearly flat until compute takes over, so the same joules now produce many tokens and energy per token collapses. This is the entire economic case for continuous batching in one curve, and it is why a serving node running at batch 1 can be twenty times less energy-efficient than the same node under load.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hw-energy" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Animate with play, or drag the batch slider.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="hw-energy-play">Play</button></div>
+        <div class="g-field">
+          <label>Model <span class="val">active params</span></label>
+          <select id="hw-energy-model"></select>
+        </div>
+        <div class="g-field">
+          <label>Accelerator <span class="val" id="hw-energy-accel-val">H100 SXM</span></label>
+          <select id="hw-energy-accel"></select>
+        </div>
+        <div class="g-field"><label>Batch size <span class="val">1</span></label><input type="range" id="hw-energy-batch" min="1" max="256" step="1" value="1"></div>
+        <div class="g-readout" id="hw-energy-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="hw-src-model"></p>
+    <div class="g-goal">📌 <span><b>Cross-link:</b> the memory accounting here — weights plus optimizer state during training — is exactly the arithmetic worked through in <a href="{{ '/ai/llm-training/scaling/' | relative_url }}">the LLM Training scaling page</a>, where the same parameter is multiplied by 16 bytes instead of 2.</span></div>
+  </section>
+
+  <section class="g-step" id="cheatsheet">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">The numbers that decide decode</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Quantity</th><th>Why it matters</th><th>Reference points</th></tr></thead>
+      <tbody>
+        <tr><td>HBM bandwidth</td><td>Sets decode step time at low batch; tokens/s ≈ BW ÷ model bytes</td><td>H100 3.35 TB/s · B200 8 TB/s · NVL72 576 TB/s aggregate</td></tr>
+        <tr><td>HBM capacity</td><td>Weights + KV + activations must fit; else shard or quantize</td><td>H100 80 GB · H200 141 GB · B200 192 GB · NVL72 13.4 TB</td></tr>
+        <tr><td>NVLink bandwidth</td><td>Hides the all-reduce when fast; tax explodes when slow</td><td>H100 900 GB/s · B200 1.8 TB/s · NVL72 130 TB/s</td></tr>
+        <tr><td>Dense FLOPs</td><td>Only binds once batch pushes the step compute-bound</td><td>H100 989 BF16 · B200 2,250 BF16</td></tr>
+        <tr><td>Fabric between nodes</td><td>Carries KV transfer and expert all-to-all</td><td>IB NDR 50 GB/s per port · RoCEv2 · NVLink domain 130 TB/s</td></tr>
+        <tr><td>Energy per token</td><td>TDP × step time ÷ batch; falls as batch rises</td><td>Rack ~120 kW · bandwidth-bound steps waste joules at batch 1</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>NVIDIA, <a href="https://www.nvidia.com/en-us/data-center/h100/">H100 Tensor Core GPU datasheet</a> and <a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">B200 / GB200 NVL72 architecture pages</a>.</li>
+      <li>Pope et al., "Efficiently Scaling Transformer Inference" (MLSys 2023) — the memory-bandwidth model behind decode step time.</li>
+      <li>Google Cloud, <a href="https://cloud.google.com/tpu/docs">TPU v5e and v5p documentation</a>; AWS, <a href="https://aws.amazon.com/ec2/instance-types/trn2/">Trainium2 (trn2.48xlarge) product page</a>.</li>
+      <li>Cerebras, "WSE-3" architecture overview; Groq, LPU architecture documentation.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Hardware sets the ceiling; the next part sets the targets you are actually judged against.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__HW_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, SS = window.ServingSim, c = G.colors();
+
+  var FALLBACK = {
+    accelerators: {
+      source: "Vendor datasheets/architecture pages, retrieved 2026-09: NVIDIA H200 datasheet (BF16 1,979 / FP8 3,958 TFLOPS sparse, 141 GB HBM3e, 4.8 TB/s, 900 GB/s NVLink, up to 700 W); NVIDIA H100 tensor-core GPU datasheet (dense BF16 989 / dense FP8 1,979, 80 GB HBM3, 3.35 TB/s, 900 GB/s NVLink, up to 700 W); NVIDIA A100 80GB datasheet (dense BF16/FP16 312, 80 GB HBM2e, 2,039 GB/s, 600 GB/s NVLink, 400 W; no FP8/FP4 tensor support); NVIDIA GB200 NVL72 page (72 Blackwell GPUs, 13.4 TB HBM3E at 576 TB/s aggregate, NVFP4 1,440 / FP8 720 / FP16-BF16 360 PFLOPS sparse, 130 TB/s NVLink, ~120 kW liquid-cooled rack); NVIDIA Blackwell architecture (B200 192 GB HBM3e, 8 TB/s, 2,250 dense BF16 / 4,500 dense FP8 / 9,000 dense FP4 TFLOPS, 1.8 TB/s NVLink, 1,000 W). AMD Instinct MI300X product page (192 GB HBM3, 5,325 GB/s, dense BF16/FP16 1,307 / dense FP8 2,615 TFLOPS, 8 Infinity Fabric links x 128 GB/s, 750 W; no native FP4). Google Cloud TPU v5e docs (16 GB HBM, 800 GiB/s, 197 BF16 / 393 INT8 TFLOPs, 400 GB/s ICI) and TPU v5p docs (95 GB HBM, 2,765 GB/s, 459 BF16 / 459 FP8 TFLOPs, 1,200 GB/s ICI). AWS EC2 Trn2 product page (trn2.48xlarge = 16 Trainium2 chips, 20.8 FP8 PFLOPS, 1.5 TB HBM3, 46 TB/s aggregate => ~1.3 PFLOPS FP8, ~650 dense BF16, 96 GB HBM3 and ~2.9 TB/s per chip).",
+      items: [
+        { name: "NVIDIA A100 80GB SXM", hbmGB: 80, bwTBs: 2.0, bf16TFLOPs: 312, fp8TFLOPs: null, fp4TFLOPs: null, nvlinkGBs: 600, tdpW: 400 },
+        { name: "NVIDIA H100 SXM", hbmGB: 80, bwTBs: 3.35, bf16TFLOPs: 989, fp8TFLOPs: 1979, fp4TFLOPs: null, nvlinkGBs: 900, tdpW: 700 },
+        { name: "NVIDIA H200 SXM", hbmGB: 141, bwTBs: 4.8, bf16TFLOPs: 989, fp8TFLOPs: 1979, fp4TFLOPs: null, nvlinkGBs: 900, tdpW: 700 },
+        { name: "NVIDIA B200", hbmGB: 192, bwTBs: 8.0, bf16TFLOPs: 2250, fp8TFLOPs: 4500, fp4TFLOPs: 9000, nvlinkGBs: 1800, tdpW: 1000 },
+        { name: "NVIDIA GB200 NVL72 (per rack)", hbmGB: 13400, bwTBs: 8.0, bf16TFLOPs: 180000, fp8TFLOPs: 360000, fp4TFLOPs: 720000, nvlinkGBs: 1800, tdpW: 120000 },
+        { name: "AMD Instinct MI300X", hbmGB: 192, bwTBs: 5.3, bf16TFLOPs: 1307, fp8TFLOPs: 2615, fp4TFLOPs: null, nvlinkGBs: 1024, tdpW: 750 },
+        { name: "Google TPU v5e", hbmGB: 16, bwTBs: 0.8, bf16TFLOPs: 197, fp8TFLOPs: null, fp4TFLOPs: null, nvlinkGBs: 400, tdpW: null },
+        { name: "Google TPU v5p", hbmGB: 95, bwTBs: 2.765, bf16TFLOPs: 459, fp8TFLOPs: 459, fp4TFLOPs: null, nvlinkGBs: 1200, tdpW: null },
+        { name: "AWS Trainium2", hbmGB: 96, bwTBs: 2.9, bf16TFLOPs: 650, fp8TFLOPs: 1300, fp4TFLOPs: null, nvlinkGBs: null, tdpW: null }
+      ]
+    },
+    model_configs: {
+      source: "Official model configs and technical reports.",
+      items: [
+        { name: "Llama 3.1 8B", layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 8.03, activeParamsB: 8.03, contextLen: 131072 },
+        { name: "Llama 3.1 70B", layers: 80, hidden: 8192, heads: 64, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 70.6, activeParamsB: 70.6, contextLen: 131072 },
+        { name: "Llama 3.1 405B", layers: 126, hidden: 16384, heads: 128, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 405, activeParamsB: 405, contextLen: 131072 },
+        { name: "DeepSeek-V3", layers: 61, hidden: 7168, heads: 128, n_kv_heads: 128, d_head: 128, kvScheme: "MLA", totalParamsB: 671, activeParamsB: 37, contextLen: 163840 },
+        { name: "Kimi K2", layers: 61, hidden: 7168, heads: 64, n_kv_heads: 64, d_head: 128, kvScheme: "MLA", totalParamsB: 1000, activeParamsB: 32, contextLen: 131072 },
+        { name: "Mistral 7B (sliding-window)", layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: "SWA-hybrid", totalParamsB: 7.24, activeParamsB: 7.24, contextLen: 32768 },
+        { name: "gpt-oss-120b", layers: 36, hidden: 2880, heads: 64, n_kv_heads: 8, d_head: 64, kvScheme: "GQA", totalParamsB: 117, activeParamsB: 5.1, contextLen: 131072 }
+      ]
+    }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function applyData(d) {
+    if (d && d.accelerators && d.accelerators.items && d.accelerators.items.length) DATA = d;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+
+  function accels() { return DATA.accelerators.items; }
+  function models() { return DATA.model_configs.items; }
+
+  function shortName(n) {
+    return n.replace("NVIDIA ", "").replace("Google ", "").replace("AWS ", "")
+      .replace("AMD ", "").replace(" Instinct", "").replace(" (per rack)", " rack")
+      .replace(" 80GB SXM", "").replace(" SXM", "");
+  }
+  function pick(list, idx) { return list[Math.max(0, Math.min(list.length - 1, idx))]; }
+  function kvAll(m, tokens, bytesPerElem) {
+    if (m.kvScheme === "MLA") return m.layers * 576 * tokens * bytesPerElem;
+    return SS.kvBytes({ layers: m.layers, kvHeads: m.n_kv_heads, headDim: m.d_head, tokens: tokens, bytesPerElem: bytesPerElem, batch: 1 });
+  }
+  function kvPerToken(m, bytesPerElem) {
+    return kvAll(m, 1, bytesPerElem);
+  }
+  function decodeTps(acc, m) {
+    if (!acc || !m) return 0;
+    var t = SS.stepTime({
+      paramsB: m.activeParamsB, bytesPerParam: 2, kvBytes: 0,
+      bwTBs: acc.bwTBs, peakTFLOPs: acc.bf16TFLOPs, batch: 1
+    });
+    return t.totalMs > 0 ? 1000 / t.totalMs : 0;
+  }
+
+  // ---- Demo 1: accelerator comparator -----------------------------------
+  (function () {
+    var canvas = document.getElementById("hw-compare");
+    var ctx, W = 640, H = 360;
+    var listEl = document.getElementById("hw-accel-list");
+    var metricRow = document.getElementById("hw-metric-row");
+    var modelSel = document.getElementById("hw-decode-model");
+    var readout = document.getElementById("hw-compare-readout");
+    var srcEl = document.getElementById("hw-src-accel");
+    var metric = "bw";
+    var selected = [1, 3, 5, 7];
+    var decodeIdx = 1;
+
+    function buildAccelList() {
+      listEl.innerHTML = "";
+      accels().forEach(function (a, i) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "accel-chip" + (selected.indexOf(i) >= 0 ? " on" : "");
+        b.textContent = shortName(a.name);
+        b.addEventListener("click", function () {
+          var at = selected.indexOf(i);
+          if (at >= 0) selected.splice(at, 1);
+          else {
+            if (selected.length >= 4) selected.shift();
+            selected.push(i);
+          }
+          buildAccelList();
+          render();
+        });
+        listEl.appendChild(b);
+      });
+    }
+    function buildModelSel() {
+      modelSel.innerHTML = "";
+      models().forEach(function (m, i) {
+        var o = document.createElement("option");
+        o.value = String(i);
+        o.textContent = m.name + "  (" + m.activeParamsB + "B active)";
+        modelSel.appendChild(o);
+      });
+      modelSel.value = String(decodeIdx);
+    }
+
+    var METRICS = {
+      bw: { key: "bwTBs", label: "HBM TB/s", digits: 2 },
+      hbm: { key: "hbmGB", label: "HBM GB", digits: 0 },
+      bf16: { key: "bf16TFLOPs", label: "dense BF16 TFLOP/s", digits: 0 },
+      fp8: { key: "fp8TFLOPs", label: "dense FP8 TFLOP/s", digits: 0 },
+      nvlink: { key: "nvlinkGBs", label: "link GB/s", digits: 0 },
+      tdp: { key: "tdpW", label: "TDP W", digits: 0 }
+    };
+
+    function render() {
+      if (!ctx) return;
+      var chosen = selected.map(function (i) { return accels()[i]; }).filter(Boolean);
+      var m = pick(models(), decodeIdx);
+      var data = [], values = [];
+      if (metric === "decode") {
+        chosen.forEach(function (a) {
+          var v = decodeTps(a, m);
+          values.push(v);
+          data.push({ label: shortName(a.name), value: v, valueLabel: v.toFixed(1) });
+        });
+      } else {
+        var spec = METRICS[metric];
+        chosen.forEach(function (a) {
+          var raw = a[spec.key];
+          var v = raw == null ? 0 : raw;
+          values.push(v);
+          data.push({ label: shortName(a.name), value: v, valueLabel: raw == null ? "n/a" : (spec.digits ? v.toFixed(spec.digits) : String(v)) });
+        });
+      }
+      var maxV = Math.max.apply(null, values.concat([0.0001]));
+      data.forEach(function (d, i) { d.color = i === 0 ? c.accent : (i === 1 ? c.accent2 : (i === 2 ? c.accent500 : c.accent700)); });
+
+      ctx.clearRect(0, 0, W, H);
+      if (!data.length) {
+        readout.innerHTML = '<span class="k">Select at least one accelerator.</span>';
+        return;
+      }
+      G.drawBars(ctx, W, H, data, { maxV: maxV, padL: 130, padR: 90, fontSize: 12 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font;
+      var title = metric === "decode" ? ("Decode tok/s · " + m.name + " (batch 1)") : METRICS[metric].label;
+      ctx.textAlign = "left"; ctx.fillText(title, 8, 14);
+
+      var lines = [];
+      if (metric === "decode") {
+        chosen.forEach(function (a) {
+          lines.push('<span class="k">' + shortName(a.name) + ":</span> <span class=\"hi\">" + decodeTps(a, m).toFixed(1) + " tok/s</span>");
+        });
+        lines.push('<span class="k">model reads per token:</span> ' + m.activeParamsB + "B params");
+      } else {
+        var spec = METRICS[metric];
+        chosen.forEach(function (a) {
+          var raw = a[spec.key];
+          lines.push('<span class="k">' + shortName(a.name) + ":</span> " + (raw == null ? '<span class="bad">n/a</span>' : (spec.digits ? Number(raw).toFixed(spec.digits) : String(raw))) + " " + spec.label.replace(/^dense |^HBM |^link /, ""));
+        });
+      }
+      if (metric === "hbm" || metric === "bf16") lines.push('<span class="k">note:</span> GB200 NVL72 is a whole rack; its HBM/FLOPs are aggregates.');
+      readout.innerHTML = lines.join("<br>");
+    }
+
+    metricRow.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-metric]");
+      if (!b) return;
+      metric = b.getAttribute("data-metric");
+      Array.prototype.forEach.call(metricRow.querySelectorAll("button"), function (x) { x.className = x === b ? "g-primary" : ""; });
+      render();
+    });
+    modelSel.addEventListener("change", function () { decodeIdx = parseInt(modelSel.value, 10) || 0; render(); });
+
+    buildAccelList(); buildModelSel();
+    onData(function () { buildAccelList(); buildModelSel(); srcEl.textContent = DATA.accelerators.source; render(); });
+    srcEl.textContent = DATA.accelerators.source;
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  // ---- Demo 2: what fits -------------------------------------------------
+  (function () {
+    var canvas = document.getElementById("hw-fit");
+    var ctx, W = 640, H = 360;
+    var modelSel = document.getElementById("hw-fit-model");
+    var accelSel = document.getElementById("hw-fit-accel");
+    var ctxS = document.getElementById("hw-fit-ctx");
+    var batchS = document.getElementById("hw-fit-batch");
+    var tpS = document.getElementById("hw-fit-tp");
+    var wRow = document.getElementById("hw-fit-wrow");
+    var kRow = document.getElementById("hw-fit-krow");
+    var readout = document.getElementById("hw-fit-readout");
+    var wBytes = 2, kvBytes = 2, modelIdx = 1, accelIdx = 1;
+
+    function fitAccels() {
+      return accels().filter(function (a) { return a.hbmGB && a.hbmGB <= 1000; });
+    }
+    function buildSelects() {
+      modelSel.innerHTML = "";
+      models().forEach(function (m, i) {
+        var o = document.createElement("option"); o.value = String(i); o.textContent = m.name; modelSel.appendChild(o);
+      });
+      modelSel.value = String(modelIdx);
+      accelSel.innerHTML = "";
+      fitAccels().forEach(function (a, i) {
+        var o = document.createElement("option"); o.value = String(i); o.textContent = shortName(a.name) + " · " + a.hbmGB + " GB"; accelSel.appendChild(o);
+      });
+      accelSel.value = String(Math.min(accelIdx, fitAccels().length - 1));
+    }
+
+    function effTokens(m, raw) {
+      if (m.kvScheme === "SWA-hybrid") return Math.min(raw, 4096);
+      return raw;
+    }
+
+    function render() {
+      if (!ctx) return;
+      var m = pick(models(), modelIdx);
+      var acc = pick(fitAccels(), accelIdx) || fitAccels()[0];
+      var ctxLen = parseInt(ctxS.value, 10);
+      var batch = parseInt(batchS.value, 10);
+      var tp = parseInt(tpS.value, 10) || 1;
+      var cap = acc.hbmGB;
+
+      var weightGB = m.totalParamsB * 1e9 * wBytes / tp / 1e9;
+      var tokens = effTokens(m, ctxLen) * batch;
+      var kvTotal = kvAll(m, tokens, kvBytes) / tp;
+      var kvGB = kvTotal / 1e9;
+      var actGB = batch * m.hidden * 2 * 6 / 1e9;
+      var total = weightGB + kvGB + actGB;
+
+      var rows = [{
+        label: "per GPU",
+        segments: [
+          { value: weightGB, color: c.accent, name: "weights" },
+          { value: kvGB, color: c.accent2, name: "KV" },
+          { value: actGB, color: c.accent400, name: "activations" }
+        ]
+      }];
+      var maxTotal = Math.max(total, cap) * 1.08;
+
+      var geo = G.drawStacked(ctx, W, H, rows, { maxTotal: maxTotal, padB: 40, padT: 16, showSegmentLabels: true, axisLabel: "HBM per GPU (GB) · capacity line at " + cap + " GB" });
+      var lineX = geo.padL + geo.scale * cap;
+      ctx.strokeStyle = total > cap ? c.accent2 : c.accent700;
+      ctx.lineWidth = 2; ctx.setLineDash(total > cap ? [6, 4] : []);
+      ctx.beginPath(); ctx.moveTo(lineX, geo.padT - 4); ctx.lineTo(lineX, H - 24); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = total > cap ? c.accent2 : c.accent700; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText(cap + " GB", lineX + 5, geo.padT + 6);
+
+      var bpt = kvPerToken(m, kvBytes) / tp;
+      var lines = [];
+      lines.push('<span class="k">weights:</span> ' + weightGB.toFixed(1) + " GB/GPU · TP " + tp);
+      lines.push('<span class="k">KV (' + batch + " seq × " + effTokens(m, ctxLen) + " tok):</span> " + kvGB.toFixed(1) + " GB/GPU");
+      lines.push('<span class="k">activations:</span> ' + G.fmtBytes(actGB * 1e9) + "/GPU");
+      lines.push('<span class="k">KV bytes/token:</span> ' + (bpt >= 1024 ? (bpt / 1024).toFixed(1) + " KB" : bpt.toFixed(0) + " B"));
+      if (total > cap) {
+        var over = total - cap;
+        var need = Math.ceil(total / cap);
+        lines.push('<span class="bad">OOM by ' + over.toFixed(1) + " GB — you need " + need + " GPUs or FP8 KV</span>");
+      } else {
+        lines.push('<span class="hi">fits with ' + (cap - total).toFixed(1) + " GB headroom</span>");
+      }
+      readout.innerHTML = lines.join("<br>");
+      var mv = document.getElementById("hw-fit-model-val");
+      if (mv) mv.textContent = m.name;
+      var accelVal = document.getElementById("hw-fit-accel-val");
+      if (accelVal) accelVal.textContent = shortName(acc.name) + " · " + cap + " GB";
+    }
+
+    wRow.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-w]"); if (!b) return;
+      wBytes = parseFloat(b.getAttribute("data-w"));
+      Array.prototype.forEach.call(wRow.querySelectorAll("button"), function (x) { x.className = x === b ? "g-primary" : ""; });
+      render();
+    });
+    kRow.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-k]"); if (!b) return;
+      kvBytes = parseFloat(b.getAttribute("data-k"));
+      Array.prototype.forEach.call(kRow.querySelectorAll("button"), function (x) { x.className = x === b ? "g-primary" : ""; });
+      render();
+    });
+    modelSel.addEventListener("change", function () { modelIdx = parseInt(modelSel.value, 10) || 0; render(); });
+    accelSel.addEventListener("change", function () { accelIdx = parseInt(accelSel.value, 10) || 0; render(); });
+    G.bindSliders([ctxS, batchS, tpS], render);
+
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    onData(function () { buildSelects(); render(); });
+    buildSelects();
+    render();
+  })();
+  (function () {
+    var canvas = document.getElementById("hw-ar");
+    var ctx, W = 640, H = 360;
+    var tpS = document.getElementById("hw-ar-tp");
+    var linkS = document.getElementById("hw-ar-link");
+    var batchS = document.getElementById("hw-ar-batch");
+    var readout = document.getElementById("hw-ar-readout");
+    var modelIdx = 0, accelIdx = 1;
+    var tp = 8, link = 50, batch = 256;
+    var COLLECTIVE_US = 0.006; // ~6 microseconds of fixed sync latency per collective
+
+    function parts(m, acc, tp, batch) {
+      var t = SS.stepTime({
+        paramsB: m.activeParamsB / tp, bytesPerParam: 2, kvBytes: 0,
+        bwTBs: acc.bwTBs, peakTFLOPs: acc.bf16TFLOPs, batch: batch
+      });
+      return { base: t.totalMs, mem: t.memMs, compute: t.computeMs };
+    }
+    function commMs(m, tp, linkGBs, batch) {
+      if (tp <= 1) return 0;
+      var bytesPerCollective = 2 * (tp - 1) / tp * m.hidden * batch * 2;
+      var bw = m.layers * 2 * bytesPerCollective / (linkGBs * 1e9) * 1000;
+      var lat = m.layers * 2 * COLLECTIVE_US;
+      return bw + lat;
+    }
+    function tax(m, acc, tp, linkGBs, batch) {
+      var p = parts(m, acc, tp, batch);
+      var comm = commMs(m, tp, linkGBs, batch);
+      var exposed = Math.max(0, comm - p.base);
+      return { base: p.base, mem: p.mem, compute: p.compute, comm: comm, exposed: exposed, pct: p.base > 0 ? exposed / p.base * 100 : 0 };
+    }
+    function crossoverLink(m, acc, tp, batch) {
+      if (tp <= 1) return 0;
+      var p = parts(m, acc, tp, batch);
+      var lat = m.layers * 2 * COLLECTIVE_US;
+      var bytes = m.layers * 2 * (2 * (tp - 1) / tp * m.hidden * batch * 2);
+      var bwBudgetMs = p.base - lat;
+      if (bwBudgetMs <= 0) return Infinity;
+      return bytes / (bwBudgetMs / 1000) / 1e9;
+    }
+
+    function render() {
+      if (!ctx) return;
+      tp = parseInt(tpS.value, 10);
+      link = parseFloat(linkS.value);
+      batch = parseInt(batchS.value, 10);
+      var m = pick(models(), modelIdx);
+      var acc = pick(accels(), accelIdx);
+
+      var ptsFast = [], ptsSlow = [], ptsCur = [], yMax = 200;
+      for (var x = 1; x <= 32; x++) {
+        var f = tax(m, acc, x, 1800, batch).pct;
+        var s = tax(m, acc, x, 50, batch).pct;
+        var cur = tax(m, acc, x, link, batch).pct;
+        yMax = Math.max(yMax, f, s, cur);
+        ptsFast.push({ x: x, y: f });
+        ptsSlow.push({ x: x, y: s });
+        ptsCur.push({ x: x, y: cur });
+      }
+      yMax = Math.ceil(yMax / 100) * 100;
+
+      var axes = G.drawLines(ctx, W, H, [
+        { points: ptsFast, color: c.accent400, width: 1.5, dashed: true },
+        { points: ptsSlow, color: c.divider, width: 1.5, dashed: true },
+        { points: ptsCur, color: c.accent2, width: 2.5 }
+      ], [1, 32], [0, yMax], { xLabel: "tensor-parallel degree", yLabel: "% added to each decode step" });
+
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font;
+      ctx.textAlign = "left";
+      ctx.fillText("dashed: 1,800 GB/s (fast) and 50 GB/s (slow) links · batch " + batch, axes.padL + 6, axes.padT + 12);
+
+      var cur = tax(m, acc, tp, link, batch);
+      var cx = axes.px(tp), cy = axes.py(Math.min(yMax, cur.pct));
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 2 * Math.PI); ctx.fill();
+
+      var co = crossoverLink(m, acc, tp, batch);
+      var lines = [];
+      lines.push('<span class="k">model:</span> ' + m.name + " · " + acc.name.split(" (")[0]);
+      lines.push('<span class="k">base step (max of mem ' + cur.mem.toFixed(2) + " / compute " + cur.compute.toFixed(2) + " ms):</span> " + cur.base.toFixed(2) + " ms");
+      lines.push('<span class="k">' + (m.layers * 2) + " collectives at " + link + " GB/s:</span> " + cur.comm.toFixed(2) + " ms");
+      lines.push('<span class="k">exposed (beyond what the step hides):</span> <span class="' + (cur.pct > 10 ? "bad" : "hi") + '">' + cur.pct.toFixed(1) + "%</span>");
+      lines.push('<span class="k">crossover — link stops hiding it below:</span> ' +
+        (isFinite(co) ? co.toFixed(0) + " GB/s" : "always exposed") + " at TP " + tp + ", batch " + batch);
+      readout.innerHTML = lines.join("<br>");
+    }
+
+    document.getElementById("hw-ar-presets").addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-link]"); if (!b) return;
+      linkS.value = b.getAttribute("data-link");
+      render();
+    });
+    G.bindSliders([tpS, linkS, batchS], render);
+    onData(render);
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  // ---- Demo 4: fabric transfer times ------------------------------------
+  (function () {
+    var canvas = document.getElementById("hw-fabric");
+    var ctx, W = 640, H = 300;
+    var gbS = document.getElementById("hw-fabric-gb");
+    var readout = document.getElementById("hw-fabric-readout");
+    var FABRICS = [
+      { name: "NVLink5 domain (1.8 TB/s)", gbs: 1800 },
+      { name: "InfiniBand XDR (800 Gb/s)", gbs: 100 },
+      { name: "InfiniBand NDR (400 Gb/s)", gbs: 50 },
+      { name: "RoCEv2 400G", gbs: 50 },
+      { name: "25 GbE", gbs: 3.125 }
+    ];
+    function render() {
+      if (!ctx) return;
+      var gb = parseFloat(gbS.value);
+      var bytes = gb * 1e9;
+      var data = FABRICS.map(function (f, i) {
+        var ms = bytes / (f.gbs * 1e9) * 1000;
+        return { label: f.name.replace(/ \(.*\)/, ""), value: ms, valueLabel: G.fmtMs(ms), color: i === 0 ? c.accent : (i === 4 ? c.accent2 : c.accent400) };
+      });
+      ctx.clearRect(0, 0, W, H);
+      G.drawBars(ctx, W, H, data, { maxV: Math.max.apply(null, data.map(function (d) { return d.value; })), padL: 130, padR: 90 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Time to move " + gb.toFixed(1) + " GB of KV between nodes", 8, 14);
+      readout.innerHTML = '<span class="k">' + gb.toFixed(1) + ' GB of KV (a 70B-class context handoff):</span> ' +
+        '<span class="hi">' + G.fmtMs(gb * 1e9 / (50 * 1e9) * 1000) + '</span> over IB NDR vs ' +
+        '<span class="hi">' + G.fmtMs(gb * 1e9 / (1800 * 1e9) * 1000) + '</span> inside an NVLink domain.';
+    }
+    G.bindSliders([gbS], render);
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  // ---- Demo 5: NVL72 scaling --------------------------------------------
+  (function () {
+    var canvas = document.getElementById("hw-nvl");
+    var ctx, W = 640, H = 300;
+    var nS = document.getElementById("hw-nvl-n");
+    var readout = document.getElementById("hw-nvl-readout");
+    function render() {
+      if (!ctx) return;
+      var n = parseInt(nS.value, 10);
+      var perGpuBw = 8.0, perGpuHbm = 192, nvGbs = 1800, nvAggr = 130000;
+      var data = [
+        { label: "HBM (TB)", value: n * perGpuHbm / 1024, valueLabel: (n * perGpuHbm / 1024).toFixed(1) + " TB", color: c.accent },
+        { label: "HBM BW (TB/s)", value: n * perGpuBw, valueLabel: (n * perGpuBw).toFixed(0) + " TB/s", color: c.accent2 },
+        { label: "NVLink per GPU", value: nvGbs, valueLabel: "1.8 TB/s", color: c.accent500 },
+        { label: "NVLink domain", value: nvAggr, valueLabel: "130 TB/s", color: c.accent700 }
+      ];
+      var maxV = Math.max.apply(null, data.map(function (d) { return d.value; }));
+      G.drawBars(ctx, W, H, data, { maxV: maxV, padL: 130, padR: 110 });
+      readout.innerHTML = '<span class="k">' + n + '-GPU domain:</span> <span class="hi">' + (n * perGpuHbm / 1024).toFixed(1) + ' TB</span> HBM · ' +
+        '<span class="hi">' + (n * perGpuBw).toFixed(0) + ' TB/s</span> bandwidth · ~' + Math.round(n * 120000 / 72 / 1000) + ' kW at full rack density';
+    }
+    G.bindSliders([nS], render);
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  // ---- Demo 6: TPU / Trainium capacity ----------------------------------
+  (function () {
+    var canvas = document.getElementById("hw-tpu");
+    var ctx, W = 640, H = 320;
+    var pRow = document.getElementById("hw-tpu-prow");
+    var readout = document.getElementById("hw-tpu-readout");
+    var bytes = 2;
+    var NAMES = ["Google TPU v5e", "Google TPU v5p", "AWS Trainium2"];
+    function render() {
+      if (!ctx) return;
+      var data = NAMES.map(function (nm, i) {
+        var a = accels().filter(function (x) { return x.name === nm; })[0];
+        var gb = a ? a.hbmGB : 0;
+        var params = gb * 1e9 / bytes / 1e9;
+        return { label: shortName(nm), value: params, valueLabel: params.toFixed(0) + "B params", color: i === 0 ? c.accent : (i === 1 ? c.accent2 : c.accent500) };
+      });
+      G.drawBars(ctx, W, H, data, { maxV: Math.max.apply(null, data.map(function (d) { return d.value; })), padL: 120, padR: 140 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Parameters that fit in HBM at " + (bytes === 2 ? "BF16" : bytes === 1 ? "FP8" : "INT4") + " — weights only", 8, 14);
+      var lines = data.map(function (d) { return '<span class="k">' + d.label + ":</span> " + d.valueLabel; });
+      lines.push('<span class="k">Note:</span> v5e is bandwidth-starved per chip; v5p and Trainium2 trade peak FLOPs for fleet economics.');
+      readout.innerHTML = lines.join("<br>");
+    }
+    pRow.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-p]"); if (!b) return;
+      bytes = parseFloat(b.getAttribute("data-p"));
+      Array.prototype.forEach.call(pRow.querySelectorAll("button"), function (x) { x.className = x === b ? "g-primary" : ""; });
+      render();
+    });
+    onData(render);
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  // ---- Demo 7: joules per token -----------------------------------------
+  (function () {
+    var canvas = document.getElementById("hw-energy");
+    var ctx, W = 640, H = 360;
+    var modelSel = document.getElementById("hw-energy-model");
+    var accelSel = document.getElementById("hw-energy-accel");
+    var batchS = document.getElementById("hw-energy-batch");
+    var readout = document.getElementById("hw-energy-readout");
+    var playBtn = document.getElementById("hw-energy-play");
+    var modelIdx = 1, accelIdx = 1, batch = 1;
+
+    function powerAccels() {
+      return accels().filter(function (a) { return a.tdpW; });
+    }
+    function buildSelects() {
+      modelSel.innerHTML = "";
+      models().forEach(function (m, i) {
+        var o = document.createElement("option"); o.value = String(i); o.textContent = m.name; modelSel.appendChild(o);
+      });
+      modelSel.value = String(modelIdx);
+      accelSel.innerHTML = "";
+      powerAccels().forEach(function (a, i) {
+        var o = document.createElement("option"); o.value = String(i); o.textContent = shortName(a.name) + " · " + a.tdpW + " W"; accelSel.appendChild(o);
+      });
+      accelSel.value = String(Math.min(accelIdx, powerAccels().length - 1));
+    }
+    function jPerToken(m, acc, b) {
+      var kv = kvPerToken(m, 2) * b;
+      var t = SS.stepTime({
+        paramsB: m.activeParamsB, bytesPerParam: 2, kvBytes: kv,
+        bwTBs: acc.bwTBs, peakTFLOPs: acc.bf16TFLOPs, batch: b
+      });
+      return { j: acc.tdpW * (t.totalMs / 1000) / b, ms: t.totalMs, bound: t.bound };
+    }
+    function render() {
+      if (!ctx) return;
+      var m = pick(models(), modelIdx);
+      var acc = pick(powerAccels(), accelIdx) || powerAccels()[0];
+      batch = parseInt(batchS.value, 10);
+      var pts = [], maxJ = 0;
+      for (var b = 1; b <= 256; b++) {
+        var r = jPerToken(m, acc, b);
+        maxJ = Math.max(maxJ, r.j);
+        pts.push({ x: b, y: r.j });
+      }
+      ctx.clearRect(0, 0, W, H);
+      var axes = G.drawLines(ctx, W, H, [{ points: pts, color: c.accent, width: 2.5 }], [1, 256], [0, maxJ * 1.05], { xLabel: "batch size (concurrent sequences per step)", yLabel: "joules per token" });
+      var cur = jPerToken(m, acc, batch);
+      var cx = axes.px(batch), cy = axes.py(Math.min(maxJ * 1.05, cur.j));
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 2 * Math.PI); ctx.fill();
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("batch " + batch + " · " + (cur.bound === "memory" ? "memory-bound" : "compute-bound"), Math.min(cx + 8, W - 160), axes.padT + 14);
+      // theoretical batch-1 asymptote
+      ctx.fillStyle = c.text; ctx.textAlign = "left";
+      ctx.fillText("J/token at batch 1: " + pts[0].y.toFixed(2) + " J", axes.padL + 8, axes.padT + 26);
+      readout.innerHTML =
+        '<span class="k">at batch ' + batch + ':</span> <span class="hi">' + cur.j.toFixed(3) + " J/token</span><br>" +
+        '<span class="k">step time:</span> ' + cur.ms.toFixed(2) + " ms · " + cur.bound + "-bound<br>" +
+        '<span class="k">' + acc.tdpW + " W × " + cur.ms.toFixed(2) + " ms ÷ " + batch + " tokens</span><br>" +
+        '<span class="k">vs batch 1:</span> ' + (pts[0].y / Math.max(1e-9, cur.j)).toFixed(1) + "× less energy per token";
+      var ev = document.getElementById("hw-energy-accel-val");
+      if (ev) ev.textContent = shortName(acc.name) + " · " + acc.tdpW + " W";
+    }
+    function setBatch(b) { batchS.value = String(b); render(); }
+    var loop = G.loop({
+      button: playBtn, interval: 60,
+      onStep: function () {
+        var next = batch >= 256 ? 1 : batch + 4;
+        setBatch(next);
+      }
+    });
+
+    modelSel.addEventListener("change", function () { modelIdx = parseInt(modelSel.value, 10) || 0; render(); });
+    accelSel.addEventListener("change", function () { accelIdx = parseInt(accelSel.value, 10) || 0; render(); });
+    G.bindSliders([batchS], render);
+    onData(function () { buildSelects(); render(); });
+    buildSelects();
+    ctx = G.setupCanvas(canvas, W, H, function () { render(); }).ctx;
+    render();
+  })();
+
+  fetch(window.__HW_DATA_URL).then(function (r) { return r.json(); }).then(applyData).catch(function () { applyData(FALLBACK); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,547 @@
+---
+title: "One trunk, many modalities"
+description: "Dropping the bridge between towers, native multimodal pretraining, modality-specific embedders feeding one stream, and modality-aware experts."
+permalink: "/ai/multimodal/early-fusion/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-demo-stack { display: flex; flex-direction: column; gap: 14px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>One trunk, many modalities</h1>
+    <p>Every model so far in this volume has the same silhouette: a strong encoder on one side, a language model on the other, and a thin bridge in between. To keep the vocabulary straight: a <em>bridge</em> is the small module that translates one tower's vectors into the other's format &mdash; a projector, a resampler, or a few cross-attention layers, depending on the design. That bridge exists because the encoder was trained first, on its own, and the language model was trained first, on text, so neither was ever asked to share a sequence. Early fusion &mdash; the name for mixing the modalities at the input, before any deep processing, rather than encoding each one separately and comparing them afterwards &mdash; deletes the bridge by refusing that premise. Instead of building two specialists and teaching them to talk, you train one <em>trunk</em>, a single shared backbone network, from scratch on one <em>interleaved</em> stream of text, image and audio tokens, meaning a sequence in which the tokens of every modality appear in the order they actually occurred: a sentence, then the image or sound that accompanied it, then the next sentence. Each modality gets its own <em>embedder</em> at the front of that trunk, a small front-end network that turns the modality's raw tokens into vectors the shared trunk can read, and the same attention then does all of the mixing. You can picture the difference as one shared language learned from birth, rather than two adults raised apart who need a translator standing between them. This part is about what the bridge costs, what replaces it, and where the replacement is still hard.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="bridge">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The bridge and its cost</h2></div>
+    <p class="g-eyebrow">Two towers, one interface</p>
+    <p>A vision-language model is usually assembled from parts rather than trained as a single whole. A vision encoder is trained with a contrastive or self-supervised objective &mdash; both are ways of teaching it to represent images without any help from a language model &mdash; and its weights are then <em>frozen</em>, meaning they are held fixed and never updated again. A small <em>projector</em> then maps its image vectors into the language model's embedding width, where <em>width</em> is how many numbers each vector contains; the projector has to produce vectors of exactly the width the language model expects, because that model will only accept its own input channel. The language model then reads image tokens as if they were foreign words. This arrangement is what the field often calls <em>late fusion</em>: the two modalities are encoded separately, in their own towers, and only meet at the very end, where a translator stands between them. This is the recipe in <a href="{{ '/ai/multimodal/adapters/' | relative_url }}">the adapter part</a>, and it works marvellously &mdash; it is also a chain of compromises. The first compromise is that the encoder never learns what the language model needs, because it was trained before the language model entered the picture and is frozen by the time the two are joined. The second is that the projector is the only interface, and therefore the only thing that trains, so all of the model's cross-modal skill has to be squeezed through that one small module. The third is that the image features are frozen at whatever the encoder happened to find important, whether or not those happen to be the features a question about the image would need.</p>
+    <p>Early fusion throws the interface away. One transformer trunk is pretrained on a stream of interleaved tokens from every modality, with a per-modality <em>embedder</em> at the input and a per-modality head at the output. <em>Pretrained</em> here means trained before the model is specialised for any particular task, on a very large stream of data. The training signal is <em>next-token prediction</em>: the model is repeatedly shown a prefix of the stream and asked to guess the token that comes next, whichever modality that token belongs to. An <em>embedder</em> is the module that turns one modality's raw tokens into vectors of the trunk's width, and a <em>head</em> is the matching module at the far end that turns the trunk's output back into whatever the task needs, such as the next token to emit. Attention runs across the whole mixed sequence, so a text token can attend to an audio token directly, with no projection in between and no frozen tower to work around. That matters because the mixing is not a one-off step at the entrance: it happens again at every layer, so the model can keep refining how the modalities inform one another as the representation deepens. The diagram contrasts the two arrangements; the slider picks which one is lit.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ef-arch-canvas" width="520" height="330"></canvas>
+        <p class="g-canvas-hint">Left: a bridged two-tower model, with a projector standing between a frozen encoder and the language model. Right: early fusion, where each modality enters through its own embedder into one shared trunk.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Architecture <span class="val">early fusion</span></label><input type="range" id="ef-mode" min="0" max="1" step="1" value="1"></div>
+        <div class="g-readout" id="ef-arch-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say exactly what a bridge is and what it costs, describe how modality-specific embedders feed one trunk, explain what modality-aware experts buy, and reason about when early fusion is worth giving up a pretrained encoder for. The thread running through all four is the same question: where should the modalities meet, at the entrance or at the end?</span></div>
+    <div class="g-toc">
+      <a href="#trunk">2 · One trunk, one context</a>
+      <a href="#embedders">3 · Modality embedders</a>
+      <a href="#experts">4 · Modality-aware experts</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="trunk">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>One trunk, one context</h2></div>
+    <p class="g-eyebrow">A shared budget and attention that crosses modalities</p>
+    <p>In an early-fused model there is a single context window, and every token competes for it. The <em>context window</em> is the fixed maximum number of tokens the model can hold in mind at once; anything beyond it has to be dropped or summarised. The competing tokens are subwords (the word pieces a text tokeniser produces), image patches (the small tiles an image is cut into), audio frames (short slices of sound), and video latents (compressed per-frame features). That is the first real consequence of fusing early: the modalities are not in separate streams joined at the end, they are in one budget that has to be divided. Concretely, if the window holds twelve thousand tokens, a long video does not get "as much room as it needs"; it gets whatever is left after the text and the image tokens, and the division is a design decision with a visible cost. Spend that budget on a fine-grained image and the audio has less room to describe what was said, and the other way round.</p>
+    <p>The second consequence is what attention does with a mixed sequence. <em>Attention</em> is the operation that lets each token gather information from other tokens by weighing how relevant they are to it, and it is deliberately blind to what kind of token it is looking at; nothing in the mechanism says "this is an audio frame, do not read it". Because every token can attend to every other, the attention matrix is not <em>block-diagonal</em> &mdash; that is, the strong weights are not confined to one square block per modality, with the gaps between blocks left empty. Instead, text tokens attend to image patches, audio frames attend to neighbouring speech and to the text around them, and image regions attend to the text that describes them. Each of those is a <em>cross-modal</em> connection, one that crosses from one modality to another. The heatmap below builds such a matrix for the token mix on the sliders, blocking it by modality so you can see the diagonal blocks (within-modality attention) and the off-diagonal ones (cross-modal attention). Turn a modality's budget down and its block shrinks; the cross terms stay, which is the whole point of fusing early &mdash; the connections between modalities survive even as a modality's share of the budget changes.</p>
+    <p>Qwen3-VL's DeepStack is a concrete instance of that claim. Instead of injecting the vision encoder's output only at the input, where the patches are handed to the trunk and then left behind, DeepStack taps the vision tower at several depths and adds those intermediate features into the matching layers of the language trunk. Early layers of the vision tower carry fine, local detail and later ones carry coarser, more semantic summaries, so routing each level to a different depth of the trunk gives the language model access to the whole hierarchy rather than a single final vector. The effect is that vision and language mix repeatedly rather than once at the door: information crosses between the modalities at many points along the stack, and that is what mixing at every layer means in practice when the vision tower was trained separately and only the trunk is shared.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="ef-budget-canvas" width="520" height="170"></canvas>
+        <p class="g-canvas-hint">The shared context budget, drawn with <code>Guide.drawStacked</code>. The dashed marker is the window capacity, and the three segments are the text, image and audio token counts on the sliders.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="ef-attn-canvas" width="470" height="360"></canvas>
+        <p class="g-canvas-hint">A mixed-modality attention matrix from <code>Guide.drawHeatmap</code>: rows are query tokens, columns are keys, labelled T for text, I for image and A for audio. Within-modality blocks are bright by construction; the off-diagonal blocks are the cross-modal attention early fusion makes possible.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-controls">
+          <div class="g-field"><label>Text tokens <span class="val">2000</span></label><input type="range" id="ef-text" min="0" max="8000" step="250" value="2000"></div>
+          <div class="g-field"><label>Image tokens <span class="val">2500</span></label><input type="range" id="ef-image" min="0" max="8000" step="250" value="2500"></div>
+          <div class="g-field"><label>Audio tokens <span class="val">1500</span></label><input type="range" id="ef-audio" min="0" max="8000" step="250" value="1500"></div>
+          <div class="g-readout" id="ef-mix-readout"></div>
+        </div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>One context is a zero-sum context.</b> Fusing early means a second of audio, a high-resolution image and a paragraph of text all draw on the same window. In a bridged model each tower has its own budget and the projector decides how much to forward; in a fused trunk that decision is made once, up front, and is paid for by every other modality. Zero-sum here means one modality's gain is another's loss: every token you add to the image is a token the text cannot use.</span></div>
+  </section>
+
+  <section class="g-step" id="embedders">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Modality embedders</h2></div>
+    <p class="g-eyebrow">Different front ends, one width</p>
+    <p>The trunk cannot be fed raw patches and raw waveform frames any more than it can be fed raw text. A <em>tokeniser</em> is the rule that decides what counts as one token for a given modality: it chops a continuous signal into discrete units, and the trunk only ever sees those units. Each modality gets an <em>embedder</em> &mdash; the direct successor of the projector in the bridged design, but trained jointly with the trunk rather than bolted on after. That difference matters: the projector was taught to translate into a frozen language model that could not adapt, whereas the embedder and the trunk are optimised together, so the trunk can learn to make sense of whatever the embedder learns to send. For text and images the embedder is close to the familiar one: a learned lookup for subwords (an <em>embedding table</em>, one row of numbers per subword, fetched by index) and a patch projection for images (a small matrix applied to each patch vector). Audio is the interesting case, because it can be embedded either as encoder features or as discrete codec tokens, which is <a href="{{ '/ai/multimodal/audio-in/' | relative_url }}">the subject of a later part</a>. Either way the embedder's job is the same: take whatever the modality's tokeniser emits and produce vectors of the trunk's width.</p>
+    <p>The embedders differ wildly in how many tokens they contribute per unit of signal, and that rate is what the budget in the previous step is dividing. Forty words of text are roughly forty tokens, but a single modest image can contribute hundreds, one second of codec audio can contribute hundreds more, and a short clip multiplies again by its frame count. The bars put a short sentence, a single image, one second of codec audio and a short clip on the same axis so the mismatch is visible: the same "one unit" of each modality is a different order of magnitude of sequence length. That mismatch is why the budget is a real constraint rather than a formality. Because every one of those tokens becomes a row of the attention matrix, token count drives both the compute and the memory, so the modality with the most generous embedder quietly decides how much of the window the others are allowed.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ef-embed-canvas" width="480" height="240"></canvas>
+        <p class="g-canvas-hint">Tokens contributed by one unit of each modality: 40 words of text, one 336-pixel image at patch P, one second of codec audio at 75&nbsp;Hz &times; 8 books, and an 8-frame clip. Image tokens come from <code>Multimodal.cost.imageTokens</code>, audio from <code>GenMedia.dsp.tokenRate</code> and video from <code>GenMedia.cost.videoTokens</code>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Image patch P <span class="val">14</span></label><input type="range" id="ef-patch" min="0" max="2" step="1" value="0"></div>
+        <div class="g-readout" id="ef-embed-readout"></div>
+        <p class="g-mini">A 336&nbsp;px image at patch 14 is 576 tokens; the same image at patch 8 is 1764. The embedder's front end, not the trunk, decides that number.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>The embedder is where a modality's tokeniser meets the trunk's width. Everything specific to images, audio or video lives here and in the output head; everything shared lives in the transformer, which is why the same architecture serves all of them. So when a model claims to handle four modalities, the shared part is the trunk; the difference is all in the front ends and the heads.</span></div>
+  </section>
+
+  <section class="g-step" id="experts">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Modality-aware experts</h2></div>
+    <p class="g-eyebrow">Shared attention, specialised feed-forward</p>
+    <p>One trunk does not have to mean one set of weights everywhere. Every transformer block separates two jobs: <em>attention</em>, which mixes information across positions, from the <em>feed-forward</em> layer, which transforms each position on its own, with no reference to its neighbours. A <em>mixture-of-experts</em> (MoE) trunk exploits that split. It keeps attention shared &mdash; attention is what lets text look at an image, so it must be common to every modality &mdash; and replaces the single feed-forward layer with a <em>router</em> and a pool of <em>experts</em>. An expert is an ordinary feed-forward layer with its own parameters, and the router is a small learned function that looks at a token and decides which experts should process it. Each token is sent to a few experts rather than all of them, and the router is free to learn that some experts are better at patch-like tokens and others at subwords or audio frames. The payoff is <em>capacity</em>: capacity meaning how much stored knowledge the model can hold, which here grows with the size of the expert pool even though each token only ever uses a few experts.</p>
+    <p>That is the "modality-aware" part, and it is a soft specialisation, not a hard rule: nothing forces expert 6 to serve audio, but a router trained on a mixed stream tends to discover the split, because the statistics of image patches and speech frames really are different. Keeping the split soft is the point: a hard rule would have to be written down by the designer in advance, and would break the moment a new modality arrived, whereas a learned router can be renegotiated by training. The heatmap shows routing weights for twelve tokens &mdash; four from each modality &mdash; into eight experts, with the top-k slider deciding how many experts each token may use. Here "top-k" means the router keeps only the k highest-scoring experts for each token and ignores the rest. A low k is a hard, sparse route, so each token touches few parameters and the model is cheap per token; a high k is nearly a dense layer with extra parameters, so more of the pool contributes and the compute approaches that of an ordinary feed-forward layer.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ef-expert-canvas" width="480" height="320"></canvas>
+        <p class="g-canvas-hint">Router weights from a seeded stream, kept only for each token's top-k experts and renormalised. Rows are tokens (T, I or A by modality), columns are experts; the bright columns per group are the specialisation the router discovers.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Experts per token (top-k) <span class="val">2</span></label><input type="range" id="ef-topk" min="1" max="4" step="1" value="2"></div>
+        <div class="g-readout" id="ef-expert-readout"></div>
+        <p class="g-mini">Sparsity buys parameters without paying for them at every token: the trunk's compute stays close to a dense model of the same active width, while the total parameter count grows with the expert pool.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Experts do not remove the shared budget.</b> Routing decides which parameters a token touches, not how many tokens there are. The context window, the embedder rates and the attention cost are unchanged; modality-aware experts are a capacity argument, not a memory one. You gain stored knowledge, not room in the window.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Fused trunks in the wild</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Early fusion</div>
+        <h3 style="margin:6px 0;">Mixed-modal pretraining from scratch</h3>
+        <p style="margin-bottom:0;">The Chameleon family trains a single token-based trunk on interleaved text and images, with a shared vocabulary and no separate vision tower. A <em>shared vocabulary</em> means the same discrete token set covers image patches and text subwords, so the trunk does not even have to know which modality a given token came from. Gemini is described the same way at scale: one model that ingests interleaved input. This is what the cheat sheet calls <em>native multimodal pretraining</em> &mdash; training the trunk on mixed modalities from the start, rather than adapting a model that learned text first. The price is that the vision front end has to be pretrained jointly, which is exactly the step the bridged recipe avoids: you cannot start from a vision encoder that already knows images and a language model that already knows text, because there is only one model and it has to learn both at once.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Bridges still win</div>
+        <h3 style="margin:6px 0;">When the pretrained encoder is the point</h3>
+        <p style="margin-bottom:0;">The bridge is not obsolete. It lets a team reuse a SigLIP or DINOv2 encoder that took a large compute budget to train, and it lets the language model stay untouched, so a project can stand on two pieces of work that other people already paid for. Flamingo's gated cross-attention and BLIP-2's Q-Former are bridges by another name, and they remain the pragmatic choice when the vision tower is better than anything you could pretrain jointly. That last condition is the deciding one: if a standalone vision encoder trained on an enormous image corpus sees better than a trunk you could afford to train on mixed data, then freezing it and training a translator is the better use of your budget.</p>
+      </div>
+    </div>
+    <p>The trade is legible once you name the two costs. A bridge trains a small interface on top of frozen parts, so its cost is the price of the bridge itself and its ceiling is whatever the frozen parts already know. Early fusion trains one large model on interleaved data, so its cost is a full pretraining run and its reward is attention that crosses modalities directly. Neither option dominates: the choice follows the encoders you already have and the compute you can spend. The next parts push the fused trunk into the two modalities that make it hardest, video with its length and audio with its continuity, then assemble the real-time omni model that uses both.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The bridge literature and the early-fusion literature are two answers to the same question about where modality mixing should happen: at the end, through a translator between frozen towers, or from the start, inside one trunk. These papers give the bridge in its two best-known forms, the fused trunk at scale, and the expert routing that a shared trunk can adopt. Read in order, they move from reusing pretrained parts to training everything together, which is the arc of this part.</p>
+    <ul class="g-refs">
+      <li>Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc and coauthors, <a href="https://arxiv.org/abs/2204.14198">"Flamingo: a Visual Language Model for Few-Shot Learning"</a>, 2022 &mdash; frozen vision and language towers joined by gated cross-attention, a bridge with extra depth.</li>
+      <li>Junnan Li, Dongxu Li, Silvio Savarese and Steven Hoi, <a href="https://arxiv.org/abs/2301.12597">"BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models"</a>, 2023 &mdash; the Q-Former, a lightweight querying bridge between frozen halves.</li>
+      <li>Chameleon Team, <a href="https://arxiv.org/abs/2405.09818">"Chameleon: Mixed-Modal Early-Fusion Foundation Models"</a>, 2024 &mdash; one token-based trunk over interleaved text and images, with no separate vision encoder.</li>
+      <li>Gemini Team, <a href="https://arxiv.org/abs/2312.11805">"Gemini: A Family of Highly Capable Multimodal Models"</a>, 2023 &mdash; a natively multimodal model family described as trained on interleaved input from the start.</li>
+      <li>Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux and coauthors, <a href="https://arxiv.org/abs/2401.04088">"Mixtral of Experts"</a>, 2024 &mdash; sparse mixture-of-experts routing, the mechanism behind modality-aware feed-forward layers.</li>
+      <li>Shuai Bai, Yuxuan Cai, Ruizhe Chen and coauthors, <a href="https://arxiv.org/abs/2511.21631">"Qwen3-VL Technical Report"</a>, 2025 &mdash; DeepStack multi-level vision injection.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Bridge</td><td>The projector, resampler or cross-attention layers joining a frozen encoder to a language model</td></tr>
+        <tr><td>Early fusion</td><td>One trunk pretrained on interleaved tokens from every modality, with no separate towers</td></tr>
+        <tr><td>Modality embedder</td><td>The per-modality front end that maps a tokeniser's output into the trunk's width</td></tr>
+        <tr><td>Shared context</td><td>One window that all modalities compete for; the division is a fixed design decision</td></tr>
+        <tr><td>Cross-modal attention</td><td>Attention weights off the modality diagonal: text attending to patches, speech to text</td></tr>
+        <tr><td>Modality-aware experts</td><td>A shared attention stack with a routed feed-forward pool that can specialise per modality</td></tr>
+        <tr><td>Native pretraining</td><td>Training the trunk on interleaved modalities from the start, rather than adapting a text model</td></tr>
+        <tr><td>What fusion does not fix</td><td>Token budget, embedder cost and the quality of the modality tokeniser all remain</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A fused trunk reads a frame like it reads a word, which is exactly what makes video so expensive: a clip is thousands of tokens in a row, and every one of them is a row of the attention matrix. The next part does the arithmetic a minute of video implies for the context window and the KV cache &mdash; the running notebook of earlier keys and values the model keeps so it does not reread the whole prompt for every new token. Once the modalities share one sequence, length stops being a per-tower detail and becomes the thing that decides what the model can afford to look at.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var CAP = 12000;
+  var textTok = 2000, imgTok = 2500, audTok = 1500;
+  var archMode = 1;
+  var EF_PATCHES = [14, 16, 8];
+  var efPatchIdx = 0;
+  var efTopK = 2;
+  var NTOK = 12, NEXP = 8;
+
+  // ---- 1. bridge versus early fusion diagram -------------------------------
+  var archSetup = Guide.setupCanvas(document.getElementById('ef-arch-canvas'), 520, 330, function () { drawArch(); });
+
+  function chip(ctx, x, y, w, h, fill, label, sub, dim) {
+    ctx.save();
+    if (dim) ctx.globalAlpha = 0.3;
+    ctx.fillStyle = fill;
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 11px ' + c.font;
+    ctx.fillText(label, x + w / 2, y + h / 2 - (sub ? 6 : 0));
+    if (sub) {
+      ctx.font = '9.5px ' + c.font;
+      ctx.fillText(sub, x + w / 2, y + h / 2 + 8);
+    }
+    ctx.restore();
+  }
+
+  function drawArch() {
+    if (!archSetup) return;
+    var ctx = archSetup.ctx, W = 520, H = 330;
+    ctx.clearRect(0, 0, W, H);
+    var bridged = archMode === 0;
+    var dimL = !bridged, dimR = bridged;
+
+    ctx.fillStyle = c.text;
+    ctx.font = 'bold 12px ' + c.font;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText('bridged two towers', 128, 6);
+    ctx.fillText('early fusion', 392, 6);
+
+    // left: frozen encoder + projector + language model
+    chip(ctx, 14, 66, 62, 30, c.accent400, 'image', null, dimL);
+    chip(ctx, 92, 66, 74, 30, c.accent2, 'vision tower', null, dimL);
+    chip(ctx, 92, 108, 74, 30, c.accent700, 'projector', null, dimL);
+    chip(ctx, 182, 84, 60, 66, c.accent, 'LLM', null, dimL);
+    chip(ctx, 14, 166, 62, 30, c.accent400, 'text', null, dimL);
+    Guide.drawArrow(ctx, 76, 81, 92, 81, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 129, 96, 129, 108, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 166, 123, 182, 118, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 76, 181, 162, 181, { color: c.text, width: 1.6, head: 8 });
+    ctx.strokeStyle = c.text;
+    ctx.globalAlpha = dimL ? 0.3 : 1;
+    ctx.beginPath();
+    ctx.moveTo(162, 181);
+    ctx.lineTo(162, 140);
+    ctx.lineTo(182, 140);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = c.accent2;
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center';
+    ctx.fillText('the bridge', 129, 146);
+    ctx.fillStyle = c.text;
+    ctx.font = '9.5px ' + c.font;
+    ctx.fillText('frozen encoder, trainable interface', 129, 210);
+
+    // right: embedders into one trunk
+    chip(ctx, 266, 66, 56, 26, c.accent400, 'text', null, dimR);
+    chip(ctx, 266, 98, 56, 26, c.accent400, 'image', null, dimR);
+    chip(ctx, 266, 130, 56, 26, c.accent400, 'audio', null, dimR);
+    chip(ctx, 336, 66, 62, 90, c.accent700, 'embedders', null, dimR);
+    chip(ctx, 412, 84, 96, 54, c.accent, 'one trunk', 'shared attention', dimR);
+    Guide.drawArrow(ctx, 322, 79, 336, 79, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 322, 111, 336, 111, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 322, 143, 336, 143, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 398, 111, 412, 111, { color: c.text, width: 1.6, head: 8 });
+    ctx.fillStyle = c.accent2;
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center';
+    ctx.fillText('no bridge', 392, 156);
+    ctx.fillStyle = c.text;
+    ctx.font = '9.5px ' + c.font;
+    ctx.fillText('jointly trained, one budget, cross-modal attention', 392, 210);
+
+    var el = document.getElementById('ef-arch-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">mode</span> <span class="hi">' + (bridged ? 'bridged two towers' : 'early fusion') + '</span></div>' +
+        '<div><span class="k">interface</span> ' + (bridged ? 'projector between frozen parts' : 'none — embedders into one trunk') + '</div>' +
+        '<div><span class="k">attention</span> ' + (bridged ? 'within the language model only' : 'across every modality') + '</div>' +
+        '<div><span class="k">pretraining</span> ' + (bridged ? 'adapter stage on frozen towers' : 'native mixed-modal from scratch') + '</div>' +
+        '<div class="g-mini">The bridge is cheap to train and reuses strong encoders; fusing early costs a joint pretraining run and buys direct cross-modal attention.</div>';
+    }
+  }
+
+  // ---- 2. shared budget and mixed-modality attention ------------------------
+  function mixCounts() {
+    var tot = Math.max(1, textTok + imgTok + audTok);
+    var N = 22;
+    var nt = Math.max(1, Math.round(N * textTok / tot));
+    var ni = Math.max(1, Math.round(N * imgTok / tot));
+    var na = N - nt - ni;
+    if (na < 1) { na = 1; ni = Math.max(1, N - nt - na); }
+    if (nt + ni + na > N) nt = Math.max(1, N - ni - na);
+    if (nt + ni + na < N) nt += N - (nt + ni + na);
+    return { text: nt, image: ni, audio: na, N: N };
+  }
+  function blockOf(counts) {
+    var blk = [], i;
+    for (i = 0; i < counts.text; i++) blk.push(0);
+    for (i = 0; i < counts.image; i++) blk.push(1);
+    for (i = 0; i < counts.audio; i++) blk.push(2);
+    return blk;
+  }
+  var BASE = [[1.0, 0.30, 0.24], [0.30, 1.0, 0.42], [0.24, 0.42, 1.0]];
+  var LETTER = ['T', 'I', 'A'];
+  function attnMatrix(counts) {
+    var blk = blockOf(counts), r = GM.rng(9), M = [];
+    for (var i = 0; i < blk.length; i++) {
+      var row = [];
+      for (var j = 0; j < blk.length; j++) row.push(BASE[blk[i]][blk[j]] * (0.55 + 0.9 * r()));
+      M.push(row);
+    }
+    return M.map(function (row) { return GM.attn.softmax(row, 0.35); });
+  }
+
+  var budSetup = Guide.setupCanvas(document.getElementById('ef-budget-canvas'), 520, 170, function () { drawBudget(); });
+  function drawBudget() {
+    if (!budSetup) return;
+    var ctx = budSetup.ctx, W = 520, H = 170;
+    var rows = [{
+      label: 'mixed context',
+      segments: [
+        { value: textTok, color: c.accent, name: 'text' },
+        { value: imgTok, color: c.accent400, name: 'image' },
+        { value: audTok, color: c.accent2, name: 'audio' }
+      ]
+    }];
+    var geo = Guide.drawStacked(ctx, W, H, rows, { padL: 104, padT: 30, padB: 54, maxTotal: CAP });
+    var xCap = geo.padL + geo.scale * CAP;
+    ctx.save();
+    ctx.strokeStyle = c.text;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(xCap, geo.padT - 6);
+    ctx.lineTo(xCap, geo.padT + geo.barH + 6);
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = c.text;
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'right';
+    ctx.fillText('capacity ' + Guide.fmtNum(CAP), xCap - 4, geo.padT - 10);
+    var legend = [['text', c.accent], ['image', c.accent400], ['audio', c.accent2]];
+    var lx = geo.padL;
+    for (var k = 0; k < legend.length; k++) {
+      ctx.fillStyle = legend[k][1];
+      ctx.fillRect(lx, geo.padT + geo.barH + 14, 10, 10);
+      ctx.fillStyle = c.text;
+      ctx.font = '10px ' + c.font;
+      ctx.textAlign = 'left';
+      ctx.fillText(legend[k][0], lx + 14, geo.padT + geo.barH + 23);
+      lx += 70;
+    }
+  }
+
+  var attnSetup = Guide.setupCanvas(document.getElementById('ef-attn-canvas'), 470, 360, function () { drawMixAttn(); });
+  function drawMixAttn() {
+    if (!attnSetup) return;
+    var counts = mixCounts();
+    var blk = blockOf(counts);
+    var M = attnMatrix(counts);
+    var labels = blk.map(function (b) { return LETTER[b]; });
+    var maxW = 0, cross = 0;
+    M.forEach(function (row, i) {
+      row.forEach(function (v, j) {
+        if (v > maxW) maxW = v;
+        if (blk[i] !== blk[j] && v > cross) cross = v;
+      });
+    });
+    Guide.drawHeatmap(attnSetup.ctx, 470, 360, M, {
+      min: 0, max: maxW || 1, colorLow: [234, 240, 255], colorHigh: [214, 0, 108],
+      rowLabels: labels, colLabels: labels, fontSize: 9
+    });
+    var el = document.getElementById('ef-mix-readout');
+    if (el) {
+      var tot = textTok + imgTok + audTok;
+      el.innerHTML =
+        '<div><span class="k">text</span> ' + Guide.fmtNum(textTok) + ' tokens</div>' +
+        '<div><span class="k">image</span> ' + Guide.fmtNum(imgTok) + ' tokens</div>' +
+        '<div><span class="k">audio</span> ' + Guide.fmtNum(audTok) + ' tokens</div>' +
+        '<div><span class="k">context used</span> <span class="hi">' + Guide.fmtPct(tot / CAP, 0) + '</span> of ' + Guide.fmtNum(CAP) + '</div>' +
+        '<div><span class="k">largest cross-modal weight</span> ' + cross.toFixed(3) + '</div>' +
+        '<div class="g-mini">' + counts.text + ' text, ' + counts.image + ' image and ' + counts.audio + ' audio tokens are shown in the matrix. The off-diagonal blocks are attention that only early fusion can give you.</div>';
+    }
+  }
+
+  // ---- 3. modality embedder token rates -------------------------------------
+  var embedSetup = Guide.setupCanvas(document.getElementById('ef-embed-canvas'), 480, 240, function () { drawEmbed(); });
+  function drawEmbed() {
+    if (!embedSetup) return;
+    var patch = EF_PATCHES[efPatchIdx];
+    var imgTokU = MM.cost.imageTokens(336, patch);
+    var audTokU = GM.dsp.tokenRate(75, 8);
+    var vid = GM.cost.videoTokens(8, 384, 384, 2, 4, 8);
+    var textTokU = 40;
+    var data = [
+      { label: 'text (40 words)', value: textTokU, valueLabel: Guide.fmtNum(textTokU), color: c.accent },
+      { label: 'image (336px, P' + patch + ')', value: imgTokU, valueLabel: Guide.fmtNum(imgTokU), color: c.accent400 },
+      { label: 'audio (1 s codec)', value: audTokU, valueLabel: Guide.fmtNum(audTokU), color: c.accent2 },
+      { label: 'video (8 frames)', value: vid.tokens, valueLabel: Guide.fmtNum(vid.tokens), color: c.accent700 }
+    ];
+    Guide.drawBars(embedSetup.ctx, 480, 240, data, { padL: 172, gap: 14, fontSize: 11 });
+    var el = document.getElementById('ef-embed-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">image patch</span> ' + patch + ' px</div>' +
+        '<div><span class="k">image tokens</span> <span class="hi">' + Guide.fmtNum(imgTokU) + '</span></div>' +
+        '<div><span class="k">audio tokens/s</span> ' + Guide.fmtNum(audTokU) + '</div>' +
+        '<div><span class="k">video tokens</span> ' + Guide.fmtNum(vid.tokens) + ' over ' + vid.latentFrames + ' latent frames</div>' +
+        '<div class="g-mini">The same trunk, the same attention, four embedders whose token rates differ by orders of magnitude. That mismatch is what the context budget has to absorb.</div>';
+    }
+  }
+
+  // ---- 4. modality-aware expert routing -------------------------------------
+  function expertPref(mod, e) {
+    if (mod === 0) return e < 3 ? 1.9 : 0.35;
+    if (mod === 1) return (e >= 3 && e < 6) ? 1.9 : 0.35;
+    return e >= 6 ? 1.9 : 0.35;
+  }
+  function routing() {
+    var r = GM.rng(5), S = [];
+    for (var t = 0; t < NTOK; t++) {
+      var mod = t % 3, row = [];
+      for (var e = 0; e < NEXP; e++) row.push(expertPref(mod, e) + 0.9 * r());
+      S.push(row);
+    }
+    var R = [];
+    for (var i = 0; i < S.length; i++) {
+      var order = [];
+      for (var j = 0; j < NEXP; j++) order.push({ v: S[i][j], j: j });
+      order.sort(function (a, b) { return b.v - a.v; });
+      var vals = [];
+      for (var e2 = 0; e2 < NEXP; e2++) vals.push(-1e9);
+      for (var k = 0; k < efTopK; k++) vals[order[k].j] = order[k].v;
+      R.push(GM.attn.softmax(vals, 0.5));
+    }
+    return R;
+  }
+  var expSetup = Guide.setupCanvas(document.getElementById('ef-expert-canvas'), 480, 320, function () { drawExpert(); });
+  function drawExpert() {
+    if (!expSetup) return;
+    var R = routing();
+    var rowLabels = [], colLabels = [];
+    for (var i = 0; i < NTOK; i++) rowLabels.push(LETTER[i % 3]);
+    for (var e = 0; e < NEXP; e++) colLabels.push(String(e));
+    Guide.drawHeatmap(expSetup.ctx, 480, 320, R, {
+      min: 0, max: 1, colorLow: [234, 240, 255], colorHigh: [43, 95, 255],
+      rowLabels: rowLabels, colLabels: colLabels, fontSize: 9
+    });
+    var load = [], used = 0;
+    for (e = 0; e < NEXP; e++) {
+      var s = 0;
+      for (i = 0; i < NTOK; i++) s += R[i][e];
+      load.push(s);
+      if (s > 1e-6) used++;
+    }
+    var mn = Math.min.apply(null, load), mx = Math.max.apply(null, load);
+    var el = document.getElementById('ef-expert-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">tokens</span> ' + NTOK + ' (4 text, 4 image, 4 audio)</div>' +
+        '<div><span class="k">experts per token</span> <span class="hi">' + efTopK + '</span></div>' +
+        '<div><span class="k">experts used</span> ' + used + ' of ' + NEXP + '</div>' +
+        '<div><span class="k">load spread</span> ' + (mn > 0 ? (mx / mn).toFixed(2) + '×' : '∞') + '</div>' +
+        '<div class="g-mini">Modality is decided by t mod 3, so the three bright column groups are the router sending text, image and audio tokens to different experts.</div>';
+    }
+  }
+
+  function redraw() { drawArch(); drawBudget(); drawMixAttn(); drawEmbed(); drawExpert(); }
+
+  Guide.bindSliders(document.querySelectorAll('#ef-mode'), function (el) {
+    archMode = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ef-text'), function (el) {
+    textTok = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ef-image'), function (el) {
+    imgTok = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ef-audio'), function (el) {
+    audTok = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ef-patch'), function (el) {
+    efPatchIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#ef-topk'), function (el) {
+    efTopK = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'early-fusion-bridge',
+      kind: 'choice',
+      prompt: 'What is the "bridge" that early fusion removes?',
+      options: [
+        { label: 'The projector or cross-attention interface between a pretrained encoder and the language model.', correct: true },
+        { label: 'The attention layers inside the language model itself.', correct: false },
+        { label: 'The tokeniser that turns text into subwords.', correct: false }
+      ],
+      explanation: 'In a bridged model the encoder is frozen, the language model is separate, and a thin projector or resampler is the only trained connection. Early fusion replaces that interface with one jointly pretrained trunk fed by per-modality embedders.'
+    },
+    {
+      id: 'early-fusion-image-tokens',
+      kind: 'numeric',
+      prompt: 'A 336×336 image is embedded at patch size 14. How many image tokens does its embedder contribute?',
+      answer: 576,
+      tolerance: 0.5,
+      explanation: 'Image tokens are (side/P)². Here 336/14 = 24 patches per side, so 24×24 = 576 tokens. The embedder front end, not the trunk, sets that number.'
+    },
+    {
+      id: 'early-fusion-experts',
+      kind: 'choice',
+      prompt: 'What do modality-aware experts change in a fused trunk?',
+      options: [
+        { label: 'They keep attention shared but route each token to a few specialised feed-forward experts.', correct: true },
+        { label: 'They give each modality its own context window and its own KV cache.', correct: false },
+        { label: 'They replace attention with per-modality convolutions at every layer.', correct: false }
+      ],
+      explanation: 'Attention must stay shared because it is what lets text look at an image. The feed-forward layer is per-position, so replacing it with a routed expert pool lets the model specialise capacity without splitting the cross-modal mixing.'
+    },
+    {
+      id: 'early-fusion-trade',
+      kind: 'choice',
+      prompt: 'Which statement best describes the trade between a bridge and early fusion?',
+      options: [
+        { label: 'The bridge reuses strong frozen encoders with little training; early fusion needs a joint pretraining run but lets attention cross modalities directly.', correct: true },
+        { label: 'Early fusion is strictly cheaper because it removes the projector parameters.', correct: false },
+        { label: 'The bridge always beats early fusion because frozen encoders are better trained.', correct: false }
+      ],
+      explanation: 'A bridge trains a small interface on top of parts that are already good, which is cheap and pragmatic. Early fusion pays for a large joint pretraining run and buys direct, unmediated cross-modal attention. Neither dominates; the choice follows the encoders you already have.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

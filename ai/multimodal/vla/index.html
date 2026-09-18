@@ -1,0 +1,455 @@
+---
+title: "Vision-language-action"
+description: "Actions as text tokens, a flow-matching action expert, chunking, and the latent world models that predict what happens next."
+permalink: "/ai/multimodal/vla/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-legend { font-size: 11.5px; opacity: 0.72; margin-top: 8px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Vision-language-action</h1>
+    <p>A vision-language model reads a picture and ends its turn with a sentence. A robot has to end its turn with a movement instead, and a movement is not a word: it is a vector of joint targets or end-effector poses that has to be continuous, well-timed and physically possible. Joint targets are the angles each motor should hold, and an end-effector pose is where the gripper at the tip of the arm should be and how it should be turned, a position plus an orientation. Neither can be picked from a fixed list of words the way a caption can, which is the whole difficulty. A vision-language-action model &mdash; a VLA &mdash; closes that gap by treating an action as one more thing the trunk can emit, where the trunk is the shared sequence-processing network that already reads the image and the instruction. It emits that action sometimes as text tokens, and sometimes through a separate action expert trained with flow matching. An action here means one command to the robot, the action expert is a small extra network dedicated to producing it, and flow matching is the technique of carrying a sample along the shortest possible straight path from noise to a target. What makes the problem distinctive is that the model is graded on consequences rather than on the next token: a slightly wrong caption is a bad caption, and a slightly wrong action is a dropped cup. That single change of grading standard propagates through every design choice in this part, because where a captioning model may round off, a control model has to be precise. This part follows the action from a discretised token to a continuous flow, then out to the chunking and the world models that let a policy move before it has finished thinking. A policy is the component that maps what the model currently sees to an action; chunking means emitting several steps of action at once; and a world model predicts what will happen next, so the policy can plan against an imagined future rather than waiting for the real one.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="seeing">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>From seeing to acting</h2></div>
+    <p class="g-eyebrow">A language model with a different output head</p>
+    <p>The shortest description of a vision-language-action model is this: it is the model from the earlier parts of this volume with the language head replaced, or augmented, by one that emits actions. The language head is the final layer that turns the trunk's internal representation into a distribution over the next word, and here it is either retrained to emit numbers or joined by a new head that does. The image tower patches the camera view, cutting it into tiles and turning each tile into a vector, the trunk reads those vectors together with the instruction, and instead of predicting the next word it predicts the next command. Everything the trunk learned about objects, spatial relations and instructions transfers, because recognising that the red block is left of the blue one, and that "pick up" names an object, is exactly what a manipulation instruction needs. That is why starting from a pretrained checkpoint matters so much: teaching a vision-language trunk the world from scratch is expensive, while fine-tuning an existing one on action data costs a fraction of it and keeps the knowledge. The new part is only the mapping from the trunk's representation to a control signal, meaning the numbers a controller turns into motor movement.</p>
+    <p>The output representation is where the design splits. One family keeps the language interface exactly as it is and discretises the action, meaning each continuous number is rounded onto a fixed grid of bins and represented by the bin's index, so an action is a short sequence of tokens the trunk can emit with the same cross-entropy loss it uses for words. Cross-entropy is the standard training objective that rewards putting probability on the correct next symbol, and it applies only when the target is one of a finite set, which the bins provide. The other family leaves the action continuous and adds a small expert that predicts it with a regression objective, meaning the expert outputs real numbers and is trained by shrinking the distance between its output and the target, usually a flow-matching velocity. The two routes are not merely stylistic: they make different assumptions about whether an action is naturally a category that can be named or a quantity that has to be measured. The diagram shows the shared pipeline; the two following steps take the two output routes in turn.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vla-pipe-canvas" width="470" height="180"></canvas>
+        <p class="g-canvas-hint">The shared pipeline: camera and instruction into the vision-language trunk, then an action output that is either discretised into tokens or produced by a continuous action expert.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="vla-pipe-readout"></div>
+        <p class="g-mini">The trunk is unchanged from the rest of the volume. A VLA is a multimodal model whose output head is a controller, which is why it inherits both the strengths and the failure modes of the underlying VLM.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> explain how an action becomes a sequence of discretised tokens, describe what a flow-matching action expert predicts instead, say why a policy is asked for a chunk of actions rather than one, and name what a latent world model adds to the loop. A latent world model predicts the next observation in the trunk's internal vector form rather than as pixels, so a rollout of the future stays cheap.</span></div>
+    <div class="g-toc">
+      <a href="#tokens">2 · Actions as tokens</a>
+      <a href="#flow">3 · The flow-matching expert</a>
+      <a href="#chunk">4 · Chunking and world models</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="tokens">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Actions as tokens</h2></div>
+    <p class="g-eyebrow">Discretise a control signal and speak it</p>
+    <p>The first family borrows a trick from the tokenizer discussion: clip each dimension of a continuous action onto a fixed set of bins and emit the bin index as a token. Degrees of freedom are the independent axes a robot can move, so a seven-degree-of-freedom arm has seven of them, each driven by one number, and one action has seven dimensions. One action step is therefore seven tokens, one per axis, and a policy that wants to move for half a second emits a few dozen of them in a row, because commands are issued many times a second. The appeal is enormous &mdash; no new head, no new loss, no architectural change at all. The same trunk that can write "pick up the red block" can, after fine-tuning on action data, write the numbers that make it happen, where fine-tuning means continuing training on a smaller specialised set of robot demonstrations. It can also interleave reasoning text with the action tokens in one stream, so it can narrate what it is about to do and then do it.</p>
+    <p>The cost is quantisation, the rounding that replaces each exact value with the nearest bin's index and discards the difference. A bin represents a range of joint angles, so every emitted token carries an error of up to half a bin, and a controller that receives a coarse target has to smooth it or the motion stutters. The error is half a bin rather than a whole one because the token stands for the centre of its bin, so the worst a value can be off is half the bin's width. More bins reduce the error but lengthen the sequence, because every extra bin is another symbol the sampler can choose, and give the sampler more ways to emit an implausible combination; fewer bins are easy to predict but too coarse to be safe. Suppose a joint's range is divided into only sixteen bins: a command can then be off by a thirty-second of the joint's travel on either side, which at the end of a long reach becomes a visible wobble. The demo discretises a seven-dimensional action over an adjustable number of bins so the tension is visible lane by lane.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vla-tokens-canvas" width="470" height="260"></canvas>
+        <p class="g-canvas-hint">Seven action dimensions, each discretised into the number of bins on the slider. The highlighted cell per lane is the token the policy would emit; the trajectory step slider moves along a demonstration.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Bins per dimension <span class="val">256</span></label><input type="range" id="vla-bins" min="0" max="4" step="1" value="4"></div>
+        <div class="g-field"><label>Trajectory step <span class="val">3</span></label><input type="range" id="vla-step" min="0" max="7" step="1" value="3"></div>
+        <div class="g-readout" id="vla-tokens-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Quantisation is a safety budget, not just an accuracy one.</b> A coarse bin is a real distance the arm can move in one command. The choice of bin count is therefore a choice about the worst-case error the controller must absorb, and it is set by the tokenizer before any policy is trained. Halving the bin count doubles the largest jump one command can ask for, so the smoothness of every motion is capped at tokenizer time.</span></div>
+  </section>
+
+  <section class="g-step" id="flow">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The flow-matching expert</h2></div>
+    <p class="g-eyebrow">A continuous head that predicts velocity, not a category</p>
+    <p>The second family refuses to discretise at all. It keeps the action continuous and attaches a small <em>action expert</em> to the pretrained trunk: a compact network that reads the trunk's representation of the scene and instruction and produces a velocity field over action space. A velocity field is a rule that gives a direction and a speed at any point, action space is the space of possible actions with one coordinate per joint, and the expert's job is to say which way and how fast to move through it. To feel the idea before its name, picture sliding a cart along straight rails at constant speed. Suppose the target action sets a gripper width of 0.4, and a noise sample starts it at 0.9. The simplest possible route from 0.9 to 0.4 is a straight line travelled at a constant speed, so a single number &mdash; the velocity &mdash; describes the entire journey, and if the expert predicts it correctly the sample lands exactly on the target. Training uses flow matching &mdash; a noise sample and a target action are connected by a straight line, and the expert is trained to predict the constant velocity that carries one to the other. Sampling starts at noise and integrates that velocity for a handful of steps, which is why these policies can run at control rates that a hundreds-step diffusion sampler cannot.</p>
+    <p>The reason the straight path matters is the number of function evaluations, meaning how many times the expert network has to be called to produce one action. A curved path needs many small steps to follow accurately, because each step approximates the curve only over a short distance; a path the model has been trained to make straight can be traversed in a few Euler steps, where an Euler step is the simplest way to advance along a direction. Because the path is straight and the velocity is constant along it, the expert only has to be right about one vector rather than about a schedule of changing directions, and there is no compounding of per-step error the way a curve invites. A few evaluations per action chunk is the difference between a policy that fits a control loop and one that does not, where the control loop is the observe-decide-act cycle the controller repeats many times a second. The plot below draws the oracle straight paths from a cloud of noise samples to one target action, and the slider walks along the path so you can read the velocity, which is constant by construction.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vla-flow-canvas" width="470" height="300"></canvas>
+        <p class="g-canvas-hint">Straight flow paths from <code>Diffusion.flowX</code> carrying noise samples to a target action, with the constant velocity of <code>Diffusion.flowVelocity</code>. The slider walks the flow time from noise to action.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Flow time t <span class="val">0.50</span></label><input type="range" id="vla-t" min="0" max="100" step="1" value="50"></div>
+        <div class="g-readout" id="vla-flow-readout"></div>
+        <p class="g-mini">A straight path is a property the training objective encourages, not an assumption: regressing x1 − x0 along a line is what lets a few integration steps reach the action.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Why an expert rather than the trunk itself?</b> A diffusion or flow head has its own parameters and its own loss, so it can be trained to be smooth without disturbing the discrete next-token objective the trunk was pretrained on. That separation matters because the trunk's objective wants sharp, confident predictions while a smooth continuous action needs the opposite. It is the unified-model settlement of the previous-to-last part, applied to control.</span></div>
+  </section>
+
+  <section class="g-step" id="chunk">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Chunking and world models</h2></div>
+    <p class="g-eyebrow">Move before the next thought finishes</p>
+    <p>A policy that emits one action per inference pays the full latency of a forward pass between every command. Inference is one run of the network, and latency is the wall-clock time that run takes. If the trunk takes fifty milliseconds and the controller runs at a hundred hertz, meaning a hundred commands per second, then the arm needs a fresh target every ten milliseconds while the model can supply one only every fifty, so the arm is idle most of the time. <em>Action chunking</em> fixes that by asking the model for a whole horizon of actions at once &mdash; the next sixteen or fifty steps &mdash; and executing them open-loop while the next inference runs in parallel. The horizon is the number of future steps requested, and open-loop means the arm keeps running the commands it was given without checking what actually happened. Chunking also smooths the motion, because a single inference fixes a consistent run of commands instead of re-deciding at every tick. The cost is reactivity: while the chunk is executed the policy cannot see a new observation, so a chunk that is too long responds slowly to a moved object and a chunk that is too short pays the inference tax on every step. Temporal ensembling, which blends overlapping chunks by averaging the predictions two successive inferences make for the same moment, is the usual compromise.</p>
+    <p>A latent world model addresses the other half of the loop. A world model is a network that predicts what happens next, and latent means it makes that prediction in the trunk's internal vector form rather than as a picture, which keeps the prediction cheap. If the trunk can predict the representation of the next observation as well as the action, then a policy can plan a short rollout in latent space, score candidate chunks against the predicted future, and act on the best one without touching the real environment. A rollout is that imagined sequence of steps, and scoring means comparing candidate actions against the future the model just predicted. The same prediction, trained on the same interleaved stream, tells the model what its action is likely to cause, which is what separates "emit a plausible movement" from "know what the movement will do". Planning against that predicted future is what lets a policy improve a chunk before it commits to it, which matters because a real arm cannot undo a movement once it is underway. The timeline below shows chunks being inferred, executed and re-planned as the horizon changes.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="vla-chunk-canvas" width="470" height="260"></canvas>
+        <p class="g-canvas-hint">A control timeline: solid blocks are actions executed open-loop, the dashed extension is the part of the chunk a latent world model rolls forward, and the ticks are inference calls. The slider sets the chunk horizon in steps.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Action chunk horizon <span class="val">16</span></label><input type="range" id="vla-h" min="1" max="50" step="1" value="16"></div>
+        <div class="g-readout" id="vla-chunk-readout"></div>
+        <p class="g-mini">Longer chunks mean fewer inference calls and smoother motion, but slower reaction. The world model is what lets the policy spend the idle time imagining the future instead of waiting.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Open-loop execution is a commitment.</b> Once a chunk is being executed the observation no longer steers it. Every design that chunks is choosing how much of the future to guess, and a world model is only useful if its predicted future is accurate enough to be worth planning against. The longer the chunk, the more of that guess is already spent by the time the world changes, so a bad prediction is expensive to correct.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">From a sentence to a movement</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Discrete</div>
+        <h3 style="margin:6px 0;">Actions as language tokens</h3>
+        <p style="margin-bottom:0;">RT-2 discretises each action dimension and appends the tokens to the vocabulary, the model's fixed list of output symbols, so a web-scale vision-language model can be fine-tuned into a policy that still answers questions. A web-scale model is one pretrained on a very large and general mixture of text and images. The inheritance is the point: semantic understanding transfers with the tokens, so the robot carries a vocabulary of objects and relations it absorbed from ordinary text and images rather than from robot data alone.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Continuous</div>
+        <h3 style="margin:6px 0;">A flow-matching action expert</h3>
+        <p style="margin-bottom:0;">The pi-zero family keeps a pretrained vision-language backbone and adds a flow-matching action expert, trained to produce smooth, high-frequency action chunks &mdash; commands issued many times a second &mdash; that the backbone alone could not emit, because a trunk trained to pick a word does not readily output a continuous number. It is the continuous route of step three, paired with the chunking of step four.</p>
+      </div>
+    </div>
+    <p>The full loop is where the rest of the guide meets control: the same latent world models that generate video (<a href="{{ '/ai/generative-media/' | relative_url }}">the sibling volume</a>) are the ones a policy rolls forward, and the same token-budget arithmetic decides whether the camera view and the instruction fit beside the action horizon in one context. Token budget is the number of tokens a fixed context window can hold, and the camera view competes with the instruction for that room. The <a href="{{ 'https://denimpatel.github.io/AI/robotics/' | relative_url }}">the robotics notes</a> take the loop further, into the control stack &mdash; the layered software between a command and a motor &mdash; that a VLA sits on top of.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers are the two output routes &mdash; discretised action tokens and a continuous action expert &mdash; together with the world-model idea the loop borrows from. Read together they trace one action from a word-like token, through a continuous velocity, to a chunk planned against an imagined future.</p>
+    <ul class="g-refs">
+      <li>Brianna Zitkovich, Tianhe Yu, Sichun Xu and coauthors, <a href="https://arxiv.org/abs/2307.15818">"RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control"</a>, 2023 &mdash; actions discretised into tokens in a vision-language vocabulary.</li>
+      <li>Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti and coauthors, <a href="https://arxiv.org/abs/2406.09246">"OpenVLA: An Open-Source Vision-Language-Action Model"</a>, 2024 &mdash; an open recipe for fine-tuning a VLM into a policy with discretised actions.</li>
+      <li>Kevin Black, Noah Brown, Danny Driess and coauthors, <a href="https://arxiv.org/abs/2410.24164">"&pi;0: A Vision-Language-Action Flow Model for General Robot Control"</a>, 2024 &mdash; a pretrained backbone with a flow-matching action expert producing action chunks.</li>
+      <li>Danijar Hafner, Jurgis Pasukonis, Jimmy Ba and Timothy Lillicrap, <a href="https://arxiv.org/abs/2301.04104">"Mastering Diverse Domains through World Models"</a>, 2023 &mdash; DreamerV3, the latent world model that plans in a learned representation rather than in pixels.</li>
+      <li>Anthony Brohan, Noah Brown, Justice Carbajal and coauthors, <a href="https://arxiv.org/abs/2212.06817">"RT-1: Robotics Transformer for Real-World Control at Scale"</a>, 2022 &mdash; the earlier token-based policy that made chunking and large-scale robot data concrete.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>VLA</td><td>A multimodal trunk whose output head emits actions instead of, or beside, text</td></tr>
+        <tr><td>Discretised action</td><td>Each action dimension clipped onto bins, emitted as an ordinary token</td></tr>
+        <tr><td>Action token</td><td>One bin index; a seven-axis arm emits seven per action step</td></tr>
+        <tr><td>Bin count</td><td>Sets the worst-case command error and the length of the action sequence</td></tr>
+        <tr><td>Action expert</td><td>A small continuous head on the trunk, trained with regression rather than cross-entropy</td></tr>
+        <tr><td>Flow matching</td><td>Regress the constant velocity along a straight noise-to-action path</td></tr>
+        <tr><td>Function evaluations</td><td>How many times the expert is called per chunk; a straight path needs few</td></tr>
+        <tr><td>Action chunk</td><td>A horizon of actions emitted at once and executed open-loop</td></tr>
+        <tr><td>Temporal ensembling</td><td>Blending overlapping predicted chunks to smooth the join between them</td></tr>
+        <tr><td>Latent world model</td><td>Predicts the next observation's representation so a policy can plan in imagination</td></tr>
+        <tr><td>Open-loop execution</td><td>Running a chunk without observing; long chunks react slowly, short ones cost more inference</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}An image in the prompt is not just more text: it moves the request from decode-bound to prefill-bound, and it creates a second workload &mdash; the encoder &mdash; that has its own pool and its own cache. Prefill is the pass that ingests the whole prompt at once, decode is the slower pass that emits output one token at a time, and an image shifts the cost toward the first. The last part prices the whole multimodal request and names what is still unsolved.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var BINS = [16, 32, 64, 128, 256];
+  var binIdx = 4;
+  var actStep = 3;
+  var flowT = 0.5;
+  var horizon = 16;
+
+  var DOF = 7;
+  var DIMS = ['shoulder', 'elbow', 'wrist 1', 'wrist 2', 'wrist 3', 'grip', 'base'];
+
+  // ---- 1. pipeline schematic ----------------------------------------------
+  var pipeSetup = Guide.setupCanvas(document.getElementById('vla-pipe-canvas'), 470, 180, function () { drawPipe(); });
+  function chip(ctx, x, y, w, h, fill, label, sub) {
+    ctx.save();
+    ctx.fillStyle = fill;
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold 10.5px ' + c.font;
+    ctx.fillText(label, x + w / 2, y + h / 2 - (sub ? 6 : 0));
+    if (sub) { ctx.font = '9px ' + c.font; ctx.fillText(sub, x + w / 2, y + h / 2 + 8); }
+    ctx.restore();
+  }
+  function drawPipe() {
+    if (!pipeSetup) return;
+    var ctx = pipeSetup.ctx, W = 470, H = 180;
+    ctx.clearRect(0, 0, W, H);
+    chip(ctx, 12, 40, 66, 34, c.accent400, 'camera', 'image tokens');
+    chip(ctx, 12, 96, 66, 34, c.accent400, 'instruction', 'text tokens');
+    chip(ctx, 116, 60, 106, 52, c.accent, 'VLM trunk', 'shared attention');
+    chip(ctx, 258, 40, 92, 34, c.accent700, 'action tokens', '256 bins/dim');
+    chip(ctx, 258, 96, 92, 34, c.accent2, 'action expert', 'flow matching');
+    chip(ctx, 382, 68, 76, 44, c.accent700, 'chunk', 'H steps');
+    Guide.drawArrow(ctx, 78, 57, 116, 74, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 78, 113, 116, 98, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 222, 74, 258, 57, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 222, 98, 258, 113, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 350, 57, 382, 80, { color: c.text, width: 1.6, head: 8 });
+    Guide.drawArrow(ctx, 350, 113, 382, 100, { color: c.text, width: 1.6, head: 8 });
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('discrete route', 304, 88);
+    ctx.fillText('continuous route', 304, 144);
+    ctx.restore();
+    var el = document.getElementById('vla-pipe-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">shared trunk</span> vision-language pretraining, unchanged</div>' +
+        '<div><span class="k">discrete route</span> action as bin tokens, cross-entropy loss</div>' +
+        '<div><span class="k">continuous route</span> flow-matching action expert, regression loss</div>' +
+        '<div><span class="k">output</span> a chunk of actions, executed open-loop</div>' +
+        '<div class="g-mini">The policy inherits the understanding of the trunk; only the output representation and head change.</div>';
+    }
+  }
+
+  // ---- 2. action tokens ----------------------------------------------------
+  var tokensSetup = Guide.setupCanvas(document.getElementById('vla-tokens-canvas'), 470, 260, function () { drawTokens(); });
+  function actionValue(d, s) { return Math.sin(s * 0.8 + d * 0.7) * 0.85; }
+  function drawTokens() {
+    if (!tokensSetup) return;
+    var ctx = tokensSetup.ctx, W = 470, H = 260;
+    ctx.clearRect(0, 0, W, H);
+    var N = BINS[binIdx];
+    var padL = 76, padR = 20, padT = 30, padB = 26;
+    var laneH = (H - padT - padB) / DOF;
+    var laneW = W - padL - padR;
+    var cellW = laneW / N;
+    var tokens = [];
+    for (var d = 0; d < DOF; d++) {
+      var a = actionValue(d, actStep);
+      var bin = Math.min(N - 1, Math.max(0, Math.floor((a + 1) / 2 * N)));
+      tokens.push(bin);
+      var y = padT + d * laneH;
+      ctx.save();
+      ctx.fillStyle = 'rgba(120,120,120,0.10)';
+      ctx.fillRect(padL, y + 2, laneW, laneH - 4);
+      ctx.fillStyle = c.accent;
+      ctx.fillRect(padL + bin * cellW, y + 2, Math.max(2, cellW - 1), laneH - 4);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      ctx.fillText(DIMS[d], padL - 8, y + laneH / 2);
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('7 action dimensions × ' + N + ' bins = one action step of ' + DOF + ' tokens', padL, 18);
+    ctx.restore();
+    var el = document.getElementById('vla-tokens-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">trajectory step</span> ' + actStep + '</div>' +
+        '<div><span class="k">bins per dimension</span> <span class="hi">' + N + '</span></div>' +
+        '<div><span class="k">tokens for this step</span> ' + DOF + '</div>' +
+        '<div><span class="k">bin quantisation</span> ' + (2 / N).toFixed(4) + ' of the action range</div>' +
+        '<div><span class="k">token ids</span> ' + tokens.join(', ') + '</div>' +
+        '<div class="g-mini">Fewer bins make the sequence short and easy to predict but coarse; more bins localise the action and give the sampler more ways to emit an implausible combination.</div>';
+    }
+  }
+
+  // ---- 3. flow-matching expert --------------------------------------------
+  var flowSetup = Guide.setupCanvas(document.getElementById('vla-flow-canvas'), 470, 300, function () { drawFlow(); });
+  function toCanvas(x, y, W, H) { return [40 + (x + 1) / 2 * (W - 80), H - 40 - (y + 1) / 2 * (H - 80)]; }
+  function drawFlow() {
+    if (!flowSetup) return;
+    var ctx = flowSetup.ctx, W = 470, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var target = [0.62, 0.24];
+    var r = GM.rng(12), i;
+    var noise = [];
+    for (i = 0; i < 6; i++) noise.push([-0.5 + 0.28 * GM.gauss(r), -0.4 + 0.28 * GM.gauss(r)]);
+    ctx.save();
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(40, 40, W - 80, H - 80);
+    ctx.strokeStyle = 'rgba(120,120,120,0.35)';
+    ctx.beginPath(); ctx.moveTo(W / 2, 40); ctx.lineTo(W / 2, H - 40); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(40, H / 2); ctx.lineTo(W - 40, H / 2); ctx.stroke();
+    ctx.restore();
+    var tp = toCanvas(target[0], target[1], W, H);
+    for (i = 0; i < noise.length; i++) {
+      var np = toCanvas(noise[i][0], noise[i][1], W, H);
+      var cp = toCanvas(D.flowX(flowT, noise[i][0], target[0]), D.flowX(flowT, noise[i][1], target[1]), W, H);
+      ctx.save();
+      ctx.strokeStyle = 'rgba(43,95,255,0.35)'; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(np[0], np[1]);
+      var arrowEnd = toCanvas(D.flowX(Math.min(1, flowT + 0.12), noise[i][0], target[0]), D.flowX(Math.min(1, flowT + 0.12), noise[i][1], target[1]), W, H);
+      ctx.lineTo(arrowEnd[0], arrowEnd[1]);
+      ctx.stroke();
+      ctx.beginPath(); ctx.arc(np[0], np[1], 3, 0, 2 * Math.PI); ctx.fillStyle = 'rgba(120,120,120,0.7)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(cp[0], cp[1], 5, 0, 2 * Math.PI); ctx.fillStyle = c.accent2; ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.beginPath(); ctx.arc(tp[0], tp[1], 7, 0, 2 * Math.PI); ctx.fillStyle = c.accent; ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('target action', tp[0] + 10, tp[1] + 4);
+    ctx.fillText('noise samples', 44, 32);
+    ctx.fillText('flow time t = ' + flowT.toFixed(2), W - 150, 32);
+    ctx.restore();
+    var vx = D.flowVelocity(noise[0][0], target[0]), vy = D.flowVelocity(noise[0][1], target[1]);
+    var el = document.getElementById('vla-flow-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">flow time</span> ' + flowT.toFixed(2) + '</div>' +
+        '<div><span class="k">target action</span> (' + target[0].toFixed(2) + ', ' + target[1].toFixed(2) + ')</div>' +
+        '<div><span class="k">velocity (sample 1)</span> <span class="hi">(' + vx.toFixed(2) + ', ' + vy.toFixed(2) + ')</span></div>' +
+        '<div><span class="k">path</span> straight, constant velocity</div>' +
+        '<div><span class="k">integration steps</span> a few Euler steps</div>' +
+        '<div class="g-mini">The expert is trained to predict this constant velocity from the trunk representation. Because the path is straight, a handful of evaluations reaches the action, which is what fits a control loop.</div>';
+    }
+  }
+
+  // ---- 4. chunking and world models ---------------------------------------
+  var chunkSetup = Guide.setupCanvas(document.getElementById('vla-chunk-canvas'), 470, 260, function () { drawChunk(); });
+  function drawChunk() {
+    if (!chunkSetup) return;
+    var ctx = chunkSetup.ctx, W = 470, H = 260;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 40, padR = 20, padT = 70, padB = 60;
+    var laneW = W - padL - padR, y = padT, h = 40;
+    var steps = 100, cellW = laneW / steps;
+    var calls = Math.ceil(steps / horizon);
+    ctx.save();
+    for (var s = 0; s < steps; s++) {
+      var chunkIndex = Math.floor(s / horizon);
+      var inChunk = s - chunkIndex * horizon;
+      var executed = inChunk < Math.ceil(horizon * 0.6);
+      ctx.fillStyle = executed ? (chunkIndex % 2 ? c.accent : c.accent400) : 'rgba(214,0,108,0.22)';
+      ctx.fillRect(padL + s * cellW, y, Math.max(1, cellW), h);
+    }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(padL, y, laneW, h);
+    ctx.restore();
+    ctx.save();
+    var lx = padL;
+    for (var i = 0; i < calls; i++) {
+      ctx.strokeStyle = c.text; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(lx, y - 10); ctx.lineTo(lx, y - 3); ctx.stroke();
+      lx += horizon * cellW;
+    }
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('inference calls: ' + calls + ' over 100 control steps', padL, y - 18);
+    ctx.fillText('executed part of each chunk', padL, y + h + 22);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('world-model rollout of the remaining horizon', padL, y + h + 40);
+    ctx.restore();
+    var el = document.getElementById('vla-chunk-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">chunk horizon</span> <span class="hi">' + horizon + ' steps</span></div>' +
+        '<div><span class="k">inference calls / 100 steps</span> ' + calls + '</div>' +
+        '<div><span class="k">latency saved</span> ' + Guide.fmtPct(1 - calls / 100, 0) + '</div>' +
+        '<div><span class="k">reaction time</span> up to ' + horizon + ' control steps</div>' +
+        '<div class="g-mini">A longer horizon cuts inference calls and smooths motion, but the policy cannot observe while executing. The dashed part is what a latent world model rolls forward to score the chunk before it is run.</div>';
+    }
+  }
+
+  function redraw() { drawPipe(); drawTokens(); drawFlow(); drawChunk(); }
+
+  Guide.bindSliders(document.querySelectorAll('#vla-bins'), function (el) {
+    binIdx = parseInt(el.value, 10);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = BINS[binIdx];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vla-step'), function (el) {
+    actStep = parseInt(el.value, 10);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = actStep;
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vla-t'), function (el) {
+    flowT = parseInt(el.value, 10) / 100;
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = flowT.toFixed(2);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#vla-h'), function (el) {
+    horizon = parseInt(el.value, 10);
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = horizon;
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'vla-action-tokens',
+      kind: 'choice',
+      prompt: 'How does the token-based VLA family represent a seven-axis action step?',
+      options: [
+        { label: 'Seven bin-index tokens, one per axis, emitted with the same cross-entropy loss as words.', correct: true },
+        { label: 'A single token whose embedding vector holds all seven float values.', correct: false },
+        { label: 'A bounding box token followed by a class label token.', correct: false }
+      ],
+      explanation: 'Each action dimension is discretised onto bins and emitted as a token, so a seven-axis arm produces seven tokens per step. The trunk needs no new head or loss, which is why semantic understanding transfers so directly.'
+    },
+    {
+      id: 'vla-bin-error-numeric',
+      kind: 'numeric',
+      prompt: 'An action dimension with a range of 2.0 is discretised into 100 bins. What is the largest command error from quantisation?',
+      answer: 0.01,
+      tolerance: 0.001,
+      explanation: 'Each bin spans 2.0 / 100 = 0.02 of the range, and the worst case is half a bin, so the maximum error is 0.01. More bins shrink this linear in the bin count but lengthen the token sequence.'
+    },
+    {
+      id: 'vla-flow-expert',
+      kind: 'choice',
+      prompt: 'What does a flow-matching action expert predict?',
+      options: [
+        { label: 'A continuous velocity field over action space, integrated from noise toward an action along a straight path.', correct: true },
+        { label: 'A probability distribution over bin indices for each action dimension.', correct: false },
+        { label: 'The next camera frame, which the policy then imitates.', correct: false }
+      ],
+      explanation: 'Flow matching connects a noise sample to a target action with a straight line and trains the expert to regress the constant velocity x1 − x0 along it. Sampling integrates that velocity in a few Euler steps, which is fast enough for control.'
+    },
+    {
+      id: 'vla-chunk-trade',
+      kind: 'choice',
+      prompt: 'What is the trade in action chunking?',
+      options: [
+        { label: 'A longer chunk means fewer inference calls and smoother motion but slower reaction, because the policy cannot observe while executing it.', correct: true },
+        { label: 'Longer chunks always improve both latency and reactivity, so the horizon should be as large as possible.', correct: false },
+        { label: 'Chunking removes the need for a policy network entirely.', correct: false }
+      ],
+      explanation: 'Chunking pays one inference for a horizon of actions, which cuts latency and smooths the command stream. The cost is open-loop execution: while the chunk runs, a moved object cannot steer the motion, so the horizon trades reactivity for throughput.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

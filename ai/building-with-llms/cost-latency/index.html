@@ -1,0 +1,560 @@
+---
+title: "Building with LLMs, Interactively — Part 4: Cost and latency from first principles"
+description: "The input/output price asymmetry, TTFT versus TPOT, why an agent loop is quadratic in turns, and effort as a dial."
+permalink: "/ai/building-with-llms/cost-latency/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Cost and latency from first principles</h1>
+    <p>Two numbers decide whether a feature ships: what it costs and how long it takes. Both follow from arithmetic you can write on a napkin, and both are governed by the same asymmetry — output tokens are the expensive side, and the loop around the model is what makes them multiply. This part builds a cost model, a latency model, the quadratic curve of an agent loop, and the effort dial that trades thinking for both.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="price">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Output is the expensive side</h2></div>
+    <p class="g-eyebrow">One formula, and where the lever is</p>
+    <p>The bill for one call is <var>input × p<sub>in</sub> + output × p<sub>out</sub></var>, plus a discounted rate for any cached input. The first thing to notice is that <var>p<sub>out</sub></var> is larger than <var>p<sub>in</sub></var> at every vendor, by a factor of three to five in the historical list prices below. The second is that the output side is the one you can usually shrink: a retrieved passage is a fixed cost of the task, but the model's own verbosity, its reasoning traces and its retries are choices. Shortening the output is almost always the highest-leverage cost edit.</p>
+    <p>The calculator uses the historical pricing table. Pick a model, set the input and output tokens, and decide how much of the input is a cache read. The stacked bars break the per-call cost into uncached input, cached input and output, and repeat it across calls and retries for the whole task.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cost-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Cost per call and per task, split into uncached input, cached input and output.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Model (historical list price)</label><select id="cost-model"></select></div>
+        <div class="g-field"><label>Input tokens <span class="val">8000</span></label><input type="range" id="cost-input" min="0" max="120000" step="1000" value="8000"></div>
+        <div class="g-field"><label>Cached fraction of input <span class="val">0</span></label><input type="range" id="cost-cached" min="0" max="100" step="5" value="0"></div>
+        <div class="g-field"><label>Output tokens <span class="val">1500</span></label><input type="range" id="cost-output" min="0" max="16000" step="100" value="1500"></div>
+        <div class="g-field"><label>Reasoning / thinking tokens <span class="val">0</span></label><input type="range" id="cost-reasoning" min="0" max="16000" step="100" value="0"></div>
+        <div class="g-field"><label>Calls in the task <span class="val">1</span></label><input type="range" id="cost-calls" min="1" max="200" step="1" value="1"></div>
+        <div class="g-field"><label>Retry rate <span class="val">0</span></label><input type="range" id="cost-retry" min="0" max="50" step="1" value="0"></div>
+        <div class="g-readout" id="cost-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cost-price-source"></p>
+    <div class="g-goal">💡 <span><b>Durable idea:</b> reasoning and thinking tokens are output tokens. Every "let the model think harder" switch is a direct multiplier on the most expensive line item, which is why the effort dial at the end of this page is a cost decision as much as a quality one.</span></div>
+  </section>
+
+  <section class="g-step" id="latency">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>TTFT, TPOT, and end to end</h2></div>
+    <p class="g-eyebrow">Two latencies, not one</p>
+    <p>Users feel two different delays. <b>Time to first token (TTFT)</b> is how long the system waits before any text appears: the request queueing, then prefill processing the whole prompt to build the first token's state. <b>Time per output token (TPOT)</b> is the cadence of the stream after that — the decode loop, one token at a time, bounded by memory bandwidth rather than arithmetic. End to end is <var>TTFT + output × TPOT</var>, and the shape matters: a long prompt hurts TTFT, a long answer hurts the decode tail, and prefix caching attacks the prefill term without touching either.</p>
+    <p>The timeline below starts at the request and ends at the last token. Adjust the queue, the prompt length, the cached fraction, the prefill rate and the per-token decode time, and watch where the time actually goes.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="latency-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Request to last token: queue, prefill, then decode. TTFT ends where prefill does; end to end is the full bar.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prompt (prefix) tokens <span class="val">12000</span></label><input type="range" id="lat-prefix" min="0" max="120000" step="1000" value="12000"></div>
+        <div class="g-field"><label>Cached fraction of prefix <span class="val">0</span></label><input type="range" id="lat-cached" min="0" max="100" step="5" value="0"></div>
+        <div class="g-field"><label>Queue time (ms) <span class="val">120</span></label><input type="range" id="lat-queue" min="0" max="2000" step="20" value="120"></div>
+        <div class="g-field"><label>Prefill rate (tokens/s) <span class="val">20000</span></label><input type="range" id="lat-tps" min="2000" max="60000" step="1000" value="20000"></div>
+        <div class="g-field"><label>TPOT (ms per token) <span class="val">25</span></label><input type="range" id="lat-tpot" min="1" max="80" step="1" value="25"></div>
+        <div class="g-field"><label>Output tokens <span class="val">300</span></label><input type="range" id="lat-output" min="1" max="2000" step="10" value="300"></div>
+        <div class="g-readout" id="lat-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cost-latency-source"></p>
+    <div class="g-warn">⚠️ <span><b>Trap:</b> streaming hides latency, it does not remove it. The user still waits for TTFT, and a slow decode makes the last token arrive long after the first — which is exactly the delay that decides whether a realtime feature feels realtime.</span></div>
+  </section>
+
+  <section class="g-step" id="quadratic">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>An agent loop is quadratic in turns</h2></div>
+    <p class="g-eyebrow">The prefix is re-sent every turn</p>
+    <p>An agent alternates a model call with a tool call, and each call sends the whole growing transcript. Turn five does not pay for turn five's new text; it pays for turns one through five, re-sent. Over <var>N</var> turns with a steady per-turn addition <var>h</var>, the cumulative input is roughly <var>h·N(N+1)/2</var> — quadratic, not linear. That single fact explains why long-running agents are expensive out of proportion to the work they appear to do, and why every harness eventually invents compaction.</p>
+    <p>Prefix caching is the brake. If the opening of the prompt is byte-identical across turns, a provider can reuse the cached computation and bill the repeat at a fraction of the input price. It does not change the shape — the input is still triangular — but it cuts the constant dramatically, and it is the reason prompt layout (stable content first, volatile content last) is an architectural decision.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="quad-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Cumulative billed input tokens over twenty turns. Solid = cold every turn; dashed = a warm prefix cache.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>New tokens per turn <span class="val">400</span></label><input type="range" id="quad-growth" min="50" max="2000" step="50" value="400"></div>
+        <div class="g-btnrow"><button id="quad-cache" class="g-primary">Prefix caching on</button></div>
+        <div class="g-readout" id="quad-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="quad-window-source"></p>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> the loop length is a design parameter. Fewer, larger steps and aggressive compaction attack the quadratic directly; caching attacks its price, not its shape.</span></div>
+  </section>
+
+  <section class="g-step" id="effort">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Effort is a dial</h2></div>
+    <p class="g-eyebrow">Diminishing returns, with a knee</p>
+    <p>Reasoning models expose an effort control: a budget for how many thinking tokens to spend before answering. More thinking helps on hard problems and wastes money on easy ones, and the benefit decays. The curve below models that: accuracy rises quickly at first and then flattens toward a ceiling, while cost grows linearly in reasoning tokens. The knee marks where the marginal return drops below roughly one accuracy point per thousand tokens — past it you are buying very little.</p>
+    <p>Move the effort slider to spend tokens and watch both curves; change the task difficulty to see the knee move. The cost side uses the output price of the model selected in the first demo, because thinking tokens are output tokens.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="effort-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Accuracy (solid) and normalised cost (dashed) versus reasoning tokens spent, with the knee marked.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Reasoning tokens spent <span class="val">3000</span></label><input type="range" id="eff-tokens" min="0" max="16000" step="250" value="3000"></div>
+        <div class="g-field"><label>Task difficulty (scale) <span class="val">1000</span></label><input type="range" id="eff-tau" min="200" max="4000" step="100" value="1000"></div>
+        <div class="g-readout" id="eff-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cost-latency-note-source"></p>
+    <div class="g-warn">⚠️ <span><b>Trap:</b> "reasoning tokens" are not free scratch paper. They are billed as output, they lengthen end-to-end latency, and on an easy task they can reduce accuracy by inviting the model to second-guess a correct answer. Default to low effort and raise it per task.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>Short answer</th></tr></thead>
+      <tbody>
+        <tr><td>What is the cost formula?</td><td><code>input × p_in + output × p_out</code>, with cached input at a discounted rate.</td></tr>
+        <tr><td>Which side is expensive?</td><td>Output. It costs 3×–5× input at every vendor in the historical table.</td></tr>
+        <tr><td>What is the usual lever?</td><td>Shorten the output: verbosity, reasoning traces and retries are all output tokens.</td></tr>
+        <tr><td>TTFT versus TPOT?</td><td>TTFT is queue plus prefill to the first token; TPOT is the per-token decode cadence after it.</td></tr>
+        <tr><td>End to end?</td><td><code>TTFT + output × TPOT</code>. Long prompts hurt TTFT; long answers hurt the tail.</td></tr>
+        <tr><td>Why is an agent loop expensive?</td><td>Each turn re-sends the whole transcript, so cumulative input is triangular — quadratic in turns.</td></tr>
+        <tr><td>What does prefix caching do?</td><td>Cuts the price of a byte-identical prefix. The input is still triangular; the constant shrinks.</td></tr>
+        <tr><td>Are reasoning tokens special?</td><td>No. They are output tokens: billed as output and added to end-to-end latency.</td></tr>
+        <tr><td>How much effort should I spend?</td><td>Enough to clear the knee. Beyond it, marginal accuracy per dollar collapses.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Prompt caching</a>, 2024 — cache-write and cache-read multipliers, and the TTL that makes prompt layout a cost decision.</li>
+      <li>OpenAI, <a href="https://platform.openai.com/docs/guides/prompt-caching">Prompt caching guide</a>, October 2024 — automatic prefix caching and the <code>cached_tokens</code> accounting used in the loop chart.</li>
+      <li>DeepSeek, <a href="https://api-docs.deepseek.com/quick_start/pricing">API pricing</a>, 2025 — the cache-hit / cache-miss / output split that makes the asymmetry concrete.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/news/context-management">Context management</a>, 2025 — compaction and memory as first-class tools for long-running agents.</li>
+      <li>Wei et al., <a href="https://arxiv.org/abs/2201.11903">"Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"</a>, NeurIPS 2022 (arXiv:2201.11903) — the source of the "thinking helps, and helps less as tasks get easier" intuition behind the effort curve.</li>
+      <li>Snell et al., <a href="https://arxiv.org/abs/2408.03314">"Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters"</a>, 2024 (arXiv:2408.03314) — the empirical case that test-time compute has strongly diminishing returns and is best allocated per difficulty.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Cost and latency are what you pay; evaluation is what you get. Next: a small, labelled evaluation harness you can run from day one, so every later change — prompting, retrieval, fine-tuning — is a number rather than an opinion.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function money(x) {
+    if (x == null || !isFinite(x)) return '$—';
+    if (x >= 1) return '$' + x.toFixed(2);
+    if (x >= 0.01) return '$' + x.toFixed(4);
+    return '$' + x.toFixed(6);
+  }
+
+  var FALLBACK = {
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD, standard, non-batch). These rot fast and are labelled historical reference points, not current quotes. Verify against live vendor pages before relying on any number.",
+      outputInputRatio: "Output is the expensive side at every vendor in this table: 3x (GPT-4o), 5x (Claude), 4x (Gemini 1.5 Flash), 4x (DeepSeek-V3). The lever is almost always shortening the output, not the input.",
+      items: [
+        { model: "GPT-4o", inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25 },
+        { model: "GPT-4o mini", inputPerMUSD: 0.15, outputPerMUSD: 0.6, cachedInputPerMUSD: 0.075 },
+        { model: "Claude 3.5 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "Claude 3.7 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "Gemini 1.5 Flash", inputPerMUSD: 0.075, outputPerMUSD: 0.3, cachedInputPerMUSD: 0.01875 },
+        { model: "DeepSeek-V3", inputPerMUSD: 0.27, outputPerMUSD: 1.1, cachedInputPerMUSD: 0.07 }
+      ]
+    },
+    prompt_cache: {
+      source: "Anthropic prompt-caching docs (2024-08; cache read 0.1x base input, cache write 1.25x) and OpenAI prompt-caching docs (2024-10; cached input 0.5x). Provider implementations differ, so the hit rate is a property of your prompt layout.",
+      anthropicCacheReadMultiplier: 0.1, minCacheableTokens: 1024
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. The voice budget figures are illustrative (500-1000 ms end-to-end is the commonly cited target); treat them as a shape, not a spec.",
+      voiceBudgetMs: { total: 800, asr: 150, llmTtft: 300, tts: 250, network: 100 },
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    context_windows: {
+      source: "Vendor model cards and API docs, retrieved 2026-09. Windows move fast; treat every value as a dated snapshot, not a current quote.",
+      items: [{ model: "GPT-4o", tokens: 128000 }, { model: "Claude 3.7 Sonnet / 4.x", tokens: 200000 }]
+    }
+  };
+
+  var PRICING = FALLBACK.pricing;
+  var CACHE = FALLBACK.prompt_cache;
+  var COSTLAT = FALLBACK.cost_latency;
+  var WINDOWS = FALLBACK.context_windows;
+
+  function priceFor(model) {
+    var found = null;
+    (PRICING.items || []).forEach(function (it) { if (it.model === model) found = it; });
+    if (!found) return { inputPerM: 3, outputPerM: 15, cachedPerM: 0.3 };
+    return { inputPerM: found.inputPerMUSD, outputPerM: found.outputPerMUSD, cachedPerM: found.cachedInputPerMUSD };
+  }
+
+  function fillModels(keep) {
+    var sel = el('cost-model');
+    var items = PRICING.items || [];
+    var prev = keep || sel.value || 'Claude 3.7 Sonnet';
+    sel.innerHTML = items.map(function (it) {
+      return '<option value="' + esc(it.model) + '">' + esc(it.model) + '</option>';
+    }).join('');
+    var has = false;
+    items.forEach(function (it) { if (it.model === prev) has = true; });
+    if (has) sel.value = prev;
+    else if (items.length) sel.value = items[0].model;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the cost calculator
+  // ------------------------------------------------------------------
+  var A = {
+    input: el('cost-input'), cached: el('cost-cached'), output: el('cost-output'),
+    reasoning: el('cost-reasoning'), calls: el('cost-calls'), retry: el('cost-retry')
+  };
+  var setupA = Guide.setupCanvas(el('cost-canvas'), 640, 340, drawA);
+  function drawA() {
+    if (!setupA) return;
+    var prices = priceFor(el('cost-model').value);
+    var input = +A.input.value;
+    var cached = input * (+A.cached.value / 100);
+    var m = AppSim.costModel({
+      inputTokens: input, cachedInputTokens: cached,
+      outputTokens: +A.output.value, reasoningTokens: +A.reasoning.value,
+      calls: +A.calls.value, retryRate: +A.retry.value / 100, prices: prices
+    });
+    var rows = [
+      { label: 'one call', segments: [
+        { value: m.inputCost, color: c.accent, name: 'uncached input' },
+        { value: m.cachedCost, color: c.accent400, name: 'cached input' },
+        { value: m.outputCost, color: c.accent2, name: 'output' }
+      ] },
+      { label: 'whole task', segments: [
+        { value: m.inputCost * m.effectiveCalls, color: c.accent },
+        { value: m.cachedCost * m.effectiveCalls, color: c.accent400 },
+        { value: m.outputCost * m.effectiveCalls, color: c.accent2 }
+      ] }
+    ];
+    var geo = Guide.drawStacked(setupA.ctx, 640, 340, rows, {
+      padL: 130, padR: 90, padT: 34, padB: 30, maxTotal: m.total || 1, gap: 24
+    });
+    var ctx = setupA.ctx;
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('cost breakdown · ' + el('cost-model').value, 14, 18);
+    var legend = [
+      { name: 'uncached input', color: c.accent },
+      { name: 'cached input', color: c.accent400 },
+      { name: 'output (+ reasoning)', color: c.accent2 }
+    ];
+    legend.forEach(function (lg, i) {
+      ctx.fillStyle = lg.color; ctx.fillRect(294 + i * 114, 12, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(lg.name, 307 + i * 114, 20);
+    });
+    ctx.font = '10px ' + c.mono;
+    ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText(money(m.perCall), 130 + (m.perCall || 0) * geo.scale + 6, 34 + geo.barH * 0.7);
+    ctx.fillText(money(m.total), 130 + (m.total || 0) * geo.scale + 6, 34 + geo.barH + 24 + geo.barH * 0.7);
+    el('cost-readout').innerHTML =
+      '<div><span class="k">per call</span> <span class="hi">' + money(m.perCall) + '</span> · output share ' + Guide.fmtPct(m.outputShare, 0) + '</div>' +
+      '<div><span class="k">effective calls</span> ' + m.effectiveCalls.toFixed(2) + ' (calls × (1 + retry rate))</div>' +
+      '<div><span class="k">task total</span> <span class="hi">' + money(m.total) + '</span></div>' +
+      '<div><span class="k">cache savings</span> ' + money(m.cacheSavings) + ' vs paying full input price</div>' +
+      '<div class="k">output is ' + (prices.outputPerM / (prices.inputPerM || 1)).toFixed(1) + '× the input price in this table</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo B — the latency timeline
+  // ------------------------------------------------------------------
+  var B = {
+    prefix: el('lat-prefix'), cached: el('lat-cached'), queue: el('lat-queue'),
+    tps: el('lat-tps'), tpot: el('lat-tpot'), output: el('lat-output')
+  };
+  var setupB = Guide.setupCanvas(el('latency-canvas'), 640, 300, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var prefix = +B.prefix.value;
+    var m = AppSim.latencyModel({
+      prefixTokens: prefix, cachedPrefixTokens: prefix * (+B.cached.value / 100),
+      queueMs: +B.queue.value, prefillTps: +B.tps.value, tpotMs: +B.tpot.value, outputTokens: +B.output.value
+    });
+    var decode = (+B.output.value) * (+B.tpot.value);
+    var base = Math.max(0, m.ttftMs - m.prefillMs - (+B.queue.value));
+    var total = Math.max(1, m.ttftMs + decode);
+    var W = 640, H = 300, ctx = setupB.ctx, padL = 40, padR = 40;
+    ctx.clearRect(0, 0, W, H);
+    var barW = W - padL - padR, y = 120, barH = 44;
+    var scale = barW / total;
+    var segs = [
+      { name: 'network / base', value: base, color: c.divider },
+      { name: 'queue', value: +B.queue.value, color: c.accent700 },
+      { name: 'prefill', value: m.prefillMs, color: c.accent },
+      { name: 'decode', value: decode, color: c.accent400 }
+    ];
+    var x = padL;
+    segs.forEach(function (s) {
+      var w = s.value * scale;
+      ctx.fillStyle = s.color;
+      ctx.fillRect(x, y, Math.max(0, w), barH);
+      if (w > 46) {
+        ctx.fillStyle = '#fff'; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText(s.name, x + w / 2, y + barH / 2 + 3);
+      }
+      x += w;
+    });
+    var ttftX = padL + m.ttftMs * scale;
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(ttftX, y - 14); ctx.lineTo(ttftX, y + barH + 34); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(padL + barW, y - 14); ctx.lineTo(padL + barW, y + barH + 34); ctx.stroke();
+    ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.fillText('TTFT ' + Guide.fmtMs(m.ttftMs), ttftX, y - 20);
+    ctx.fillStyle = c.text; ctx.fillText('end to end ' + Guide.fmtMs(m.e2eMs), padL + barW, y + barH + 48);
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('one request, start to last token', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent;
+    ctx.textAlign = 'left';
+    ctx.fillText('prefill ' + Guide.fmtMs(m.prefillMs), padL, y + barH + 22);
+    ctx.fillText('decode ' + Guide.fmtMs(decode) + ' (' + B.output.value + ' tok × ' + B.tpot.value + ' ms)', padL + 180, y + barH + 22);
+    el('lat-readout').innerHTML =
+      '<div><span class="k">TTFT</span> <span class="hi">' + Guide.fmtMs(m.ttftMs) + '</span> = base + queue + prefill ' + Guide.fmtMs(m.prefillMs) + '</div>' +
+      '<div><span class="k">TPOT</span> ' + Guide.fmtMs(m.tpotMs) + ' · <span class="k">decode</span> ' + Guide.fmtMs(decode) + '</div>' +
+      '<div><span class="k">end to end</span> <span class="hi">' + Guide.fmtMs(m.e2eMs) + '</span></div>' +
+      '<div><span class="k">cached prefix</span> ' + Guide.fmtPct(m.cachedFraction, 0) + ' of ' + Guide.fmtNum(prefix) + ' tokens</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo C — quadratic input, caching as the brake
+  // ------------------------------------------------------------------
+  var D = { growth: el('quad-growth'), cache: true };
+  var setupD = Guide.setupCanvas(el('quad-canvas'), 640, 320, drawD);
+  var FIXED = 700;
+  function drawD() {
+    if (!setupD) return;
+    var g = +D.growth.value, N = 20;
+    var coldPts = [], warmPts = [];
+    var cumCold = 0, cumWarm = 0, crossTurn = -1;
+    var window = (WINDOWS.items && WINDOWS.items.length) ? WINDOWS.items[0].tokens : 128000;
+    for (var n = 1; n <= N; n++) {
+      var perTurn = FIXED + n * g;
+      cumCold += perTurn;
+      var cachedPortion = FIXED + (n - 1) * g;
+      var billed = FIXED + g + (D.cache ? cachedPortion * (CACHE.anthropicCacheReadMultiplier || 0.1) : cachedPortion);
+      cumWarm += billed;
+      coldPts.push({ x: n, y: cumCold });
+      warmPts.push({ x: n, y: cumWarm });
+      if (crossTurn < 0 && perTurn > window) crossTurn = n;
+    }
+    var maxY = coldPts[N - 1].y;
+    var ctx = setupD.ctx;
+    var geo = Guide.drawLines(ctx, 640, 320,
+      [
+        { points: coldPts, color: c.accent, width: 2.4 },
+        { points: warmPts, color: c.accent2, width: 2.4, dashed: true }
+      ],
+      [0, N], [0, maxY * 1.06],
+      { xLabel: 'turn', padL: 64, padB: 30 });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('cumulative billed input tokens', geo.padL + 8, geo.padT + 14);
+    ctx.fillStyle = c.accent; ctx.fillText('cold every turn (triangular)', geo.padL + 8, geo.padT + 28);
+    ctx.fillStyle = c.accent2; ctx.fillText('warm prefix cache (cached portion at ' + Math.round((CACHE.anthropicCacheReadMultiplier || 0.1) * 100) + '% of input)', geo.padL + 8, geo.padT + 42);
+    var saved = cumCold - cumWarm;
+    el('quad-readout').innerHTML =
+      '<div><span class="k">cumulative @ 20 turns</span> cold <span class="hi">' + Guide.fmtNum(cumCold) + '</span> · warm ' + Guide.fmtNum(cumWarm) + '</div>' +
+      '<div><span class="k">tokens saved</span> <span class="hi">' + Guide.fmtNum(saved) + '</span> (' + Guide.fmtPct(saved / cumCold, 0) + ')</div>' +
+      '<div><span class="k">growth shape</span> ' + (cumCold / (FIXED + g)).toFixed(1) + '× a single turn — quadratic in turns</div>' +
+      '<div class="' + (crossTurn > 0 ? 'bad' : 'k') + '">' + (crossTurn > 0
+        ? 'the per-turn context passes a ' + Guide.fmtNum(window) + '-token window on turn ' + crossTurn
+        : 'the per-turn context stays inside a ' + Guide.fmtNum(window) + '-token window at this growth') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo E — the effort dial
+  // ------------------------------------------------------------------
+  var E = { tokens: el('eff-tokens'), tau: el('eff-tau') };
+  var setupE = Guide.setupCanvas(el('effort-canvas'), 640, 340, drawE);
+  function drawE() {
+    if (!setupE) return;
+    var spent = +E.tokens.value, tau = +E.tau.value;
+    var base = 0.45, maxA = 0.95;
+    var acc = function (t) { return maxA - (maxA - base) * Math.exp(-t / tau); };
+    var prices = priceFor(el('cost-model').value);
+    var cost = function (t) { return t / 1e6 * prices.outputPerM; };
+    var cmax = cost(16000) || 1;
+    var accPts = [], costPts = [];
+    for (var t = 0; t <= 16000; t += 200) {
+      accPts.push({ x: t, y: acc(t) });
+      costPts.push({ x: t, y: cost(t) / cmax });
+    }
+    var slope0 = (maxA - base) / tau;
+    var thr = 0.01 / 1000;
+    var knee = slope0 > thr ? -tau * Math.log(thr / slope0) : 0;
+    if (!isFinite(knee) || knee < 0) knee = 0;
+    if (knee > 16000) knee = 16000;
+    var ctx = setupE.ctx;
+    var geo = Guide.drawLines(ctx, 640, 340,
+      [
+        { points: accPts, color: c.accent, width: 2.4 },
+        { points: costPts, color: c.accent2, width: 2, dashed: true }
+      ],
+      [0, 16000], [0, 1],
+      { xLabel: 'reasoning tokens spent', padL: 54, padB: 32, padT: 38 });
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('accuracy (solid) and normalised cost (dashed) vs thinking', 14, 18);
+    var kx = geo.px(knee);
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.4; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(kx, geo.padT); ctx.lineTo(kx, geo.padT + geo.plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('knee ≈ ' + Guide.fmtNum(knee) + ' tok', kx, geo.padT - 4);
+    var ex = geo.px(spent);
+    ctx.beginPath(); ctx.arc(ex, geo.py(acc(spent)), 4.5, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent; ctx.fill();
+    ctx.beginPath(); ctx.arc(ex, geo.py(cost(spent) / cmax), 4.5, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent2; ctx.fill();
+    el('eff-readout').innerHTML =
+      '<div><span class="k">at ' + Guide.fmtNum(spent) + ' thinking tokens</span> accuracy <span class="hi">' + Guide.fmtPct(acc(spent), 1) + '</span></div>' +
+      '<div><span class="k">thinking cost</span> ' + money(cost(spent)) + ' at ' + money(prices.outputPerM) + '/M output</div>' +
+      '<div><span class="k">knee</span> ≈ ' + Guide.fmtNum(knee) + ' tokens (below ~1 accuracy point per 1000 tokens)</div>' +
+      '<div class="k">' + (spent > knee ? 'past the knee — each extra point of accuracy is now expensive' : 'before the knee — thinking is still buying accuracy cheaply') + '</div>';
+  }
+
+  function drawAll() { drawA(); drawB(); drawD(); drawE(); }
+
+  Guide.bindSliders([A.input, A.cached, A.output, A.reasoning, A.calls, A.retry], drawA);
+  Guide.bindSliders([B.prefix, B.cached, B.queue, B.tps, B.tpot, B.output], drawB);
+  Guide.bindSliders([D.growth], drawD);
+  Guide.bindSliders([E.tokens, E.tau], drawE);
+  el('cost-model').addEventListener('change', drawAll);
+  el('quad-cache').addEventListener('click', function () {
+    D.cache = !D.cache;
+    this.className = D.cache ? 'g-primary' : '';
+    this.textContent = D.cache ? 'Prefix caching on' : 'Prefix caching off';
+    drawD();
+  });
+
+  function setSources(data) {
+    var price = (data && data.pricing) || FALLBACK.pricing;
+    var cache = (data && data.prompt_cache) || FALLBACK.prompt_cache;
+    var cl = (data && data.cost_latency) || FALLBACK.cost_latency;
+    var cw = (data && data.context_windows) || FALLBACK.context_windows;
+    el('cost-price-source').textContent = price.source || FALLBACK.pricing.source;
+    el('cost-latency-source').textContent = cl.source || FALLBACK.cost_latency.source;
+    el('quad-window-source').textContent = (cw.source || FALLBACK.context_windows.source) +
+      ' Cache multipliers: ' + (cache.source || FALLBACK.prompt_cache.source);
+    el('cost-latency-note-source').textContent = 'Cache layers, cheapest conceptually first: ' +
+      ((cl.cacheLayers || []).join('; ')) + '.';
+  }
+
+  function applyNumbers(data) {
+    PRICING = (data && data.pricing && data.pricing.items && data.pricing.items.length) ? data.pricing : FALLBACK.pricing;
+    CACHE = (data && data.prompt_cache) || FALLBACK.prompt_cache;
+    COSTLAT = (data && data.cost_latency) || FALLBACK.cost_latency;
+    WINDOWS = (data && data.context_windows) || FALLBACK.context_windows;
+    fillModels();
+    setSources(data);
+    drawAll();
+  }
+
+  // First paint from the fallback table, then the fetch refines it.
+  applyNumbers(FALLBACK);
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'cost-latency-asymmetry',
+      kind: 'choice',
+      prompt: 'Which side of the bill is larger at every vendor in the pricing table?',
+      options: [
+        { label: 'Output — it costs about 3× to 5× the input price.' },
+        { label: 'Input — prompts are the long part.' },
+        { label: 'They are the same price.' },
+        { label: 'Cached input, because cache writes cost more.' }
+      ],
+      explanation: 'Output is the expensive side: 3× (GPT-4o), 5× (Claude), 4× (Gemini 1.5 Flash) and 4× (DeepSeek-V3) in the historical table. That is why shortening the output, not the prompt, is usually the highest-leverage cost edit.'
+    },
+    {
+      id: 'cost-latency-calc',
+      kind: 'numeric',
+      prompt: 'A call sends 12,000 uncached input tokens at $3 per million and produces 800 output tokens at $15 per million. What is the cost of one call, in US dollars?',
+      answer: 0.048,
+      unit: 'USD',
+      tolerance: 0.0005,
+      explanation: 'Input: 12,000 / 1e6 × $3 = $0.036. Output: 800 / 1e6 × $15 = $0.012. Total = $0.048 — and notice that the 800-token answer costs a third as much as the 12,000-token prompt.'
+    },
+    {
+      id: 'cost-latency-e2e',
+      kind: 'numeric',
+      prompt: 'A request has a 40,000-token uncached prefix, 160 ms of queue time, a 40 ms base overhead, a prefill rate of 20,000 tokens/s, and 200 output tokens at a TPOT of 20 ms. What is the end-to-end latency in milliseconds?',
+      answer: 6200,
+      unit: 'ms',
+      tolerance: 20,
+      explanation: 'Prefill = 40,000 / 20,000 × 1000 = 2,000 ms. TTFT = 40 + 160 + 2,000 = 2,200 ms. Decode = 200 × 20 = 4,000 ms. End to end = 2,200 + 4,000 = 6,200 ms.'
+    },
+    {
+      id: 'cost-latency-quadratic',
+      kind: 'choice',
+      prompt: 'Why is the input cost of an agent loop roughly quadratic in the number of turns?',
+      options: [
+        { label: 'Each turn re-sends the whole growing transcript, so turns sum to a triangular total.' },
+        { label: 'The model recomputes the transcript from scratch on the server side even if it is not sent.' },
+        { label: 'Each tool call adds a fixed overhead that doubles per turn.' },
+        { label: 'Output tokens are counted twice.' }
+      ],
+      explanation: 'A stateless model is sent the whole history on every turn. With a steady per-turn addition h, N turns cost about h·N(N+1)/2 input tokens — triangular, i.e. quadratic in turns. Prefix caching discounts the constant; it does not change the shape.'
+    },
+    {
+      id: 'cost-latency-effort',
+      kind: 'choice',
+      prompt: 'What is true of a reasoning-effort dial?',
+      options: [
+        { label: 'Thinking tokens are billed as output, so more effort means slower and more expensive answers with diminishing accuracy gains.' },
+        { label: 'Thinking tokens are free because they are internal.' },
+        { label: 'Maximum effort is always the best default for every task.' },
+        { label: 'Effort changes only cost, never latency.' }
+      ],
+      explanation: 'Reasoning tokens are output tokens: billed at the output rate and added to end-to-end latency. Accuracy improves quickly at low effort and flattens toward a ceiling, so the knee — not the maximum — is the sensible default, with per-task exceptions.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

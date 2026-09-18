@@ -1,0 +1,669 @@
+---
+title: "Agents in Action, Interactively — Part 12: Observability, online eval, and evals as the moat"
+description: "OTel GenAI semantics, logging retrieved context and prompt versions, A/B power, implicit signals, cost/latency on the same dashboard."
+permalink: "/ai/agents-in-action/observability/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Observability, online eval, and evals as the moat</h1>
+    <p>An evaluation is a question you ask of recorded runs. If the run was not traced, the question has no data to answer it — so observability is not a separate ops concern bolted on at the end, it is the substrate the eval sits on. This part covers the OpenTelemetry spans that carry an agent's shape, the fields without which a score cannot be attributed (prompt version, retrieved document ids, tool calls, cost), the discipline of redacting PII before anything is written down, online evaluation against live traffic with the implicit signals users hand you for free, the statistics of A/B testing with real power, and the dashboard where quality, cost and latency finally meet. It ends on the thesis the whole volume has been building toward: prompts get copied, evals compound.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="substrate">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>You cannot analyse a trace you did not record</h2></div>
+    <p class="g-eyebrow">The eval is a query; the trace is the table</p>
+    <p>The OpenTelemetry GenAI semantic conventions give an agent request a standard shape: a <strong>span</strong> for the top-level request, child spans for each model call and each tool call, and attributes that carry the model identity, the token usage and the parameters. The conventions name the attributes rather than inventing your own, so the same trace can be read by a generic backend: <code>gen_ai.system</code>, <code>gen_ai.request.model</code>, <code>gen_ai.request.temperature</code>, <code>gen_ai.usage.input_tokens</code> and <code>gen_ai.usage.output_tokens</code>. A chat span, a tool span and a retrieval span are the three shapes you will see most; an agent request is a tree of them, and the tree is what tells you where the time and the tokens actually went.</p>
+    <p>What the conventions buy you is that the eval harness reads runs, not reconstructions. A pass rate stops being a number you derived from a log line and becomes a filter over spans: "requests where the tool returned a 500" or "sessions where the model call used prompt v14". The demo below is one such request, drawn as a span waterfall. Click any span to see the attributes the conventions would attach to it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="trace-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">One agent request as nested spans on a shared time axis. Indentation is nesting; the bar is duration; the detail panel shows the attributes for the selected span.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="trace-next" class="g-primary">Next span</button>
+        </div>
+        <div class="g-readout" id="trace-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="obs-pricing-source"></p>
+    <div class="g-goal">💡 <span><b>Instrument once, evaluate forever.</b> The same span tree answers "where did the latency go", "what did this run cost" and "why did this eval case regress". Retrofitting telemetry after a quality incident means the incident is unanswerable.</span></div>
+  </section>
+
+  <section class="g-step" id="what-to-log">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Log the context and the prompt version — or the score is unattributable</h2></div>
+    <p class="g-eyebrow">Four fields that turn a number into a diagnosis</p>
+    <p>Token counts and a latency are not enough. When an eval moves, you need to know <em>what changed</em>, and a run that did not record its inputs cannot tell you. Four fields do most of that work. The <strong>prompt version</strong> — a content hash or a semantic version, not "the current prompt" — pins the instructions and the examples that produced the output. The <strong>retrieved document ids</strong> (with their scores and the index revision) pin the evidence the model saw, which is the difference between "the model got worse" and "the index returned the wrong chunks". The <strong>tool calls</strong>, with arguments and results, pin the world the agent acted on. And the <strong>cost and latency</strong> ride along on the same span so a quality change can be judged against what it cost to buy. Join all of this with a request id and an eval result becomes a pointer back into the exact run.</p>
+    <div class="g-code"><span class="k">// the attributes that make an eval result attributable</span>
+{
+  <span class="s">"gen_ai.request.model"</span>: "gpt-4o",
+  <span class="s">"app.prompt.version"</span>:    "v14@3f9c1a",   <span class="k">// content hash of the prompt</span>
+  <span class="s">"app.retrieved.ids"</span>:      ["kv-cache", "paged-memory", "batching"],
+  <span class="s">"app.retrieved.index"</span>:    "corpus-2026-09-01", <span class="k">// which index revision</span>
+  <span class="s">"app.tool.calls"</span>:          ["fetch_doc", "search"],
+  <span class="s">"gen_ai.usage.input_tokens"</span>:  13100,
+  <span class="s">"gen_ai.usage.output_tokens"</span>: 520,
+  <span class="s">"app.cost.usd"</span>: 0.0173,
+  <span class="s">"app.latency.ms"</span>: 2600,
+  <span class="s">"app.user.id_hash"</span>: "sha256:9c1f…"  <span class="k">// never the raw id</span>
+}</div>
+    <p><strong>Redact before you write, not after you export.</strong> Logs are copied, sampled, shipped to a vendor and kept for months; a raw prompt is the highest-risk artifact in the system because it is where users paste secrets and personal data. Redaction belongs at the boundary, before the span is emitted: hash or drop direct identifiers, redact detected PII classes, and keep the raw text only under a separate, short retention with explicit access — or not at all. It is a lossy tradeoff and it is the right one: a redacted trace you can share across the team beats a raw one nobody is allowed to look at. Part 16 returns to this as a production control, but the cheap version of it belongs here, in the logging boundary itself.</p>
+    <div class="g-warn">⚠️ <span><b>A trace with no prompt version is a number with no address.</b> If you cannot say which instructions and which retrieved documents produced a run, you cannot reproduce it, cannot bisect a regression, and cannot tell a model upgrade from an index change.</span></div>
+  </section>
+
+  <section class="g-step" id="power">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Online eval and A/B testing with real power</h2></div>
+    <p class="g-eyebrow">How many samples before the difference means anything</p>
+    <p>Offline evals run on a frozen set; online evals run on live traffic, which is the only place the distribution of real requests lives. The tool for online change is the A/B test, and the tool is only as good as its <strong>power</strong>: the probability that it detects a real effect of a given size. Power is not a property of the test — it is a property of the test <em>at a sample size</em>, and the arithmetic is unforgiving. For two proportions, the samples needed per arm are roughly <code>n = (z<sub>1−α/2</sub> + z<sub>1−β</sub>)² · (p₁(1−p₁) + p₂(1−p₂)) / (p₂ − p₁)²</code>. At a 10% baseline, a 2-point lift needs a few thousand sessions <em>per arm</em>; a half-point lift needs sixteen times as many, because the required n scales with the inverse square of the effect.</p>
+    <p>Move the sliders below. The left panel is required sample size as a function of the effect you want to detect; the right panel is the reason a dashboard that updates every hour is dangerous — if you check the result and stop when it looks significant, the false-positive rate is not 5%, it is the rate of a test you ran many times.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ab-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: required sessions per arm against the effect size, with the current setting marked. Right: family-wise false-positive rate as interim looks accumulate, against a nominal 5% line.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Baseline rate <span class="val">0.10</span></label><input type="range" id="ab-base" min="0.02" max="0.5" step="0.01" value="0.1"></div>
+        <div class="g-field"><label>Effect to detect (absolute) <span class="val">0.02</span></label><input type="range" id="ab-effect" min="0.005" max="0.1" step="0.005" value="0.02"></div>
+        <div class="g-field"><label>Traffic (sessions / day) <span class="val">8000</span></label><input type="range" id="ab-traffic" min="500" max="200000" step="500" value="8000"></div>
+        <div class="g-field"><label>Interim looks <span class="val">1</span></label><input type="range" id="ab-looks" min="1" max="40" step="1" value="1"></div>
+        <div class="g-readout" id="ab-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="obs-evals-source"></p>
+    <div class="g-warn">⚠️ <span><b>Peeking inflates false positives.</b> The formula assumes one look after the samples are in. Checking repeatedly and stopping on the first significant result is a different test with a much higher error rate; if you must monitor continuously, use a sequential or always-valid method, not a fixed-horizon p-value read early.</span></div>
+  </section>
+
+  <section class="g-step" id="implicit">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Implicit signals are the label you already have</h2></div>
+    <p class="g-eyebrow">Users grade every answer, whether or not you ask</p>
+    <p>Explicit feedback — a thumbs-up, a rating — is sparse, biased toward the extremes and easy to game. The dense signal is behavioural, and it is already in the traces. A user who <strong>accepts</strong> an answer and moves on is a weak positive. A user who <strong>edits</strong> the answer before accepting it is telling you exactly where it was wrong. A user who <strong>retries</strong>, or who <strong>rephrases the question</strong> as a follow-up, is a negative — the first answer failed to land. A <strong>copy event</strong> that is not followed by an edit is a strong positive. None of these is labelled, all of them are proxy, and together the edit rate is one of the best cheap quality meters an agent product has.</p>
+    <p>The funnel below turns 20,000 sessions into accepted, edited and retried outcomes, and the scatter checks the proxy against the thing you already trust: the offline eval. If the two agree, the implicit signal is a usable online meter; if they do not, one of the two is measuring something else, and that is worth knowing before you wire it to a dashboard.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="funnel-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Top: sessions through answers to accepted, edited and retried outcomes. Bottom: each dot is one day; x is the offline eval score, y is the observed edit rate, and the line is the fit.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Offline eval pass rate <span class="val">0.80</span></label><input type="range" id="funnel-offline" min="0.55" max="0.95" step="0.01" value="0.8"></div>
+        <div class="g-readout" id="funnel-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Correlate the proxy with the eval, then trust the cheaper one.</b> An offline set is slow and stale; a behavioural signal is free and current. Their correlation is the licence to use the cheap signal online — and the check that you are not optimising a metric users do not care about.</span></div>
+  </section>
+
+  <section class="g-step" id="dashboard">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Quality, cost and latency on the same dashboard</h2></div>
+    <p class="g-eyebrow">They trade off; a dashboard that shows one hides the trade</p>
+    <p>A quality number in isolation invites a decision that quietly spends money and time to buy it. Every operating point in an agent system sits in three dimensions at once: what it costs per task, how long it takes, and how good it is. Concretely, the dials are mundane — retrieve more candidates and rerank (cost, latency up, quality up), call a bigger model (cost up, latency up, quality up), cache more aggressively (cost down, latency down, correctness risk up), run fewer reasoning steps (all three down). The points that survive are the <strong>Pareto frontier</strong>: no other feasible point is at least as cheap, at least as fast and at least as good. Everything else is dominated, and a team that ships a dominated point is paying for nothing.</p>
+    <p>The dashboard below plots candidate operating points with cost on one axis, latency on the other, and quality as the size of the bubble. Set a quality floor and the frontier recomputes over the points that clear it — and note how raising the floor moves the frontier out toward cost and latency, which is the trade made visible.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dash-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Each bubble is an operating point; bigger is higher quality. Dark points are on the Pareto frontier among those meeting the floor; hollow points are dominated; grey points miss the floor.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Quality floor <span class="val">0.75</span></label><input type="range" id="dash-floor" min="0.6" max="0.95" step="0.01" value="0.75"></div>
+        <div class="g-readout" id="dash-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="obs-cost-source"></p>
+    <div class="g-goal">💡 <span><b>Evals are the moat because prompts are not.</b> A prompt, a scaffold, a tool schema — each is copyable the afternoon it ships. The labelled dataset, the trace corpus and the eval harness that turns a change into a decided bet are not: they compound with every shipped run, and they are the only part of the system that gets harder to copy the longer you do it. The moat is not the model you call; it is the evidence you can bring to the next decision.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the system</th></tr></thead>
+      <tbody>
+        <tr><td>Why instrument before evaluating?</td><td>An eval is a query over recorded runs. No trace, no answer.</td></tr>
+        <tr><td>What does a GenAI span carry?</td><td>Model, parameters, input/output token usage, and one span per model and tool call.</td></tr>
+        <tr><td>Which field pins the instructions?</td><td>The prompt version — a content hash or semantic version, not "current".</td></tr>
+        <tr><td>Which field pins the evidence?</td><td>Retrieved document ids with scores, plus the index revision.</td></tr>
+        <tr><td>When do you redact PII?</td><td>Before the span is written. Hash identifiers, redact data classes, keep raw text only under tight retention.</td></tr>
+        <tr><td>Offline or online eval?</td><td>Both. Offline is fast and frozen; online sees the real request distribution.</td></tr>
+        <tr><td>How many samples for an A/B? </td><td>n per arm grows with the inverse square of the effect. A half-size effect needs four times the samples.</td></tr>
+        <tr><td>Why is peeking wrong?</td><td>Stopping on the first significant interim look inflates false positives far past the nominal rate.</td></tr>
+        <tr><td>What are implicit signals?</td><td>Accepted, edited, retried, copied, rephrased. Dense, free, and only proxies — correlate them with the eval.</td></tr>
+        <tr><td>Why one dashboard?</td><td>Quality, cost and latency trade off. Showing one hides the decision.</td></tr>
+        <tr><td>What is the moat?</td><td>Evals, datasets and traces compound. Prompts and scaffolds get copied.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>OpenTelemetry, <a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/">"Semantic Conventions for GenAI"</a>, specification, revisions dated 2024–2025 — the span and attribute names (<code>gen_ai.*</code>) used throughout this part.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — pass^k and the argument that reliability, not best-of-k capability, is the product number.</li>
+      <li>Kohavi, Tang &amp; Xu, <a href="https://experimentguide.com/">"Trustworthy Online Controlled Experiments: A Practical Guide to A/B Testing"</a>, Cambridge University Press, 2020 — power, sample-size arithmetic and the peeking problem this part reduces to two sliders.</li>
+      <li>Sculley et al., <a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">"Hidden Technical Debt in Machine Learning Systems"</a>, NeurIPS 2015 — the original argument that monitoring, configuration and data dependencies are where ML systems decay.</li>
+      <li>Es et al., <a href="https://arxiv.org/abs/2309.15217">"RAGAS: Automated Evaluation of Retrieval Augmented Generation"</a>, EACL 2024 — the component metrics an offline harness computes, and the reason retrieved ids must be logged to compute them.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2307.03172">"Lost in the Middle: How Language Models Use Long Contexts"</a>, TACL 2024 — why the placement of retrieved context, not just its presence, is a quality variable worth logging.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Observability and evals tell you whether a change helped. The next question is whether fine-tuning is the change to make at all — and when the honest answer is that a better prompt, a better retriever or a better harness will do the job for a fraction of the cost.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD, standard, non-batch). Offline fallback constants; verify against live vendor pages.",
+      as_of: "2025-02",
+      items: [
+        { model: "GPT-4o", inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25 },
+        { model: "Claude 3.7 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "Gemini 1.5 Flash", inputPerMUSD: 0.075, outputPerMUSD: 0.3, cachedInputPerMUSD: 0.01875 }
+      ],
+      outputInputRatio: "Output is the expensive side at every vendor in this table."
+    },
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench (2025, which introduced pass^k); GAIA (Mialon et al., arXiv:2311.12983, 2023); OSWorld (Xie et al., arXiv:2404.07972, 2024). Public scores are contaminated by leakage, scaffolding and harness drift. Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns cost O(N^2) input tokens before caching. Offline fallback constants.",
+      voiceBudgetMs: { total: 800, asr: 150, llmTtft: 300, tts: 250, network: 100 },
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    }
+  };
+
+  var PRICING = { inputPerM: 2.5, outputPerM: 10.0, cachedPerM: 1.25 };
+
+  // ------------------------------------------------------------------
+  // Demo A — trace span waterfall with a click-to-detail panel
+  // ------------------------------------------------------------------
+  var TOTAL_MS = 2600;
+  var SPANS = [
+    { id: 'root', name: 'agent request', depth: 0, start: 0, dur: 2600, kind: 'agent' },
+    { id: 'retrieve', name: 'retrieve', depth: 1, start: 20, dur: 180, kind: 'retrieval' },
+    { id: 'embed', name: 'embed query', depth: 2, start: 28, dur: 20, kind: 'retrieval', tokensIn: 120 },
+    { id: 'vsearch', name: 'vector search (ANN)', depth: 2, start: 52, dur: 24, kind: 'retrieval', docs: 3 },
+    { id: 'bm25', name: 'BM25 lexical', depth: 2, start: 52, dur: 18, kind: 'retrieval', docs: 50 },
+    { id: 'rerank', name: 'rerank 50 → 5', depth: 2, start: 82, dur: 104, kind: 'retrieval', tokensIn: 5200, docs: 5 },
+    { id: 'm1', name: 'model call 1 (chat)', depth: 1, start: 220, dur: 640, kind: 'chat', model: 'GPT-4o', tokensIn: 3200, tokensOut: 120, cached: 2400, promptVersion: 'v14@3f9c1a' },
+    { id: 't1', name: 'tool fetch_doc', depth: 2, start: 520, dur: 160, kind: 'tool', tool: 'fetch_doc', tokensOut: 900 },
+    { id: 'm2', name: 'model call 2 (chat)', depth: 1, start: 880, dur: 700, kind: 'chat', model: 'GPT-4o', tokensIn: 4300, tokensOut: 140, cached: 3900, promptVersion: 'v14@3f9c1a' },
+    { id: 't2', name: 'tool search', depth: 2, start: 1200, dur: 210, kind: 'tool', tool: 'search', tokensOut: 1200 },
+    { id: 'm3', name: 'model call 3 (chat)', depth: 1, start: 1620, dur: 900, kind: 'chat', model: 'GPT-4o', tokensIn: 5600, tokensOut: 260, cached: 5100, promptVersion: 'v14@3f9c1a' }
+  ];
+  var A = { selected: 0 };
+  var traceRects = [];
+  var setupA = Guide.setupCanvas(el('trace-canvas'), 640, 340, drawA);
+
+  function kindColor(k) {
+    if (k === 'agent') return c.accent700;
+    if (k === 'chat') return c.accent;
+    if (k === 'tool') return c.accent2;
+    return c.accent400;
+  }
+  function spanCost(s) {
+    if (s.kind !== 'chat') return 0;
+    return AppSim.costModel({
+      inputTokens: s.tokensIn || 0, outputTokens: s.tokensOut || 0,
+      cachedInputTokens: s.cached || 0, prices: PRICING
+    }).perCall;
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 150, padR = 20, padT = 30, rowH = 25;
+    var plotW = W - padL - padR;
+    function px(v) { return padL + plotW * v / TOTAL_MS; }
+    // time grid
+    ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    for (var t = 0; t <= TOTAL_MS; t += 500) {
+      ctx.beginPath(); ctx.moveTo(px(t), padT - 8); ctx.lineTo(px(t), padT + SPANS.length * rowH); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+    for (var t2 = 0; t2 <= TOTAL_MS; t2 += 500) ctx.fillText(t2 + 'ms', px(t2), padT - 12);
+    traceRects = [];
+    SPANS.forEach(function (s, i) {
+      var y = padT + i * rowH;
+      var bh = rowH - 8;
+      var x0 = px(s.start), x1 = px(s.start + s.dur);
+      var w = Math.max(3, x1 - x0);
+      var selected = i === A.selected;
+      ctx.fillStyle = kindColor(s.kind);
+      ctx.globalAlpha = selected ? 1 : 0.72;
+      ctx.fillRect(x0, y, w, bh);
+      ctx.globalAlpha = 1;
+      if (selected) {
+        ctx.strokeStyle = c.text; ctx.lineWidth = 1.5;
+        ctx.strokeRect(x0 - 1.5, y - 1.5, w + 3, bh + 3);
+      }
+      ctx.fillStyle = c.text; ctx.font = (selected ? '600 ' : '') + '10.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(s.name.slice(0, 22), 10 + s.depth * 12, y + bh * 0.78);
+      traceRects.push({ id: s.id, x: x0, y: y, w: w, h: bh });
+    });
+    // legend + readout
+    var s = SPANS[A.selected];
+    var totalCost = SPANS.reduce(function (a, x) { return a + spanCost(x); }, 0);
+    var lines = [];
+    lines.push('<div><span class="k">span</span> <span class="hi">' + s.name + '</span> · <span class="k">kind</span> ' + s.kind + '</div>');
+    lines.push('<div><span class="k">duration</span> ' + Guide.fmtMs(s.dur) + ' · <span class="k">start</span> ' + s.start + ' ms</div>');
+    if (s.kind === 'chat') {
+      lines.push('<div><span class="k">model</span> ' + s.model + ' · <span class="k">input</span> ' + Guide.fmtNum(s.tokensIn) + ' tok (' + Guide.fmtNum(s.cached) + ' cached) · <span class="k">output</span> ' + Guide.fmtNum(s.tokensOut) + ' tok</div>');
+      lines.push('<div><span class="k">cost</span> $' + spanCost(s).toFixed(5) + ' · <span class="k">prompt version</span> ' + s.promptVersion + '</div>');
+      lines.push('<div class="k">logged: retrieved ids on the retrieve span, tool calls below this one</div>');
+    } else if (s.kind === 'retrieval') {
+      lines.push('<div><span class="k">docs touched</span> ' + (s.docs != null ? s.docs : '—') + (s.tokensIn ? ' · <span class="k">scored tokens</span> ' + Guide.fmtNum(s.tokensIn) : '') + '</div>');
+      lines.push('<div class="k">logged: document ids + scores + index revision (corpus-2026-09-01)</div>');
+    } else if (s.kind === 'tool') {
+      lines.push('<div><span class="k">tool</span> ' + s.tool + (s.tokensOut ? ' · <span class="k">result tokens</span> ' + Guide.fmtNum(s.tokensOut) : '') + '</div>');
+      lines.push('<div class="k">logged: arguments and results, so an eval can filter on tool outcome</div>');
+    } else {
+      lines.push('<div class="k">the root span joins every child: one request id, one tree</div>');
+    }
+    lines.push('<div><span class="k">request cost</span> <span class="hi">$' + totalCost.toFixed(5) + '</span> across ' + SPANS.filter(function (x) { return x.kind === 'chat'; }).length + ' model calls</div>');
+    el('trace-readout').innerHTML = lines.join('');
+  }
+  el('trace-canvas').addEventListener('click', function (ev) {
+    var p = Guide.hitTest(this, ev);
+    for (var i = 0; i < traceRects.length; i++) {
+      var r = traceRects[i];
+      if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y && p.y <= r.y + r.h) {
+        A.selected = i; drawA(); return;
+      }
+    }
+  });
+  el('trace-next').addEventListener('click', function () {
+    A.selected = (A.selected + 1) % SPANS.length; drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — A/B power and the peeking problem
+  // ------------------------------------------------------------------
+  var Z_ALPHA = 1.959964, Z_POWER = 0.841621, ALPHA = 0.05;
+  var setupB = Guide.setupCanvas(el('ab-canvas'), 640, 340, drawB);
+  function reqN(p1, eff) {
+    var p2 = Math.min(0.995, p1 + eff);
+    var d = Math.max(1e-4, p2 - p1);
+    return Math.pow(Z_ALPHA + Z_POWER, 2) * (p1 * (1 - p1) + p2 * (1 - p2)) / (d * d);
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var p1 = +el('ab-base').value, eff = +el('ab-effect').value;
+    var traffic = +el('ab-traffic').value, looks = +el('ab-looks').value;
+    var nNow = reqN(p1, eff);
+    var total = 2 * nNow;
+    var days = total / Math.max(1, traffic);
+    var fwer = 1 - Math.pow(1 - ALPHA, looks);
+    // Left panel: n vs effect.
+    var LX = 52, LY = 46, LW = 238, LH = 226;
+    var E0 = 0.01, E1 = 0.10;
+    var yMax = Math.ceil(reqN(p1, E0) / 2000) * 2000 || 1;
+    function lpx(e) { return LX + LW * (e - E0) / (E1 - E0); }
+    function lpy(n) { return LY + LH * (1 - Math.min(1, n / yMax)); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(LX, LY); ctx.lineTo(LX, LY + LH); ctx.lineTo(LX + LW, LY + LH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('sessions per arm', LX, LY - 12);
+    ctx.textAlign = 'center'; ctx.fillText('effect to detect', LX + LW / 2, LY + LH + 22);
+    Guide.niceTicks(E0, E1, 4).forEach(function (e) {
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font;
+      ctx.fillText(e.toFixed(2), lpx(e), LY + LH + 12);
+    });
+    Guide.niceTicks(0, yMax, 4).forEach(function (v) {
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(Guide.fmtNum(v), LX - 4, lpy(v) + 3);
+    });
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 2.2; ctx.beginPath();
+    for (var e = E0; e <= E1 + 1e-9; e += 0.0025) {
+      var X = lpx(e), Y = lpy(reqN(p1, e));
+      if (e === E0 || (e - E0) < 0.001) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.stroke();
+    var cxe = Math.max(E0, Math.min(E1, eff));
+    ctx.beginPath(); ctx.arc(lpx(cxe), lpy(nNow), 5, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1; ctx.stroke();
+    // Right panel: fwer vs looks.
+    var RX = 366, RY = 46, RW = 238, RH = 226;
+    function rpx(k) { return RX + RW * (k - 1) / 39; }
+    function rpy(v) { return RY + RH * (1 - v); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(RX, RY); ctx.lineTo(RX, RY + RH); ctx.lineTo(RX + RW, RY + RH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('false-positive rate', RX, RY - 12);
+    ctx.textAlign = 'center'; ctx.fillText('interim looks', RX + RW / 2, RY + RH + 22);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(RX, rpy(ALPHA)); ctx.lineTo(RX + RW, rpy(ALPHA)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('nominal 5%', RX + 4, rpy(ALPHA) - 4);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.2; ctx.beginPath();
+    for (var k = 1; k <= 40; k++) {
+      var X2 = rpx(k), Y2 = rpy(1 - Math.pow(1 - ALPHA, k));
+      if (k === 1) ctx.moveTo(X2, Y2); else ctx.lineTo(X2, Y2);
+    }
+    ctx.stroke();
+    ctx.beginPath(); ctx.arc(rpx(looks), rpy(fwer), 5, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1; ctx.stroke();
+    el('ab-readout').innerHTML =
+      '<div><span class="k">baseline</span> ' + Guide.fmtPct(p1, 0) + ' → <span class="k">target</span> ' + Guide.fmtPct(Math.min(0.995, p1 + eff), 0) + ' (+' + (eff * 100).toFixed(1) + ' pts)</div>' +
+      '<div><span class="k">required</span> <span class="hi">' + Guide.fmtNum(nNow) + '</span> sessions per arm · ' + Guide.fmtNum(total) + ' total</div>' +
+      '<div><span class="k">time to significance</span> ' + days.toFixed(1) + ' days at ' + Guide.fmtNum(traffic) + ' sessions/day (50/50 split)</div>' +
+      '<div><span class="k">false positive at ' + looks + ' look' + (looks === 1 ? '' : 's') + '</span> <span class="' + (fwer > 0.1 ? 'bad' : 'hi') + '">' + Guide.fmtPct(fwer, 1) + '</span></div>' +
+      (fwer > 0.1 ? '<div class="bad">repeated looks push the error rate well past 5% — use a sequential test or fix the horizon</div>'
+                  : '<div class="k">one pre-registered look keeps the error rate at the nominal level</div>');
+  }
+  Guide.bindSliders([el('ab-base'), el('ab-effect'), el('ab-traffic'), el('ab-looks')], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — implicit-signal funnel and correlation with the offline eval
+  // ------------------------------------------------------------------
+  var setupC = Guide.setupCanvas(el('funnel-canvas'), 640, 360, drawC);
+  function dayData(offline) {
+    var r = AppSim.rng(17);
+    var days = [];
+    for (var i = 0; i < 20; i++) {
+      var offlineDay = Math.max(0.3, Math.min(0.99, offline + 0.02 * AppSim.gaussian(r)));
+      var edit = Math.max(0.02, Math.min(0.6, 0.62 - 0.55 * offlineDay + 0.03 * AppSim.gaussian(r)));
+      days.push({ offline: offlineDay, edit: edit });
+    }
+    return days;
+  }
+  function pearson(xs, ys) {
+    var n = xs.length, mx = 0, my = 0, i;
+    for (i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
+    mx /= n; my /= n;
+    var sxy = 0, sxx = 0, syy = 0;
+    for (i = 0; i < n; i++) {
+      var dx = xs[i] - mx, dy = ys[i] - my;
+      sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+    }
+    return sxy / Math.sqrt(Math.max(1e-12, sxx * syy));
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var offline = +el('funnel-offline').value;
+    var days = dayData(offline);
+    var meanEdit = days.reduce(function (a, d) { return a + d.edit; }, 0) / days.length;
+    var retry = 0.06;
+    var accept = Math.max(0.05, 1 - meanEdit - retry);
+    var sessions = 20000, answers = Math.round(sessions * 0.90);
+    var stages = [
+      { name: 'sessions', v: sessions, color: c.accent400 },
+      { name: 'answers shown', v: answers, color: c.accent400 },
+      { name: 'accepted as-is', v: Math.round(answers * accept), color: c.accent700 },
+      { name: 'edited then accepted', v: Math.round(answers * meanEdit), color: c.accent2 },
+      { name: 'retried / rephrased', v: Math.round(answers * retry), color: '#c9a227' }
+    ];
+    var maxV = sessions;
+    var barL = 150, barW = 400, top = 24, rowH = 28;
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('implicit signals, seed 17', 12, 14);
+    stages.forEach(function (s, i) {
+      var y = top + i * rowH;
+      ctx.fillStyle = c.divider; ctx.fillRect(barL, y, barW, 16);
+      ctx.fillStyle = s.color; ctx.fillRect(barL, y, barW * (s.v / maxV), 16);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(s.name, barL - 8, y + 13);
+      ctx.textAlign = 'left';
+      ctx.fillText(Guide.fmtNum(s.v), barL + barW * (s.v / maxV) + 6, y + 13);
+    });
+    // scatter: offline vs edit rate
+    var SX = 62, SY = 214, SW = 556, SH = 118;
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('per day · x = offline eval pass rate · y = observed edit rate', SX, SY - 8);
+    var xMin = 0.3, xMax = 0.99, yMin = 0, yMax = 0.6;
+    function spx(v) { return SX + SW * (v - xMin) / (xMax - xMin); }
+    function spy(v) { return SY + SH * (1 - (v - yMin) / (yMax - yMin)); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(SX, SY); ctx.lineTo(SX, SY + SH); ctx.lineTo(SX + SW, SY + SH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('0.30', SX, SY + SH + 12); ctx.fillText('0.65', SX + SW / 2, SY + SH + 12); ctx.fillText('0.99', SX + SW, SY + SH + 12);
+    ctx.textAlign = 'right';
+    ctx.fillText('0%', SX - 4, SY + SH); ctx.fillText('30%', SX - 4, spy(0.3) + 3); ctx.fillText('60%', SX - 4, SY + 3);
+    var xs = days.map(function (d) { return d.offline; });
+    var ys = days.map(function (d) { return d.edit; });
+    var r = pearson(xs, ys);
+    days.forEach(function (d) {
+      ctx.beginPath(); ctx.arc(spx(d.offline), spy(d.edit), 3.5, 0, 2 * Math.PI);
+      ctx.fillStyle = c.accent; ctx.globalAlpha = 0.6; ctx.fill(); ctx.globalAlpha = 1;
+    });
+    var mx = xs.reduce(function (a, b) { return a + b; }, 0) / xs.length;
+    var my = ys.reduce(function (a, b) { return a + b; }, 0) / ys.length;
+    var sxy = 0, sxx = 0;
+    days.forEach(function (d) { sxy += (d.offline - mx) * (d.edit - my); sxx += (d.offline - mx) * (d.offline - mx); });
+    var slope = sxy / Math.max(1e-12, sxx), intercept = my - slope * mx;
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(spx(xMin), spy(Math.max(yMin, Math.min(yMax, intercept + slope * xMin))));
+    ctx.lineTo(spx(xMax), spy(Math.max(yMin, Math.min(yMax, intercept + slope * xMax))));
+    ctx.stroke(); ctx.setLineDash([]);
+    el('funnel-readout').innerHTML =
+      '<div><span class="k">accept</span> ' + Guide.fmtPct(accept, 0) + ' · <span class="k">edit</span> <span class="hi">' + Guide.fmtPct(meanEdit, 1) + '</span> · <span class="k">retry</span> ' + Guide.fmtPct(retry, 0) + ' of answers</div>' +
+      '<div><span class="k">edit rate vs offline eval</span> Pearson r = <span class="hi">' + r.toFixed(2) + '</span></div>' +
+      (r < -0.5 ? '<div class="k">the proxy tracks the eval — the cheap behavioural signal is a usable online meter here</div>'
+                : '<div class="bad">the proxy is drifting from the eval — one of the two is measuring something else</div>');
+  }
+  Guide.bindSliders([el('funnel-offline')], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — unified dashboard with a Pareto frontier
+  // ------------------------------------------------------------------
+  var POINTS = [
+    { name: 'A', cost: 0.008, lat: 900, q: 0.62 },
+    { name: 'B', cost: 0.012, lat: 700, q: 0.68 },
+    { name: 'C', cost: 0.020, lat: 520, q: 0.74 },
+    { name: 'D', cost: 0.030, lat: 430, q: 0.79 },
+    { name: 'E', cost: 0.045, lat: 360, q: 0.83 },
+    { name: 'F', cost: 0.070, lat: 300, q: 0.86 },
+    { name: 'G', cost: 0.110, lat: 250, q: 0.88 },
+    { name: 'H', cost: 0.170, lat: 210, q: 0.90 },
+    { name: 'I', cost: 0.260, lat: 185, q: 0.915 },
+    { name: 'J', cost: 0.400, lat: 165, q: 0.925 },
+    { name: 'K', cost: 0.150, lat: 400, q: 0.82 },
+    { name: 'L', cost: 0.060, lat: 480, q: 0.78 }
+  ];
+  var setupD = Guide.setupCanvas(el('dash-canvas'), 640, 340, drawD);
+  function dominates(o, p) {
+    return o.cost <= p.cost && o.lat <= p.lat && o.q >= p.q &&
+      (o.cost < p.cost || o.lat < p.lat || o.q > p.q);
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var floor = +el('dash-floor').value;
+    var feasible = POINTS.filter(function (p) { return p.q >= floor; });
+    var frontier = feasible.filter(function (p) {
+      return !feasible.some(function (o) { return o !== p && dominates(o, p); });
+    }).slice().sort(function (a, b) { return a.cost - b.cost; });
+    var padL = 58, padR = 24, padT = 40, padB = 36;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var costMax = 0.45, latMin = 150, latMax = 950;
+    function px(v) { return padL + plotW * (v / costMax); }
+    function py(v) { return padT + plotH * (1 - (v - latMin) / (latMax - latMin)); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('cost per task (USD)', padL + plotW / 2, H - 6);
+    ctx.save(); ctx.translate(14, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('p95 latency (ms)', 0, 0); ctx.restore();
+    Guide.niceTicks(0, costMax, 5).forEach(function (v) {
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('$' + v.toFixed(2), px(v), padT + plotH + 12);
+    });
+    Guide.niceTicks(latMin, latMax, 5).forEach(function (v) {
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(v, padL - 4, py(v) + 3);
+    });
+    // frontier line
+    if (frontier.length > 1) {
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+      ctx.beginPath();
+      frontier.forEach(function (p, i) {
+        var X = px(p.cost), Y = py(p.lat);
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      });
+      ctx.stroke();
+    }
+    POINTS.forEach(function (p) {
+      var X = px(p.cost), Y = py(p.lat);
+      var rad = 4 + 11 * (p.q - 0.6) / 0.36;
+      var onFront = frontier.indexOf(p) >= 0;
+      var ok = p.q >= floor;
+      ctx.beginPath(); ctx.arc(X, Y, rad, 0, 2 * Math.PI);
+      if (!ok) { ctx.fillStyle = c.divider; ctx.fill(); }
+      else if (onFront) { ctx.fillStyle = c.accent700; ctx.fill(); }
+      else { ctx.fillStyle = c.accent400; ctx.globalAlpha = 0.35; ctx.fill(); ctx.globalAlpha = 1; }
+      ctx.strokeStyle = onFront ? c.text : c.divider; ctx.lineWidth = onFront ? 1.5 : 1; ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(p.name, X + rad + 2, Y + 3);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('bubble size = quality · dark = Pareto frontier · hollow = dominated · grey = below floor', padL, 22);
+    var best = frontier.length ? frontier[0] : null;
+    var bestQ = frontier.reduce(function (m, p) { return (!m || p.q > m.q) ? p : m; }, null);
+    el('dash-readout').innerHTML =
+      '<div><span class="k">quality floor</span> ' + Guide.fmtPct(floor, 0) + ' · <span class="k">feasible</span> ' + feasible.length + ' of ' + POINTS.length + ' points</div>' +
+      '<div><span class="k">Pareto frontier</span> <span class="hi">' + frontier.length + '</span> point' + (frontier.length === 1 ? '' : 's') + (frontier.length ? ': ' + frontier.map(function (p) { return p.name; }).join(' → ') : '') + '</div>' +
+      (best ? '<div><span class="k">cheapest feasible on the frontier</span> ' + best.name + ' · $' + best.cost.toFixed(3) + '/task · ' + best.lat + ' ms · q ' + best.q.toFixed(3) + '</div>' : '<div class="bad">no point clears the floor — the floor is the requirement, so the frontier is empty</div>') +
+      (bestQ ? '<div class="k">best quality on the frontier: ' + bestQ.name + ' at $' + bestQ.cost.toFixed(3) + '/task and ' + bestQ.lat + ' ms — the trade made visible</div>' : '');
+  }
+  Guide.bindSliders([el('dash-floor')], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — sets citations and the pricing used by demo A
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var d = data || FALLBACK;
+    if (el('obs-pricing-source')) el('obs-pricing-source').textContent = (d.pricing && d.pricing.source) || FALLBACK.pricing.source;
+    if (el('obs-evals-source')) el('obs-evals-source').textContent = (d.evals && d.evals.source) || FALLBACK.evals.source;
+    if (el('obs-cost-source')) el('obs-cost-source').textContent = (d.cost_latency && d.cost_latency.source) || FALLBACK.cost_latency.source;
+    if (d.pricing && d.pricing.items && d.pricing.items.length) {
+      var it = d.pricing.items.filter(function (x) { return x.model === 'GPT-4o'; })[0] || d.pricing.items[0];
+      PRICING = { inputPerM: it.inputPerMUSD, outputPerM: it.outputPerMUSD, cachedPerM: it.cachedInputPerMUSD };
+    }
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'observability-substrate',
+      kind: 'choice',
+      prompt: 'Why is observability the substrate of evaluation rather than a separate ops concern?',
+      options: [
+        { label: 'An eval is a query over recorded runs, so a run that was not traced cannot be evaluated.' },
+        { label: 'Because tracing is cheaper than running an offline eval set.' },
+        { label: 'Because traces replace the need for a labelled dataset.' },
+        { label: 'Because observability vendors also grade model outputs.' }
+      ],
+      explanation: 'An eval asks "what happened on runs that look like this". If the run was not recorded — spans, context, versions, outcomes — the question has no data to answer it. Evaluation consumes telemetry; it does not substitute for it.'
+    },
+    {
+      id: 'observability-attribution',
+      kind: 'choice',
+      prompt: 'Quality moved on the eval. Which two logged fields let you tell a prompt change from an index change?',
+      options: [
+        { label: 'The prompt version and the retrieved document ids (with the index revision).' },
+        { label: 'The token counts and the latency.' },
+        { label: 'The model name and the temperature.' },
+        { label: 'The request id and the user id.' }
+      ],
+      explanation: 'The prompt version pins the instructions; the retrieved ids and index revision pin the evidence. Without both, a moved score is unattributable: you cannot tell whether the model got worse, the instructions changed, or retrieval returned different chunks.'
+    },
+    {
+      id: 'observability-implicit',
+      kind: 'choice',
+      prompt: 'Which behavioural signal is the strongest evidence that an answer was wrong?',
+      options: [
+        { label: 'The user edits the answer before accepting it, or immediately retries and rephrases.' },
+        { label: 'The user copies the answer without editing it.' },
+        { label: 'The user accepts the answer and moves on.' },
+        { label: 'The answer used a small number of output tokens.' }
+      ],
+      explanation: 'Edits and retries are explicit corrections of the model output — the user is showing you exactly where it failed. A copy with no edit is a positive, and a silent accept is a weak positive. All are proxies, which is why they are correlated against the offline eval before being trusted.'
+    },
+    {
+      id: 'observability-sample-size',
+      kind: 'numeric',
+      prompt: 'Using the two-proportion formula with α = 0.05 (z = 1.96) and 80% power (z = 0.84), a baseline rate of 0.10 and an absolute effect of 0.02, how many sessions are needed per arm?',
+      answer: 3834,
+      unit: 'sessions per arm',
+      tolerance: 150,
+      explanation: 'n = (1.96 + 0.84)² × (0.10×0.90 + 0.12×0.88) / (0.02)² = 7.84 × 0.1956 / 0.0004 ≈ 3,834 sessions per arm — about 7,670 total, and four times that per arm to detect a 0.01 effect instead.'
+    },
+    {
+      id: 'observability-moat',
+      kind: 'choice',
+      prompt: 'What is the moat thesis of this part?',
+      options: [
+        { label: 'Evals, datasets and traces compound; prompts and scaffolds get copied.' },
+        { label: 'A bigger model is a durable advantage because it is expensive to train.' },
+        { label: 'Latency is the only metric users notice, so optimise it and quality follows.' },
+        { label: 'Prompt engineering is the defensible asset once it is tuned.' }
+      ],
+      explanation: 'A prompt or a scaffold is copyable the afternoon it ships. The labelled dataset, the trace corpus and the eval harness that turns a change into a decided bet compound with every shipped run, and they get harder for a competitor to match the longer you accumulate them.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

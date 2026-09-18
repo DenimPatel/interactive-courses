@@ -1,0 +1,350 @@
+---
+title: "LLM Training, Interactively — Part 1: What Even Is a Language Model?"
+description: "An interactive, step-by-step guide to how large language models are trained — starting from next-token prediction, n-gram order, and perplexity, using the fully-open OLMo model family as a running example."
+permalink: "/ai/llm-training/language-models/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 1 of 15</span>
+    <h1>LLM Training, Interactively</h1>
+    <p>Every chat assistant you've used — Claude, GPT, Gemini, Llama — went through the same broad pipeline: a base model learns language by predicting text, then it's shaped into an assistant, then it's aligned to be helpful and safe. Most labs won't show you the middle of that pipeline. This guide will, using <strong>OLMo</strong>, the model family from the Allen Institute for AI (Ai2) that publishes its dataset, its code, and hundreds of checkpoints from an actual training run — so every claim here points at something you can go inspect yourself.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="setup">
+    <div class="llmt-step-head"><span class="llmt-step-num">0</span><h2>Why OLMo, and what this series covers</h2></div>
+    <p class="llmt-eyebrow">Setup</p>
+    <p>Most "open" models today are really only <strong>open-weight</strong>: you get the final numbers, not how they got there. The exact web-crawl recipe, the filtering thresholds, the preference data, the reward model — those stay inside the lab. That's a problem if you actually want to understand training, not just call an API.</p>
+    <p><strong>OLMo</strong> (Ai2) is built differently. Ai2 releases the pretraining corpus (<strong>Dolma</strong>, a multi-trillion-token corpus, along with the exact curation code), checkpoints saved roughly every 1,000 training steps, full loss curves and hardware logs, and a tool called <strong>OlmoTrace</strong> that lets you trace a specific generated response back to the pretraining documents that most likely shaped it. We'll lean on OLMo throughout this series as the concrete, verifiable example behind each abstract idea.</p>
+    <div class="llmt-goal">💡 <span><b>The shape of the series:</b> Part 1 (this page) covers next-token prediction and perplexity. Part 2 covers tokenization and embeddings for real. Part 3 opens up the transformer block itself. Part 4 covers the pretraining <em>dataset</em>. Part 5 covers <em>pretraining</em> — the training loop. Part 6 covers scaling laws and training systems. Part 7 covers <em>supervised fine-tuning</em> and LoRA. Part 8 covers <em>alignment</em> — RLHF and DPO. Part 9 covers reasoning and RL with verifiable rewards. Part 10 covers evaluation. Part 11 covers inference and serving. Part 12 covers <em>guardrails</em> — safety and deployment.</span></div>
+    {% endraw %}<p>Prerequisites: comfort with vectors, matrices, probability, and basic calculus — the level of a first-year graduate course. We'll define every model-specific term as it comes up. See the <a href="{{ '/ai/llm-training/' | relative_url }}">series hub</a> for the full map, or the <a href="{{ '/ai/llm-training/glossary/' | relative_url }}">glossary</a> for any term out of order.</p>{% raw %}
+  </section>
+
+  <section class="llmt-step" id="what-is-lm">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>A language model is a probability distribution over the next word</h2></div>
+    <p class="llmt-eyebrow">Foundations</p>
+    <p>Strip away the transformer architecture, the GPUs, the trillions of tokens, and a language model is answering one narrow question, over and over: <em>given the text so far, what word (or token) is likely to come next?</em> Formally, it defines a conditional probability distribution</p>
+    <div class="llmt-math llmt-katex">$$P(x_t \mid x_1, x_2, \ldots, x_{t-1})$$</div>
+    <p>over its vocabulary, where <var>x<sub>t</sub></var> is the next token and <var>x<sub>1</sub>…x<sub>t-1</sub></var> is everything said before it. Chain that one-step prediction together — predict a token, append it, predict the next one — and you get a model that can generate whole passages. This is called <strong>autoregressive</strong> generation, and it's the objective every GPT-style model, including OLMo, is pretrained on.</p>
+    <p>Below is a genuine (if tiny) example: a bigram model — it predicts the next word using only the <em>previous</em> word — trained on a 110-word toy passage. Type a prompt ending in one of the passage's words (try <code>the</code>, <code>robot</code>, or <code>window</code>) and watch the actual learned distribution.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="s1-canvas" width="560" height="260"></canvas>
+        <p class="llmt-canvas-hint">Bars show P(next word | last word), estimated by counting the toy passage below.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field">
+          <label>Prompt</label>
+          <input type="text" id="s1-prompt" value="the robot read the">
+        </div>
+        <div class="llmt-readout" id="s1-readout"></div>
+        <p style="font-size:12px; opacity:0.65; margin-top:10px;">Toy passage: <em id="s1-corpus"></em></p>
+      </div>
+    </div>
+    <div class="llmt-goal">🎯 <b>Learning goal:</b> a language model doesn't "know" the next word — it estimates <em>how likely</em> each candidate is, given everything it's seen. A bigram model estimates this from one previous word; OLMo estimates it from up to thousands of previous tokens, using a transformer instead of a counting table — but the object being predicted is exactly the same shape.</div>
+  </section>
+
+  <section class="llmt-step" id="ngram-order">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>Why not just use a bigger counting table?</h2></div>
+    <p class="llmt-eyebrow">Motivating neural language models</p>
+    <p>The obvious fix for a bigram model's short memory is to condition on more previous words — a trigram, a 4-gram, and so on. Try it below: as <var>n</var> grows, generated text gets locally more coherent, because the model has more context to work with. But watch the coverage number — as <var>n</var> grows, the number of <var>n</var>-word sequences that actually appeared in this tiny passage collapses toward zero, and the model has nothing to fall back on.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <div class="llmt-field"><label>n-gram order n <span class="val" id="ng-n-val">2</span></label>
+          <input type="range" id="ng-n" min="1" max="4" step="1" value="2"></div>
+        <div class="llmt-btnrow"><button id="ng-generate" class="llmt-primary">Generate 15 words</button></div>
+        <div class="llmt-readout" id="ng-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>This is exactly why n-gram language models lost out to neural ones:</b> the number of possible n-word contexts grows exponentially with n (vocabulary size <var>V</var> raised to the <var>n</var>), so a counting table needs exponentially more data to have seen most of them even once — <strong>data sparsity</strong>. A neural network doesn't store a table entry per exact context; it learns a smooth function of the context's embedding, so it can generalize to word sequences it never saw verbatim during training. This — not just "more context" — is the real reason transformers replaced n-gram models rather than just scaling n up.</span></div>
+  </section>
+
+  <section class="llmt-step" id="perplexity">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Perplexity: turning loss into a number you can feel</h2></div>
+    <p class="llmt-eyebrow">Foundations</p>
+    <p>Training minimizes the average negative log-probability the model assigns to the actual next token — the <strong>cross-entropy loss</strong>. That number in nats or bits isn't very intuitive on its own, so it's usually reported as <strong>perplexity</strong>, its exponential:</p>
+    <div class="llmt-math llmt-katex">$$\text{loss} = -\frac{1}{T}\sum_{t=1}^{T} \log P(x_t \mid x_{<t}), \qquad \text{perplexity} = e^{\text{loss}}$$</div>
+    <p>Perplexity has a clean reading: it's the <em>effective number of equally-likely choices</em> the model was uncertain between, on average, at each step. A perplexity of 1 means the model was completely certain every time (loss = 0); a perplexity equal to the vocabulary size means it was no better than guessing uniformly at random.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-field"><label>Text to score against the bigram model (from Section 1's toy corpus)</label>
+        <input type="text" id="ppl-input" value="the robot read the text"></div>
+      <div class="llmt-readout" id="ppl-readout"></div>
+    </div>
+    <p class="llmt-canvas-hint">Try a sequence the bigram model has never seen the like of (e.g. <code>the window read the robot</code>) and watch perplexity spike — an ungrammatical or surprising continuation is, by definition, one the model assigned low probability to.</p>
+  </section>
+
+  <section class="llmt-step" id="tokens-embeddings-pointer">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Before prediction: tokens and embeddings</h2></div>
+    <p class="llmt-eyebrow">Foundations</p>
+    {% endraw %}<p>Models don't operate on raw characters or whole words — they operate on <strong>tokens</strong> from a fixed vocabulary, each looked up in a learned <strong>embedding table</strong> to become a vector. Both of those deserve real treatment rather than a paragraph, so <a href="{{ '/ai/llm-training/tokens/' | relative_url }}">Part 2</a> is entirely devoted to them: a byte-level BPE tokenizer we actually trained, and word embeddings we actually learned from co-occurrence statistics — not illustrative placeholders.</p>{% raw %}
+  </section>
+
+  <section class="llmt-step" id="generation">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>Putting it together: autoregressive generation</h2></div>
+    <p class="llmt-eyebrow">Foundations</p>
+    <p>Tokenize the prompt, look up embeddings, run them through the network to get a probability distribution over the next token, pick one, append it, and repeat. That loop — one forward pass per new token — is exactly how every response you've ever gotten from a chat model was produced (Part 11 covers the sampling choices — temperature, top-k, top-p — in full). Use the same bigram model from Step 1 to generate a few tokens yourself:</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <div class="llmt-field">
+          <label>Seed text</label>
+          <input type="text" id="s4-seed" value="the robot">
+        </div>
+        <div class="llmt-btnrow">
+          <button id="s4-step" class="llmt-primary">Generate next token ▸</button>
+          <button id="s4-reset">Reset</button>
+        </div>
+        <div class="llmt-readout" id="s4-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Notice:</b> a bigram model only remembers one word back, so it wanders and repeats quickly. Real transformer models condition on the <em>entire</em> preceding context (OLMo 2 supports contexts of several thousand tokens) via the attention mechanism covered in Part 3 — which is most of why they stay coherent, not a fundamentally different objective.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th><th>Where it fits</th></tr></thead>
+      <tbody>
+        <tr><td>Next-token distribution</td><td><code>P(x<sub>t</sub> | x&lt;<sub>t</sub>)</code>, a probability over the whole vocabulary</td><td>What the model outputs at every position</td></tr>
+        <tr><td>n-gram sparsity</td><td>Exact-context counting tables need exponentially more data as context grows</td><td>The reason neural LMs replaced n-gram models</td></tr>
+        <tr><td>Cross-entropy loss</td><td>Average negative log-probability of the true next token</td><td>What training actually minimizes</td></tr>
+        <tr><td>Perplexity</td><td><code>e^loss</code> — effective number of equally-likely choices</td><td>The human-readable form of the loss curve (Part 5)</td></tr>
+        <tr><td>Autoregressive generation</td><td>Predict → sample → append → repeat</td><td>How a distribution over one token becomes a whole response</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Vaswani et al., <a href="https://arxiv.org/abs/1706.03762">"Attention Is All You Need"</a> (2017) — the transformer architecture.</li>
+      <li>Jurafsky &amp; Martin, <a href="https://web.stanford.edu/~jurafsky/slp3/3.pdf">"Speech and Language Processing", Ch. 3</a> — n-gram language models and perplexity.</li>
+      <li>OLMo 2 Team (Ai2), <a href="https://arxiv.org/abs/2501.00656">"2 OLMo 2 Furious"</a> (2024) — the OLMo 2 model report.</li>
+      <li><a href="https://allenai.org/olmo">Ai2's OLMo project page</a> — models, data, and code.</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>Next: what tokens and embeddings actually are, built for real instead of illustrated.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/tokens/' | relative_url }}">Continue: tokenization &amp; embeddings →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+
+  var CORPUS = "the small robot rolled across the quiet lab and stopped by the window the window was open and the cold air moved the curtain the robot raised its arm and closed the window then the robot returned to the workbench where a dataset of text waited to be read the robot read the text one token at a time and learned to guess the next token after every word the small model inside the robot updated its numbers a little the more text it read the better its guesses became until one day the robot could finish a sentence someone else had started";
+
+  document.getElementById('s1-corpus').textContent = '"' + CORPUS + '"';
+
+  var words = CORPUS.split(/\s+/);
+  var bigram = {};
+  for (var i=0; i<words.length-1; i++){
+    var a = words[i], b = words[i+1];
+    if (!bigram[a]) bigram[a] = {};
+    bigram[a][b] = (bigram[a][b]||0) + 1;
+  }
+
+  function nextDist(lastWord){
+    var d = bigram[lastWord];
+    if (!d) return null;
+    var total = 0; for (var k in d) total += d[k];
+    var arr = Object.keys(d).map(function(w){ return {w:w, p:d[w]/total, c:d[w]}; });
+    arr.sort(function(x,y){ return y.p - x.p; });
+    return arr;
+  }
+  function bigramProb(a,b){
+    var d = bigram[a];
+    if (!d) return 1/1000; // unseen-context fallback probability, for a finite perplexity
+    var total = 0; for (var k in d) total += d[k];
+    return d[b] ? d[b]/total : 1/(1000*total);
+  }
+
+  function sampleFrom(dist, temperature){
+    temperature = temperature || 1.0;
+    var weights = dist.map(function(d){ return Math.pow(d.c, 1/temperature); });
+    var total = weights.reduce(function(a,b){return a+b;},0);
+    var r = Math.random()*total, acc = 0;
+    for (var i=0;i<dist.length;i++){ acc += weights[i]; if (r <= acc) return dist[i].w; }
+    return dist[dist.length-1].w;
+  }
+
+  // ---- Step 1: next-word distribution bar chart ----
+  (function(){
+    var canvas = document.getElementById('s1-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var input = document.getElementById('s1-prompt');
+    var readout = document.getElementById('s1-readout');
+
+    function draw(){
+      ctx.clearRect(0,0,W,H);
+      var text = input.value.trim();
+      var toks = text.length ? text.split(/\s+/) : [];
+      var last = toks.length ? toks[toks.length-1] : null;
+      var dist = last ? nextDist(last) : null;
+
+      ctx.font = '12px ' + (css_font());
+      if (!dist){
+        ctx.fillStyle = c.text;
+        ctx.fillText('No data for "' + (last||'') + '" — try a word from the toy passage (e.g. "the", "robot", "window").', 14, H/2);
+        readout.innerHTML = '<span class="k">last word:</span> ' + (last ? '"'+last+'"' : '(empty)') + ' — not seen in passage';
+        return;
+      }
+      dist = dist.slice(0, 8);
+      G.drawBars(ctx, W, H, dist.map(function(d,i){ return {label:d.w, value:d.p, valueLabel:(d.p*100).toFixed(0)+'%', color: i===0?c.accent:c.accent400}; }));
+
+      var readoutHtml = '<span class="k">last word:</span> "' + last + '"<br>';
+      readoutHtml += '<span class="k">top prediction:</span> <span class="hi">' + dist[0].w + '</span> (' + (dist[0].p*100).toFixed(0) + '%)<br>';
+      readoutHtml += '<span class="k">candidates seen after "' + last + '":</span> ' + dist.length;
+      readout.innerHTML = readoutHtml;
+    }
+    function css_font(){ return getComputedStyle(document.documentElement).getPropertyValue('--font-body') || 'sans-serif'; }
+    input.addEventListener('input', draw);
+    draw();
+  })();
+
+  // ---- Step 2: n-gram order slider ----
+  (function(){
+    var nSlider = document.getElementById('ng-n'), nVal = document.getElementById('ng-n-val');
+    var genBtn = document.getElementById('ng-generate');
+    var readout = document.getElementById('ng-readout');
+
+    function buildNgramModel(n){
+      var table = {};
+      var allContexts = {};
+      for (var i=0; i<=words.length-n; i++){
+        var ctxArr = words.slice(i, i+n-1);
+        var ctx = ctxArr.join(' ');
+        var next = words[i+n-1];
+        if (!table[ctx]) table[ctx] = {};
+        table[ctx][next] = (table[ctx][next]||0) + 1;
+        allContexts[ctx] = true;
+      }
+      return { table: table, possibleContexts: Object.keys(allContexts).length };
+    }
+
+    function render(){
+      var n = parseInt(nSlider.value,10);
+      nVal.textContent = n;
+      var model = buildNgramModel(n);
+      var vocabSize = Object.keys(words.reduce(function(acc,w){acc[w]=1;return acc;},{})).length;
+      var possibleNgrams = Math.pow(vocabSize, n-1);
+      var coverage = model.possibleContexts / possibleNgrams;
+      readout.innerHTML = '<span class="k">distinct (n-1)-word contexts seen:</span> ' + model.possibleContexts +
+        '<br><span class="k">possible (n-1)-word contexts (V^(n-1), V=' + vocabSize + '):</span> ' + possibleNgrams.toExponential(1) +
+        '<br><span class="k">coverage:</span> <span class="' + (coverage<0.01?'bad':'hi') + '">' + (coverage*100).toExponential(1) + '%</span>';
+      return model;
+    }
+    var currentModel = render();
+    genBtn.addEventListener('click', function(){
+      currentModel = render();
+      var n = parseInt(nSlider.value,10);
+      var seq = words.slice(0, n-1);
+      for (var step=0; step<15; step++){
+        var ctx = seq.slice(seq.length-(n-1)).join(' ');
+        var dist = currentModel.table[ctx];
+        if (!dist){ seq.push(words[Math.floor(Math.random()*words.length)]); continue; }
+        var keys = Object.keys(dist);
+        var total = keys.reduce(function(a,k){return a+dist[k];},0);
+        var r = Math.random()*total, acc=0, chosen=keys[0];
+        for (var i=0;i<keys.length;i++){ acc+=dist[keys[i]]; if (r<=acc){ chosen=keys[i]; break; } }
+        seq.push(chosen);
+      }
+      readout.innerHTML += '<br><span class="k">generated:</span> <span class="hi">' + seq.join(' ') + '</span>';
+    });
+    nSlider.addEventListener('input', function(){ currentModel = render(); });
+  })();
+
+  // ---- Step 3: perplexity ----
+  (function(){
+    var input = document.getElementById('ppl-input');
+    var readout = document.getElementById('ppl-readout');
+    function render(){
+      var toks = input.value.trim().split(/\s+/);
+      if (toks.length < 2){ readout.innerHTML = 'Type at least two words.'; return; }
+      var logProbs = [];
+      for (var i=1;i<toks.length;i++) logProbs.push(Math.log(bigramProb(toks[i-1], toks[i])));
+      var loss = -logProbs.reduce(function(a,b){return a+b;},0)/logProbs.length;
+      var ppl = Math.exp(loss);
+      readout.innerHTML = '<span class="k">tokens scored:</span> ' + toks.length +
+        '<br><span class="k">cross-entropy loss:</span> ' + loss.toFixed(3) + ' nats' +
+        '<br><span class="k">perplexity:</span> <span class="hi">' + ppl.toFixed(1) + '</span>' +
+        '<br><span style="opacity:0.6">≈ the model was, on average, choosing among about ' + ppl.toFixed(0) + ' equally-likely options at each step</span>';
+    }
+    input.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Step 5: generation loop ----
+  (function(){
+    var seedInput = document.getElementById('s4-seed');
+    var stepBtn = document.getElementById('s4-step');
+    var resetBtn = document.getElementById('s4-reset');
+    var readout = document.getElementById('s4-readout');
+    var current = seedInput.value;
+
+    function render(){
+      var toks = current.split(/\s+/);
+      var last = toks[toks.length-1];
+      var dist = nextDist(last);
+      readout.innerHTML = '<span class="k">generated so far:</span> <span class="hi">' + current + '</span><br>' +
+        (dist ? '<span class="k">next-token options:</span> ' + dist.slice(0,4).map(function(d){return d.w+' ('+(d.p*100).toFixed(0)+'%)';}).join(', ') : '<span class="k">no continuation known for "'+last+'"</span>');
+    }
+    stepBtn.addEventListener('click', function(){
+      var toks = current.split(/\s+/);
+      var last = toks[toks.length-1];
+      var dist = nextDist(last);
+      if (dist){ current += ' ' + sampleFrom(dist, 0.7); }
+      render();
+    });
+    resetBtn.addEventListener('click', function(){ current = seedInput.value; render(); });
+    seedInput.addEventListener('change', function(){ current = seedInput.value; render(); });
+    render();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

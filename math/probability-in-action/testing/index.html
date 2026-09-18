@@ -1,0 +1,566 @@
+---
+title: "Probability in Action, Interactively — Part 5: Hypothesis testing, and how it goes wrong"
+description: "Null against alternative, Type I and Type II error, power and effect size, the p-value under the null, and the multiplicity that turns a clean test into a p-hacking machine."
+permalink: "/math/probability-in-action/testing/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-axiom { display: flex; gap: 12px; align-items: baseline; margin: 10px 0; }
+  .g-axiom .tag {
+    font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+    color: var(--color-accent-800); background: var(--color-accent-100);
+    border-radius: var(--radius-sm); padding: 3px 8px; flex: 0 0 auto;
+  }
+  .g-verdict { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+  .g-verdict .cell {
+    flex: 1 1 180px; border: 1px solid var(--color-divider); border-radius: var(--radius-sm);
+    padding: 10px 12px; background: var(--color-neutral-100);
+  }
+  .g-verdict .cell b { display: block; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-accent-700); margin-bottom: 4px; }
+  .g-verdict .cell span { font-size: 13px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>Hypothesis testing, and how it goes wrong</h1>
+    <p>A test is a decision procedure with two ways to be wrong, and it is designed to control only one of them. You fix a rule, you look at the data, and you either reject a default story or fail to. The machinery is simple &mdash; one test statistic, two distributions, a threshold &mdash; but almost every statistical scandal in the sciences is a story about people who used the simple machinery while quietly doing something else: testing many hypotheses and reporting one, choosing the analysis after seeing the data, or reading a small p-value as a probability that the null is true. This part builds the test from its two error rates, then simulates exactly the ways it is abused, so you can recognize them in the wild.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Choosing between stories, with a known cost of being wrong</p>
+    <p>Suppose you run a new recommendation model against the old one and the new one wins on your holdout by a hair. Did you improve the system, or did you watch a coin land heads? The data are random, so both explanations are live, and no amount of staring at the number will separate them. A hypothesis test makes the choice explicit: name a default story, name the alternative you care about, pick a statistic that behaves differently under the two, and reject the default only when the statistic lands somewhere the default almost never produces.</p>
+    <p>The default story is the <strong>null hypothesis</strong> <var>H_0</var>, usually "no effect", "no difference", "the coin is fair". The alternative <var>H_1</var> is the world you hope to detect. The test is deliberately asymmetric. You assume <var>H_0</var> while you compute, you control how often you would wrongly reject it, and the alternative only enters when you ask how often the test succeeds. That asymmetry is the source of most of the confusion that follows, and it is not a bug &mdash; it is the design.</p>
+    <p>A concrete running example: a classifier that should be right one half the time if its features carry nothing. You collect <var>n</var> labelled examples and count correct predictions. Under the null the count is binomial with success probability <var>1/2</var>. If you observe far more correct than one half, you reject the null and claim the classifier learned something. If you observe near one half, you fail to reject &mdash; which is not the same as proving the classifier learned nothing, and the gap between those two statements is another recurring trap.</p>
+    <p>Four quantities govern everything. The chance of rejecting a true null is <var>$\alpha$</var>; the chance of failing to reject a false null is <var>$\beta$</var>; the chance of catching a real effect is the power <var>$1-\beta$</var>; and the quantity that decides whether there is any hope of catching it is the effect size. Fix <var>$\alpha$</var> small, spend more data, and power rises; ignore effect size, and you will design experiments that cannot possibly succeed while still producing publishable noise.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a p-value is a statement about the data given the null and never the reverse, why a single small p-value is weak evidence when you did not pre-register the test, and why running many tests and reporting the best one guarantees a discovery whether or not anything is there.</span></div>
+    <div class="g-toc">
+      <a href="#errors">2 · Null, alternative, α and β</a>
+      <a href="#power">3 · Power and effect size</a>
+      <a href="#pvalue">4 · The p-value, and what it is not</a>
+      <a href="#multiplicity">5 · Multiplicity and p-hacking</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="errors">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Null, alternative, α and β</h2></div>
+    <p class="g-eyebrow">One statistic, two distributions, two ways to be wrong</p>
+    <p>Standardise the running example. Let <var>$\bar X$</var> be the average score of your classifier over <var>n</var> independent examples, with a known spread <var>$\sigma$</var> per example. The test statistic is the standardised distance from the null's idea of "no skill", <var>$Z=(\bar X-\mu_0)/(\sigma/\sqrt n)$</var>. Under <var>H_0</var> the central limit theorem makes <var>Z</var> approximately standard normal. Under a specific alternative with effect <var>$\delta=(\mu_1-\mu_0)/\sigma$</var>, the same statistic is normal with mean <var>$\delta\sqrt n$</var> and variance one. The whole test is a picture of two bell curves.</p>
+    <div class="g-math g-katex">$$Z=\frac{\bar X-\mu_0}{\sigma/\sqrt n}\;\sim\;N(0,1)\ \text{ under }H_0,\qquad Z\;\sim\;N\!\left(\delta\sqrt n,\,1\right)\ \text{ under }H_1.$$</div>
+    <p>Choose a critical value <var>c</var> and the rule "reject <var>H_0</var> when <var>$Z\ge c$</var>". Everything follows. The area of the <var>H_0</var> curve to the right of <var>c</var> is the false-positive rate <var>$\alpha$</var>, the size of the test. The area of the <var>H_1</var> curve to the left of <var>c</var> is <var>$\beta$</var>, the false-negative rate. Slide <var>$\alpha$</var> down and the critical value moves right: fewer false alarms, but the shaded slab of missed effects grows if the alternative has not moved.</p>
+    <div class="g-math g-katex">$$\alpha=P(\text{reject } H_0\mid H_0),\qquad \beta=P(\text{fail to reject } H_0\mid H_1),\qquad \text{power}=1-\beta.$$</div>
+    <div class="g-verdict">
+      <div class="cell"><b>Type I</b><span>Reject a true null. Rate <var>$\alpha$</var>; you choose it, conventionally 0.05. This is the only error the p-value controls.</span></div>
+      <div class="cell"><b>Type II</b><span>Fail to reject a false null. Rate <var>$\beta$</var>; you inherit it from the effect size, the sample size and <var>$\alpha$</var>.</span></div>
+    </div>
+    <p>The canvas makes the trade visible. The two bells are the sampling distributions of <var>Z</var>; the vertical line is the critical value; the pink tail on the right belongs to <var>H_0</var> and is <var>$\alpha$</var>; the blue slab on the left belongs to <var>H_1</var> and is <var>$\beta$</var>. Drag the handle on the blue peak to change the effect size, and use the sliders for the sample size and <var>$\alpha$</var>. When the blue bell slides right, <var>$\beta$</var> shrinks and power climbs. When it overlaps the pink bell, no threshold can separate them. That overlap, not the arithmetic, is what a weak study looks like.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="na-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Two sampling distributions of <var>Z</var>. Pink = the <var>$\alpha$</var> tail of <var>H_0</var> beyond the critical value; blue = the <var>$\beta$</var> slab of <var>H_1</var> below it. Drag the handle on the blue peak to set the effect size.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Effect size <span class="val">0.5</span></label><input type="range" id="na-effect" min="0" max="1" step="0.01" value="0.5"></div>
+        <div class="g-field"><label>Sample size n <span class="val">25</span></label><input type="range" id="na-n" min="4" max="400" step="4" value="25"></div>
+        <div class="g-field"><label>Significance α <span class="val">0.05</span></label><input type="range" id="na-alpha" min="0.01" max="0.2" step="0.01" value="0.05"></div>
+        <div class="g-readout" id="na-readout"></div>
+      </div>
+    </div>
+    <p>Two details the picture clarifies. First, the critical value depends only on <var>$\alpha$</var>, not on the alternative: the test is specified before you see the data, and that is what makes <var>$\alpha$</var> a rate rather than a description. Second, the distance between the curve centres is <var>$\delta\sqrt n$</var>, the <strong>noncentrality</strong>. Quadrupling the sample size doubles that distance, which is why data buys power only as its square root, and why an effect of size zero can never be detected no matter how long you run.</p>
+  </section>
+
+  <section class="g-step" id="power">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Power and effect size</h2></div>
+    <p class="g-eyebrow">The probability that the experiment works</p>
+    <p>Power is the chance the test rejects when there really is something to find. It is the single most informative number about a study, and it is almost never reported. An underpowered study is not merely unlucky: it fails to detect real effects most of the time, and the effects it does detect are, by a selection effect, systematically larger than the truth. Among experiments that barely clear the threshold, the only way to clear it with random noise is for the noise to push upward, so published estimates are inflated. This is the <strong>winner's curse</strong>, and it is the same mechanism that makes a backtest look brilliant until it is run forward.</p>
+    <p>For the one-sided normal test you can invert the picture and solve for the sample size that reaches a target power. If <var>$z_{1-\alpha}$</var> and <var>$z_{\text{power}}$</var> are the corresponding normal quantiles, the requirement <var>$\delta\sqrt n\ge z_{1-\alpha}+z_{\text{power}}$</var> gives a compact formula. It is the design equation: tell it the smallest effect you care about and the power you want, and it tells you how much data you need before you have any right to run the test.</p>
+    <div class="g-math g-katex">$$n\;\approx\;\left(\frac{z_{1-\alpha}+z_{\text{power}}}{\delta}\right)^{2}.$$</div>
+    <p>The formula is brutal in the way it punishes small effects. Halving <var>$\delta$</var> quadruples <var>n</var>. With the conventional <var>$\alpha=0.05$</var> and 80% power, the parenthetical factor is about 2.49, so a weak effect of <var>$\delta=0.1$</var> needs <var>$n\approx 620$</var> per group, while a strong <var>$\delta=0.8$</var> needs only about ten. Most of the replications that fail in the behavioural sciences are replications of studies that were never powered for the effect they claimed.</p>
+    <p>There is a second lesson in the curve: power is not a property of the test alone. Change the effect size and the same <var>n</var> moves from hopeless to certain. That is why reporting a p-value without an effect size and an interval is incomplete &mdash; a tiny p-value from a huge sample can correspond to an effect too small to matter, and the <a href="{{ '/math/probability-in-action/intervals/' | relative_url }}">confidence-interval part</a> is the honest companion to any test. Drag the effect-size slider and watch the whole power curve shift; the vertical line marks the sample size that reaches the 80% target.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pow-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Power of a one-sided test at <var>$\alpha=0.05$</var> as a function of <var>n</var> for the effect size you choose. The dashed line is the 80% target; the vertical line is the <var>n</var> that reaches it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Effect size δ <span class="val">0.5</span></label><input type="range" id="pow-delta" min="0.1" max="1" step="0.05" value="0.5"></div>
+        <div class="g-readout" id="pow-readout"></div>
+      </div>
+    </div>
+    <p>The curve is the design sledgehammer, but note what it assumes: a known <var>$\sigma$</var>, a one-sided alternative, one test. Real analyses choose among several endpoints, look at the data midway, or drop a group that is not behaving. Each of those choices quietly changes the null distribution of the statistic, and the nominal <var>$\alpha$</var> stops meaning what it says. That is the subject of the last two sections.</p>
+  </section>
+
+  <section class="g-step" id="pvalue">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The p-value, and what it is not</h2></div>
+    <p class="g-eyebrow">A tail area, not a posterior probability</p>
+    <p>The p-value is the chance of seeing a statistic at least as extreme as the one you observed, assuming the null is exactly true: <var>$p=P(T\ge t_{\text{obs}}\mid H_0)$</var>. It is a statement about the data given the null. It is emphatically not the probability that the null is true given the data, which is the quantity everyone wants and which requires a prior. The two are related only through Bayes' rule, and when the prior on a real effect is small &mdash; say most tested genes do nothing &mdash; a p-value of 0.01 can coexist with a posterior probability of the null above one half.</p>
+    <div class="g-math g-katex">$$p=P(T\ge t_{\text{obs}}\mid H_0),\qquad \text{not}\quad P(H_0\mid \text{data}).$$</div>
+    <p>The clean fact that exposes the misunderstanding is the distribution of the p-value itself. When the null is true and the test is valid, the p-value is uniformly distributed on <var>[0,1]</var>. Every value is equally likely, including 0.04. So under a true null, five percent of experiments will produce <var>p<0.05</var>, one percent will produce <var>p<0.01</var>, and a single "significant" result is exactly what the null predicts at the advertised rate. A small p-value is not evidence that something is there; it is evidence that the data are surprising under a hypothesis you already doubted.</p>
+    <p>When the null is false, the p-value distribution shifts toward zero, and the size of the shift measures power. With a large effect and plenty of data, p-values pile up near zero and a single experiment is convincing. With a small effect and little data, the distribution barely tilts and most experiments produce p-values indistinguishable from uniform. The simulation below draws thousands of idealized experiments and histograms their p-values. Under <var>H_0</var> the bars are flat. Under <var>H_1</var> they lean left. Toggle between the two and watch the lean grow with the effect size.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pv-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Histogram of p-values from thousands of simulated one-sided z-tests. Flat under <var>H_0</var>; piled toward zero under <var>H_1</var>. The dashed line is what a uniform distribution would give.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="pv-h0" class="active">Under H₀</button>
+          <button type="button" id="pv-h1">Under H₁</button>
+          <button type="button" id="pv-reseed">New run</button>
+        </div>
+        <div class="g-field"><label>Sample size n <span class="val">20</span></label><input type="range" id="pv-n" min="4" max="120" step="4" value="20"></div>
+        <div class="g-field"><label>Effect size δ (H₁) <span class="val">0.4</span></label><input type="range" id="pv-delta" min="0" max="1" step="0.05" value="0.4"></div>
+        <div class="g-readout" id="pv-readout"></div>
+      </div>
+    </div>
+    <p>Two consequences follow immediately. First, a p-value cannot be compared across studies with different sample sizes or different models; it is not an effect size, and the same physical effect produces smaller p-values from larger samples. Second, the logic of "reject or not" throws away the magnitude. Reporting <var>p=0.049</var> as a discovery and <var>p=0.051</var> as a failure is a ritual, not an inference; the two experiments carry almost identical information. What a test gives you is a calibrated false-alarm rate under a specified null, and that is all it gives you.</p>
+  </section>
+
+  <section class="g-step" id="multiplicity">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Multiplicity and p-hacking</h2></div>
+    <p class="g-eyebrow">Why the best of many tests is always significant</p>
+    <p>The false-alarm rate <var>$\alpha$</var> is a promise about one pre-specified test. Run several tests and the promise lapses. If you test <var>m</var> independent true nulls, each at level <var>$\alpha$</var>, the chance that at least one comes back significant is <var>$1-(1-\alpha)^m$</var>. At <var>$\alpha=0.05$</var> that probability passes one half by <var>m=14</var>, reaches 64% at twenty tests, and approaches one as <var>m</var> grows. The expected number of false positives is exactly <var>$m\alpha$</var>, so twenty null tests buy you one spurious discovery on average, free of charge.</p>
+    <div class="g-math g-katex">$$P(\text{at least one false positive})=1-(1-\alpha)^m,\qquad \text{Bonferroni: }\alpha_{\text{per test}}=\frac{\alpha}{m}.$$</div>
+    <p>The fix is to move the goalposts for each individual test. The <strong>Bonferroni</strong> correction tests each hypothesis at <var>$\alpha/m$</var>; by the union bound the chance of any false positive across the family is then at most <var>$\alpha$</var>. It is conservative when the tests are positively correlated, which they usually are, but it never fails to control the <strong>family-wise error rate</strong>. The <strong>&Scaron;id&aacute;k</strong> correction, testing each at <var>$1-(1-\alpha)^{1/m}$</var>, is exact for independent tests and slightly less conservative; both answer the same question, "what is my chance of at least one false claim across the whole family?"</p>
+    <p>P-hacking is multiplicity performed without acknowledging it. If you try several model specifications and report the one that cleared the threshold, you have run the family and hidden the losers. If you add data points until significance and stop, you have given the test many chances to fire. If you choose the endpoint after seeing the data, you have purchased a tail area with degrees of freedom the null distribution never knew about. None of this requires dishonesty; the garden of forking paths is wide, and every fork is a test that nobody wrote down. The remedy is pre-specification: decide the test, the endpoint and the stopping rule before the data arrive, or disclose the family and correct for it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mc-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Family-wise error rate against the number of null tests <var>m</var>. The rising curve is uncorrected; the Bonferroni and &Scaron;id&aacute;k curves are pinned at <var>$\alpha=0.05$</var>; the dots are a simulation of many families.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Tests in the family m <span class="val">50</span></label><input type="range" id="mc-m" min="1" max="200" step="1" value="50"></div>
+        <div class="g-field"><label>Family level α <span class="val">0.05</span></label><input type="range" id="mc-alpha" min="0.01" max="0.2" step="0.01" value="0.05"></div>
+        <div class="g-btnrow"><button type="button" id="mc-reseed">New simulation</button></div>
+        <div class="g-readout" id="mc-readout"></div>
+      </div>
+    </div>
+    <p>Look at the simulated dots against the rising curve: the theory is not pessimistic, it is exact. Then look at the two flat lines. Bonferroni and &Scaron;id&aacute;k control the family-wise error at <var>$\alpha$</var> no matter how large the family grows, at the cost of making each individual test harder to pass. There is an unavoidable exchange rate here. If you want the freedom to search, you must pay for it either in stricter thresholds, in a held-out confirmation set, or in a prior that shrinks small effects toward zero. The one thing you cannot do is run the family and report the winner as if it were the only test.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The test is everywhere data are compared</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / benchmarks</div>
+        <h3 style="margin:6px 0;">Leaderboards are families of tests</h3>
+        <p style="margin-bottom:0;">Comparing many models on many tasks is a multiplicity problem with dozens of correlated hypotheses. A single best-on-the-board result is the maximum of a noisy family, so <a href="{{ 'https://denimpatel.github.io/AI/ai/benchmarks/' | relative_url }}">benchmark</a> claims need confidence intervals and corrections, not just a winning score.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / evaluation</div>
+        <h3 style="margin:6px 0;">Significance in model evaluation</h3>
+        <p style="margin-bottom:0;">A/B tests and evaluation suites decide whether an update ships, and they run at scale. Bootstrapped intervals, paired tests and multiplicity control are the difference between a real gain and a lucky slice of <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation</a> noise.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Tests and intervals are duals</h3>
+        <p style="margin-bottom:0;">Rejecting the null at level <var>$\alpha$</var> is the same as the <var>$1-\alpha$</var> confidence interval excluding the null value. That duality is built in <a href="{{ '/math/probability-in-action/intervals/' | relative_url }}">Confidence vs credible</a>, and it is why an interval always tells you more than a binary verdict.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Selecting the best model is a test</h3>
+        <p style="margin-bottom:0;">Keeping whichever configuration scored best on a validation set is a selection over a family, and the winner's curse inflates its apparent accuracy. Robust pipelines account for this, much as <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization</a> accounts for noise in the objective it minimizes.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Null hypothesis</td><td><var>H_0</var></td><td>The default: no effect, no difference. Assumed while you compute.</td></tr>
+        <tr><td>Alternative</td><td><var>H_1</var></td><td>The effect you hope to detect; sets the power, not the threshold.</td></tr>
+        <tr><td>Type I error</td><td><var>$\alpha=P(\text{reject}\mid H_0)$</var></td><td>False alarm rate. You choose it; conventionally 0.05.</td></tr>
+        <tr><td>Type II error</td><td><var>$\beta=P(\text{fail to reject}\mid H_1)$</var></td><td>Missed effect rate. Inherited from data and effect size.</td></tr>
+        <tr><td>Power</td><td><var>$1-\beta$</var></td><td>Chance the experiment succeeds when the effect is real.</td></tr>
+        <tr><td>Noncentrality</td><td><var>$\delta\sqrt n$</var></td><td>Distance between the two distributions; grows like <var>$\sqrt n$</var>.</td></tr>
+        <tr><td>p-value</td><td><var>$p=P(T\ge t_{\text{obs}}\mid H_0)$</var></td><td>A tail area under the null, not <var>$P(H_0\mid\text{data})$</var>.</td></tr>
+        <tr><td>p under <var>H_0</var></td><td>uniform on <var>[0,1]</var></td><td>Every value equally likely; 5% land below 0.05 by construction.</td></tr>
+        <tr><td>Sample size</td><td><var>$n\approx((z_{1-\alpha}+z_{\text{power}})/\delta)^2$</var></td><td>Design equation: small effects cost quadratically more data.</td></tr>
+        <tr><td>Family-wise error</td><td><var>$1-(1-\alpha)^m$</var></td><td>Chance of at least one false positive across <var>m</var> null tests.</td></tr>
+        <tr><td>Bonferroni</td><td><var>$\alpha/m$</var></td><td>Per-test threshold that caps family-wise error at <var>$\alpha$</var>.</td></tr>
+        <tr><td>&Scaron;id&aacute;k</td><td><var>$1-(1-\alpha)^{1/m}$</var></td><td>Exact per-test threshold for independent tests; slightly looser.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Ronald A. Fisher, <em>Statistical Methods for Research Workers</em>, 1925 &mdash; where the p-value and the notion of a significance level were introduced.</li>
+      <li>Jerzy Neyman and Egon Pearson, "On the Problem of the Most Efficient Tests of Statistical Hypotheses", 1933 &mdash; the two-error framework, power and the alternative.</li>
+      <li>Jacob Cohen, <em>Statistical Power Analysis for the Behavioral Sciences</em>, 1988 &mdash; effect sizes and the design equation in practice.</li>
+      <li>Andrew Gelman and Eric Loken, <a href="https://doi.org/10.1515/9783110489753-012">"The Statistical Crisis in Science"</a>, 2014 &mdash; the garden of forking paths and why p-hacking needs no fraud.</li>
+      <li>Ronald L. Wasserstein and Nicole A. Lazar, <a href="https://doi.org/10.1080/00031305.2016.1154108">"The ASA Statement on p-Values"</a>, 2016 &mdash; the six things a p-value is not, written by the professional society.</li>
+      <li>Bradley Efron and Trevor Hastie, <em>Computer Age Statistical Inference</em>, chapters 3 and 4 &mdash; testing and false discovery, with the same simulations as this part.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}One dataset, no formula: resample it with replacement and grow a sampling distribution from the data itself.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var ND = Prob.dist.normal(0, 1);
+
+  function el(id) { return document.getElementById(id); }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function fmt(x, d) { d = d == null ? 3 : d; return x.toFixed(d); }
+  function zq(a) { return ND.quantile(1 - a); }
+  function setVal(id, text) {
+    var s = el(id);
+    if (s && s.parentElement) { var v = s.parentElement.querySelector('.val'); if (v) v.textContent = text; }
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — null vs alternative with a draggable effect size
+  // ------------------------------------------------------------------
+  var naState = { delta: 0.5, n: 25, alpha: 0.05 };
+  var naPlot = null, naHandles = null;
+
+  function naSpecs() {
+    var nc = naState.delta * Math.sqrt(naState.n);
+    var h1 = Prob.dist.normal(nc, 1);
+    return [{ id: 'effect', x: nc, y: h1.pdf(nc), r: 8, color: c.accent, label: 'drag effect size' }];
+  }
+
+  function naDraw() {
+    if (!naPlot) return;
+    var pl = naPlot;
+    var nc = naState.delta * Math.sqrt(naState.n);
+    var crit = zq(naState.alpha);
+    var h1 = Prob.dist.normal(nc, 1);
+    pl.xRange[0] = -4;
+    pl.xRange[1] = Math.max(4.5, nc + 4);
+    pl.yRange[0] = 0;
+    pl.yRange[1] = 0.46;
+    pl.clear();
+    pl.grid({ step: 1 });
+    pl.area(function (x) { return ND.pdf(x); }, crit, pl.xRange[1], { color: 'rgba(214,0,108,0.24)', label: 'α / Type I' });
+    pl.area(function (x) { return h1.pdf(x); }, pl.xRange[0], Math.min(crit, pl.xRange[1]), { color: 'rgba(43,95,255,0.24)', label: 'β / Type II' });
+    pl.curve(function (x) { return ND.pdf(x); }, { color: c.accent2, width: 2.2, label: 'H₀ ~ N(0,1)' });
+    pl.curve(function (x) { return h1.pdf(x); }, { color: c.accent, width: 2.2, label: 'H₁ ~ N(nc,1)' });
+    pl.vline(crit, { color: '#555555', dash: [5, 4], labelText: 'critical value c' });
+    pl.axes({ step: 1, xLabel: 'test statistic Z', yLabel: 'density' });
+    pl.legend();
+    if (naHandles) naHandles.draw();
+    var beta = h1.cdf(crit);
+    var power = 1 - beta;
+    el('na-readout').innerHTML =
+      '<div><span class="k">effect size δ</span> <span class="hi">' + fmt(naState.delta, 2) + '</span></div>' +
+      '<div><span class="k">sample size n</span> ' + naState.n + '</div>' +
+      '<div><span class="k">noncentrality δ√n</span> ' + fmt(nc, 3) + '</div>' +
+      '<div><span class="k">critical value c</span> ' + fmt(crit, 3) + '</div>' +
+      '<div><span class="k">α / Type I</span> ' + fmt(naState.alpha, 3) + '</div>' +
+      '<div><span class="k">β / Type II</span> ' + fmt(beta, 3) + '</div>' +
+      '<div><span class="k">power 1 − β</span> <span class="hi">' + fmt(power, 3) + '</span></div>' +
+      '<div style="margin-top:6px;">Drag the blue peak, or slide n and α. Power rises with the noncentrality δ√n.</div>';
+  }
+
+  naPlot = Prob.plot(el('na-canvas'), {
+    W: 640, H: 380, xRange: [-4, 8], yRange: [0, 0.46], onResize: naDraw
+  });
+  naHandles = naPlot.handles(naSpecs, function (id, x) {
+    if (id !== 'effect') return;
+    naState.delta = clamp(x / Math.sqrt(naState.n), 0, 1);
+    el('na-effect').value = naState.delta.toFixed(2);
+    setVal('na-effect', naState.delta.toFixed(2));
+    naDraw();
+  }, {});
+
+  Guide.bindSliders([el('na-effect')], function (s) { naState.delta = parseFloat(s.value); naDraw(); });
+  Guide.bindSliders([el('na-n')], function (s) { naState.n = parseInt(s.value, 10); naDraw(); });
+  Guide.bindSliders([el('na-alpha')], function (s) { naState.alpha = parseFloat(s.value); naDraw(); });
+  naDraw();
+
+  // ------------------------------------------------------------------
+  // Demo B — power vs sample size for a chosen effect size
+  // ------------------------------------------------------------------
+  var powState = { delta: 0.5, alpha: 0.05 };
+  var powPlot = null;
+
+  function powAt(delta, n, alpha) {
+    var nc = delta * Math.sqrt(n);
+    return 1 - ND.cdf(zq(alpha) - nc);
+  }
+
+  function powDraw() {
+    if (!powPlot) return;
+    var pl = powPlot;
+    var d = powState.delta, a = powState.alpha;
+    var n80 = Math.pow((zq(a) + ND.quantile(0.8)) / d, 2);
+    pl.xRange[0] = 0;
+    pl.xRange[1] = 400;
+    pl.yRange[0] = 0;
+    pl.yRange[1] = 1.02;
+    pl.clear();
+    pl.grid({ step: 100 });
+    pl.curve(function (n) { return powAt(d, n, a); }, { color: c.accent, width: 2.4, from: 1, to: 400, samples: 240, label: 'power, δ = ' + d.toFixed(2) });
+    pl.hline(0.8, { color: c.accent2, dash: [6, 4], labelText: '80% target' });
+    if (n80 <= 400) pl.vline(n80, { color: 'rgba(32,30,29,0.5)', dash: [4, 4], labelText: 'n ≈ ' + Math.ceil(n80) });
+    pl.axes({ step: 100, xLabel: 'sample size n', yLabel: 'power' });
+    pl.legend();
+    el('pow-readout').innerHTML =
+      '<div><span class="k">effect size δ</span> <span class="hi">' + d.toFixed(2) + '</span></div>' +
+      '<div><span class="k">n for 80% power</span> <span class="hi">' + Math.ceil(n80) + '</span></div>' +
+      '<div><span class="k">power at n = 100</span> ' + fmt(powAt(d, 100, a), 3) + '</div>' +
+      '<div><span class="k">power at n = 400</span> ' + fmt(powAt(d, 400, a), 3) + '</div>' +
+      '<div style="margin-top:6px;">Halving δ quadruples the data needed. Small effects are expensive, not impossible.</div>';
+  }
+
+  powPlot = Prob.plot(el('pow-canvas'), {
+    W: 640, H: 340, xRange: [0, 400], yRange: [0, 1], onResize: powDraw
+  });
+  Guide.bindSliders([el('pow-delta')], function (s) { powState.delta = parseFloat(s.value); powDraw(); });
+  powDraw();
+
+  // ------------------------------------------------------------------
+  // Demo C — the p-value distribution under H0 and H1
+  // ------------------------------------------------------------------
+  var pvState = { m: 3000, n: 20, delta: 0.4, mode: 0, seed: 20260914, pvals: [] };
+  var pvPlot = null;
+
+  function pvRegenerate() {
+    var r = Prob.rng(pvState.seed);
+    var nc = pvState.mode === 1 ? pvState.delta * Math.sqrt(pvState.n) : 0;
+    var out = new Array(pvState.m);
+    for (var i = 0; i < pvState.m; i++) {
+      var z = nc + r.normal(0, 1);
+      out[i] = 1 - ND.cdf(z);
+    }
+    pvState.pvals = out;
+  }
+
+  function pvDraw() {
+    if (!pvPlot) return;
+    var pl = pvPlot;
+    var pv = pvState.pvals;
+    var h = Prob.hist(pv, { bins: 20, range: [0, 1] });
+    var m = pvState.m, i, maxFrac = 0, scaled = [];
+    for (i = 0; i < h.bins.length; i++) {
+      var frac = h.bins[i].count / m;
+      if (frac > maxFrac) maxFrac = frac;
+      scaled.push({ x0: h.bins[i].x0, x1: h.bins[i].x1, y: frac });
+    }
+    pl.xRange[0] = 0;
+    pl.xRange[1] = 1;
+    pl.yRange[0] = 0;
+    pl.yRange[1] = Math.max(0.1, Math.min(1, maxFrac * 1.15));
+    pl.clear();
+    pl.grid({ step: 0.1 });
+    pl.bars(scaled, { color: 'rgba(43,95,255,0.55)' });
+    pl.hline(1 / 20, { color: c.accent2, dash: [6, 4], labelText: 'uniform expectation' });
+    pl.vline(0.05, { color: 'rgba(214,0,108,0.7)', dash: [4, 4], labelText: 'p = 0.05' });
+    pl.axes({ step: 0.1, xLabel: 'p-value', yLabel: 'fraction per bin' });
+    var below = 0, sum = 0;
+    for (i = 0; i < pv.length; i++) { if (pv[i] < 0.05) below++; sum += pv[i]; }
+    el('pv-readout').innerHTML =
+      '<div><span class="k">mode</span> <span class="hi">' + (pvState.mode === 1 ? 'H₁, δ = ' + pvState.delta.toFixed(2) : 'H₀ true') + '</span></div>' +
+      '<div><span class="k">experiments simulated</span> ' + pvState.m + '</div>' +
+      '<div><span class="k">fraction p &lt; 0.05</span> <span class="hi">' + fmt(below / pv.length, 3) + '</span></div>' +
+      '<div><span class="k">mean p-value</span> ' + fmt(sum / pv.length, 3) + '</div>' +
+      '<div style="margin-top:6px;">Under H₀ every fraction is its own p-value, so 5% cross below 0.05 no matter which experiment you ran.</div>';
+  }
+
+  pvPlot = Prob.plot(el('pv-canvas'), {
+    W: 640, H: 360, xRange: [0, 1], yRange: [0, 1], onResize: pvDraw
+  });
+
+  function pvMode(mode) {
+    pvState.mode = mode;
+    el('pv-h0').className = mode === 0 ? 'active' : '';
+    el('pv-h1').className = mode === 1 ? 'active' : '';
+    pvRegenerate();
+    pvDraw();
+  }
+  el('pv-h0').addEventListener('click', function () { pvMode(0); });
+  el('pv-h1').addEventListener('click', function () { pvMode(1); });
+  el('pv-reseed').addEventListener('click', function () {
+    pvState.seed = (pvState.seed * 1103515245 + 12345) % 2147483647;
+    pvRegenerate();
+    pvDraw();
+  });
+  Guide.bindSliders([el('pv-n')], function (s) { pvState.n = parseInt(s.value, 10); pvRegenerate(); pvDraw(); });
+  Guide.bindSliders([el('pv-delta')], function (s) { pvState.delta = parseFloat(s.value); pvRegenerate(); pvDraw(); });
+  pvRegenerate();
+  pvDraw();
+
+  // ------------------------------------------------------------------
+  // Demo D — multiplicity: family-wise error and corrections
+  // ------------------------------------------------------------------
+  var mcState = { m: 50, alpha: 0.05, seed: 20260914, mMax: 200, R: 600, minIdx: null };
+  var mcPlot = null;
+
+  function mcRecompute() {
+    var r = Prob.rng(mcState.seed);
+    var a = mcState.alpha;
+    var R = mcState.R, mMax = mcState.mMax;
+    var minIdx = new Array(R);
+    for (var f = 0; f < R; f++) {
+      var idx = Infinity;
+      for (var k = 1; k <= mMax; k++) {
+        if (r.uniform() < a && idx === Infinity) idx = k;
+      }
+      minIdx[f] = idx;
+    }
+    mcState.minIdx = minIdx;
+  }
+
+  function mcEmpirical(k) {
+    var idx = mcState.minIdx, hit = 0;
+    for (var f = 0; f < idx.length; f++) { if (idx[f] <= k) hit++; }
+    return hit / idx.length;
+  }
+
+  function fweUncorrected(m, a) { return 1 - Math.pow(1 - a, m); }
+  function fweBonferroni(m, a) { return 1 - Math.pow(1 - a / m, m); }
+
+  function mcDraw() {
+    if (!mcPlot) return;
+    var pl = mcPlot;
+    var a = mcState.alpha, mMax = mcState.mMax;
+    pl.xRange[0] = 1;
+    pl.xRange[1] = mMax;
+    pl.yRange[0] = 0;
+    pl.yRange[1] = 1.02;
+    pl.clear();
+    pl.grid({ step: 50 });
+    pl.curve(function (m) { return fweUncorrected(m, a); }, { color: c.accent2, width: 2.4, from: 1, to: mMax, samples: 200, label: 'uncorrected FWER' });
+    pl.curve(function (m) { return fweBonferroni(m, a); }, { color: c.accent, width: 2, from: 1, to: mMax, samples: 200, label: 'Bonferroni α/m' });
+    pl.hline(a, { color: 'rgba(32,30,29,0.6)', dash: [5, 4], labelText: 'Šidák / target α' });
+    var pts = [], step = 5;
+    for (var k = step; k <= mMax; k += step) pts.push({ x: k, y: mcEmpirical(k) });
+    pl.points(pts, { color: 'rgba(43,95,255,0.9)', r: 2.6, label: 'simulated families' });
+    pl.vline(mcState.m, { color: 'rgba(214,0,108,0.7)', dash: [4, 4], labelText: 'm = ' + mcState.m });
+    pl.axes({ step: 50, xLabel: 'number of null tests m', yLabel: 'family-wise error rate' });
+    pl.legend();
+    var m = mcState.m;
+    el('mc-readout').innerHTML =
+      '<div><span class="k">tests in family m</span> <span class="hi">' + m + '</span></div>' +
+      '<div><span class="k">uncorrected FWER</span> <span class="hi">' + fmt(fweUncorrected(m, a), 3) + '</span></div>' +
+      '<div><span class="k">simulated FWER</span> ' + fmt(mcEmpirical(m), 3) + '</div>' +
+      '<div><span class="k">Bonferroni threshold α/m</span> ' + fmt(a / m, 4) + '</div>' +
+      '<div><span class="k">Šidák threshold</span> ' + fmt(1 - Math.pow(1 - a, 1 / m), 4) + '</div>' +
+      '<div><span class="k">corrected FWER</span> ' + fmt(fweBonferroni(m, a), 3) + '</div>' +
+      '<div style="margin-top:6px;">Uncorrected error climbs toward 1; both corrections hold the family-wise rate near α.</div>';
+  }
+
+  mcPlot = Prob.plot(el('mc-canvas'), {
+    W: 640, H: 360, xRange: [1, 200], yRange: [0, 1], onResize: mcDraw
+  });
+  el('mc-reseed').addEventListener('click', function () {
+    mcState.seed = (mcState.seed * 1103515245 + 12345) % 2147483647;
+    mcRecompute();
+    mcDraw();
+  });
+  mcRecompute();
+  Guide.bindSliders([el('mc-m')], function (s) { mcState.m = parseInt(s.value, 10); mcDraw(); });
+  Guide.bindSliders([el('mc-alpha')], function (s) { mcState.alpha = parseFloat(s.value); mcRecompute(); mcDraw(); });
+  mcDraw();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'testing-alpha-meaning',
+      kind: 'choice',
+      prompt: 'What exactly does <var>&alpha; = 0.05</var> control?',
+      options: [
+        { label: 'The long-run rate of rejecting <var>H<sub>0</sub></var> when <var>H<sub>0</sub></var> is true.', correct: true },
+        { label: 'The probability that <var>H<sub>0</sub></var> is true after seeing the data.', correct: false },
+        { label: 'The probability that the observed effect is real.', correct: false }
+      ],
+      explanation: '&alpha; is the false-positive rate under the null: P(reject | H0). It says nothing about the posterior probability of H0 without a prior.'
+    },
+    {
+      id: 'testing-multiplicity-numeric',
+      kind: 'numeric',
+      prompt: 'With <var>&alpha; = 0.05</var>, what is <var>P(at least one false positive)</var> across <var>m = 20</var> independent true nulls, <var>1 &minus; 0.95<sup>20</sup></var>?',
+      answer: 0.64,
+      tolerance: 0.02,
+      explanation: '0.95^20 ≈ 0.3585, so 1 − 0.3585 ≈ 0.6415. Twenty null tests buy roughly a two-thirds chance of a spurious hit.'
+    },
+    {
+      id: 'testing-pvalue-not',
+      kind: 'choice',
+      prompt: 'Which statement about a p-value is correct?',
+      options: [
+        { label: 'It is the probability of data at least this extreme, assuming the null is true.', correct: true },
+        { label: 'It is the probability that the null is true.', correct: false },
+        { label: 'It is the probability that the result will replicate.', correct: false }
+      ],
+      explanation: 'A p-value is P(T ≥ t_obs | H0). It is not P(H0 | data), and it is not a replication probability — bayesians can read the first while rejecting the other two.'
+    },
+    {
+      id: 'testing-power-numeric',
+      kind: 'numeric',
+      prompt: 'If the Type II error rate is <var>&beta; = 0.2</var>, what is the power?',
+      answer: 0.8,
+      tolerance: 0.001,
+      explanation: 'Power = 1 − &beta; = 1 − 0.2 = 0.8: the test catches a real effect of the assumed size 80% of the time.'
+    },
+    {
+      id: 'testing-bonferroni-numeric',
+      kind: 'numeric',
+      prompt: 'A family of <var>m = 10</var> tests is corrected at family-wise level <var>0.05</var>. What per-test threshold does Bonferroni use, <var>&alpha;/m</var>?',
+      answer: 0.005,
+      tolerance: 0.0005,
+      explanation: '0.05 / 10 = 0.005. Each test must clear a ten-times stricter threshold so the family-wise false-positive rate stays near 5%.'
+    },
+    {
+      id: 'testing-effect-size',
+      kind: 'choice',
+      prompt: 'Holding <var>n</var> and <var>&alpha;</var> fixed, what happens to power as the true effect size shrinks toward zero?',
+      options: [
+        { label: 'It falls toward <var>&alpha;</var>, the test becomes unable to distinguish the alternatives.', correct: true },
+        { label: 'It stays the same, because power depends only on n.', correct: false },
+        { label: 'It rises, because small effects are easier to detect.', correct: false }
+      ],
+      explanation: 'As δ → 0 the two sampling distributions coincide, so rejecting at level &alpha; happens at rate &alpha; whether or not the null is true — power degenerates to the false-positive rate.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

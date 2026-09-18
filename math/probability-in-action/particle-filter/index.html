@@ -1,0 +1,622 @@
+---
+title: "Probability in Action, Interactively — Part 18: Particle filters"
+description: "The Bayes filter with no Gaussians in sight: a cloud of weighted samples that keeps every hypothesis alive, tracks a robot through a 2D obstacle map, and shows particle depletion — then the resampling and roughening tricks that repair it."
+permalink: "/math/probability-in-action/particle-filter/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #pf-canvas, #mcl-canvas { display: block; width: 100%; }
+  .g-legend-item var { font-style: normal; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability in Action</span>
+    <h1>Particle filters</h1>
+    <p>The Bayes filter is a two-line recursion, but only two families of belief have closed forms: a grid of bins, and a Gaussian. Neither survives a corridor with two equally likely ends, a room with symmetric furniture, or a robot that has not been told where it started. A particle filter takes the third road. It represents the belief directly as a set of random samples &mdash; hypotheses about the state &mdash; each carrying a weight that says how well it explains the sensor readings. The prediction is a push through the motion model, the update is a multiplication by the likelihood, and a resampling step prunes the hypotheses that stopped making sense. That is the entire algorithm, and it handles the multimodal, curved, non-Gaussian beliefs the other filters cannot. This part builds it, breaks it on purpose so you can watch it deplete, and then fixes it.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">The Bayes filter, without the Gaussian</p>
+    <p>Every recursive filter in this act is the same statement wearing different clothes. Given the belief <var>bel(x<sub>t-1</sub>)</var> at the last step, a control <var>u<sub>t</sub></var> and a measurement <var>z<sub>t</sub></var>, the new belief is a prediction followed by a correction:</p>
+    <div class="g-math g-katex">$$\mathrm{bel}(x_t)\;\propto\;p(z_t\mid x_t)\int p(x_t\mid x_{t-1},u_t)\,\mathrm{bel}(x_{t-1})\,dx_{t-1}.$$</div>
+    <p>The integral is the hard part, and the history of probabilistic robotics is a history of dodging it. The histogram filter chops the state space into bins and turns the integral into a sum, which is honest but exponential in the number of dimensions. The Kalman filter assumes the belief is Gaussian and the dynamics are linear, which reduces the recursion to matrix arithmetic &mdash; and which fails the moment the belief grows a second lump. A robot that hears "the corridor has a wall ahead" does not believe in one wall; it believes in several walls at once, one for each place it might be, and a single Gaussian cannot hold several lumps at the same time.</p>
+    <p>So ask the question differently. We do not need a formula for the belief. We need to answer questions with it: where am I, how sure am I, which of these two corridors is it. Those are integrals against the belief &mdash; expectations &mdash; and expectations can be estimated by sampling. Instead of storing a density, store a cloud of points drawn from it. More points near a place means more belief there. The cloud <em>is</em> the distribution, up to sampling error, and the error shrinks like <var>1/&radic;N</var> no matter how many dimensions the state has.</p>
+    <p>That is the whole idea, and it is called a particle filter, a sequential Monte Carlo method, or in robotics simply Monte Carlo localization. The next sections make it precise: what a particle is, how the three steps of the loop treat it, and why a careless implementation quietly throws away the very diversity that made the method worth using.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a cloud of <var>N</var> weighted samples approximates the Bayes filter for any shape of belief, how prediction, weighting and resampling move that cloud from prior to posterior, and why the effective sample size <var>1/&sum;<sub>i</sub>w&#771;<sub>i</sub><sup>2</sup></var> is the number that tells you when the filter is about to lose its mind.</span></div>
+    <div class="g-toc">
+      <a href="#particles">2 · Particles as samples</a>
+      <a href="#swr">3 · Sample, weight, resample</a>
+      <a href="#depletion">4 · Particle depletion and the fixes</a>
+      <a href="#mcl">5 · Monte Carlo localization</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="particles">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Particles as samples</h2></div>
+    <p class="g-eyebrow">A cloud of hypotheses standing in for a density</p>
+    <p>A particle is a single guess at the state, drawn at random. If we draw <var>N</var> of them from a distribution, the fraction that land in any region is, up to noise, the probability of that region. That is the simplest possible estimator of a density: sample it and count. The prediction we wanted, the expectation of a function <var>f</var>, becomes a plain average,</p>
+    <div class="g-math g-katex">$$\mathbb{E}[f(x)]=\int f(x)\,p(x)\,dx\;\approx\;\frac{1}{N}\sum_{i=1}^{N} f\!\left(x^{(i)}\right),\qquad x^{(i)}\sim p,$$</div>
+    <p>and the average converges to the integral by the law of large numbers. Nothing here cares whether <var>p</var> is a bell, a banana, or three separate islands, and nothing here gets worse when the state has twenty dimensions instead of one. The price is that the estimate is random: reload the page and the cloud is different, so every number carries a sampling error of order <var>1/&radic;N</var>.</p>
+    <p>The demo below makes the exchange concrete. A cloud of samples is drawn from a distribution shaped like a bell, and drawn next to it is the density the cloud is standing in for. At small <var>N</var> the histogram is lumpy and the sample mean wanders; turn <var>N</var> up and the lumps soften, the mean settles, and the cloud starts to look like a photograph of the density. Reseeding shows that the underlying distribution never changed &mdash; only the draw did.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pf-canvas" width="640" height="210"></canvas>
+        <p class="g-canvas-hint">The ticks at the baseline are individual particles; the bars are their histogram; the bold pink curve is the true density they were drawn from.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Samples <var>N</var> <span class="val">120</span></label><input type="range" id="pf-n" min="10" max="400" step="10" value="120"></div>
+        <div class="g-btnrow"><button type="button" id="pf-reseed">Redraw the cloud</button></div>
+        <div class="g-readout" id="pf-readout"></div>
+      </div>
+    </div>
+    <p>Read the readout as evidence, not decoration. The error in the sample mean is a random variable &mdash; it shrinks like <var>1/&radic;N</var> on average but not monotonically. At <var>N=10</var> a lucky cloud can beat an unlucky cloud of a hundred. This is exactly the behaviour that particle filters inherit, and it is why a filter with too few particles is not merely inaccurate; it is unreliable in a way that no amount of clever bookkeeping repairs.</p>
+  </section>
+
+  <section class="g-step" id="swr">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Sample, weight, resample</h2></div>
+    <p class="g-eyebrow">The loop, one step at a time</p>
+    <p>Now put the cloud into the Bayes recursion. The belief at time <var>t</var> is represented by particles <var>x<sub>t</sub><sup>(i)</sup></var> with weights <var>w<sub>t</sub><sup>(i)</sup></var> that sum to one, and the claim we are making is</p>
+    <div class="g-math g-katex">$$\mathrm{bel}(x_t)\;\approx\;\sum_{i=1}^{N} w_t^{(i)}\,\delta\!\left(x_t-x_t^{(i)}\right),$$</div>
+    <p>a sum of spikes, one per particle, each weighted. Prediction is the easy half: push every particle through the motion model, one independent random draw each,</p>
+    <div class="g-math g-katex">$$x_t^{(i)}\sim p\!\left(x_t\mid x_{t-1}^{(i)},u_t\right),\qquad w_t^{(i)}\leftarrow w_{t-1}^{(i)}.$$</div>
+    <p>Because the motion model is itself stochastic, the particles fan out: a tight cloud becomes a looser one, and that spread <em>is</em> the predicted uncertainty. No Jacobian, no linearisation, no Gaussian assumption &mdash; the model does the work.</p>
+    <p>Correction is where the measurement enters. Each particle is scored by how likely the observed reading would have been if that hypothesis were the truth, and the weight is multiplied by that likelihood:</p>
+    <div class="g-math g-katex">$$w_t^{(i)}\;\propto\;p\!\left(z_t\mid x_t^{(i)}\right)\cdot w_{t-1}^{(i)},\qquad \tilde w_t^{(i)}=\frac{w_t^{(i)}}{\sum_{j=1}^{N} w_t^{(j)}}.$$</div>
+    <p>This is importance sampling: we cannot draw from the posterior directly, so we draw from the motion model and reweight by how well each draw explains the data. Consequences follow immediately. A particle sitting where the robot actually is gets a large factor and grows; a particle in the wrong corridor gets a factor near zero and fades. The normalisation is nothing but the evidence <var>p(z<sub>t</sub>)</var>, estimated for free.</p>
+    <p>Weighting alone has a fatal drift. After a few corrections the weights are wildly unequal, almost all of the belief mass sits on one or two lucky particles, and the rest contribute nothing. Resampling fixes the drift by redrawing the cloud from itself: particle <var>i</var> is copied with probability equal to its normalised weight, and every copy starts fresh with weight <var>1/N</var>.</p>
+    <div class="g-math g-katex">$$\Pr\!\left(x^{(i)}\text{ is copied}\right)=\tilde w^{(i)},\qquad\text{then set}\quad w^{(i)}=\tfrac{1}{N}\ \text{for all } i.$$</div>
+    <p>The effect is a kind of natural selection. Regions of high belief get more descendants; regions of low belief go extinct. After resampling the cloud is concentrated where the evidence points, and it is free to fan out again on the next prediction. Prediction, weighting and resampling &mdash; three lines of code each &mdash; are the whole of a particle filter. The library's <code>Prob.filters.particleFilter</code> exposes exactly these as <code>predict</code>, <code>update</code> and <code>resample</code>.</p>
+  </section>
+
+  <section class="g-step" id="depletion">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Particle depletion and the fixes</h2></div>
+    <p class="g-eyebrow">When a healthy cloud collapses to one guess</p>
+    <p>The failure mode is called particle depletion, and it is a consequence of weighted resampling in a peaked world. Give the filter a very sharp likelihood &mdash; a sensor so precise it effectively points at one place &mdash; and a small cloud. Most particles will be far from where the robot is, their weights will fall to nearly zero, and the normalisation will pile essentially all the mass onto the one particle that happened to land near the truth. Its descendants then fill the entire cloud: <var>N</var> particles, but one distinct hypothesis, repeated. The filter is now confident and wrong, and it has no way back, because nothing left in the cloud can generate the correct answer.</p>
+    <p>The number that detects this in real time is the <strong>effective sample size</strong>, the reciprocal of the sum of squared normalised weights:</p>
+    <div class="g-math g-katex">$$\mathrm{ESS}=\frac{1}{\sum_{i=1}^{N}\left(\tilde w_t^{(i)}\right)^2},\qquad 1\le\mathrm{ESS}\le N.$$</div>
+    <p>If the weights are all equal the ESS is <var>N</var>; if one particle holds everything it is one. It is not the number of particles, but the number of particles that are actually doing work. A common rule is to resample only when the ESS falls below half of <var>N</var>, so the cloud keeps its diversity on easy steps and is pruned only when the weights have genuinely concentrated.</p>
+    <p>Two repairs matter. The first is <strong>low-variance resampling</strong>. Naive resampling draws <var>N</var> independent copies, which is unbiased but noisy &mdash; two descendants of the same likely particle, none of another &mdash; and that noise wastes diversity. Systematic resampling walks the cumulative weight once with evenly spaced offsets,</p>
+    <div class="g-math g-katex">$$u_k=\frac{u_0+k-1}{N},\quad u_0\sim\mathcal{U}[0,1),\qquad x_t^{(i)}=x_t^{(j)}\ \text{for the } j \text{ with } \textstyle\sum_{l&lt;j}\tilde w^{(l)}\le u_k&lt;\sum_{l\le j}\tilde w^{(l)},$$</div>
+    <p>so a particle with weight <var>m/N</var> is copied almost exactly <var>m</var> times. The expected number of copies is unchanged, but the variance is dramatically smaller, and the cloud stays spread out instead of clumping.</p>
+    <p>The second repair is <strong>roughening</strong>, or regularisation: after resampling, add a little jitter to each particle, scaled to the spread of the cloud. Copies of one ancestor are nudged apart, so the cloud regains the diversity that resampling removed. The jitter must be small &mdash; too much and the filter ignores its own measurements. The point is to keep a living population, not to manufacture noise. In the localization demo below you can switch both repairs on and off and watch the ESS respond.</p>
+  </section>
+
+  <section class="g-step" id="mcl">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Monte Carlo localization</h2></div>
+    <p class="g-eyebrow">A robot lost in a room full of rectangles</p>
+    <p>Monte Carlo localization is the particle filter with the state set to the robot's pose. Here that is <var>(x,y,&theta;)</var> in a rectangular map, the motion model adds a noisy step to each particle, and the sensor is a fan of range beams: the robot reports how far it can see along five directions, and a particle is scored by how closely the walls it predicts match those readings. The map itself is the constraint. A particle in the wrong room predicts walls in the wrong places and dies at the next correction; a particle in the right pose keeps predicting the right distances and survives. Symmetry is the interesting case: two poses that see identical walls stay equally weighted until the robot moves and breaks the tie, which is exactly the multimodality a Gaussian filter cannot represent.</p>
+    <p>The canvas draws the obstacles as blocks, the true pose as a dark arrow, the sensor fan as faint pink rays, and every particle as a small arrow coloured and sized by its normalised weight. The bold ring is the weighted estimate, the belief's mean pose. Start it, press <b>Predict</b> a few times and watch the cloud smear; press <b>Update</b> and watch the arrows that point at the true pose brighten while the others fade. The readout tracks the ESS.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mcl-canvas" width="640" height="430"></canvas>
+        <p class="g-canvas-hint">Press <b>Predict</b> to move the robot and spread the cloud, <b>Update</b> to weight each hypothesis by the range readings, and <b>Resample</b> to let the fittest breed. Set <b>N</b> small and <b>sensor &sigma;</b> low, then press Update repeatedly without resampling to force depletion.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Particles <var>N</var> <span class="val">40</span></label><input type="range" id="mcl-n" min="10" max="200" step="10" value="40"></div>
+        <div class="g-field"><label>Motion noise <var>&sigma;</var> <span class="val">0.25</span></label><input type="range" id="mcl-noise" min="0.02" max="0.8" step="0.01" value="0.25"></div>
+        <div class="g-field"><label>Sensor <var>&sigma;</var> <span class="val">0.50</span></label><input type="range" id="mcl-sensor" min="0.15" max="1.2" step="0.05" value="0.5"></div>
+        <div class="g-btnrow">
+          <button type="button" id="mcl-predict">Predict</button>
+          <button type="button" id="mcl-update">Update</button>
+          <button type="button" id="mcl-resample">Resample</button>
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="mcl-lowvar" class="active">Low-variance resample</button>
+          <button type="button" id="mcl-rough">Roughening</button>
+          <button type="button" id="mcl-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="mcl-readout"></div>
+        <div class="g-legend">
+          <span class="g-legend-item"><span class="g-swatch" style="background:#201e1d"></span> true pose</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#d6006c"></span> weighted estimate</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#2b5fff"></span> particles (bright = heavy)</span>
+        </div>
+      </div>
+    </div>
+    <p>Now run the experiment the section promised. Drop <var>N</var> to ten or twenty, pull the sensor noise down to make the likelihood peaked, and press <b>Update</b> two or three times without resampling. The ESS collapses toward one, a single bright arrow survives, and the readout warns you. Press <b>Resample</b> and the whole cloud becomes copies of that arrow &mdash; depletion, made visible. Reset, then do it again with <b>roughening</b> on: the copies are nudged apart, a few recover weight on the next update, and the cloud stays alive. This is the practical face of the sampling-error trade-off from section two: with too few particles, the filter is not just noisier, it is brittle.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Sampling wherever the integral refuses to close</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Localization without a map of beliefs</h3>
+        <p style="margin-bottom:0;">A robot that wakes up not knowing where it is needs the multimodal belief a filter like this one carries. The motion model comes from <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry</a>, and the correction from a laser or range fan like the one on the canvas. This is the standard answer to the global-localization problem.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">SLAM and fastSLAM</h3>
+        <p style="margin-bottom:0;">In simultaneous localization and mapping the map is part of the state, and a particle can carry its own map. FastSLAM exploits that decomposition to sample trajectories and solve the map in closed form, which is why particle methods sit beside the <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">factor-graph and bundle-adjustment view</a> in the vision guide.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Monte Carlo, sequenced</h3>
+        <p style="margin-bottom:0;">The particle filter is <a href="{{ '/math/probability-in-action/monte-carlo/' | relative_url }}">Monte Carlo integration</a> advanced one time step at a time: estimate an expectation by sampling, then recycle the samples instead of starting over. Importance sampling is the same weight-multiply-normalise move, applied every frame.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Estimation</div>
+        <h3 style="margin:6px 0;">The non-Gaussian Kalman</h3>
+        <p style="margin-bottom:0;">Where the belief really is a single bell, the <a href="{{ '/math/probability-in-action/kalman/' | relative_url }}">Kalman filter</a> is cheaper and exact, and a particle filter with enough samples reproduces it. The two are not rivals: the Gaussian assumption buys speed, the cloud buys shapes, and the choice is a bet on the belief.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td>Belief as spikes</td><td><var>$\mathrm{bel}(x_t)\approx\sum_i w_t^{(i)}\delta(x_t-x_t^{(i)})$</var></td><td>A weighted cloud is the distribution.</td></tr>
+        <tr><td>Prediction</td><td><var>$x_t^{(i)}\sim p(x_t\mid x_{t-1}^{(i)},u_t)$</var></td><td>Push each particle through the motion model.</td></tr>
+        <tr><td>Weight update</td><td><var>$w_t^{(i)}\propto p(z_t\mid x_t^{(i)})\,w_{t-1}^{(i)}$</var></td><td>Importance sampling: score by the likelihood.</td></tr>
+        <tr><td>Normalised weight</td><td><var>$\tilde w^{(i)}=w^{(i)}/\sum_j w^{(j)}$</var></td><td>The evidence is the normaliser.</td></tr>
+        <tr><td>Resampling</td><td><var>$\Pr(x^{(i)}\text{ copied})=\tilde w^{(i)},\ \text{then } w^{(i)}=1/N$</var></td><td>Fitter particles breed; weak ones go extinct.</td></tr>
+        <tr><td>Low-variance resample</td><td><var>u_k=(u_0+k-1)/N</var></td><td>Evenly spaced draws stay spread out.</td></tr>
+        <tr><td>Effective sample size</td><td><var>$\mathrm{ESS}=1/\sum_i(\tilde w^{(i)})^2$</var></td><td>How many particles are actually working.</td></tr>
+        <tr><td>Resample trigger</td><td><var>$\mathrm{ESS} &lt; N/2$</var></td><td>Prune only when the weights have concentrated.</td></tr>
+        <tr><td>Weighted estimate</td><td><var>$\hat x_t=\sum_i \tilde w_t^{(i)} x_t^{(i)}$</var></td><td>The cloud's mean pose.</td></tr>
+        <tr><td>Roughening</td><td><var>$x^{(i)}\leftarrow x^{(i)}+\epsilon^{(i)},\ \epsilon\sim\text{small noise}$</var></td><td>Jitter restores diversity after resampling.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Sebastian Thrun, Wolfram Burgard and Dieter Fox, <em>Probabilistic Robotics</em>, 2005, chapter 4 &mdash; the sample, weight, resample loop and Monte Carlo localization, written for exactly the robot on the canvas.</li>
+      <li>Arnaud Doucet, Nando de Freitas and Neil Gordon, eds., <em>Sequential Monte Carlo Methods in Practice</em>, 2001 &mdash; the reference treatment, including the low-variance resampling scheme.</li>
+      <li>M. Sanjeev Arulampalam et al., <a href="https://doi.org/10.1109/78.978374">"A Tutorial on Particle Filters for Online Nonlinear/Non-Gaussian Bayesian Tracking"</a>, IEEE Trans. Signal Processing, 2002 &mdash; the standard tutorial, with the ESS derivation and resampling schemes side by side.</li>
+      <li>Pierre Del Moral, <em>Feynman&ndash;Kac Formulae: Genealogical and Interacting Particle Systems with Applications</em>, 2004 &mdash; the convergence theory behind the cloud, for when you want the theorems.</li>
+      <li>N. J. Gordon, D. J. Salmond and A. F. M. Smith, <a href="https://doi.org/10.1049/ip-f-2.1993.0015">"Novel approach to nonlinear/non-Gaussian Bayesian state estimation"</a>, IEE Proceedings F, 1993 &mdash; the paper that introduced the bootstrap filter.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A single bad reading can drag a least-squares fit anywhere &mdash; the next part makes the fit resist it.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function wrap(a) {
+    while (a > Math.PI) a -= 2 * Math.PI;
+    while (a < -Math.PI) a += 2 * Math.PI;
+    return a;
+  }
+  function fmt(x, d) { d = d == null ? 3 : d; return x.toFixed(d); }
+
+  // ------------------------------------------------------------------
+  // Demo A - a cloud of samples approximating a density
+  // ------------------------------------------------------------------
+  var A = { n: 120, mu: 0.55, sd: 0.13, seed: 20260914, parts: [] };
+  var aSetup = null;
+
+  function aGenerate() {
+    var r = Prob.rng(A.seed);
+    A.parts = [];
+    for (var i = 0; i < A.n; i++) {
+      var v = A.mu + A.sd * r.normal();
+      while (v < 0.02 || v > 0.98) { v = A.mu + A.sd * r.normal(); }
+      A.parts.push(v);
+    }
+  }
+
+  function aDraw() {
+    if (!aSetup) return;
+    var ctx = aSetup.ctx, W = 640, H = 210;
+    var padL = 30, padR = 30, padT = 18, padB = 40;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    ctx.clearRect(0, 0, W, H);
+    function X(v) { return padL + v * plotW; }
+    function pdf(v) { var d = (v - A.mu) / A.sd; return Math.exp(-0.5 * d * d); }
+    var bins = 24, counts = [], i;
+    for (i = 0; i < bins; i++) counts.push(0);
+    for (i = 0; i < A.parts.length; i++) {
+      counts[clamp(Math.floor(A.parts[i] * bins), 0, bins - 1)]++;
+    }
+    var cmax = 0;
+    for (i = 0; i < bins; i++) cmax = Math.max(cmax, counts[i]);
+    ctx.fillStyle = 'rgba(43,95,255,0.16)';
+    for (i = 0; i < bins; i++) {
+      if (!counts[i]) continue;
+      var h = plotH * (counts[i] / (cmax || 1)) * 0.9;
+      ctx.fillRect(X(i / bins), padT + plotH - h, plotW / bins - 1, h);
+    }
+    ctx.beginPath();
+    for (i = 0; i <= 100; i++) {
+      var v0 = i / 100, y0 = padT + plotH * (1 - 0.9 * pdf(v0));
+      if (i === 0) ctx.moveTo(X(v0), y0); else ctx.lineTo(X(v0), y0);
+    }
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.2; ctx.stroke();
+    ctx.strokeStyle = c.accent; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    for (i = 0; i < A.parts.length; i++) {
+      var xp = X(A.parts[i]);
+      ctx.beginPath(); ctx.moveTo(xp, padT + plotH - 6); ctx.lineTo(xp, padT + plotH + 6); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT + plotH); ctx.lineTo(W - padR, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    for (i = 0; i <= 10; i++) ctx.fillText((i / 10).toFixed(1), X(i / 10), padT + plotH + 24);
+    ctx.textAlign = 'left';
+    ctx.fillText('sample value', padL, 14);
+    var mean = 0;
+    for (i = 0; i < A.parts.length; i++) mean += A.parts[i];
+    mean = A.parts.length ? mean / A.parts.length : 0;
+    el('pf-readout').innerHTML =
+      '<div><span class="k">samples N</span> <span class="hi">' + A.parts.length + '</span></div>' +
+      '<div><span class="k">sample mean</span> ' + fmt(mean, 4) + '</div>' +
+      '<div><span class="k">true mean</span> ' + fmt(A.mu, 4) + '</div>' +
+      '<div><span class="k">error</span> ' + fmt(Math.abs(mean - A.mu), 4) + '</div>' +
+      '<div style="margin-top:6px;">The bars are a histogram of the cloud; the pink curve is the density it stands in for.</div>';
+  }
+
+  Guide.bindSliders([el('pf-n')], function (s) {
+    A.n = parseInt(s.value, 10);
+    aGenerate(); aDraw();
+  });
+  el('pf-reseed').addEventListener('click', function () {
+    A.seed = (A.seed * 1103515245 + 12345) % 2147483647;
+    aGenerate(); aDraw();
+  });
+  aGenerate();
+  aSetup = Guide.setupCanvas(el('pf-canvas'), 640, 210, aDraw);
+  aDraw();
+
+  // ------------------------------------------------------------------
+  // Demo B - Monte Carlo localization in a 2D obstacle map
+  // ------------------------------------------------------------------
+  var MAPW = 10, MAPH = 6.5, MAXR = 7;
+  var B_W = 640, B_H = 430;
+  var BOBST = [
+    { x: 2.0, y: 1.2, w: 0.6, h: 2.2 },
+    { x: 4.2, y: 3.4, w: 2.2, h: 0.6 },
+    { x: 6.8, y: 0.8, w: 1.4, h: 2.0 },
+    { x: 1.4, y: 4.6, w: 2.4, h: 0.7 }
+  ];
+  var SCALE = Math.min((B_W - 40) / MAPW, (B_H - 40) / MAPH);
+  var BPADL = (B_W - SCALE * MAPW) / 2, BPADT = (B_H - SCALE * MAPH) / 2;
+  var B_MS = 0.85, B_MT = 0.28;
+  var BEAMS = [-1.1, -0.55, 0, 0.55, 1.1];
+  var BNBEAM = BEAMS.length;
+
+  function SX(x) { return BPADL + x * SCALE; }
+  function SY(y) { return BPADT + y * SCALE; }
+  function inRect(x, y, r, m) {
+    m = m || 0;
+    return x >= r.x - m && x <= r.x + r.w + m && y >= r.y - m && y <= r.y + r.h + m;
+  }
+  function free(x, y) {
+    if (x < 0.4 || x > MAPW - 0.4 || y < 0.4 || y > MAPH - 0.4) return false;
+    for (var i = 0; i < BOBST.length; i++) if (inRect(x, y, BOBST[i], 0.35)) return false;
+    return true;
+  }
+  function rayRect(ox, oy, dx, dy, r) {
+    var tmin = -Infinity, tmax = Infinity, t1, t2, s;
+    if (Math.abs(dx) < 1e-9) { if (ox < r.x || ox > r.x + r.w) return Infinity; }
+    else {
+      t1 = (r.x - ox) / dx; t2 = (r.x + r.w - ox) / dx;
+      if (t1 > t2) { s = t1; t1 = t2; t2 = s; }
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    if (Math.abs(dy) < 1e-9) { if (oy < r.y || oy > r.y + r.h) return Infinity; }
+    else {
+      t1 = (r.y - oy) / dy; t2 = (r.y + r.h - oy) / dy;
+      if (t1 > t2) { s = t1; t1 = t2; t2 = s; }
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    if (tmax < Math.max(tmin, 0)) return Infinity;
+    return tmin >= 0 ? tmin : (tmax >= 0 ? 0 : Infinity);
+  }
+  function castRay(ox, oy, ang) {
+    var dx = Math.cos(ang), dy = Math.sin(ang), t = MAXR, i;
+    if (dx > 1e-9) t = Math.min(t, (MAPW - ox) / dx); else if (dx < -1e-9) t = Math.min(t, (0 - ox) / dx);
+    if (dy > 1e-9) t = Math.min(t, (MAPH - oy) / dy); else if (dy < -1e-9) t = Math.min(t, (0 - oy) / dy);
+    for (i = 0; i < BOBST.length; i++) t = Math.min(t, rayRect(ox, oy, dx, dy, BOBST[i]));
+    return Math.max(t, 0);
+  }
+
+  var B = {
+    n: 40, seed: 20260914,
+    motionNoise: 0.25, sensorSig: 0.5,
+    lowvar: true, rough: false,
+    truePose: [5.0, 5.2, -1.3],
+    pf: null
+  };
+  var bSetup = null, bRng = null;
+
+  function initPose(r) {
+    for (var k = 0; k < 60; k++) {
+      var x = r.uniform() * MAPW, y = r.uniform() * MAPH, th = r.uniform() * 2 * Math.PI - Math.PI;
+      if (free(x, y)) return [x, y, th];
+    }
+    return [MAPW / 2, MAPH / 2, 0];
+  }
+  function motionModel(s, u, r) {
+    var x = s[0] + u.v * Math.cos(s[2]) + r.normal(0, B.motionNoise);
+    var y = s[1] + u.v * Math.sin(s[2]) + r.normal(0, B.motionNoise);
+    var th = wrap(s[2] + u.w + r.normal(0, B.motionNoise * 1.4));
+    return [x, y, th];
+  }
+  function likelihood(s, z) {
+    var d2 = 0;
+    for (var i = 0; i < BNBEAM; i++) {
+      var pred = castRay(s[0], s[1], s[2] + BEAMS[i]);
+      var e = (z[i] - pred) / B.sensorSig;
+      d2 += e * e;
+    }
+    d2 /= BNBEAM;
+    if (d2 > 45) d2 = 45;
+    return Math.exp(-0.5 * d2);
+  }
+  function buildFilter() {
+    B.pf = Prob.filters.particleFilter({
+      n: B.n,
+      rng: Prob.rng(B.seed + 7),
+      init: initPose,
+      motion: motionModel,
+      weight: likelihood
+    });
+  }
+  function measure(pose) {
+    var z = [], i;
+    for (i = 0; i < BNBEAM; i++) {
+      z.push(Math.max(0, castRay(pose[0], pose[1], pose[2] + BEAMS[i]) + bRng.normal(0, B.sensorSig)));
+    }
+    return z;
+  }
+  function stepTrue() {
+    var nx = B.truePose[0] + B_MS * Math.cos(B.truePose[2]);
+    var ny = B.truePose[1] + B_MS * Math.sin(B.truePose[2]);
+    if (free(nx, ny)) {
+      B.truePose[0] = nx; B.truePose[1] = ny; B.truePose[2] = wrap(B.truePose[2] + B_MT);
+    } else {
+      B.truePose[2] = wrap(B.truePose[2] + B_MT * 3.2);
+    }
+  }
+  function ess() {
+    var s = 0, w = B.pf.weights, i;
+    for (i = 0; i < w.length; i++) s += w[i] * w[i];
+    return s > 0 ? 1 / s : 0;
+  }
+  function weightedPose() {
+    var w = B.pf.weights, ps = B.pf.particles, i;
+    var sx = 0, sy = 0, cx = 0, cy = 0;
+    for (i = 0; i < ps.length; i++) {
+      sx += w[i] * ps[i][0]; sy += w[i] * ps[i][1];
+      cx += w[i] * Math.cos(ps[i][2]); cy += w[i] * Math.sin(ps[i][2]);
+    }
+    return [sx, sy, Math.atan2(cy, cx)];
+  }
+  function naiveResample() {
+    var ps = B.pf.particles, w = B.pf.weights, n = ps.length, i;
+    var cum = [], s = 0, out = [];
+    for (i = 0; i < n; i++) { s += w[i]; cum.push(s); }
+    for (i = 0; i < n; i++) {
+      var u = bRng.uniform() * s, j = 0;
+      while (j < n - 1 && u > cum[j]) j++;
+      out.push(ps[j].slice());
+    }
+    for (i = 0; i < n; i++) { ps[i] = out[i]; w[i] = 1 / n; }
+  }
+  function roughen() {
+    if (!B.rough) return;
+    var ps = B.pf.particles, i;
+    for (i = 0; i < ps.length; i++) {
+      ps[i][0] += bRng.normal(0, 0.14);
+      ps[i][1] += bRng.normal(0, 0.14);
+      ps[i][2] = wrap(ps[i][2] + bRng.normal(0, 0.09));
+    }
+  }
+  function bDraw() {
+    if (!bSetup) return;
+    var ctx = bSetup.ctx, W = B_W, H = B_H, i, j;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(43,95,255,0.05)';
+    ctx.fillRect(SX(0), SY(0), SCALE * MAPW, SCALE * MAPH);
+    ctx.strokeStyle = 'rgba(32,30,29,0.06)'; ctx.lineWidth = 1;
+    for (i = 0; i <= MAPW; i++) { ctx.beginPath(); ctx.moveTo(SX(i), SY(0)); ctx.lineTo(SX(i), SY(MAPH)); ctx.stroke(); }
+    for (j = 0; j <= Math.ceil(MAPH); j++) { ctx.beginPath(); ctx.moveTo(SX(0), SY(j)); ctx.lineTo(SX(MAPW), SY(j)); ctx.stroke(); }
+    ctx.fillStyle = 'rgba(32,30,29,0.14)';
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    for (i = 0; i < BOBST.length; i++) {
+      var r = BOBST[i];
+      ctx.fillRect(SX(r.x), SY(r.y), SCALE * r.w, SCALE * r.h);
+      ctx.strokeRect(SX(r.x), SY(r.y), SCALE * r.w, SCALE * r.h);
+    }
+    ctx.strokeStyle = 'rgba(214,0,108,0.35)'; ctx.lineWidth = 1.4;
+    for (i = 0; i < BNBEAM; i++) {
+      var a = B.truePose[2] + BEAMS[i];
+      var d = castRay(B.truePose[0], B.truePose[1], a);
+      ctx.beginPath();
+      ctx.moveTo(SX(B.truePose[0]), SY(B.truePose[1]));
+      ctx.lineTo(SX(B.truePose[0] + d * Math.cos(a)), SY(B.truePose[1] + d * Math.sin(a)));
+      ctx.stroke();
+    }
+    var w = B.pf.weights, ps = B.pf.particles, wmax = 0;
+    for (i = 0; i < w.length; i++) wmax = Math.max(wmax, w[i]);
+    for (i = 0; i < ps.length; i++) {
+      var rel = wmax > 0 ? w[i] / wmax : 0;
+      ctx.globalAlpha = 0.14 + 0.86 * rel;
+      var x0 = SX(ps[i][0]), y0 = SY(ps[i][1]);
+      var len = (0.45 + 0.35 * rel) * SCALE;
+      Guide.drawArrow(ctx, x0, y0, x0 + len * Math.cos(ps[i][2]), y0 + len * Math.sin(ps[i][2]),
+        { color: rel > 0.6 ? c.accent2 : c.accent, width: 1 + 1.6 * rel, head: 4 + 4 * rel });
+    }
+    ctx.globalAlpha = 1;
+    var est = weightedPose();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(SX(est[0]), SY(est[1]), 9, 0, 2 * Math.PI); ctx.stroke();
+    Guide.drawArrow(ctx, SX(B.truePose[0]), SY(B.truePose[1]),
+      SX(B.truePose[0]) + 0.9 * SCALE * Math.cos(B.truePose[2]),
+      SY(B.truePose[1]) + 0.9 * SCALE * Math.sin(B.truePose[2]),
+      { color: c.text, width: 2.4, head: 10 });
+    var e = ess();
+    var deplete = ps.length > 0 && e / ps.length < 0.35;
+    el('mcl-readout').innerHTML =
+      '<div><span class="k">particles N</span> <span class="hi">' + ps.length + '</span></div>' +
+      '<div><span class="k">ESS</span> ' + fmt(e, 1) + '</div>' +
+      '<div><span class="k">ESS / N</span> ' + fmt(ps.length ? e / ps.length : 0, 3) + '</div>' +
+      '<div><span class="k">estimate</span> (' + fmt(est[0], 2) + ', ' + fmt(est[1], 2) + ', ' + fmt(est[2], 2) + ')</div>' +
+      '<div><span class="k">true pose</span> (' + fmt(B.truePose[0], 2) + ', ' + fmt(B.truePose[1], 2) + ', ' + fmt(B.truePose[2], 2) + ')</div>' +
+      '<div style="margin-top:6px;">' + (deplete ?
+        'Weight is concentrating on a few particles &mdash; depletion. Resample, then roughen to restore diversity.' :
+        'Weight is spread across many particles: the cloud is healthy and its spread is the uncertainty.') + '</div>';
+  }
+  function bReset() {
+    bRng = Prob.rng(B.seed + 101);
+    B.truePose = [5.0, 5.2, -1.3];
+    buildFilter();
+    bDraw();
+  }
+
+  el('mcl-predict').addEventListener('click', function () {
+    stepTrue();
+    B.pf.predict({ v: B_MS, w: B_MT });
+    bDraw();
+  });
+  el('mcl-update').addEventListener('click', function () {
+    B.pf.update(measure(B.truePose));
+    bDraw();
+  });
+  el('mcl-resample').addEventListener('click', function () {
+    if (B.lowvar) B.pf.resample(); else naiveResample();
+    roughen();
+    bDraw();
+  });
+  el('mcl-lowvar').addEventListener('click', function () {
+    B.lowvar = !B.lowvar; this.classList.toggle('active', B.lowvar);
+  });
+  el('mcl-rough').addEventListener('click', function () {
+    B.rough = !B.rough; this.classList.toggle('active', B.rough);
+  });
+  Guide.bindSliders([el('mcl-n')], function (s) {
+    B.n = parseInt(s.value, 10);
+    bReset();
+  });
+  Guide.bindSliders([el('mcl-noise')], function (s) {
+    B.motionNoise = parseFloat(s.value);
+    bDraw();
+  });
+  Guide.bindSliders([el('mcl-sensor')], function (s) {
+    B.sensorSig = parseFloat(s.value);
+    bDraw();
+  });
+  el('mcl-reset').addEventListener('click', function () {
+    B.seed = (B.seed * 1103515245 + 12345) % 2147483647;
+    bReset();
+  });
+  bSetup = Guide.setupCanvas(el('mcl-canvas'), B_W, B_H, bDraw);
+  bReset();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'particle-filter-represent',
+      kind: 'choice',
+      prompt: 'What does a single particle represent in a particle filter?',
+      options: [
+        { label: 'One sampled hypothesis about the state, carrying a weight that says how well it explains the data.', correct: true },
+        { label: 'One bin of a fixed grid over the state space.', correct: false },
+        { label: 'The mean and covariance of a Gaussian belief.', correct: false }
+      ],
+      explanation: 'A particle is one draw from the belief, and its weight is the likelihood of the measurement under that hypothesis. The cloud of weighted particles together approximates the whole distribution, however many lumps it has.'
+    },
+    {
+      id: 'particle-filter-ess-uniform',
+      kind: 'numeric',
+      prompt: 'A filter has <var>N=200</var> particles and all normalised weights are equal. What is the effective sample size <var>1/&sum;<sub>i</sub>w&#771;<sub>i</sub><sup>2</sup></var>?',
+      answer: 200,
+      tolerance: 0.5,
+      explanation: 'With every weight equal to 1/N, the squared weights sum to N*(1/N)² = 1/N, so the reciprocal is N. Equal weights mean every particle is pulling its weight.'
+    },
+    {
+      id: 'particle-filter-weight',
+      kind: 'choice',
+      prompt: 'In the correction step, what does a particle\'s weight get multiplied by?',
+      options: [
+        { label: 'The likelihood <var>p(z<sub>t</sub>|x<sub>t</sub><sup>(i)</sup>)</var> of the measurement under that hypothesis.', correct: true },
+        { label: 'The motion-model density of the particle\'s previous position.', correct: false },
+        { label: 'A constant chosen so the weights sum to one before any data arrive.', correct: false }
+      ],
+      explanation: 'This is importance sampling: particles are drawn from the prediction, and reweighted by how probable the observed measurement would be if the particle were the truth. Normalising afterwards gives the evidence as a side effect.'
+    },
+    {
+      id: 'particle-filter-depletion',
+      kind: 'choice',
+      prompt: 'Which description matches particle depletion?',
+      options: [
+        { label: 'Nearly all the weight lands on a few particles, so resampling fills the cloud with copies of them and the diversity is gone.', correct: true },
+        { label: 'The particles spread out too much and the estimate becomes a simple average.', correct: false },
+        { label: 'The weights are all equal, so resampling has no effect.', correct: false }
+      ],
+      explanation: 'A peaked likelihood plus few samples concentrates weight on a handful of lucky particles. Their descendants dominate, the cloud loses distinct hypotheses, and the filter can become confidently wrong with no way to recover.'
+    },
+    {
+      id: 'particle-filter-ess-two',
+      kind: 'numeric',
+      prompt: 'Two particles have normalised weights <var>0.5</var> and <var>0.5</var>. What is the ESS, <var>1/&sum;<sub>i</sub>w&#771;<sub>i</sub><sup>2</sup></var>?',
+      answer: 2,
+      tolerance: 0.01,
+      explanation: '0.5² + 0.5² = 0.5, so the reciprocal is 2. One particle carrying all the weight would give an ESS of 1; the ESS can never exceed the number of particles.'
+    },
+    {
+      id: 'particle-filter-roughening',
+      kind: 'choice',
+      prompt: 'After a low-variance resample has duplicated the surviving particles, what does roughening add?',
+      options: [
+        { label: 'A small jitter to each particle, nudging copies apart so the cloud recovers the diversity resampling removed.', correct: true },
+        { label: 'A large random jump, so the filter can explore the whole map again.', correct: false },
+        { label: 'A correction to the particle weights that makes them sum to one.', correct: false }
+      ],
+      explanation: 'Roughening is regularisation: a small noise term, scaled to the spread of the cloud, restores distinct hypotheses without overwhelming the measurement. Too much jitter and the filter ignores its sensors.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

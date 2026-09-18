@@ -1,0 +1,663 @@
+---
+title: "Nonlinear Optimization in 3D — Rotations Beyond a Single Angle"
+description: "Part five of the interactive optimization guide — moving from a single 2D heading to full 3D orientation, where rotations don't commute and can't simply be added, and seeing the same gradient descent, Gauss-Newton and Levenberg-Marquardt still solve it."
+permalink: "/vision/nonlinear-optimization/3d-rotations/"
+section: "vision"
+series: "nonlinear_optimization"
+redirect_from:
+  - /nonlinear-optimization-3d-rotations.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .nlo { max-width: 1180px; }
+  .nlo .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .nlo-part { display: inline-block; font-size: 11.5px; }
+  .nlo-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .nlo-step:first-of-type { border-top: none; }
+  .nlo-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .nlo-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .nlo-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .nlo-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .nlo-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .nlo-goal b { color: var(--color-accent-800); }
+  .nlo-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .nlo-warn b { color: var(--color-accent-2-800); }
+  .nlo-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .nlo-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .nlo-canvas-wrap { flex: 1 1 380px; min-width: 280px; }
+  .nlo-canvas-wrap canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .nlo-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .nlo-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .nlo-field { margin-bottom: 14px; }
+  .nlo-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .nlo-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .nlo-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .nlo-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .nlo-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .nlo-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .nlo-btnrow button.nlo-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .nlo-btnrow button.nlo-primary:hover { background: var(--color-accent-600); }
+  .nlo-btnrow button:disabled { opacity: 0.45; cursor: default; }
+  .nlo-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .nlo-readout .k { opacity: 0.6; }
+  .nlo-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .nlo-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .nlo-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .nlo-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .nlo-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .nlo-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
+  .nlo-table th, .nlo-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--color-divider); }
+  .nlo-table th { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .nlo-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .nlo-cheat th, .nlo-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .nlo-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .nlo-cheat code { white-space: nowrap; }
+  .nlo-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  @media (max-width: 640px) {
+    .nlo-eyebrow { margin-left: 0; }
+    .nlo-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.nonlinear_optimization %}
+
+<main>
+<div class="wrap nlo">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · part 5</span>
+    <h1>Rotations Beyond a Single Angle</h1>
+    <p><a class="nlo-part" href="{{ '/vision/nonlinear-optimization/pose-graph/' | relative_url }}">← Part 4 recap: trajectories, drift, and loop closure</a></p>
+    <p>Every part so far lived in a flat 2D plane, where a heading was just one number, θ, that wrapped around every 360°. Real robots, drones, and cameras rotate in full 3D — and in 3D, orientation stops being one number, stops commuting, and stops being something you can just add to. This last part is about that one shift in how rotation itself behaves, and shows that gradient descent, Newton, Gauss-Newton and Levenberg-Marquardt still solve it once you know the right way to take a step.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="nlo-step" id="setup">
+    <div class="nlo-step-head"><span class="nlo-step-num">0</span><h2>What's new: orientation isn't one number anymore</h2></div>
+    <p class="nlo-eyebrow">Recap</p>
+    <p>In 2D, "which way am I facing" is a single angle θ, and the only wrinkle was that it wraps around (parts 2–4). In 3D, orientation needs <strong>three</strong> independent numbers — think roll, pitch, and yaw — but those three numbers behave nothing like an (x, y, z) position. You can't average two orientations by averaging their numbers, and — this is the genuinely new part — <strong>the order you apply two rotations in changes the result.</strong></p>
+    <div class="nlo-goal">💡 <span><b>The plan:</b> see rotations fail to commute, learn the one rule for perturbing an orientation correctly, then point the exact same Gauss-Newton and Levenberg-Marquardt machinery from parts 1–4 at a 3D problem.</span></div>
+  </section>
+
+  <section class="nlo-step" id="commute">
+    <div class="nlo-step-head"><span class="nlo-step-num">1</span><h2>Rotations don't commute</h2></div>
+    <p class="nlo-eyebrow">The surprise</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> in 2D, stacking two rotations just adds two angles — order never mattered. In 3D, rotating around the x-axis then the y-axis lands somewhere completely different than y-axis-then-x-axis, for the exact same two rotations.</div>
+    <p>Both triads below start pointing the same way and get the exact same two rotations applied — one around the x-axis, one around the y-axis — just in the opposite order. Drag the sliders and watch them end up pointing in genuinely different directions. This is <em>why</em> 3D orientation can't be treated as a vector of three independent numbers you add together.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s1-canvas" width="480" height="380"></canvas>
+        <div class="nlo-legend">
+          <span><i style="background:var(--color-accent)"></i>Rotate x, then y</span>
+          <span><i style="background:var(--color-accent-2)"></i>Rotate y, then x</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-field"><label>Rotation about x-axis <span class="val" id="s1-rxval"></span></label><input type="range" id="s1-rx" min="0" max="120" step="1" value="70"></div>
+        <div class="nlo-field"><label>Rotation about y-axis <span class="val" id="s1-ryval"></span></label><input type="range" id="s1-ry" min="0" max="120" step="1" value="70"></div>
+        <div class="nlo-readout" id="s1-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="perturb">
+    <div class="nlo-step-head"><span class="nlo-step-num">2</span><h2>Perturbing a rotation: compose, don't add</h2></div>
+    <p class="nlo-eyebrow">The fix</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> just like part 2's wrapped angle wasn't a plain subtraction, a small nudge to a 3D orientation isn't a plain addition either. The correct move is to compose a small rotation <em>on top</em> of the current one.</div>
+    <div class="nlo-math">R&#8341;&#8330;&#8321; = R&#8341; · Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;δ = a small 3-number "nudge" (an axis to tilt around, and by how much)</div>
+    <p><code>Exp(δ)</code> — the matrix exponential of a small rotation vector, also called Rodrigues' formula — turns that 3-number nudge into an actual tiny rotation matrix, which then gets composed onto the current orientation. Drag the nudge sliders below: the solid triad applies the nudge correctly, by composing; the faint dashed one applies the same numbers <em>naively</em>, just adding them to the equivalent roll/pitch/yaw angles. For a tiny nudge they're nearly identical — push the sliders further and watch them visibly diverge.</p>
+{% endraw %}    <div class="nlo-goal">📖 <span>New to <code>Exp(δ)</code>, skew-symmetric matrices, or why composing is mandatory here? The <a href="{{ '/vision/nonlinear-optimization/3d-rotations-math/' | relative_url }}">math primer</a> derives Rodrigues' formula from scratch, two different ways, with its own interactive widgets — worth a detour before continuing.</span></div>{% raw %}
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s2-canvas" width="480" height="380"></canvas>
+        <div class="nlo-legend">
+          <span><i style="background:var(--color-accent)"></i>Composed: R · Exp(δ)</span>
+          <span style="opacity:.6"><i style="background:var(--color-accent-2)"></i>Naive: angles added directly</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-field"><label>Nudge δx <span class="val" id="s2-dxval"></span></label><input type="range" id="s2-dx" min="-60" max="60" step="1" value="10"></div>
+        <div class="nlo-field"><label>Nudge δy <span class="val" id="s2-dyval"></span></label><input type="range" id="s2-dy" min="-60" max="60" step="1" value="10"></div>
+        <div class="nlo-field"><label>Nudge δz <span class="val" id="s2-dzval"></span></label><input type="range" id="s2-dz" min="-60" max="60" step="1" value="0"></div>
+        <div class="nlo-readout" id="s2-readout"></div>
+      </div>
+    </div>
+    <div class="nlo-warn">⚠️ <span><b>In practice:</b> this is also why orientation is usually <em>stored</em> as a rotation matrix or a 4-number quaternion (which avoids the singularities plain roll/pitch/yaw angles run into — "gimbal lock") but <em>updated</em> during optimization using a 3-number tangent nudge like δ above. Storage representation and update representation don't have to be the same thing.</span></div>
+  </section>
+
+  <section class="nlo-step" id="fit3d">
+    <div class="nlo-step-head"><span class="nlo-step-num">3</span><h2>Finding an orientation from landmark sightings</h2></div>
+    <p class="nlo-eyebrow">Gauss-Newton, in 3D</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> the robot's position is known this time — only its <em>orientation</em> is unknown. Each landmark gives a noisy bearing (a 3D direction, not just an angle), and the residual is simply how far off that direction is from what the current orientation estimate predicts.</div>
+    <div class="nlo-math">r&#8290;(R) = measured&#8290; − R&#7488;n&#8290;&nbsp;&nbsp;&nbsp;&nbsp;n&#8290; = true world-frame direction to landmark i (known)</div>
+    <p>Four landmarks, each observed as a noisy 3D direction in the robot's own frame. Step through Gauss-Newton (its Jacobian here is estimated numerically rather than hand-derived — deriving 3D rotation derivatives analytically needs more differential-geometry machinery than fits on this page, but the update rule is identical either way) and watch the colored dots — each one a landmark direction, rotated into the world by the <em>current</em> orientation estimate — slide onto the fixed true directions.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s3-canvas" width="480" height="400"></canvas>
+        <div class="nlo-legend">
+          <span>◆ true landmark direction</span>
+          <span><i style="background:var(--color-accent)"></i>estimate's predicted direction</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-btnrow">
+          <button id="s3-step" class="nlo-primary">Step ▸</button>
+          <button id="s3-run">Run</button>
+          <button id="s3-reset">Reset</button>
+        </div>
+        <div class="nlo-readout" id="s3-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="lm3d">
+    <div class="nlo-step-head"><span class="nlo-step-num">4</span><h2>Levenberg-Marquardt on the rotation</h2></div>
+    <p class="nlo-eyebrow">Same damping, one more time</p>
+    <div class="nlo-goal">🎯 <b>Learning goal:</b> the damping term still adds <code>λI</code> to a 3×3 <code>J&#7488;J</code> — the dimensionality of the tangent nudge, not the representation of the rotation itself, is all that ever mattered.</div>
+    <p>Same landmarks, but this time starting almost 180° off — pointing roughly the opposite way. Gauss-Newton's numerical Jacobian is a much rougher local model out here; adaptive λ keeps the early steps honest.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s4-canvas" width="480" height="400"></canvas>
+      </div>
+      <div class="nlo-controls">
+        <label class="nlo-toggle"><input type="checkbox" id="s4-adaptive" checked> Adapt λ automatically</label>
+        <div class="nlo-btnrow">
+          <button id="s4-step" class="nlo-primary">Step ▸</button>
+          <button id="s4-run">Run</button>
+          <button id="s4-reset">Reset</button>
+        </div>
+        <div class="nlo-readout" id="s4-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="playground">
+    <div class="nlo-step-head"><span class="nlo-step-num">5</span><h2>Playground: race all three, in 3D</h2></div>
+    <p class="nlo-eyebrow">Put it all together</p>
+    <p>Same four-landmark scenario, same badly-wrong starting orientation, three methods racing at once (Newton is left out here too, for the same reason as parts 3–4). The table tracks the remaining angle between the estimate and the true orientation.</p>
+    <div class="nlo-demo">
+      <div class="nlo-canvas-wrap">
+        <canvas id="s5-canvas" width="480" height="400"></canvas>
+        <div class="nlo-legend">
+          <span><i style="background:#9b9797"></i>Gradient descent</span>
+          <span><i style="background:var(--color-accent-2)"></i>Gauss-Newton</span>
+          <span><i style="background:#1a7a3a"></i>Levenberg-Marquardt</span>
+        </div>
+      </div>
+      <div class="nlo-controls">
+        <div class="nlo-btnrow">
+          <button id="s5-run" class="nlo-primary">Race ▸</button>
+          <button id="s5-reset">Reset</button>
+          <button id="s5-scenario">New scenario</button>
+        </div>
+        <table class="nlo-table" id="s5-table">
+          <thead><tr><th>Method</th><th>Iters</th><th>Angle err</th><th>Status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="nlo-step" id="cheatsheet">
+    <div class="nlo-step-head"><span class="nlo-step-num">✓</span><h2>Cheat sheet — and the whole series</h2></div>
+    <p class="nlo-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="nlo-cheat">
+      <thead><tr><th>Concept</th><th>What changed from part 4</th></tr></thead>
+      <tbody>
+        <tr><td>Unknown</td><td>A 2D heading θ → a full 3D orientation (3 degrees of freedom, not 1)</td></tr>
+        <tr><td>New surprise</td><td>Rotations don't commute — order matters, unlike adding angles in 2D</td></tr>
+        <tr><td>Storage vs. update</td><td>Store orientation as a matrix or quaternion; <em>update</em> it with a small 3-number tangent nudge, composed via <code>R · Exp(δ)</code></td></tr>
+        <tr><td>Jacobian</td><td>Estimated numerically here, rather than hand-derived — same idea, less differential geometry</td></tr>
+        <tr><td>Update rules</td><td>Identical in spirit to every part before this — gradient descent, Gauss-Newton, and Levenberg-Marquardt all still apply, over whatever the tangent space happens to be</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p style="margin-top:20px;">Across five parts, one method kept reappearing in a new costume every time: turn "what's the right answer" into "what minimizes a cost function," take the best step you can with the information available — slope alone (gradient descent), slope and curvature (Newton), a cheap stand-in for curvature (Gauss-Newton), or a damped blend of the two (Levenberg-Marquardt) — and repeat. Position, then heading, then an unknown map, then a whole trajectory, then a rotation that doesn't even live in ordinary space: the update rule barely changed. That's the actual lesson underneath all the robot-localization dressing — nonlinear least-squares is one idea, reused everywhere.</p>
+  </section>
+{% endraw %}
+
+  <div class="nlo-next">
+    <span>Missed the earlier parts? Start with position-only localization.</span>
+    <a class="btn btn-secondary" href="{{ '/vision/nonlinear-optimization/gradient-descent/' | relative_url }}">← Back to part 1</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.nonlinear_optimization %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+
+  function gaussianNoise(std){
+    var u = Math.max(Math.random(), 1e-9), v = Math.random();
+    return std * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v);
+  }
+  function deg2rad(d){ return d*Math.PI/180; }
+  function rad2deg(r){ return r*180/Math.PI; }
+
+  // ---------- 3D vector / matrix helpers ----------
+  function normalize(v){ var n = Math.hypot(v[0],v[1],v[2]) || 1e-9; return [v[0]/n, v[1]/n, v[2]/n]; }
+  function cross(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+  function dot(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+  function matVec(R,v){ return [R[0][0]*v[0]+R[0][1]*v[1]+R[0][2]*v[2], R[1][0]*v[0]+R[1][1]*v[1]+R[1][2]*v[2], R[2][0]*v[0]+R[2][1]*v[1]+R[2][2]*v[2]]; }
+  function transpose(R){ return [[R[0][0],R[1][0],R[2][0]],[R[0][1],R[1][1],R[2][1]],[R[0][2],R[1][2],R[2][2]]]; }
+  function matMul(A,B){
+    var C=[[0,0,0],[0,0,0],[0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<3;j++) for (var k=0;k<3;k++) C[i][j]+=A[i][k]*B[k][j];
+    return C;
+  }
+  var I3 = [[1,0,0],[0,1,0],[0,0,1]];
+  function expMap(w){
+    var theta = Math.hypot(w[0],w[1],w[2]);
+    if (theta < 1e-9) return I3;
+    var k = [w[0]/theta, w[1]/theta, w[2]/theta];
+    var K = [[0,-k[2],k[1]],[k[2],0,-k[0]],[-k[1],k[0],0]];
+    var K2 = matMul(K,K);
+    var s = Math.sin(theta), c = 1-Math.cos(theta);
+    var R = [[1,0,0],[0,1,0],[0,0,1]];
+    for (var i=0;i<3;i++) for (var j=0;j<3;j++) R[i][j] += s*K[i][j] + c*K2[i][j];
+    return R;
+  }
+  function rotX(a){ var c=Math.cos(a),s=Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
+  function rotY(a){ var c=Math.cos(a),s=Math.sin(a); return [[c,0,s],[0,1,0],[-s,0,c]]; }
+  function rotZ(a){ var c=Math.cos(a),s=Math.sin(a); return [[c,-s,0],[s,c,0],[0,0,1]]; }
+  function eulerToMat(rx,ry,rz){ return matMul(matMul(rotZ(rz),rotY(ry)),rotX(rx)); }
+  function rotAngleBetween(R1,R2){
+    var Rd = matMul(transpose(R1), R2);
+    var tr = Rd[0][0]+Rd[1][1]+Rd[2][2];
+    var c = Math.max(-1, Math.min(1, (tr-1)/2));
+    return Math.acos(c);
+  }
+
+  // ---------- Orientation-only least-squares engine (numeric Jacobian) ----------
+  function residuals(R, worldDirs, measDirs){
+    return worldDirs.map(function(n,i){
+      var predicted = matVec(transpose(R), n);
+      return [ measDirs[i][0]-predicted[0], measDirs[i][1]-predicted[1], measDirs[i][2]-predicted[2] ];
+    });
+  }
+  function rotCost(R, worldDirs, measDirs){
+    var rows = residuals(R, worldDirs, measDirs), s = 0;
+    rows.forEach(function(r){ s += dot(r,r); });
+    return 0.5*s;
+  }
+  function gradAndHessNumeric(R, worldDirs, measDirs){
+    var h = 1e-6, g = [0,0,0], Jcols = [];
+    for (var k=0;k<3;k++){
+      var dp=[0,0,0]; dp[k]=h; var dm=[0,0,0]; dm[k]=-h;
+      var Rp = matMul(R, expMap(dp)), Rm = matMul(R, expMap(dm));
+      var rp = residuals(Rp, worldDirs, measDirs), rm = residuals(Rm, worldDirs, measDirs);
+      Jcols.push(rp.map(function(rpi,i){ return [(rpi[0]-rm[i][0])/(2*h),(rpi[1]-rm[i][1])/(2*h),(rpi[2]-rm[i][2])/(2*h)]; }));
+    }
+    var r0 = residuals(R, worldDirs, measDirs);
+    var H = [[0,0,0],[0,0,0],[0,0,0]];
+    for (var a=0;a<3;a++){
+      for (var i=0;i<r0.length;i++) g[a] += dot(r0[i], Jcols[a][i]);
+      for (var b=0;b<3;b++){ var s=0; for (i=0;i<r0.length;i++) s += dot(Jcols[a][i], Jcols[b][i]); H[a][b]=s; }
+    }
+    return { g:g, H:H };
+  }
+  function solve3(H, g){
+    var A = [H[0].slice(),H[1].slice(),H[2].slice()];
+    var b = [-g[0],-g[1],-g[2]];
+    for (var col=0; col<3; col++){
+      var piv = col;
+      for (var r=col+1;r<3;r++) if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+      if (Math.abs(A[piv][col]) < 1e-11) return null;
+      if (piv !== col){ var t=A[piv]; A[piv]=A[col]; A[col]=t; var tb=b[piv]; b[piv]=b[col]; b[col]=tb; }
+      for (r=col+1;r<3;r++){
+        var f = A[r][col]/A[col][col];
+        for (var c=col;c<3;c++) A[r][c] -= f*A[col][c];
+        b[r] -= f*b[col];
+      }
+    }
+    var x = [0,0,0];
+    for (r=2;r>=0;r--){ var s=b[r]; for (c=r+1;c<3;c++) s -= A[r][c]*x[c]; x[r] = s/A[r][r]; }
+    return x;
+  }
+  function rotStep(method, R, worldDirs, measDirs, engineState){
+    var gh = gradAndHessNumeric(R, worldDirs, measDirs);
+    var g = gh.g;
+    if (method === 'gd'){
+      var alpha = 1.0, cOld = rotCost(R, worldDirs, measDirs), Rnew;
+      for (var i=0;i<25;i++){
+        var delta = [-alpha*g[0], -alpha*g[1], -alpha*g[2]];
+        Rnew = matMul(R, expMap(delta));
+        if (rotCost(Rnew, worldDirs, measDirs) < cOld || alpha < 1e-4) break;
+        alpha *= 0.5;
+      }
+      return { R: Rnew, grad: g };
+    }
+    var H = gh.H;
+    if (method === 'lm') H = [[gh.H[0][0]+engineState.lambda,gh.H[0][1],gh.H[0][2]],[gh.H[1][0],gh.H[1][1]+engineState.lambda,gh.H[1][2]],[gh.H[2][0],gh.H[2][1],gh.H[2][2]+engineState.lambda]];
+    var delta = solve3(H, g);
+    if (!delta) delta = [-0.05*g[0], -0.05*g[1], -0.05*g[2]];
+    var candidate = matMul(R, expMap(delta));
+    if (method === 'lm'){
+      var cOld2 = rotCost(R, worldDirs, measDirs), cNew2 = rotCost(candidate, worldDirs, measDirs);
+      if (cNew2 < cOld2){ engineState.lambda = Math.max(engineState.lambda*0.4, 1e-3); return { R: candidate, grad: g }; }
+      engineState.lambda = Math.min(engineState.lambda*3, 1e6);
+      return { R: R, grad: g };
+    }
+    return { R: candidate, grad: g };
+  }
+
+  // ---------- Simple orthographic 3D projection for canvas ----------
+  var VIEW_RX = deg2rad(18), VIEW_RY = deg2rad(-32);
+  function applyView(p){
+    var cy=Math.cos(VIEW_RY), sy=Math.sin(VIEW_RY);
+    var x1 = cy*p[0]+sy*p[2], z1 = -sy*p[0]+cy*p[2], y1 = p[1];
+    var cx=Math.cos(VIEW_RX), sx=Math.sin(VIEW_RX);
+    var y2 = cx*y1 - sx*z1, z2 = sx*y1 + cx*z1;
+    return [x1, y2, z2];
+  }
+  function makeProjector(canvas, scale){
+    var cx = canvas.width/2, cy = canvas.height/2;
+    return function(p){ var v = applyView(p); return [cx + scale*v[0], cy - scale*v[1]]; };
+  }
+  function drawAxes(ctx, project, R, colors, alpha, labelPrefix){
+    var axes = [[1,0,0],[0,1,0],[0,0,1]];
+    var origin = project([0,0,0]);
+    axes.forEach(function(a,i){
+      var world = matVec(R, a);
+      var end = project([world[0]*1.6, world[1]*1.6, world[2]*1.6]);
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = colors[i]; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(origin[0],origin[1]); ctx.lineTo(end[0],end[1]); ctx.stroke();
+      var ang = Math.atan2(end[1]-origin[1], end[0]-origin[0]);
+      ctx.beginPath(); ctx.moveTo(end[0],end[1]);
+      ctx.lineTo(end[0]-7*Math.cos(ang-0.4), end[1]-7*Math.sin(ang-0.4));
+      ctx.lineTo(end[0]-7*Math.cos(ang+0.4), end[1]-7*Math.sin(ang+0.4));
+      ctx.closePath(); ctx.fillStyle = colors[i]; ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  }
+  function drawGroundGrid(ctx, project){
+    ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 1;
+    for (var i=-2;i<=2;i++){
+      var a = project([i, -2, -2]), b = project([i, -2, 2]);
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+      var c = project([-2, -2, i]), d = project([2, -2, i]);
+      ctx.beginPath(); ctx.moveTo(c[0],c[1]); ctx.lineTo(d[0],d[1]); ctx.stroke();
+    }
+  }
+
+  // ---------- Step 1: non-commutativity ----------
+  (function(){
+    var canvas = document.getElementById('s1-canvas'), ctx = canvas.getContext('2d');
+    var project = makeProjector(canvas, 90);
+    function draw(){
+      var rx = deg2rad(parseFloat(document.getElementById('s1-rx').value));
+      var ry = deg2rad(parseFloat(document.getElementById('s1-ry').value));
+      var Rxy = matMul(rotY(ry), rotX(rx)); // apply x first, then y (rightmost applied first)
+      var Ryx = matMul(rotX(rx), rotY(ry)); // apply y first, then x
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      drawGroundGrid(ctx, project);
+      drawAxes(ctx, project, Ryx, [COLOR_ACCENT2,COLOR_ACCENT2,COLOR_ACCENT2], 0.45);
+      drawAxes(ctx, project, Rxy, [COLOR_ACCENT,COLOR_ACCENT,COLOR_ACCENT], 1);
+      var angleApart = rad2deg(rotAngleBetween(Rxy, Ryx));
+      document.getElementById('s1-rxval').textContent = document.getElementById('s1-rx').value + '°';
+      document.getElementById('s1-ryval').textContent = document.getElementById('s1-ry').value + '°';
+      document.getElementById('s1-readout').innerHTML =
+        '<div><span class="k">angle between the two results</span> = <span class="hi">' + angleApart.toFixed(1) + '°</span></div>' +
+        '<div style="opacity:.7;margin-top:6px;">Zero only when one of the rotations is zero — otherwise, order matters.</div>';
+    }
+    ['s1-rx','s1-ry'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
+    draw();
+  })();
+
+  // ---------- Step 2: perturb — compose vs naive add ----------
+  (function(){
+    var canvas = document.getElementById('s2-canvas'), ctx = canvas.getContext('2d');
+    var project = makeProjector(canvas, 90);
+    var baseEuler = [deg2rad(25), deg2rad(20), deg2rad(15)];
+    var Rbase = eulerToMat(baseEuler[0], baseEuler[1], baseEuler[2]);
+    function draw(){
+      var dx = deg2rad(parseFloat(document.getElementById('s2-dx').value));
+      var dy = deg2rad(parseFloat(document.getElementById('s2-dy').value));
+      var dz = deg2rad(parseFloat(document.getElementById('s2-dz').value));
+      var Rcomposed = matMul(Rbase, expMap([dx,dy,dz]));
+      var Rnaive = eulerToMat(baseEuler[0]+dx, baseEuler[1]+dy, baseEuler[2]+dz);
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      drawGroundGrid(ctx, project);
+      drawAxes(ctx, project, Rnaive, [COLOR_ACCENT2,COLOR_ACCENT2,COLOR_ACCENT2], 0.45);
+      drawAxes(ctx, project, Rcomposed, [COLOR_ACCENT,COLOR_ACCENT,COLOR_ACCENT], 1);
+      var gap = rad2deg(rotAngleBetween(Rcomposed, Rnaive));
+      document.getElementById('s2-dxval').textContent = document.getElementById('s2-dx').value + '°';
+      document.getElementById('s2-dyval').textContent = document.getElementById('s2-dy').value + '°';
+      document.getElementById('s2-dzval').textContent = document.getElementById('s2-dz').value + '°';
+      document.getElementById('s2-readout').innerHTML =
+        '<div><span class="k">gap between composed &amp; naive</span> = <span class="hi">' + gap.toFixed(1) + '°</span></div>' +
+        '<div style="opacity:.7;margin-top:6px;">Small nudge → nearly identical. Bigger nudge → they clearly disagree.</div>';
+    }
+    ['s2-dx','s2-dy','s2-dz'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
+    draw();
+  })();
+
+  // ---------- Shared 3D scenario ----------
+  function makeRotScenario(trueEuler, initEuler, noiseStd){
+    var trueR = eulerToMat(trueEuler[0], trueEuler[1], trueEuler[2]);
+    var landmarks = [[3,1,0.6],[-2,2,1.4],[1,-2.5,2],[0.6,0.6,-3]];
+    var worldDirs = landmarks.map(normalize);
+    var measDirs = worldDirs.map(function(n){
+      var b = matVec(transpose(trueR), n);
+      return normalize([b[0]+gaussianNoise(noiseStd), b[1]+gaussianNoise(noiseStd), b[2]+gaussianNoise(noiseStd)]);
+    });
+    return { trueR: trueR, worldDirs: worldDirs, measDirs: measDirs, initR: eulerToMat(initEuler[0], initEuler[1], initEuler[2]) };
+  }
+  function drawScenario(canvas, project, scenario, R, color){
+    ctx_clear(canvas);
+    var ctx = canvas.getContext('2d');
+    drawGroundGrid(ctx, project);
+    scenario.worldDirs.forEach(function(n){
+      var p = project([n[0]*1.8, n[1]*1.8, n[2]*1.8]);
+      ctx.fillStyle = COLOR_ACCENT2;
+      ctx.beginPath(); ctx.moveTo(p[0],p[1]-6); ctx.lineTo(p[0]+6,p[1]); ctx.lineTo(p[0],p[1]+6); ctx.lineTo(p[0]-6,p[1]); ctx.closePath(); ctx.fill();
+    });
+    scenario.measDirs.forEach(function(m){
+      var predictedWorld = matVec(R, m);
+      var p = project([predictedWorld[0]*1.8, predictedWorld[1]*1.8, predictedWorld[2]*1.8]);
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(p[0],p[1],5,0,7); ctx.fill();
+    });
+    drawAxes(ctx, project, R, [color,color,color], 0.9);
+  }
+  function ctx_clear(canvas){ var ctx=canvas.getContext('2d'); ctx.clearRect(0,0,canvas.width,canvas.height); }
+
+  // ---------- Step 3: Gauss-Newton fit ----------
+  (function(){
+    var canvas = document.getElementById('s3-canvas');
+    var project = makeProjector(canvas, 85);
+    var scenario = makeRotScenario([deg2rad(23), deg2rad(-34), deg2rad(51)], [deg2rad(-70), deg2rad(85), deg2rad(-20)], 0.03);
+    var R = scenario.initR;
+    var iterCount = 0, running=false, timer=null;
+    function redraw(){ drawScenario(canvas, project, scenario, R, COLOR_ACCENT); }
+    function updateReadout(){
+      var errDeg = rad2deg(rotAngleBetween(R, scenario.trueR));
+      document.getElementById('s3-readout').innerHTML =
+        '<div><span class="k">iteration</span> = <span class="hi">' + iterCount + '</span></div>' +
+        '<div><span class="k">cost</span> = ' + rotCost(R, scenario.worldDirs, scenario.measDirs).toFixed(5) + '</div>' +
+        '<div><span class="k">angle error</span> = <span class="hi">' + errDeg.toFixed(2) + '°</span></div>';
+    }
+    function doStep(){
+      var res = rotStep('gauss-newton', R, scenario.worldDirs, scenario.measDirs, {});
+      R = res.R; iterCount++;
+      redraw(); updateReadout();
+      return Math.hypot(res.grad[0],res.grad[1],res.grad[2]) < 1e-4;
+    }
+    function stopRun(){ running=false; if (timer){clearInterval(timer);timer=null;} document.getElementById('s3-run').textContent='Run'; }
+    function reset(){ stopRun(); R = scenario.initR; iterCount = 0; redraw(); updateReadout(); }
+    document.getElementById('s3-step').addEventListener('click', doStep);
+    document.getElementById('s3-reset').addEventListener('click', reset);
+    document.getElementById('s3-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running=true; document.getElementById('s3-run').textContent='Stop';
+      var count=0; timer=setInterval(function(){ var done=doStep(); count++; if (done||count>30) stopRun(); }, 350);
+    });
+    reset();
+  })();
+
+  // ---------- Step 4: LM ----------
+  (function(){
+    var canvas = document.getElementById('s4-canvas');
+    var project = makeProjector(canvas, 85);
+    var scenario = makeRotScenario([deg2rad(23), deg2rad(-34), deg2rad(51)], [deg2rad(150), deg2rad(-60), deg2rad(100)], 0.03);
+    var R, iterCount, engineState, running=false, timer=null;
+    var adaptiveBox = document.getElementById('s4-adaptive');
+    function redraw(){ drawScenario(canvas, project, scenario, R, '#1a7a3a'); }
+    function updateReadout(){
+      var errDeg = rad2deg(rotAngleBetween(R, scenario.trueR));
+      document.getElementById('s4-readout').innerHTML =
+        '<div><span class="k">iteration</span> = <span class="hi">' + iterCount + '</span></div>' +
+        '<div><span class="k">λ</span> = <span class="hi">' + engineState.lambda.toExponential(2) + '</span></div>' +
+        '<div><span class="k">angle error</span> = ' + errDeg.toFixed(2) + '°</div>';
+    }
+    function doStep(){
+      if (!adaptiveBox.checked) engineState.lambda = 1;
+      var res = rotStep('lm', R, scenario.worldDirs, scenario.measDirs, engineState);
+      R = res.R; iterCount++;
+      redraw(); updateReadout();
+      return Math.hypot(res.grad[0],res.grad[1],res.grad[2]) < 1e-4;
+    }
+    function stopRun(){ running=false; if (timer){clearInterval(timer);timer=null;} document.getElementById('s4-run').textContent='Run'; }
+    function reset(){ stopRun(); R = scenario.initR; iterCount = 0; engineState = { lambda: 1 }; redraw(); updateReadout(); }
+    document.getElementById('s4-step').addEventListener('click', doStep);
+    document.getElementById('s4-reset').addEventListener('click', reset);
+    document.getElementById('s4-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running=true; document.getElementById('s4-run').textContent='Stop';
+      var count=0; timer=setInterval(function(){ var done=doStep(); count++; if (done||count>30) stopRun(); }, 350);
+    });
+    reset();
+  })();
+
+  // ---------- Step 5: playground race ----------
+  (function(){
+    var canvas = document.getElementById('s5-canvas');
+    var project = makeProjector(canvas, 85);
+    var scenario = makeRotScenario([deg2rad(23), deg2rad(-34), deg2rad(51)], [deg2rad(150), deg2rad(-60), deg2rad(100)], 0.03);
+    var methods = [
+      { key:'gd', label:'Gradient descent', color:'#9b9797' },
+      { key:'gauss-newton', label:'Gauss-Newton', color: COLOR_ACCENT2 },
+      { key:'lm', label:'Levenberg-Marquardt', color: '#1a7a3a' }
+    ];
+    var Rs, engineStates, iters, done, running=false, timer=null;
+    function tbody(){ return document.querySelector('#s5-table tbody'); }
+    function renderTable(){
+      var rows = methods.map(function(m,i){
+        var errDeg = rad2deg(rotAngleBetween(Rs[i], scenario.trueR));
+        var status = done[i] ? (done[i]==='ok' ? 'converged' : done[i]) : 'running';
+        return '<tr><td><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+m.color+';margin-right:6px;"></i>'+m.label+'</td><td>'+iters[i]+'</td><td>'+errDeg.toFixed(2)+'°</td><td>'+status+'</td></tr>';
+      });
+      tbody().innerHTML = rows.join('');
+    }
+    function redraw(){
+      ctx_clear(canvas);
+      var ctx = canvas.getContext('2d');
+      drawGroundGrid(ctx, project);
+      scenario.worldDirs.forEach(function(n){
+        var p = project([n[0]*1.8, n[1]*1.8, n[2]*1.8]);
+        ctx.fillStyle = COLOR_TEXT;
+        ctx.beginPath(); ctx.moveTo(p[0],p[1]-6); ctx.lineTo(p[0]+6,p[1]); ctx.lineTo(p[0],p[1]+6); ctx.lineTo(p[0]-6,p[1]); ctx.closePath(); ctx.fill();
+      });
+      methods.forEach(function(m,i){ drawAxes(ctx, project, Rs[i], [m.color,m.color,m.color], 0.9); });
+    }
+    function reset(newScenario){
+      stopRun();
+      if (newScenario) scenario = newScenario;
+      Rs = methods.map(function(){ return scenario.initR; });
+      engineStates = methods.map(function(){ return { lambda: 1 }; });
+      iters = methods.map(function(){ return 0; });
+      done = methods.map(function(){ return null; });
+      redraw(); renderTable();
+    }
+    function stopRun(){ running=false; if (timer){clearInterval(timer);timer=null;} document.getElementById('s5-run').textContent='Race ▸'; }
+    function tick(){
+      var allDone = true;
+      methods.forEach(function(m,i){
+        if (done[i]) return;
+        if (iters[i] >= 40){ done[i]='stalled'; return; }
+        var res = rotStep(m.key, Rs[i], scenario.worldDirs, scenario.measDirs, engineStates[i]);
+        Rs[i] = res.R; iters[i]++;
+        if (Math.hypot(res.grad[0],res.grad[1],res.grad[2]) < 1e-4) done[i]='ok';
+        allDone = false;
+      });
+      redraw(); renderTable();
+      if (allDone) stopRun();
+    }
+    document.getElementById('s5-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running=true; document.getElementById('s5-run').textContent='Stop';
+      timer=setInterval(tick, 280);
+    });
+    document.getElementById('s5-reset').addEventListener('click', function(){ reset(); });
+    document.getElementById('s5-scenario').addEventListener('click', function(){
+      var e1 = [Math.random()*Math.PI*2-Math.PI, Math.random()*Math.PI-Math.PI/2, Math.random()*Math.PI*2-Math.PI];
+      reset(makeRotScenario(e1, [deg2rad(150), deg2rad(-60), deg2rad(100)], 0.03));
+    });
+    reset();
+  })();
+
+})();
+</script>
+{% endraw %}
+</body>
+</html>

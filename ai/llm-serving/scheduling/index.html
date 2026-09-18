@@ -1,0 +1,666 @@
+---
+title: "LLM Serving, Interactively — Part 7: The scheduler: queues, fairness and admission control"
+description: "How a serving scheduler decides what runs each iteration: FCFS head-of-line blocking, SJF and SRPT, learned length prediction, starvation and aging, priority tiers, admission control, queue depth and fair queueing across tenants."
+permalink: "/ai/llm-serving/scheduling/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .hol-canvas { touch-action: none; }
+  .sched-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; margin-top: 8px; }
+  .sched-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .sched-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .g-readout table { border-collapse: collapse; width: 100%; }
+  .g-readout th { font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.6; padding: 3px 6px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 7 of 20</span>
+    <h1>The scheduler: queues, fairness and admission control</h1>
+    <p>A serving engine has one scarce resource per iteration — the batch slot — and a scheduler that decides who gets it. Every number a deployment advertises, TTFT, TPOT, p99 and goodput, is downstream of that decision repeated a few thousand times a second. This page opens the black box and lets you break it.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <nav class="g-toc">
+    <a href="#step-decides">1 · What the scheduler decides</a>
+    <a href="#step-fcfs">2 · FCFS and HOL blocking</a>
+    <a href="#step-sjf">3 · SJF, SRPT and prediction</a>
+    <a href="#step-starvation">4 · Starvation, aging and tiers</a>
+    <a href="#step-admission">5 · Admission control</a>
+    <a href="#step-queue">6 · Queue depth</a>
+    <a href="#step-fair">7 · Fairness and goodput</a>
+  </nav>
+
+  <section class="g-step" id="step-decides">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>What the scheduler decides every step</h2></div>
+    <p class="g-eyebrow">The loop, and the five questions inside it</p>
+    <p>Continuous batching recast serving as a loop rather than a batch job: every iteration the engine forms a fresh batch from whichever sequences are resident. The training guide's <a href="{{ '/ai/llm-training/inference/#batching' | relative_url }}">continuous batching</a> section explains why that loop exists and how it hides decode latency behind prefill; the scheduler is the policy that runs inside the loop, and it is where the latency tail is actually made. At each tick it answers five questions at once.</p>
+    <ul>
+      <li><b>Admission.</b> Which requests from the waiting queue may occupy one of the <code>max_num_seqs</code> batch slots this iteration?</li>
+      <li><b>Order.</b> When more requests are admissible than fit, which ones go first?</li>
+      <li><b>Preemption.</b> When the KV pool is exhausted, which running sequence is evicted — and does it recompute its prefill or swap its blocks to host memory (<a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a>)?</li>
+      <li><b>Chunking.</b> How is the per-iteration prefill token budget split between a long prompt being prefilled and the decode steps already in flight (<a href="{{ '/ai/llm-serving/batching/' | relative_url }}">Part 6</a>)?</li>
+      <li><b>Placement.</b> In a disaggregated or replicated deployment, which worker sees the request at all (<a href="{{ '/ai/llm-serving/disaggregation/' | relative_url }}">Part 13</a>, <a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a>)?</li>
+    </ul>
+    <p>These are one policy expressed in five places. A scheduler that admits greedily but orders badly produces exactly the symptom this page is about: a median that looks healthy and a p99 that does not. The budget it is dividing is fixed by the arrival rate and the service time, which is where queueing theory enters. A recap of the prefill/decode split from the training guide is worth one line — decode is memory-bandwidth-bound at roughly 1–2 FLOPs/byte, prefill is compute-bound — and then the interesting part begins: a scheduler can only rearrange <em>when</em> that work happens, never how much of it exists.</p>
+    <div class="g-math g-katex">$$L = \lambda W \qquad \text{Little's law: requests in the system} = \text{arrival rate} \times \text{time in system}$$</div>
+    <p>Little's law is the invariant every scheduling choice trades against. If the arrival rate is 8 req/s and the SLO allows 1.5 s, then at most 12 requests may be in flight; admit a 13th and someone misses. Read it backwards and it turns queue length into a capacity estimate — the basis of the control signal in step 6.</p>
+    <div class="g-goal">💡 <span><b>The invariant:</b> the scheduler cannot create capacity, only allocate delay. Every policy below is a different answer to <em>whose</em> delay gets minimised.</span></div>
+  </section>
+
+  <section class="g-step" id="step-fcfs">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>FCFS and head-of-line blocking</h2></div>
+    <p class="g-eyebrow">The default, and its structural flaw</p>
+    <p>First-come, first-served is the default waiting-queue order in most engines, and it is genuinely fair in the queueing sense: no request can be delayed by a later arrival, so variance is low and nobody can game the queue. Its flaw only appears when job sizes are heavy-tailed, which for LLMs they are: prompt lengths are well modelled as log-normal with a coefficient of variation near 0.7, and agentic traces add 100K-token prompts next to 200-token chat turns (<a href="{{ '/ai/llm-training/tools-agents/' | relative_url }}">tools and agents</a>).</p>
+    <p>Under FCFS one long prefill at the head blocks every short request behind it. That is head-of-line (HOL) blocking, and it is a pure ordering cost: a 4,000-token prompt at roughly 2,000 prefill tokens/s occupies the batch for about two seconds, during which a 120-token request behind it cannot start. Chunked prefill bounds the damage by splitting the long prefill into token chunks and interleaving them with decode, so the short request starts within a chunk rather than after the whole prompt — but chunking does not reorder the queue. The short request still waits behind however many long prefills were already admitted. Only reordering removes HOL blocking.</p>
+    <p>The magnitude of the ordering effect is visible in production traces: vLLM served agentic workloads with <span id="num-vllm-throughput">3.8×</span> higher throughput and <span id="num-vllm-ttft">46×</span> lower P50 TTFT than its baseline. Some of that is prefix-cache hits (<a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a>), but a large share is simply keeping short requests from queueing behind long ones.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="hol-canvas" class="hol-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Drag any row up or down to reorder the queue. Every TTFT recomputes live for a single prefill server at 1,000 tokens/s.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="hol-short">Shortest first</button>
+          <button id="hol-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="hol-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Try this:</b> leave the 1,800-token request first and the 120-token request second; the short one waits ~1.9 s for a response that takes ~0.1 s to compute. Drag the short one ahead and its TTFT drops to ~120 ms.</span></div>
+  </section>
+
+  <section class="g-step" id="step-sjf">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>SJF, SRPT and learned length prediction</h2></div>
+    <p class="g-eyebrow">The theoretically optimal answer, and why it is dangerous</p>
+    <p>Shortest-job-first and its preemptive twin, shortest-remaining-processing-time, are the classic answer to HOL blocking. SRPT is provably optimal for mean response time on a single server, and SJF is optimal among non-preemptive disciplines under the same objective — these are old queueing-theory results, not LLM-specific. Both require knowing the service time before the job runs. For an LLM, the prefill length is known exactly (it is the prompt), which is why an engine can already order on it; the decode length is not, so length prediction means predicting the output.</p>
+    <p>Because the distribution is heavy-tailed, that optimality is narrow. SJF and SRPT buy their low median by stranding the long tail: in the bake-off below, oracle-SJF cuts p50 from about 1.9 s under FCFS to about 0.6 s, and simultaneously pushes p99 from about 4.2 s to about 12 s. The tail is exactly where the users who submitted long reasoning requests live (<a href="{{ '/ai/llm-training/reasoning/' | relative_url }}">reasoning</a>), and it is where an SLO is written. Optimising the mean and meeting a quantile are different objectives, and here they point in opposite directions.</p>
+    <p>Prediction is the practical obstacle. Output length is guessed from the prompt by a regression or classifier, and reasoning models that emit thousands of thinking tokens are the hardest case. The accuracy slider below perturbs the oracle: it preserves the exact multiset of job lengths and only changes how well the scheduler knows which request is which. At 80% accuracy the tail is already worse than the oracle's; at 0% the ordering is a random permutation of the same job lengths, the starvation count climbs, and p99 grows past 14 s even though the median stays flattering — the median is exactly the part a mis-ordered queue does not strand. Prediction error is not a rounding error — it is the whole policy.</p>
+
+    <div class="g-demo" style="flex-direction: column;">
+      <div class="g-grid3" style="width: 100%;">
+        <div class="g-field">
+          <label>Length-prediction accuracy (%) <span class="val">80</span></label>
+          <input type="range" id="acc-slider" min="0" max="100" step="5" value="80">
+        </div>
+        <div class="g-field">
+          <label>Starvation threshold (ms) <span class="val">5000</span></label>
+          <input type="range" id="thr-slider" min="1000" max="10000" step="500" value="5000">
+        </div>
+      </div>
+      <div class="g-canvas-wrap" style="flex-basis: 100%;">
+        <canvas id="bakeoff-canvas" width="640" height="300"></canvas>
+        <div class="sched-legend">
+          <span><i style="background: var(--color-accent);"></i> p50 (median)</span>
+          <span><i style="background: var(--color-accent-2);"></i> p99 tail above the median</span>
+          <span><i style="background: var(--color-accent-700);"></i> 1.5 s TTFT SLO</span>
+          <span>right of each bar: requests that waited past the threshold</span>
+        </div>
+        <p class="g-canvas-hint">Same 47-request heavy-tailed workload (log-normal prompts, mean 512 tok, CV 0.8) through every policy. Predicted-SJF permutes lengths by the accuracy slider.</p>
+      </div>
+      <div class="g-btnrow" id="policy-btns" style="width: 100%;">
+        <button data-policy="fcfs">FCFS</button>
+        <button data-policy="oracle" class="g-primary">Oracle SJF</button>
+        <button data-policy="pred">Predicted SJF</button>
+        <button data-policy="srpt">SRPT</button>
+        <button data-policy="priority">2-tier priority</button>
+        <button data-policy="aging">Aging-FCFS</button>
+      </div>
+      <div class="g-canvas-wrap" style="flex-basis: 100%;">
+        <canvas id="gantt-canvas" width="640" height="240"></canvas>
+        <p class="g-canvas-hint">Gantt of the selected policy (up to 20 of 47 lanes). Press play to replay the schedule left to right.</p>
+      </div>
+      <div class="g-btnrow" style="width: 100%;">
+        <button id="gantt-play">Play</button>
+      </div>
+      <div class="g-readout" id="bakeoff-readout" style="width: 100%;"></div>
+    </div>
+    <div class="g-goal">💡 <span><b>Read the table, not just the bars:</b> SRPT has the best p50 in the set and still starves requests. The starvation column is the cost the median hides.</span></div>
+  </section>
+
+  <section class="g-step" id="step-starvation">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Starvation, aging and priority tiers</h2></div>
+    <p class="g-eyebrow">What to do when the optimal policy is unfair</p>
+    <p>The failure mode of SJF and SRPT is starvation: a long request can be overtaken indefinitely because a fresh short request always looks better. The starvation counter in step 3 is the metric to watch, not the median. Aging fixes it by adding a request's accumulated wait to its effective priority so that it eventually wins the ordering decision — classic anti-starvation, and the reason FCFS with aging is a safe default when lengths cannot be predicted. The engine's own aging weight is coarse: it credits one unit of priority per 1,000 ms of wait, so the tier gap must be scaled to the SLO horizon or aging is either inert or a hard priority floor.</p>
+    <p>Production APIs rarely have one SLO. A two-tier scheme gives interactive traffic strict precedence and pushes batch work into the leftover capacity — the same economics that make batch inference cheap. Multi-SLO scheduling generalises this: rather than one queue, each class carries its own latency target, and the scheduler admits whichever request is furthest from meeting <em>its</em> target. Prefill and decode pull in opposite directions here. Admitting a long prefill helps that request's TTFT but spikes inter-token latency for everyone already decoding, so chunk size is itself a scheduling parameter (<a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a>). When you tune these knobs, measure the SLO with the same rigour you would apply to model quality (<a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation</a>).</p>
+    <div class="g-warn">⚠ <span><b>The trap:</b> a policy tuned to the mean will look great in dashboards and fail the users with the longest, most valuable requests. Always plot p99 and the starvation count together.</span></div>
+  </section>
+
+  <section class="g-step" id="step-admission">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Admission control</h2></div>
+    <p class="g-eyebrow">Goodput versus offered load</p>
+    <p>Everything above assumes the queue is finite in policy but infinite in effect. Under overload that assumption is what kills you. Past capacity, a naive system keeps accepting work; queueing delay grows without bound, clients time out and retry, and the retries add load on top of the work already queued. Effective goodput — requests per second that actually meet their SLO — then collapses even though raw GPU throughput looks flat or slightly higher. This is congestion collapse, and it is a scheduling problem, not a capacity problem.</p>
+    <p>Admission control is the fix: bound the number of in-flight requests (a queue-depth cap, or <code>max_num_seqs</code> plus a waiting-queue limit) and shed at the edge with a 429 once the bound is hit, so the work you do admit finishes inside its SLO. The demo shows a modelled goodput curve: without shedding, goodput peaks a little above capacity and then falls as retries and timeouts consume the machine; with a shed threshold at capacity it stays flat. Shedding early looks wasteful — you reject work you could technically start — but the accepted work meets its target, which is the definition of goodput. A measured version of the same effect: the Mooncake deployment gained its throughput and TTFT improvements precisely because keeping queues short is worth more than keeping them busy.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="admission-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">A modelled congestion-collapse curve for one replica. The vertical line is the shed threshold; pull it left to reject earlier.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Shed threshold (req/s) <span class="val">100</span></label>
+          <input type="range" id="shed-slider" min="40" max="200" step="5" value="100">
+        </div>
+        <div class="g-readout" id="admission-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Rule of thumb:</b> shed at the knee, not past it. A threshold near capacity preserves goodput; a threshold below capacity trades goodput for headroom against bursty arrivals.</span></div>
+  </section>
+
+  <section class="g-step" id="step-queue">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Queue depth as the control signal</h2></div>
+    <p class="g-eyebrow">What to measure, and what to scale on</p>
+    <p>Queue depth is the right control signal because Little's law relates it directly to the SLO. Given an arrival rate and a latency target, L = λW fixes how many requests may be in flight; anything above that is guaranteed to miss. A serving deployment should therefore publish the waiting-queue length, the running-batch size and KV-cache utilisation as first-class metrics, and autoscale on them rather than on GPU utilisation. A saturated decode server shows high memory-bandwidth utilisation and low SM occupancy while its queue grows, so utilisation hides the problem that queue length exposes (<a href="{{ '/ai/llm-serving/cluster/' | relative_url }}">Part 19</a>).</p>
+    <p>Queue depth also drives the internal decisions. The prefill token budget is chosen so the waiting queue drains at the SLO rate, and KV-block pressure is what triggers preemption in the first place (<a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">Part 5</a>). Long-context requests make the signal noisy, because a single 100K-token prompt consumes many blocks and distorts per-request depth (<a href="{{ '/ai/llm-serving/long-context/' | relative_url }}">Part 15</a>); when the workload skews long, account in tokens, not requests. The same caveat applies at the model level: attention cost per token grows with context, so a head count that looks short in requests can be long in compute.</p>
+    <div class="g-goal">💡 <span><b>Dashboard trio:</b> waiting requests, running sequences, KV blocks in use. If waiting is rising while running is capped, you need capacity or an admission limit — not a tuning change.</span></div>
+  </section>
+
+  <section class="g-step" id="step-fair">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Fair queueing across tenants and goodput-aware scheduling</h2></div>
+    <p class="g-eyebrow">One GPU, many customers</p>
+    <p>Without per-tenant scheduling, a tenant that submits long prompts damages every other tenant sharing the replica — the noisy-neighbour effect. The demo below runs a short, interactive tenant B alongside a long-prompt batch tenant A under three regimes: global FCFS, tenant-aware priority, and full isolation. Under FCFS, B's p99 TTFT runs into seconds; give B precedence and it drops by an order of magnitude without touching the hardware. The mechanism is packet scheduling borrowed from networking: weighted fair queueing or deficit round-robin gives each tenant a share of the batch slot per iteration, and per-tenant token buckets cap how far ahead any tenant can get. LoRA serving adds a wrinkle — many tenants share one base model, so fairness is enforced on adapters and request queues, not on weights (<a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a>).</p>
+    <p>Goodput-aware scheduling closes the loop. Instead of maximising tokens per second, the scheduler maximises the number of requests that meet both their TTFT and TPOT targets, and routes or sheds the rest. Disaggregated deployments make this explicit: separate prefill and decode pools, each scheduled against its own SLO, are how DistServe reports <span id="num-distserve">7.4×/12.6×</span> more goodput than a colocated baseline. The general rule is uncomfortable but simple — when you cannot serve everything well, decide who you are going to serve well, and encode that decision in the admission policy rather than discovering it in the p99.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tenant-canvas" width="640" height="260"></canvas>
+        <p class="g-canvas-hint">p99 time-to-first-token for tenant B as tenant A's load rises. Bars are simulated with the same engine as step 3.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>Tenant A offered load (×) <span class="val">1</span></label>
+          <input type="range" id="tenant-load" min="0.5" max="3" step="0.1" value="1">
+        </div>
+        <div class="g-readout" id="tenant-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Forward link:</b> <a href="{{ '/ai/llm-serving/multi-tenancy/' | relative_url }}">Part 17</a> takes the fairness machinery further — LoRA adapter paging, quota enforcement and the billing side of noisy neighbours.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <p class="g-eyebrow">Scheduling policies at a glance</p>
+    <div style="overflow-x: auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Policy</th><th>Ordering rule</th><th>Strength</th><th>Failure mode</th></tr></thead>
+      <tbody>
+        <tr><td>FCFS</td><td>Arrival time</td><td>Zero variance; no starvation; needs no prediction</td><td>Head-of-line blocking: p99 tracks the longest job in front</td></tr>
+        <tr><td>SJF (oracle)</td><td>Ascending total length</td><td>Optimal mean response time when lengths are known</td><td>Requires an oracle; starves long jobs</td></tr>
+        <tr><td>SRPT</td><td>Ascending remaining work, preemptive</td><td>Provably optimal mean; rescues short jobs behind long ones</td><td>Starvation; preemption churn; needs remaining-work estimate</td></tr>
+        <tr><td>Priority (multi-tier)</td><td>Class first, then arrival</td><td>Protects an interactive SLO from batch traffic</td><td>Low tier starves unless paired with aging or borrowing</td></tr>
+        <tr><td>Aging-FCFS</td><td>FCFS plus wait-time credit</td><td>Prevents starvation with no prediction; simple</td><td>Aging rate must match the SLO horizon; can spoil the median</td></tr>
+        <tr><td>WFQ / DRR</td><td>Per-tenant weighted share per iteration</td><td>Bounds cross-tenant damage; enforces contracts</td><td>Per-tenant accounting; less efficient when nearly idle</td></tr>
+        <tr><td>Chunked prefill (budget split)</td><td>Token budget, not queue order</td><td>Caps inter-token latency spikes from long prefills</td><td>More scheduling machinery; adds prefill latency under contention</td></tr>
+        <tr><td>Admission control / shedding</td><td>Cap in-flight, reject past threshold</td><td>Preserves goodput through overload; stops collapse</td><td>Rejects work that might have completed; threshold is workload-specific</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Yu et al., <a href="https://www.usenix.org/conference/osdi22/presentation/yu">“Orca: A Distributed Serving System for Transformer-Based Generative Models”</a>, OSDI 2022 — iteration-level scheduling and continuous batching.</li>
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">“Efficient Memory Management for Large Language Model Serving with PagedAttention”</a>, SOSP 2023 — vLLM, paged KV and preemption.</li>
+      <li>Agrawal et al., <a href="https://arxiv.org/abs/2403.02310">“Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve”</a>, OSDI 2024 — chunked prefill and stall-free batching.</li>
+      <li>Dean &amp; Barroso, <a href="https://dl.acm.org/doi/10.1145/2408776.2408794">“The Tail at Scale”</a>, Communications of the ACM 2013 — tail latency and queueing in large systems.</li>
+      <li>Little, <a href="https://doi.org/10.1287/opre.9.3.383">“A Proof for the Queuing Formula: L = λW”</a>, Operations Research 1961 — the invariant behind queue-depth control.</li>
+      <li>Demers, Keshav &amp; Shenker, <a href="https://dl.acm.org/doi/10.1145/75246.75248">“Analysis and Simulation of a Fair Queueing Algorithm”</a>, SIGCOMM 1989 — weighted fair queueing.</li>
+      <li>Zhong et al., <a href="https://arxiv.org/abs/2401.09670">“DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving”</a>, OSDI 2024 — the goodput framing used in step 7.</li>
+    </ul>
+    <p class="g-source" id="num-source"></p>
+    <p class="g-source">Terms used above are collected in the <a href="{{ '/ai/llm-serving/glossary/' | relative_url }}">series glossary</a>.</p>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The queue is under control; the next lever is not doing the work at all when the prefix is already cached.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>
+var SCHED_NUM_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var HORIZON = 20000;
+
+  /* ---------------- numbers JSON with offline fallback ---------------- */
+  var NUM_FALLBACK = {
+    source: "Offline fallback: the vLLM x Mooncake agentic-trace figures and the DistServe goodput range reproduced from the LLM Serving numbers file. Treat as indicative.",
+    prefix_cache: { vllmMooncake: { throughputX: 3.8, ttftX: 46 }, radixAttentionSpeedup: 6.0, source: "Offline fallback: built-in constants." },
+    disaggregation: { distServeSpeedups: [7.4, 12.6, 20], source: "Offline fallback: built-in constants." }
+  };
+  function applyNumbers(n) {
+    var pc = (n.prefix_cache && n.prefix_cache.vllmMooncake) || {};
+    var ds = (n.disaggregation && n.disaggregation.distServeSpeedups) || [];
+    var t1 = document.getElementById('num-vllm-throughput');
+    var t2 = document.getElementById('num-vllm-ttft');
+    var t3 = document.getElementById('num-distserve');
+    if (t1 && pc.throughputX != null) t1.textContent = Guide.fmtNum(pc.throughputX, 1) + '×';
+    if (t2 && pc.ttftX != null) t2.textContent = Guide.fmtNum(pc.ttftX, 0) + '×';
+    if (t3 && ds.length >= 2) t3.textContent = Guide.fmtNum(ds[0], 1) + '×/' + Guide.fmtNum(ds[1], 1) + '×';
+    var src = document.getElementById('num-source');
+    var txt = (n.prefix_cache && n.prefix_cache.source) ? n.prefix_cache.source : NUM_FALLBACK.source;
+    if (src) src.textContent = 'Service numbers source: ' + txt;
+  }
+  try {
+    fetch(SCHED_NUM_URL).then(function (r) { return r.json(); }).then(applyNumbers).catch(function () { applyNumbers(NUM_FALLBACK); });
+  } catch (e) { applyNumbers(NUM_FALLBACK); }
+  applyNumbers(NUM_FALLBACK);
+
+  /* ---------------- Demo A: policy bake-off ---------------- */
+  (function () {
+    var bakeCanvas = document.getElementById('bakeoff-canvas');
+    var ganttCanvas = document.getElementById('gantt-canvas');
+    var readout = document.getElementById('bakeoff-readout');
+    var accSlider = document.getElementById('acc-slider');
+    var thrSlider = document.getElementById('thr-slider');
+    var playBtn = document.getElementById('gantt-play');
+    var btnWrap = document.getElementById('policy-btns');
+    var SLO_MS = 1500;
+    var results = null, selected = 'oracle', cursor = 0, ganttMax = HORIZON, loop = null;
+    var bakeSetup = Guide.setupCanvas(bakeCanvas, 640, 300, function (W, H) { if (results) drawBake(W, H); });
+    var ganttSetup = Guide.setupCanvas(ganttCanvas, 640, 240, function (W, H) { if (results) drawGantt(W, H); });
+
+    var base = ServingSim.workload({ seed: 7, rate: 2.2, promptMean: 512, promptCV: 0.8, decodeMean: 200, decodeCV: 0.9, horizon: HORIZON });
+    var tierRng = Guide.seededRandom(99);
+    var REQS = base.requests.map(function (q) {
+      var hi = tierRng() < 0.3;
+      return { id: q.id, arrival: q.arrival, promptLen: q.promptLen, outputLen: q.outputLen, priority: hi ? 0 : 0.002 };
+    });
+
+    function predicted(accuracy) {
+      var r = Guide.seededRandom(1234);
+      var lens = REQS.map(function (q) { return q.promptLen; }).slice().sort(function (a, b) { return a - b; });
+      var minL = lens[0], span = Math.max(1, lens[lens.length - 1] - minL);
+      var keyed = REQS.map(function (q, i) {
+        var norm = (q.promptLen - minL) / span;
+        return { i: i, key: accuracy * norm + (1 - accuracy) * r() };
+      });
+      keyed.sort(function (a, b) { return a.key - b.key; });
+      var out = REQS.map(function (q) { return { id: q.id, arrival: q.arrival, promptLen: q.promptLen, outputLen: q.outputLen, priority: q.priority }; });
+      for (var k = 0; k < keyed.length; k++) out[keyed[k].i].promptLen = lens[k];
+      return out;
+    }
+
+    var DEFS = [
+      { id: 'fcfs', label: 'FCFS', policy: 'fcfs', preempt: 'recompute', reqs: function () { return REQS; } },
+      { id: 'oracle', label: 'Oracle SJF', policy: 'sjf', preempt: 'none', reqs: function () { return REQS; } },
+      { id: 'pred', label: 'Predicted SJF', policy: 'sjf', preempt: 'none', reqs: function () { return predicted(parseFloat(accSlider.value) / 100); } },
+      { id: 'srpt', label: 'SRPT', policy: 'srpt', preempt: 'recompute', reqs: function () { return REQS; } },
+      { id: 'priority', label: '2-tier priority', policy: 'priority', preempt: 'recompute', reqs: function () { return REQS; } },
+      { id: 'aging', label: 'Aging-FCFS', policy: 'aging', preempt: 'recompute', reqs: function () { return REQS; } }
+    ];
+
+    function compute() {
+      var thr = parseFloat(thrSlider.value);
+      results = DEFS.map(function (d) {
+        var res = ServingSim.run({
+          requests: d.reqs(), policy: d.policy, capacity: 8, kvBlocks: 512, blockSize: 16,
+          chunkedPrefill: true, prefillTokBudget: 1024, stepMs: 20, preempt: d.preempt, horizon: HORIZON
+        });
+        var star = 0, maxT = 0;
+        Object.keys(res.perReq).forEach(function (k) {
+          var pr = res.perReq[k];
+          if (pr.ttft > thr) star++;
+          if (pr.completion > maxT) maxT = pr.completion;
+        });
+        return { def: d, res: res, p50: res.stats.ttft.p50, p99: res.stats.ttft.p99, star: star, done: res.finished.length, maxT: maxT };
+      });
+      render();
+    }
+
+    function drawBake(W, H) {
+      var ctx = bakeSetup.ctx;
+      var maxP99 = 1;
+      results.forEach(function (r) { if (r.p99 > maxP99) maxP99 = r.p99; });
+      maxP99 = maxP99 * 1.08;
+      var padR = 82, gap = 12;
+      var rows = results.map(function (r) {
+        return {
+          label: r.def.label,
+          segments: [
+            { value: r.p50, color: c.accent, name: 'p50' },
+            { value: Math.max(0, r.p99 - r.p50), color: c.accent2, name: 'p99 tail' }
+          ]
+        };
+      });
+      var geo = Guide.drawStacked(ctx, W, H, rows, { padL: 122, padR: padR, padT: 30, padB: 28, maxTotal: maxP99, axisLabel: 'TTFT (ms) — median + tail' });
+      var plotW = W - 122 - padR;
+      var sloX = 122 + plotW * (SLO_MS / maxP99);
+      ctx.strokeStyle = c.accent700;
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(sloX, 24); ctx.lineTo(sloX, H - 28); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('SLO 1.5s', sloX + 3, 20);
+      ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      results.forEach(function (r, i) {
+        var y = geo.padT + i * (geo.barH + gap) + geo.barH * 0.72;
+        var tipX = 122 + plotW * (r.p99 / maxP99);
+        ctx.fillStyle = r.star > 0 ? c.accent2 : c.text;
+        ctx.fillText(r.star + (r.star > 0 ? ' starving' : ''), tipX + 6, y);
+      });
+    }
+
+    function selectedResult() {
+      for (var i = 0; i < results.length; i++) if (results[i].def.id === selected) return results[i];
+      return results[0];
+    }
+
+    function drawGantt(W, H) {
+      var r = selectedResult();
+      if (!r) return;
+      var ctx = ganttSetup.ctx;
+      ganttMax = r.maxT;
+      var info = ServingSim.drawGantt(ctx, W, H, r.res.perReq, { colors: c, maxLanes: 20, t0: 0, t1: ganttMax });
+      var bg = Guide.css('--color-neutral-100') || '#f2efe9';
+      var xcur = info.px(cursor);
+      ctx.fillStyle = bg;
+      ctx.fillRect(xcur, 8, Math.max(0, (W - 8) - xcur), (H - 22) - 8);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(xcur, 8); ctx.lineTo(xcur, H - 22); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.mono; ctx.textAlign = 'left';
+      ctx.fillText((cursor / 1000).toFixed(2) + 's', Math.min(xcur + 3, W - 44), 18);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText('Gantt · ' + r.def.label + ' (' + Math.min(20, Object.keys(r.res.perReq).length) + ' lanes)', W - 10, 18);
+    }
+
+    function render() {
+      drawBake(640, 300);
+      drawGantt(640, 240);
+      var thr = parseFloat(thrSlider.value);
+      var html = '<table><thead><tr><th style="text-align:left;">policy</th><th style="text-align:right;">p50</th><th style="text-align:right;">p99</th><th style="text-align:right;">starved &gt;' + Guide.fmtMs(thr) + '</th><th style="text-align:right;">done</th></tr></thead><tbody>';
+      results.forEach(function (r) {
+        var bg = r.def.id === selected ? ' style="background:var(--color-accent-100);"' : '';
+        html += '<tr' + bg + '><td style="padding:3px 6px;">' + r.def.label + '</td>' +
+          '<td style="padding:3px 6px;text-align:right;font-family:var(--font-mono);">' + Guide.fmtMs(r.p50) + '</td>' +
+          '<td style="padding:3px 6px;text-align:right;font-family:var(--font-mono);">' + Guide.fmtMs(r.p99) + '</td>' +
+          '<td style="padding:3px 6px;text-align:right;font-family:var(--font-mono);color:' + (r.star > 0 ? 'var(--color-accent-2-700)' : 'inherit') + ';">' + r.star + '</td>' +
+          '<td style="padding:3px 6px;text-align:right;font-family:var(--font-mono);">' + r.done + '/' + Object.keys(r.res.perReq).length + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      readout.innerHTML = html;
+    }
+
+    var btns = btnWrap.querySelectorAll('button');
+    Array.prototype.forEach.call(btns, function (b) {
+      b.addEventListener('click', function () {
+        selected = b.getAttribute('data-policy');
+        cursor = 0;
+        Array.prototype.forEach.call(btns, function (x) { x.className = (x === b) ? 'g-primary' : ''; });
+        render();
+      });
+    });
+
+    loop = Guide.loop({
+      button: playBtn, interval: 50, playLabel: '▶ Play', pauseLabel: '⏸ Pause',
+      onStep: function (dt) {
+        cursor += dt * 4;
+        if (cursor > ganttMax + 600) cursor = 0;
+        drawGantt(640, 240);
+      }
+    });
+
+    Guide.bindSliders([accSlider, thrSlider], function () { compute(); });
+    compute();
+  })();
+
+  /* ---------------- Demo B: isolated head-of-line blocking ---------------- */
+  (function () {
+    var canvas = document.getElementById('hol-canvas');
+    var readout = document.getElementById('hol-readout');
+    var RATE = 1.0;
+    var DEFAULT = [1800, 120, 1600, 240, 900, 300];
+    var queue = DEFAULT.map(function (len) { return { len: len }; });
+    var dragIdx = -1;
+    var setup = Guide.setupCanvas(canvas, 640, 360, function (W, H) { draw(W, H); });
+
+    function layout() {
+      var padT = 16, padB = 20;
+      return { padT: padT, padB: padB, rowH: (360 - padT - padB) / queue.length };
+    }
+    function rowAt(y) {
+      var L = layout();
+      var i = Math.floor((y - L.padT) / L.rowH);
+      return (i >= 0 && i < queue.length) ? i : -1;
+    }
+    function cumulative() {
+      var out = [], acc = 0;
+      queue.forEach(function (q) { acc += q.len / RATE; out.push(acc); });
+      return out;
+    }
+    function draw(W, H) {
+      if (!setup) return;
+      var ctx = setup.ctx;
+      ctx.clearRect(0, 0, W, H);
+      var L = layout();
+      var cums = cumulative();
+      var total = cums[cums.length - 1];
+      var maxLen = Math.max.apply(null, queue.map(function (q) { return q.len; }));
+      var listW = Math.min(300, W * 0.5);
+      var barX = listW + 26;
+      var barW = W - barX - 56;
+      queue.forEach(function (q, i) {
+        var y = L.padT + i * L.rowH;
+        var bh = L.rowH * 0.72;
+        var w = (listW - 26) * (q.len / maxLen);
+        ctx.fillStyle = (i === dragIdx) ? c.accent : c.accent400;
+        ctx.fillRect(12, y, Math.max(6, w), bh);
+        ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText('#' + (i + 1) + ' · ' + q.len + ' tok', 16, y + bh * 0.7);
+        var y2 = y + bh * 0.5;
+        var tw = Math.max(2, barW * (cums[i] / total));
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = (i === dragIdx) ? c.accent2 : c.accent500;
+        ctx.fillRect(barX, y2 - 5, tw, 10);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.mono; ctx.textAlign = 'left';
+        ctx.fillText(cums[i].toFixed(0) + 'ms', barX + tw + 5, y2 + 3);
+      });
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('queue order (drag rows) →', 12, 11);
+      ctx.fillText('time to first token', barX, 11);
+    }
+    function updateReadout() {
+      var cums = cumulative();
+      var html = '<table><thead><tr><th style="text-align:left;">pos</th><th style="text-align:right;">prompt</th><th style="text-align:right;">TTFT</th></tr></thead><tbody>';
+      queue.forEach(function (q, i) {
+        html += '<tr><td style="padding:2px 6px;">#' + (i + 1) + '</td>' +
+          '<td style="padding:2px 6px;text-align:right;font-family:var(--font-mono);">' + q.len + ' tok</td>' +
+          '<td style="padding:2px 6px;text-align:right;font-family:var(--font-mono);">' + Guide.fmtMs(cums[i]) + '</td></tr>';
+      });
+      var mean = cums.reduce(function (a, b) { return a + b; }, 0) / cums.length;
+      html += '</tbody></table><div style="margin-top:6px;"><span class="k">longest wait:</span> <span class="bad">' + Guide.fmtMs(cums[cums.length - 1]) + '</span> · <span class="k">mean TTFT:</span> ' + Guide.fmtMs(mean) + '</div>';
+      readout.innerHTML = html;
+    }
+    function refresh() { draw(640, 360); updateReadout(); }
+
+    function onDown(ev) {
+      var p = Guide.hitTest(canvas, ev);
+      var i = rowAt(p.y);
+      if (i >= 0) {
+        dragIdx = i;
+        if (canvas.setPointerCapture) canvas.setPointerCapture(ev.pointerId);
+        ev.preventDefault();
+        refresh();
+      }
+    }
+    function onMove(ev) {
+      if (dragIdx < 0) return;
+      var p = Guide.hitTest(canvas, ev);
+      var t = rowAt(p.y);
+      if (t >= 0 && t !== dragIdx) {
+        var it = queue.splice(dragIdx, 1)[0];
+        queue.splice(t, 0, it);
+        dragIdx = t;
+        refresh();
+      }
+      ev.preventDefault();
+    }
+    function onUp() { if (dragIdx >= 0) { dragIdx = -1; refresh(); } }
+
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    document.getElementById('hol-short').addEventListener('click', function () {
+      queue.sort(function (a, b) { return a.len - b.len; });
+      refresh();
+    });
+    document.getElementById('hol-reset').addEventListener('click', function () {
+      queue = DEFAULT.map(function (len) { return { len: len }; });
+      refresh();
+    });
+    refresh();
+  })();
+
+  /* ---------------- Demo C: admission control / congestion collapse ---------------- */
+  (function () {
+    var canvas = document.getElementById('admission-canvas');
+    var readout = document.getElementById('admission-readout');
+    var thrSlider = document.getElementById('shed-slider');
+    var C = 100;
+    function eff(u) { return u <= 1 ? 1 : Math.exp(-1.2 * (u - 1)); }
+    function gp(x) { return x * eff(x / C); }
+    var setup = Guide.setupCanvas(canvas, 640, 300, function (W, H) { draw(W, H); });
+
+    function draw(W, H) {
+      if (!setup) return;
+      var ctx = setup.ctx;
+      var T = parseFloat(thrSlider.value);
+      var xMax = 3 * C;
+      var ptsNo = [], ptsShed = [];
+      for (var i = 0; i <= 120; i++) {
+        var x = xMax * i / 120;
+        ptsNo.push({ x: x, y: gp(x) });
+        ptsShed.push({ x: x, y: gp(Math.min(x, T)) });
+      }
+      var axes = Guide.drawLines(ctx, W, H, [
+        { points: ptsNo, color: c.accent2, width: 2 },
+        { points: ptsShed, color: c.accent, width: 2.4 }
+      ], [0, xMax], [0, 1.28 * C], { xLabel: 'offered load (req/s, × capacity)', yLabel: 'goodput (SLO-meeting req/s)' });
+      var xc = axes.px(C);
+      ctx.strokeStyle = c.divider; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(xc, axes.padT); ctx.lineTo(xc, H - 28); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('capacity', xc, axes.padT - 2);
+      var xt = axes.px(T);
+      ctx.strokeStyle = c.accent; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(xt, axes.padT + 10); ctx.lineTo(xt, H - 28); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.textAlign = 'left'; ctx.font = '10px ' + c.font;
+      ctx.fillStyle = c.accent2; ctx.fillText('no shedding → collapse', axes.padL + 8, axes.padT + 12);
+      ctx.fillStyle = c.accent; ctx.fillText('shed at threshold', axes.padL + 8, axes.padT + 26);
+    }
+    function update() {
+      var T = parseFloat(thrSlider.value);
+      var shock = 2.5 * C;
+      var gNo = gp(shock), gShed = gp(Math.min(shock, T));
+      var shedFrac = Math.max(0, 1 - T / shock);
+      readout.innerHTML =
+        '<div><span class="k">shed threshold:</span> <span class="hi">' + T.toFixed(0) + ' req/s</span> (' + (T / C * 100).toFixed(0) + '% of capacity)</div>' +
+        '<div><span class="k">at 2.5× overload — no shedding:</span> <span class="bad">' + gNo.toFixed(0) + ' goodput</span></div>' +
+        '<div><span class="k">at 2.5× overload — with shedding:</span> <span class="hi">' + gShed.toFixed(0) + ' goodput</span></div>' +
+        '<div><span class="k">shed at the edge:</span> ' + (shedFrac * 100).toFixed(0) + '% of offered</div>';
+    }
+    Guide.bindSliders([thrSlider], function () { draw(640, 300); update(); });
+    draw(640, 300); update();
+  })();
+
+  /* ---------------- Demo D: two tenants, one GPU ---------------- */
+  (function () {
+    var canvas = document.getElementById('tenant-canvas');
+    var readout = document.getElementById('tenant-readout');
+    var loadSlider = document.getElementById('tenant-load');
+    var setup = Guide.setupCanvas(canvas, 640, 260, function (W, H) { draw(W, H); });
+    var H2 = 18000, A_BASE = 2.5, B_RATE = 1.0;
+    var state = null;
+
+    function merge(a, b) {
+      var id = 0, map = {}, out = [];
+      a.forEach(function (q) { out.push({ id: id, arrival: q.arrival, promptLen: q.promptLen, outputLen: q.outputLen }); map[id] = 'A'; id++; });
+      b.forEach(function (q) { out.push({ id: id, arrival: q.arrival, promptLen: q.promptLen, outputLen: q.outputLen }); map[id] = 'B'; id++; });
+      return { requests: out, map: map };
+    }
+    function p99(res, map, t) {
+      var arr = [];
+      Object.keys(res.perReq).forEach(function (k) { if (map[k] === t) arr.push(res.perReq[k].ttft); });
+      return ServingSim.percentile(arr, 99);
+    }
+    function runOpts(requests, policy) {
+      return { requests: requests, policy: policy, capacity: 8, kvBlocks: 1024, blockSize: 16, chunkedPrefill: true, prefillTokBudget: 1024, stepMs: 20, preempt: 'recompute', horizon: H2 };
+    }
+    function compute() {
+      var mult = parseFloat(loadSlider.value);
+      var A = ServingSim.workload({ seed: 21, rate: A_BASE * mult, promptMean: 1600, promptCV: 0.6, decodeMean: 160, decodeCV: 0.6, horizon: H2 });
+      var B = ServingSim.workload({ seed: 22, rate: B_RATE, promptMean: 128, promptCV: 0.5, decodeMean: 100, decodeCV: 0.5, horizon: H2 });
+      var mg = merge(A.requests, B.requests);
+      var shared = ServingSim.run(runOpts(mg.requests, 'fcfs'));
+      var prioReqs = mg.requests.map(function (q) {
+        return { id: q.id, arrival: q.arrival, promptLen: q.promptLen, outputLen: q.outputLen, priority: mg.map[q.id] === 'B' ? 0 : 1 };
+      });
+      var fair = ServingSim.run(runOpts(prioReqs, 'priority'));
+      var isoMap = {};
+      B.requests.forEach(function (q) { isoMap[q.id] = 'B'; });
+      var iso = ServingSim.run(Object.assign(runOpts(B.requests, 'fcfs'), { capacity: 4 }));
+      state = {
+        mult: mult,
+        aShared: p99(shared, mg.map, 'A'), bShared: p99(shared, mg.map, 'B'),
+        aFair: p99(fair, mg.map, 'A'), bFair: p99(fair, mg.map, 'B'),
+        bIso: p99(iso, isoMap, 'B')
+      };
+    }
+    function draw(W, H) {
+      if (!state) return;
+      var ctx = setup.ctx;
+      var maxV = Math.max(state.bShared, state.bFair, state.bIso) * 1.12;
+      Guide.drawBars(ctx, W, H, [
+        { label: 'shared · FCFS', value: state.bShared, valueLabel: Guide.fmtMs(state.bShared), color: c.accent2 },
+        { label: 'shared · tenant-aware', value: state.bFair, valueLabel: Guide.fmtMs(state.bFair), color: c.accent500 },
+        { label: 'isolated (4 slots)', value: state.bIso, valueLabel: Guide.fmtMs(state.bIso), color: c.accent }
+      ], { padL: 158, padT: 28, maxV: maxV });
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('tenant B p99 TTFT — short interactive traffic sharing one GPU', 158, 16);
+    }
+    function update() {
+      var damage = state.bIso > 0 ? state.bShared / state.bIso : 0;
+      var repair = state.bShared > 0 ? 1 - state.bFair / state.bShared : 0;
+      readout.innerHTML =
+        '<div><span class="k">tenant A:</span> <span class="hi">' + (A_BASE * state.mult).toFixed(1) + ' req/s</span> long prompts (1,600 tok)</div>' +
+        '<div><span class="k">tenant B:</span> 1.0 req/s, 128-tok prompts</div>' +
+        '<div><span class="k">B p99 — shared FCFS:</span> <span class="bad">' + Guide.fmtMs(state.bShared) + '</span> · A: ' + Guide.fmtMs(state.aShared) + '</div>' +
+        '<div><span class="k">B p99 — tenant-aware:</span> <span class="hi">' + Guide.fmtMs(state.bFair) + '</span> · A: ' + Guide.fmtMs(state.aFair) + '</div>' +
+        '<div><span class="k">B p99 — isolated:</span> ' + Guide.fmtMs(state.bIso) + '</div>' +
+        '<div><span class="k">noisy-neighbour damage:</span> ' + damage.toFixed(0) + '× vs isolated · tenant-aware recovers ' + (repair * 100).toFixed(0) + '%</div>';
+    }
+    Guide.bindSliders([loadSlider], function () { compute(); draw(640, 260); update(); });
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

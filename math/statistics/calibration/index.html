@@ -1,0 +1,455 @@
+---
+title: "Statistics, Interactively — Part 24: Evaluation, ROC/PR, and calibration"
+description: "One threshold slider drives a confusion matrix, an ROC operating point, a precision-recall point and a reliability diagram at once, as Brier, log-loss and ECE track whether the score means what it says."
+permalink: "/math/statistics/calibration/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .g-panel { background: var(--color-bg); border-radius: var(--radius-sm); padding: 8px; }
+  .g-panel-label { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; margin: 0 0 6px; }
+  .g-cm { display: grid; grid-template-columns: auto 1fr 1fr; gap: 4px; align-items: stretch; margin-top: 6px; }
+  .g-cm .h { font-size: 10.5px; opacity: 0.6; display: flex; align-items: center; }
+  .g-cm .cell { padding: 8px 6px; border-radius: var(--radius-sm); background: var(--color-surface); text-align: center; }
+  .g-cm .cell.hit { background: var(--color-accent-100); color: var(--color-accent-800); }
+  .g-cm .cell.miss { background: var(--color-accent-2-100); color: var(--color-accent-2-800); }
+  .g-cm .cell .n { display: block; font-family: var(--font-mono); font-size: 17px; font-weight: 600; }
+  .g-cm .cell .l { font-size: 9.5px; opacity: 0.65; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  @media (max-width: 720px) { .g-panels { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>Evaluation, ROC/PR, and calibration</h1>
+    <p>A classifier rarely hands you a decision. It hands you a score &mdash; a number that rises with the evidence for the positive class &mdash; and leaves the decision to you. Turning that score into a yes or no takes a threshold, and a threshold is not a detail: move it and the confusion matrix fills differently, the error rates change, and the point you are operating at slides along a fixed curve. Nothing about the model changed. The policy changed. This part puts one threshold slider in charge of four views of the same decision &mdash; the confusion matrix, the ROC point, the precision-recall point and the reliability diagram &mdash; so you can watch the trade-offs move together, and then see a monotone recalibration change what the score <em>means</em> without changing how it <em>ranks</em>.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">What does a score actually promise?</p>
+    <p>A binary classifier produces a real-valued score for every input, and usually a threshold turns that score into a label. The same score can be thresholded low, so almost everything is called positive, or high, so almost everything is called negative. Each choice produces a different 2&times;2 tally of outcomes, and therefore different headline numbers. Accuracy, precision, recall, the false-positive rate &mdash; all of them are functions of where the threshold sits, not of the model alone.</p>
+    <p>There are really two questions buried in one score, and they are independent. The first is a question of <em>ranking</em>: does the score put true positives above true negatives? The second is a question of <em>calibration</em>: does a score of 0.8 mean an 80% chance? A model can answer the first question beautifully and the second question terribly. It can order examples correctly while its numbers are nonsense as probabilities, like a thermometer that ranks days from hot to cold perfectly but prints every reading ten degrees too high.</p>
+    <p>This part separates those two questions with pictures. The ROC curve, the precision-recall curve and AUC are about ranking. The reliability diagram, the Brier score, log-loss and the expected calibration error are about meaning. A single toggle in the demo below performs a rank-preserving transform and leaves the ranking world untouched while the meaning world straightens out.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> one threshold turns a score into a confusion matrix, an ROC point and a PR point at the same time; why precision and recall trade against each other under class imbalance; why AUC measures ranking rather than correctness; and why a model can score near-perfect AUC yet be badly calibrated.</span></div>
+    <div class="g-toc">
+      <a href="#views">2 · One slider, four views</a>
+      <a href="#matrix">3 · The confusion matrix and the threshold</a>
+      <a href="#roc">4 · TPR, FPR, ROC and AUC</a>
+      <a href="#pr">5 · Precision, recall, and when PR wins</a>
+      <a href="#calibration">6 · Calibration is not discrimination</a>
+      <a href="#shows">7 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="views">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>One slider, four views</h2></div>
+    <p class="g-eyebrow">The signature interaction</p>
+    <p>The demo below builds a small scored dataset of 420 examples. Each example has a hidden latent value $x$, drawn from a standard normal; the true probability of the positive label is a logistic function of $x$; the label is then drawn from that probability. The <em>score</em> is built from the same latent value but through a deliberately over-confident transform: its logit is the true logit stretched by a factor of $1.8$, plus a little noise. So the score separates the classes well &mdash; it ranks them in almost the right order &mdash; but it shouts much louder than the evidence warrants. It is a good ranker and a bad probability.</p>
+    <p>One threshold slider sits on the right. As you drag it, four pictures update together: the histogram of scores with the threshold drawn through it, the confusion matrix that the threshold produces, the operating point it marks on a pre-drawn ROC curve, and the operating point it marks on a pre-drawn precision-recall curve. The reliability diagram re-colours with the threshold as well, shading the bins that the threshold calls positive. A second control, <em>Recalibrate</em>, applies a strictly increasing map fitted to the data and lets you watch the calibration metrics improve while every ranking quantity stays fixed.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div class="g-panel">
+          <p class="g-panel-label">Score distribution and threshold</p>
+          <canvas id="score-canvas" width="560" height="300"></canvas>
+        </div>
+        <div class="g-panels" style="margin-top:12px;">
+          <div class="g-panel">
+            <p class="g-panel-label">ROC &mdash; operating point</p>
+            <canvas id="roc-canvas" width="520" height="380"></canvas>
+          </div>
+          <div class="g-panel">
+            <p class="g-panel-label">Precision&ndash;recall &mdash; operating point</p>
+            <canvas id="pr-canvas" width="520" height="380"></canvas>
+          </div>
+        </div>
+        <div class="g-panel" style="margin-top:12px;">
+          <p class="g-panel-label">Reliability diagram (calibration)</p>
+          <canvas id="rel-canvas" width="560" height="360"></canvas>
+        </div>
+        <p class="g-canvas-hint">The four panels share one threshold. The ROC, PR and reliability curves themselves are fixed; only the marked operating point and the shading move with the slider.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Threshold <span class="val">0.5</span></label><input type="range" id="threshold-slider" min="0" max="1" step="0.01" value="0.5"></div>
+        <div class="g-btnrow">
+          <button type="button" id="recal-btn">Recalibrate: off</button>
+        </div>
+        <div class="g-cm" id="cm-grid"></div>
+        <div class="g-readout" id="readout" style="margin-top:12px;"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>A threshold is a decision, not a property of the model.</b> Two teams can share one model and report opposite precision and recall because they chose different operating points. Before comparing numbers, ask where the threshold sat &mdash; and whether accuracy is even the right summary when one class is rare.</span></div>
+  </section>
+
+  <section class="g-step" id="matrix">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The confusion matrix and the threshold</h2></div>
+    <p class="g-eyebrow">Four counts that say everything</p>
+    <p>Fix a threshold and every example falls into one of four cells. A true positive is a positive example the classifier called positive. A false positive is a negative example called positive. A false negative is a positive example called negative, and a true negative is a negative example called negative. Those four counts &mdash; TP, FP, FN, TN &mdash; are the confusion matrix, and every evaluation number on this page is just arithmetic on them.</p>
+    <div class="g-math g-katex">$$\mathrm{TPR}=\mathrm{recall}=\frac{TP}{TP+FN},\qquad \mathrm{FPR}=\frac{FP}{FP+TN}$$</div>
+    <p>The true-positive rate is the fraction of real positives that were caught; the false-positive rate is the fraction of real negatives that were wrongly flagged. Both move as the threshold moves, and always in the same direction: lowering the threshold catches more positives (TPR up) but also flags more negatives (FPR up). You cannot improve one without worsening the other, because one slider controls both. That coupling is the whole reason the trade-off needs a curve rather than a single number.</p>
+    <p>Precision and recall describe the same matrix from the other side:</p>
+    <div class="g-math g-katex">$$\mathrm{precision}=\frac{TP}{TP+FP},\qquad \mathrm{recall}=\frac{TP}{TP+FN}$$</div>
+    <p>Recall is identical to TPR &mdash; it asks how much of the positive class you found. Precision asks, of everything you flagged, how much was real. The difference is the denominator: recall divides by the true positives, precision divides by the predicted positives. A classifier can have perfect recall by calling everything positive, at which point its precision collapses to the base rate. It can have perfect precision by calling only one, almost certainly correct, example positive, at which point its recall collapses. Neither number alone describes the model; together with the threshold they pin down the operating point.</p>
+    <p>Accuracy, the fraction of all examples classified correctly, is the number people reach for first and the one that misleads most often. If 95% of examples are negative, a classifier that always says "negative" is 95% accurate and useless. The confusion matrix exposes this immediately, because it shows the positive class with zero TP &mdash; which is why every careful evaluation reports the class balance alongside the score.</p>
+  </section>
+
+  <section class="g-step" id="roc">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>TPR, FPR, ROC and AUC</h2></div>
+    <p class="g-eyebrow">Every threshold at once</p>
+    <p>Instead of choosing one threshold, sweep it across every value the score takes. Each threshold lands on a point $(\mathrm{FPR},\mathrm{TPR})$ in the unit square, and the points trace out the receiver operating characteristic, or ROC curve. The curve begins at the origin when the threshold is so high that nothing is positive, and ends at the top-right corner when it is so low that everything is. In between it bows toward the upper-left corner &mdash; the region of high recall and low false alarms.</p>
+    <p>The diagonal from $(0,0)$ to $(1,1)$ is the performance of random guessing, because a coin flip has $\mathrm{TPR}=\mathrm{FPR}$ at every threshold. A useful model lives above the diagonal. The <em>area</em> under the ROC curve, AUC, has a clean probabilistic reading: it is the probability that a randomly chosen positive example receives a higher score than a randomly chosen negative one. AUC is therefore a pure statement about ranking. It does not care what the actual scores are, only what order they fall in, which is why applying any strictly increasing transform to the scores &mdash; multiplying by two, taking a sigmoid, squaring &mdash; leaves AUC exactly where it was.</p>
+    <p>That invariance is a strength and a trap. It is a strength because AUC summarises discrimination without committing to a threshold, so it compares models fairly on the one thing they agree on. It is a trap because a single number hides the shape of the curve and the operating point you actually care about. Two models with identical AUC can behave completely differently in the high-recall region that your application lives in. And AUC shares the ROC curve's indifference to class balance: it weighs the minority class only through the count of positive examples, so a model can post a flattering AUC while its positive-class predictions are poor. That is when the precision-recall curve earns its place.</p>
+  </section>
+
+  <section class="g-step" id="pr">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Precision, recall, and when PR wins</h2></div>
+    <p class="g-eyebrow">The curve that notices the rare class</p>
+    <p>Plot precision against recall as the threshold sweeps and you get the precision-recall curve. It begins at full recall, where everything is flagged, and precision equals the prevalence of the positive class. As the threshold rises, recall falls but precision rises, until the classifier is flagging only its most confident examples. The PR curve does not have a fixed baseline: the floor is not zero but the prevalence, so the curve lives in a smaller box when positives are rare.</p>
+    <p>This is exactly what makes PR the honest picture under class imbalance. A flooding classifier that flags everything gets recall one and precision equal to prevalence. If positives are one in a thousand, precision is 0.001 &mdash; visibly terrible &mdash; while on the ROC curve the same operating point sits at $\mathrm{FPR}=1$, a corner the eye tends to dismiss. ROC is symmetric in the two classes; PR is not, because precision's denominator contains the false positives, and when negatives vastly outnumber positives a small FPR is a large number of false positives. For rare positives &mdash; disease detection, fraud, a tiny set of unsafe outputs &mdash; the PR curve shows the cost that ROC smooths over.</p>
+    <p>When a single summary is needed, the harmonic mean of precision and recall, the $F_1$ score, is the usual choice:</p>
+    <div class="g-math g-katex">$$F_1 = 2\cdot\frac{\mathrm{precision}\cdot\mathrm{recall}}{\mathrm{precision}+\mathrm{recall}}$$</div>
+    <p>The harmonic mean punishes imbalance between the two: it is high only when both are high, and it collapses if either is near zero. It is still threshold-dependent, so it is a summary of one chosen operating point rather than of the model. The general lesson from both curves is the same: there is no threshold-free verdict on a classifier. There is only a ranking, a set of trade-offs, and a choice about which errors you would rather make.</p>
+  </section>
+
+  <section class="g-step" id="calibration">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Calibration is not discrimination</h2></div>
+    <p class="g-eyebrow">Does the number mean the number?</p>
+    <p>Discrimination is ranking; calibration is meaning. A model is calibrated if the examples it scores 0.8 are positive about 80% of the time. To check this, group the predictions into bins of confidence and compare, in each bin, the average predicted probability against the observed frequency of positives. The result is the reliability diagram: confidence along the horizontal axis, empirical positive rate along the vertical. A perfectly calibrated model lies on the diagonal. A point below the diagonal means the model is over-confident &mdash; it claimed more probability than reality delivered; above the diagonal means it is under-confident.</p>
+    <p>The shaded, size-weighted distance between the reliability curve and the diagonal has a name, the expected calibration error, which averages the gap in each bin weighted by how many examples fall there:</p>
+    <div class="g-math g-katex">$$\mathrm{ECE}=\sum_{b}\frac{n_b}{N}\,\left|\mathrm{acc}_b-\mathrm{conf}_b\right|$$</div>
+    <p>Calibration needs a score of its own, and the honest ones are the strictly proper scoring rules, which are minimised in expectation only by the true probabilities. The Brier score is the mean squared error of the probabilities against the labels, and log-loss is the average negative log-likelihood of the true labels:</p>
+    <div class="g-math g-katex">$$\mathrm{Brier}=\frac{1}{N}\sum_i(\hat p_i-y_i)^2,\qquad \mathrm{logloss}=-\frac{1}{N}\sum_i\big[y_i\log\hat p_i+(1-y_i)\log(1-\hat p_i)\big]$$</div>
+    <p>Log-loss is the more punishing of the two: it grows without bound when the model is confidently wrong, so it notices over-confidence sharply, while Brier stays bounded and gentler. In the demo, toggling <em>Recalibrate</em> applies a strictly increasing map fitted on the logit of the score &mdash; a monotone transform, so the order of any two examples is preserved. The ROC curve, the PR curve, the operating points and AUC are therefore untouched to the last digit: the ranking is identical. But the reliability diagram straightens toward the diagonal, and ECE, Brier and log-loss all fall. Same decisions; better probabilities.</p>
+    <p>This is how a model can rank well and still be badly calibrated, and modern neural networks very often are. Training with cross-entropy on increasingly large models tends to produce over-confident predictions, and a preference model that scores two candidate answers for reinforcement learning from human feedback is a ranker first and a probability second &mdash; its scores order answers usefully while its absolute values drift. The <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">RLHF chapter</a> leans on those scores as rewards, which is exactly a setting where calibration matters beyond ordering. The fix is cheap: fit a monotone map on held-out data, as the toggle does, and convert a good ranker into a trustworthy probability without retraining it.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Reading a score defensibly</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Benchmarks and scores</h3>
+        <p style="margin-bottom:0;">A held-out benchmark score is a summary of a ranking, and the <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation chapter</a> treats it as one: accuracy is threshold-dependent, and a model that tops a leaderboard may simply be ranking well while its confidence values are inflated. Reporting ROC/PR curves and a calibration check turns a single headline number into a defensible claim about the operating region you actually use.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Thresholding a classifier</h3>
+        <p style="margin-bottom:0;">Guardrail classifiers for toxicity or jailbreak detection are scores thresholded into decisions, and their whole job is the trade-off in this part. The <a href="{{ '/ai/llm-training/guardrails/' | relative_url }}">guardrails chapter</a> sets the operating point deliberately: where to sit on the PR curve depends on whether a missed harm or a false alarm costs more. In production, the same questions show up as the monitoring metrics in the <a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">serving metrics chapter</a>, where a shifting class balance quietly moves precision even when the model does not change.</p>
+      </div>
+    </div>
+    <p>The same four views repeat anywhere a score becomes a decision. A medical triage model is a ranking plus a chosen sensitivity, and its calibration decides whether a risk number can be shown to a patient. A spam filter lives at a precision that keeps the inbox clean, accepting the recall it loses. A retrieval system's similarity scores are rankers that must be calibrated before they can be multiplied into a probability. In each case the discipline is identical: look at the ranking with ROC or PR, look at the meaning with a reliability diagram, and compare numbers only at a stated threshold.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below treat evaluation as three separate questions &mdash; where to threshold, how well the model ranks, and whether the numbers are true &mdash; rather than one score to maximise. If you take away one thing, take away the split between discrimination and calibration.</p>
+    <p>Fawcett's tutorial is the standard derivation of the ROC curve and the AUC's probabilistic meaning; Saito and Rehmsmeier make the case for precision-recall under imbalance with examples; Guo and colleagues document how modern neural networks become over-confident and how a single temperature or monotone map repairs it; and Gneiting and Raftery is the definitive account of why Brier and log-loss are the right scoring rules to trust.</p>
+    <ul class="g-refs">
+      <li>Tom Fawcett, <a href="https://doi.org/10.1016/j.patrec.2005.10.010">"An introduction to ROC analysis"</a>, <em>Pattern Recognition Letters</em>, 2006 &mdash; the curve, the area, and the ranking interpretation.</li>
+      <li>Takaya Saito and Marc Rehmsmeier, <a href="https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0118432">"The precision-recall plot is more informative than the ROC plot when evaluating binary classifiers on imbalanced datasets"</a>, 2015.</li>
+      <li>Chuan Guo, Geoff Pleiss, Yu Sun and Kilian Weinberger, <a href="https://arxiv.org/abs/1706.04599">"On Calibration of Modern Neural Networks"</a>, 2017 &mdash; over-confidence and its monotone fixes.</li>
+      <li>Tilmann Gneiting and Adrian Raftery, <a href="https://doi.org/10.1198/016214506000001437">"Strictly Proper Scoring Rules, Prediction, and Estimation"</a>, 2007 &mdash; why Brier and log-loss are the honest summaries.</li>
+      <li>scikit-learn, <a href="https://scikit-learn.org/stable/modules/calibration.html">"Probability calibration"</a> &mdash; reliability diagrams and the calibration methods behind the toggle.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Threshold</td><td>The score cut that turns a ranking into a decision; a policy choice, not a model property</td></tr>
+        <tr><td>TP / FP / FN / TN</td><td>The confusion matrix counts behind every metric on this page</td></tr>
+        <tr><td>TPR (recall)</td><td>$TP/(TP+FN)$: the fraction of real positives caught</td></tr>
+        <tr><td>FPR</td><td>$FP/(FP+TN)$: the fraction of real negatives flagged</td></tr>
+        <tr><td>Precision</td><td>$TP/(TP+FP)$: of those flagged, the fraction that were real</td></tr>
+        <tr><td>ROC curve</td><td>TPR versus FPR over every threshold; the diagonal is chance</td></tr>
+        <tr><td>AUC</td><td>Probability a random positive outranks a random negative; invariant to monotone transforms</td></tr>
+        <tr><td>PR curve</td><td>Precision versus recall; baseline is prevalence, and it is the honest curve under imbalance</td></tr>
+        <tr><td>Calibration</td><td>Whether a score of 0.8 really means 80%; separate from ranking</td></tr>
+        <tr><td>Reliability diagram</td><td>Observed frequency versus predicted confidence, against the diagonal</td></tr>
+        <tr><td>ECE</td><td>Count-weighted average gap between confidence and accuracy across bins</td></tr>
+        <tr><td>Brier / log-loss</td><td>Proper scoring rules for probabilities; log-loss punishes confident errors hardest</td></tr>
+        <tr><td>Recalibration</td><td>A strictly increasing map fit on held-out data; fixes meaning, preserves ranking</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A score that is calibrated gives you a probability. The next part turns that probability into a range for the quantity you actually care about, and shows what coverage means when the world shifts.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) {
+    d = d == null ? 3 : d;
+    if (x == null || !isFinite(x)) return '\u2014';
+    return x.toFixed(d);
+  }
+  function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
+
+  // ---------------------------------------------------------------
+  // The scored, deliberately over-confident dataset.
+  //   x ~ N(0,1);  true p = sigmoid(SLOPE * x);  y ~ Bernoulli(p)
+  //   raw logit = DISTORT * SLOPE * x + noise;  score = sigmoid(logit)
+  // The score ranks well but is stretched, so it is badly calibrated.
+  // ---------------------------------------------------------------
+  var N = 420, SLOPE = 1.25, DISTORT = 1.8, BINS = 10;
+  var r = S.rng(20260914);
+  var yTrue = [], rawLogit = [], rawScores = [];
+  for (var i = 0; i < N; i++) {
+    var x = S.sample.normal(r, 0, 1);
+    var p = sigmoid(SLOPE * x);
+    var y = S.sample.bernoulli(r, p);
+    var z = DISTORT * SLOPE * x + S.sample.normal(r, 0, 0.45);
+    yTrue.push(y); rawLogit.push(z); rawScores.push(sigmoid(z));
+  }
+  var prevalence = 0;
+  for (i = 0; i < N; i++) prevalence += yTrue[i];
+  prevalence /= N;
+
+  // Platt scaling: fit sigmoid(A*z + B) to the labels by Newton's method.
+  // A > 0 makes the map strictly increasing, so it preserves the ranking.
+  function fitPlatt(z, y) {
+    var A = 1 / DISTORT, B = 0;
+    for (var it = 0; it < 60; it++) {
+      var g0 = 0, g1 = 0, h00 = 0, h01 = 0, h11 = 0;
+      for (var k = 0; k < z.length; k++) {
+        var q = sigmoid(A * z[k] + B), w = q * (1 - q), d = q - y[k];
+        g0 += d * z[k]; g1 += d;
+        h00 += w * z[k] * z[k]; h01 += w * z[k]; h11 += w;
+      }
+      var det = h00 * h11 - h01 * h01;
+      if (Math.abs(det) < 1e-9) break;
+      var dA = (h11 * g0 - h01 * g1) / det;
+      var dB = (-h01 * g0 + h00 * g1) / det;
+      A -= dA; B -= dB;
+      if (Math.abs(dA) + Math.abs(dB) < 1e-10) break;
+    }
+    if (!(A > 0)) A = 1 / DISTORT;
+    return { A: A, B: B };
+  }
+  var platt = fitPlatt(rawLogit, yTrue);
+  var calScores = rawLogit.map(function (z) { return sigmoid(platt.A * z + platt.B); });
+
+  // Fixed curves and AUC, computed once from the raw ranking. A monotone
+  // recalibration does not change any of these.
+  var rocCurve = S.metric.roc(yTrue, rawScores);
+  var prCurve = S.metric.pr(yTrue, rawScores);
+  var aucValue = S.metric.auc(rocCurve.fpr, rocCurve.tpr);
+
+  // ---------------------------------------------------------------
+  // state
+  // ---------------------------------------------------------------
+  var threshold = 0.5;
+  var calibrated = false;
+  function activeScores() { return calibrated ? calScores : rawScores; }
+  function currentOp() {
+    var sc = activeScores(), pred = [];
+    for (var k = 0; k < N; k++) pred.push(sc[k] >= threshold ? 1 : 0);
+    return S.metric.confusion(yTrue, pred, 1);
+  }
+  function histBins(h) {
+    var b = [];
+    for (var k = 0; k < h.counts.length; k++) b.push({ x0: h.edges[k], x1: h.edges[k + 1], h: h.counts[k] });
+    return b;
+  }
+
+  // ---------------------------------------------------------------
+  // canvases
+  // ---------------------------------------------------------------
+  var scorePlot, rocPlot, prPlot, relPlot;
+
+  function drawScore() {
+    if (!scorePlot) return;
+    var sc = activeScores(), neg = [], pos = [];
+    for (var k = 0; k < N; k++) (yTrue[k] === 1 ? pos : neg).push(sc[k]);
+    var hN = S.summary.histogram(neg, { bins: 24, domain: [0, 1] });
+    var hP = S.summary.histogram(pos, { bins: 24, domain: [0, 1] });
+    var maxY = 1;
+    for (k = 0; k < hN.counts.length; k++) maxY = Math.max(maxY, hN.counts[k], hP.counts[k]);
+    scorePlot.yRange[0] = 0; scorePlot.yRange[1] = maxY * 1.2;
+    scorePlot.clear();
+    scorePlot.axes({ xLabel: 'score', yLabel: 'count' });
+    scorePlot.columns(histBins(hN), { color: c.accent400, alpha: 0.55 });
+    scorePlot.columns(histBins(hP), { color: c.accent2, alpha: 0.55 });
+    scorePlot.vline(threshold, { color: c.text, dashed: true, width: 1.6, label: 'threshold ' + fmt(threshold, 2), labelY: maxY * 1.13, labelColor: c.text });
+    scorePlot.legend([
+      { label: 'label 0', color: c.accent400, fill: true },
+      { label: 'label 1', color: c.accent2, fill: true }
+    ], { dy: 6 });
+  }
+
+  function drawROC() {
+    if (!rocPlot) return;
+    rocPlot.clear();
+    rocPlot.axes({ xLabel: 'false positive rate', yLabel: 'true positive rate' });
+    rocPlot.curve([[0, 0], [1, 1]], { color: 'rgba(32,30,29,0.35)', dashed: true, width: 1.2 });
+    var pts = [];
+    for (var k = 0; k < rocCurve.fpr.length; k++) pts.push([rocCurve.fpr[k], rocCurve.tpr[k]]);
+    rocPlot.curve(pts, { color: c.accent, width: 2.2 });
+    var op = currentOp();
+    rocPlot.points([[op.fpr, op.tpr]], { color: c.accent2, r: 5, stroke: '#fff', width: 1.5 });
+    rocPlot.text('AUC ' + fmt(aucValue, 3) + ' \u00b7 invariant', 0.96, 0.07, { align: 'right', color: c.accent700 });
+  }
+
+  function drawPR() {
+    if (!prPlot) return;
+    prPlot.clear();
+    prPlot.axes({ xLabel: 'recall', yLabel: 'precision' });
+    prPlot.hline(prevalence, { color: 'rgba(32,30,29,0.35)', dashed: true, width: 1.2 });
+    var pts = [];
+    for (var k = 0; k < prCurve.recall.length; k++) pts.push([prCurve.recall[k], prCurve.precision[k]]);
+    prPlot.curve(pts, { color: c.accent, width: 2.2 });
+    var op = currentOp();
+    prPlot.points([[op.recall, op.precision]], { color: c.accent2, r: 5, stroke: '#fff', width: 1.5 });
+    prPlot.text('baseline = prevalence ' + fmt(prevalence, 2), 0.96, 0.08, { align: 'right', color: c.text });
+  }
+
+  function drawRel() {
+    if (!relPlot) return;
+    var sc = activeScores();
+    var bins = S.metric.calibrationBins(sc, yTrue, BINS);
+    relPlot.clear();
+    relPlot.axes({ xLabel: 'predicted probability', yLabel: 'empirical positive rate' });
+    relPlot.curve([[0, 0], [1, 1]], { color: 'rgba(32,30,29,0.35)', dashed: true, width: 1.2 });
+    var line = [];
+    for (var k = 0; k < bins.length; k++) {
+      var b = bins[k];
+      line.push([b.confidence, b.accuracy]);
+      var above = b.confidence >= threshold;
+      relPlot.points([[b.confidence, b.accuracy]], { color: above ? c.accent2 : c.accent400, r: 3 + 8 * Math.sqrt(b.count / N), stroke: '#fff', width: 1 });
+    }
+    relPlot.curve(line, { color: c.accent, width: 1.6 });
+    relPlot.text('ECE ' + fmt(S.metric.ece(sc, yTrue, BINS), 3), 0.96, 0.08, { align: 'right', color: c.accent700 });
+    relPlot.legend([
+      { label: 'called positive (\u2265 threshold)', color: c.accent2 },
+      { label: 'called negative', color: c.accent400 }
+    ], { dy: 6 });
+  }
+
+  function cmHTML(op) {
+    function cell(v, lab, cls) {
+      return '<div class="cell ' + cls + '"><span class="n">' + v + '</span><span class="l">' + lab + '</span></div>';
+    }
+    return '<div class="h"></div><div class="h" style="text-align:center">pred +</div><div class="h" style="text-align:center">pred &minus;</div>' +
+      '<div class="h">actual +</div>' + cell(op.tp, 'TP', 'hit') + cell(op.fn, 'FN', 'miss') +
+      '<div class="h">actual &minus;</div>' + cell(op.fp, 'FP', 'miss') + cell(op.tn, 'TN', 'hit');
+  }
+
+  function renderReadout() {
+    var sc = activeScores();
+    var op = currentOp();
+    el('cm-grid').innerHTML = cmHTML(op);
+    el('readout').innerHTML =
+      '<div><span class="k">threshold</span> <span class="hi">' + fmt(threshold, 2) + '</span></div>' +
+      '<div><span class="k">TPR (recall)</span> ' + fmt(op.tpr, 3) + ' <span class="k">FPR</span> ' + fmt(op.fpr, 3) + '</div>' +
+      '<div><span class="k">precision</span> ' + fmt(op.precision, 3) + ' <span class="k">recall</span> ' + fmt(op.recall, 3) + '</div>' +
+      '<div><span class="k">accuracy</span> ' + fmt(op.accuracy, 3) + ' <span class="k">prevalence</span> ' + fmt(prevalence, 3) + '</div>' +
+      '<div><span class="k">AUC</span> ' + fmt(aucValue, 3) + '</div>' +
+      '<div><span class="k">Brier</span> ' + fmt(S.metric.brier(sc, yTrue), 3) + ' <span class="k">log-loss</span> ' + fmt(S.metric.logLoss(sc, yTrue), 3) + '</div>' +
+      '<div><span class="k">ECE</span> <span class="' + (calibrated ? 'hi' : '') + '">' + fmt(S.metric.ece(sc, yTrue, BINS), 3) + '</span></div>' +
+      '<div class="g-mini">' + (calibrated
+        ? 'Monotone recalibration: the ranking, ROC and AUC are untouched, but the reliability diagram straightens and the proper scores fall.'
+        : 'Raw over-confident scores: the reliability diagram bows away from the diagonal while the ranking is already good.') + '</div>';
+  }
+
+  function redrawAll() { drawScore(); drawROC(); drawPR(); drawRel(); renderReadout(); }
+
+  scorePlot = S.plot(el('score-canvas'), { W: 560, H: 300, xRange: [0, 1], yRange: [0, 1], xLabel: 'score', yLabel: 'count', onResize: drawScore });
+  rocPlot = S.plot(el('roc-canvas'), { W: 520, H: 380, xRange: [0, 1], yRange: [0, 1], xLabel: 'false positive rate', yLabel: 'true positive rate', onResize: drawROC });
+  prPlot = S.plot(el('pr-canvas'), { W: 520, H: 380, xRange: [0, 1], yRange: [0, 1], xLabel: 'recall', yLabel: 'precision', onResize: drawPR });
+  relPlot = S.plot(el('rel-canvas'), { W: 560, H: 360, xRange: [0, 1], yRange: [0, 1], xLabel: 'predicted probability', yLabel: 'empirical positive rate', onResize: drawRel });
+
+  Guide.bindSliders([el('threshold-slider')], function (sl) {
+    threshold = parseFloat(sl.value);
+    redrawAll();
+  });
+
+  el('recal-btn').addEventListener('click', function () {
+    calibrated = !calibrated;
+    this.classList.toggle('active', calibrated);
+    this.textContent = calibrated ? 'Recalibrate: on' : 'Recalibrate: off';
+    redrawAll();
+  });
+
+  redrawAll();
+
+  // ---------------------------------------------------------------
+  // Check your understanding
+  // ---------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'calibration-precision',
+      kind: 'numeric',
+      prompt: 'At some threshold a confusion matrix has TP = 30, FP = 10, FN = 20 and TN = 140. What is the precision?',
+      answer: 0.75,
+      tolerance: 0.001,
+      explanation: 'Precision = TP / (TP + FP) = 30 / 40 = 0.75. Recall would be TP / (TP + FN) = 30 / 50 = 0.6; the two denominators are the whole difference between the metrics.'
+    },
+    {
+      id: 'calibration-monotone-auc',
+      kind: 'choice',
+      prompt: 'You apply a strictly increasing transform to every score before thresholding. Which quantity is guaranteed to stay exactly the same?',
+      options: [
+        { label: 'AUC, because the transform preserves the ranking of examples but not the meaning of the numbers.', correct: true },
+        { label: 'The Brier score, because the transform leaves the probabilities untouched.', correct: false },
+        { label: 'Precision at every threshold, because the ordering is unchanged.', correct: false }
+      ],
+      explanation: 'A monotone map preserves order, so a positive still outranks every negative it outranked before and AUC is identical. The numeric values change, so calibration metrics such as Brier and log-loss do change, and precision at a fixed numeric threshold can move even though the ranking cannot.'
+    },
+    {
+      id: 'calibration-overconfident',
+      kind: 'choice',
+      prompt: 'On a reliability diagram, a bin sits clearly below the diagonal. What is the model doing there?',
+      options: [
+        { label: 'It is over-confident: it predicted a higher probability than the observed frequency of positives.', correct: true },
+        { label: 'It is under-confident: it predicted a lower probability than the observed frequency of positives.', correct: false },
+        { label: 'It is ranking badly, because a point off the diagonal means a poor AUC.', correct: false }
+      ],
+      explanation: 'The horizontal axis is predicted confidence and the vertical axis is observed frequency. Below the diagonal means confidence exceeds accuracy, the signature of over-confidence. Calibration and discrimination are separate: a model can sit far from the diagonal and still have a high AUC.'
+    },
+    {
+      id: 'calibration-brier',
+      kind: 'numeric',
+      prompt: 'A model gives probabilities 0.8 and 0.2 for two examples whose true labels are 1 and 0. What is the Brier score?',
+      answer: 0.04,
+      tolerance: 0.001,
+      explanation: 'Brier = mean of (p \u2212 y)\u00b2 = [(0.8 \u2212 1)\u00b2 + (0.2 \u2212 0)\u00b2] / 2 = [0.04 + 0.04] / 2 = 0.04. Lower is better; the score rewards probabilities that are both confident and correct.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

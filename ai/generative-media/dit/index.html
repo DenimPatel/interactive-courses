@@ -1,0 +1,351 @@
+---
+title: "The DiT backbone"
+description: "Patching a latent into tokens, plain transformer blocks with adaLN-Zero conditioning, the scaling that followed, and U-Net against DiT."
+permalink: "/ai/generative-media/dit/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-panel { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+  .g-panel figure { margin: 0; flex: 0 1 300px; max-width: 320px; min-width: 220px; }
+  .g-panel canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-panel figcaption { font-size: 11px; opacity: 0.7; margin-top: 5px; font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>The DiT backbone</h1>
+    <p>The U-Net's resolution pyramid is an assumption about images: that locality matters, that nearby pixels are more related than distant ones. A transformer refuses the assumption, cutting the latent into a flat sequence of patches and letting every token attend to every other. The Diffusion Transformer &mdash; DiT &mdash; is that idea with one addition that made it trainable: conditioning by adaptive layer norm, initialised to identity. This part patches a latent, modulates a block, and prices the whole thing against the U-Net it replaced.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="patch">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Patching a latent into tokens</h2></div>
+    <p class="g-eyebrow">From a grid to a sequence</p>
+    <p>A transformer consumes a sequence, so the first job is to make one. The latent is divided into a regular grid of non-overlapping patches, each patch is flattened, and a linear layer projects it to the model's width. The result is a token sequence whose length is the number of patches, and it is on that sequence, not on pixels, that attention operates. A 32&times;32 latent with 4&times;4 patches gives 64 tokens; with 2&times;2 patches it gives 256.</p>
+    <p>Patch size is a resolution-versus-cost dial. Small patches keep fine spatial detail and produce a long sequence, which attention charges for quadratically; large patches are cheap and blunt. Most trained DiTs use patch size 2 on the latent, which is equivalent to patch size 16 on the 8&times;-compressed image.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-panel">
+        <figure>
+          <canvas id="dit-patch-canvas" width="300" height="300"></canvas>
+          <figcaption id="dit-patch-cap">32×32 latent, 4×4 patches</figcaption>
+        </figure>
+        <div class="g-controls">
+          <div class="g-field">
+            <label>patch size <span class="val">4</span></label>
+            <input type="range" id="dit-patch" min="0" max="3" step="1" value="1">
+          </div>
+          <div class="g-readout" id="dit-patch-readout"></div>
+          <p class="g-mini">The grid drawn on the latent is the tokenisation: each cell becomes one token before any network runs.</p>
+        </div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> tokenise a latent by hand, describe a DiT block and what adaLN-Zero changes, price a DiT against a U-Net at the same resolution, and explain what MMDiT splits into two streams.</span></div>
+    <div class="g-toc">
+      <a href="#blocks">2 · Plain transformer blocks</a>
+      <a href="#adaln">3 · adaLN-Zero</a>
+      <a href="#vs">4 · U-Net against DiT</a>
+      <a href="#scaling">5 · Scaling and MMDiT</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="blocks">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Plain transformer blocks</h2></div>
+    <p class="g-eyebrow">No convolutions, no pyramid, just attention and a feed-forward</p>
+    <p>Once the latent is a sequence of tokens, the denoiser becomes the standard transformer block repeated: layer norm, multi-head self-attention, a residual add, then layer norm, a feed-forward MLP, and another residual. There is no convolution anywhere and no resolution pyramid at all. Every token lives at the same scale, and every token can reach every other token in a single attention layer.</p>
+    <p>The parameter count of a block is dominated by four projection matrices of size $d\times d$ for the attention, plus two of size $d\times 4d$ for the MLP &mdash; about $12d^2$ per block, or $4d^2 + 2d\cdot 4d$ in the accounting <code>GenMedia.cost.transformerParams</code> uses. The compute is a different matter: attention contributes a term quadratic in the token count, while the projections and MLP are linear in it. At 256 tokens the quadratic term is small; at 4096 tokens it dominates, which is why latent compression is a prerequisite rather than a convenience.</p>
+    <p>Dropping the pyramid has a real cost. A U-Net's convolutions embed locality and translation equivariance for free; a transformer must learn them from data, which takes more parameters and more compute. In exchange the architecture is uniform, scales predictably, and can be shrunk or widened without re-deriving how the resolutions line up.</p>
+    <div class="g-warn">⚠ <span><b>Uniform sequence, uniform cost.</b> Because the cost is quadratic in token count and linear in width, a DiT's budget is set almost entirely by the patch size and the latent resolution chosen upstream. Getting the <a href="{{ '/ai/generative-media/latent-diffusion/' | relative_url }}">latent</a> wrong cannot be fixed by adding layers.</span></div>
+  </section>
+
+  <section class="g-step" id="adaln">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>adaLN-Zero</h2></div>
+    <p class="g-eyebrow">Conditioning that starts as the identity</p>
+    <p>A transformer block needs to know the timestep and the class or prompt. The U-Net injects that information into every residual block; a DiT does the same through <em>adaptive layer norm</em>. A small MLP reads the conditioning vector and emits, for each block, a scale $\gamma$ and a shift $\beta$ that modulate the features after normalisation:</p>
+    <p>$$ \text{adaLN-Zero}(x) = x\,(1+\gamma) + \beta. $$</p>
+    <p>The zero in the name is the initialisation. At the start of training $\gamma$ and $\beta$ are set to zero, so $x(1+0)+0 = x$ and every conditioned block is exactly the identity. Gradients flow cleanly through a stack of identity mappings, and the modulation is learned in gradually rather than imposed on an untrained network. The same idea modulates the attention and MLP sublayers separately, and it costs only $6d$ extra parameters per block &mdash; which is why adaptive conditioning is cheap even at scale.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dit-adaln-canvas" width="560" height="260"></canvas>
+        <p class="g-canvas-hint">A fixed input vector $x$ (light bars) and the same vector after adaLN-Zero (pink bars) with $\beta = 0.4\gamma$. At $\gamma = 0$ the two coincide: the block is the identity.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>modulation γ <span class="val">0.6</span></label>
+          <input type="range" id="dit-gamma" min="0" max="1.5" step="0.05" value="0.6">
+        </div>
+        <div class="g-readout" id="dit-adaln-readout"></div>
+        <p class="g-mini">Drag γ to zero and the bars overlap exactly. That overlap is the initialisation that makes deep DiTs trainable.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="vs">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>U-Net against DiT</h2></div>
+    <p class="g-eyebrow">Same resolution, two architectures</p>
+    <p>Put the two backbones side by side on the same 32&times;32 latent and the trade is visible in the parameter and FLOP counts. The U-Net's cost is spread across a pyramid and concentrates at the wide, deep levels; the DiT's cost is uniform across a stack of identical blocks and scales cleanly with depth and width. Slide the depth and width and watch the DiT bill move while the U-Net bill stays put.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dit-compare-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Total parameters for the U-Net envelope and for a DiT with the depth and width set below, both operating on the same 32&times;32 latent with 2&times;2 patches.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>DiT depth (blocks) <span class="val">12</span></label>
+          <input type="range" id="dit-layers" min="4" max="28" step="1" value="12">
+        </div>
+        <div class="g-field">
+          <label>DiT width d <span class="val">384</span></label>
+          <input type="range" id="dit-d" min="128" max="896" step="64" value="384">
+        </div>
+        <div class="g-readout" id="dit-compare-readout"></div>
+      </div>
+    </div>
+    <p>The comparison is not that one architecture is smaller. It is that the DiT's cost is a smooth function of two integers, so a scaling study can sweep them independently and plot the result. The U-Net's cost is a function of many coupled choices &mdash; how many levels, how many blocks each, where attention sits &mdash; and moving one moves everything else.</p>
+  </section>
+
+  <section class="g-step" id="scaling">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Scaling and MMDiT</h2></div>
+    <p class="g-eyebrow">What uniformity buys, and where it was split again</p>
+    <p>Because a DiT is a uniform stack, its capacity is described by two numbers and its compute by one, and that is exactly the setup a scaling law needs. The DiT paper swept depth, width and patch size against measured Gflops and found that sample quality tracked compute closely, with the largest models setting the state of the art at the time. Scaling a uniform architecture is a matter of arithmetic; scaling a pyramid means re-deciding the pyramid every time.</p>
+    <p>The first large follow-ups pushed the uniform idea to its limit and then broke it deliberately. <em>MMDiT</em>, the backbone of Stable Diffusion 3, keeps two separate streams of tokens &mdash; one for the noisy image patches, one for the text &mdash; each with its own set of weights, and fuses them only inside the attention operation, where image tokens and text tokens are concatenated into a single sequence of keys and values. That gives the text its own representation without forcing it through the image stream, and it is why MMDiT conditions better on long prompts than a single-stream DiT with cross-attention bolted on.</p>
+    <p>Other variants trade the same way. U-ViT keeps a long skip from input to output; PixArt-α adds cross-attention to a pretrained text encoder to save training compute. The uniform block survives all of them; what changes is where the conditioning enters.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The architecture the frontier settled on</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image &amp; video</div>
+        <h3 style="margin:6px 0;">SD3, Flux, Sora</h3>
+        <p style="margin-bottom:0;">MMDiT is the backbone of SD3 and Flux, and video models patchify a spatio-temporal latent into the same kind of token sequence. The <a href="{{ '/ai/generative-media/guidance/' | relative_url }}">guidance</a> machinery is unchanged; only the denoiser underneath it was swapped.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sequence models</div>
+        <h3 style="margin:6px 0;">The ViT inheritance</h3>
+        <p style="margin-bottom:0;">Patchify-then-attend is the Vision Transformer's move, and a DiT is a ViT that predicts noise instead of a label. Everything the <a href="{{ '/ai/generative-media/dit/' | relative_url }}">transformer stack</a> knows about scaling, mixed precision and attention kernels transfers directly.</p>
+      </div>
+    </div>
+    <p>Once a denoiser is a plain transformer, it inherits the transformer's entire toolchain: flash attention, tensor parallelism, and the ablations that say what happens when you scale depth rather than width. That inheritance, more than any single benchmark, is why the field moved.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The DiT paper is short and unusually clean, and it is the single best source for the adaLN-Zero trick and the scaling curves. The Vision Transformer is the direct ancestor; the MMDiT paper is where the uniform stream was deliberately split.</p>
+    <p>Peebles and Xie introduce the DiT and the Gflops scaling study; Dosovitskiy and coauthors introduce the patch-embedding transformer; Esser and coauthors describe MMDiT; and Bao and coauthors give the long-skip variant.</p>
+    <ul class="g-refs">
+      <li>William Peebles and Saining Xie, <a href="https://arxiv.org/abs/2212.09748">"Scalable Diffusion Models with Transformers"</a>, 2022 &mdash; DiT, adaLN-Zero and the scaling law.</li>
+      <li>Alexey Dosovitskiy and coauthors, <a href="https://arxiv.org/abs/2010.11929">"An Image is Worth 16x16 Words"</a>, 2020 &mdash; patch embedding and the ViT that DiT inherits.</li>
+      <li>Patrick Esser and coauthors, <a href="https://arxiv.org/abs/2403.03206">"Scaling Rectified Flow Transformers for High-Resolution Image Synthesis"</a>, 2024 &mdash; MMDiT's two streams fused at attention.</li>
+      <li>Fan Bao and coauthors, <a href="https://arxiv.org/abs/2209.12152">"All are Worth Words: A ViT Backbone for Diffusion Models"</a>, 2022 &mdash; U-ViT and the long-skip alternative.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Patchify</td><td>Split the latent into non-overlapping patches; each becomes a token</td></tr>
+        <tr><td>Token count</td><td>$(H/p)\times(W/p)$; attention cost is quadratic in it</td></tr>
+        <tr><td>DiT block</td><td>Norm, self-attention, norm, MLP, two residual adds; no convolution</td></tr>
+        <tr><td>adaLN-Zero</td><td>$x(1+\gamma)+\beta$ with $\gamma=\beta=0$ at init, so the block starts as identity</td></tr>
+        <tr><td>Cost per block</td><td>About $4d^2$ for attention projections plus $2\cdot 4d^2$ for the MLP</td></tr>
+        <tr><td>MMDiT</td><td>Separate image and text streams, fused only inside attention</td></tr>
+        <tr><td>No pyramid</td><td>One resolution, one width; locality must be learned from data</td></tr>
+        <tr><td>Scaling handle</td><td>Depth $L$, width $d$ and patch size $p$ &mdash; three integers to sweep</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A denoiser is only half the story; the other half is what you tell it to draw. The final part is about conditioning and classifier-free guidance: text encoders, cross- against joint attention, and the guidance scale that trades diversity for fidelity.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var PATCHES = [2, 4, 8, 16];
+  var patchIdx = 1;
+  var latentImage = GM.img.circles(32, 9);
+  var rOpts = {
+    cols: 32, rows: 32, channels: 3, W: 300, H: 300,
+    patch: PATCHES[patchIdx], onResize: function () { redrawPatch(); }
+  };
+  var patchR = GM.raster(document.getElementById('dit-patch-canvas'), rOpts);
+
+  var gamma = 0.6;
+  var XVALS = [0.2, 0.5, 0.8, 0.35, 0.65];
+  var ditLayers = 12, ditD = 384;
+
+  var adaLNPlot = GM.plot(document.getElementById('dit-adaln-canvas'), {
+    W: 560, H: 260, xRange: [0, 5.6], yRange: [-0.3, 3.0],
+    xLabel: 'channel', yLabel: 'activation', onResize: redrawAdaLN
+  });
+
+  var cmpSetup = Guide.setupCanvas(document.getElementById('dit-compare-canvas'), 640, 220, function () { drawCompare(); });
+
+  function redrawPatch() {
+    if (!patchR) return;
+    patchR.fromArray(latentImage.data);
+    patchR.draw();
+    var p = PATCHES[patchIdx];
+    var g = Math.floor(32 / p);
+    var tokens = g * g;
+    var cap = document.getElementById('dit-patch-cap');
+    if (cap) cap.textContent = '32×32 latent, ' + p + '×' + p + ' patches';
+    var el = document.getElementById('dit-patch-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">patch size</span> <span class="hi">' + p + '×' + p + '</span></div>' +
+        '<div><span class="k">token grid</span> ' + g + '×' + g + '</div>' +
+        '<div><span class="k">tokens</span> ' + Guide.fmtNum(tokens) + '</div>' +
+        '<div><span class="k">patch values</span> ' + (p * p * 4) + ' (4 latent channels)</div>' +
+        '<div class="g-mini">Attention cost scales with tokens², so halving the patch size quadruples the token count and multiplies attention work by 16.</div>';
+    }
+  }
+
+  function redrawAdaLN() {
+    if (!adaLNPlot) return;
+    adaLNPlot.clear();
+    adaLNPlot.axes({ xLabel: 'channel', yLabel: 'activation' });
+    var beta = 0.4 * gamma;
+    var bins = [], maxDiff = 0;
+    for (var i = 0; i < XVALS.length; i++) {
+      var y = D.adaLNZero(XVALS[i], gamma, beta);
+      if (Math.abs(y - XVALS[i]) > maxDiff) maxDiff = Math.abs(y - XVALS[i]);
+      bins.push({ x0: i + 0.08, x1: i + 0.46, h: XVALS[i], color: c.accent400 });
+      bins.push({ x0: i + 0.54, x1: i + 0.92, h: y, color: c.accent2 });
+    }
+    adaLNPlot.columns(bins, { alpha: 0.85 });
+    adaLNPlot.legend([
+      { label: 'x (block input)', color: c.accent400, fill: true },
+      { label: 'adaLN-Zero(x)', color: c.accent2, fill: true }
+    ], { dy: 6 });
+    var el = document.getElementById('dit-adaln-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">γ</span> <span class="hi">' + gamma.toFixed(2) + '</span></div>' +
+        '<div><span class="k">β = 0.4γ</span> ' + beta.toFixed(3) + '</div>' +
+        '<div><span class="k">max |out − x|</span> ' + maxDiff.toFixed(4) + '</div>' +
+        '<div class="g-mini">' + (gamma === 0 ? 'γ = 0, so the block is exactly the identity — the initialisation that stabilises deep stacks.' : 'Conditioning shifts and scales the normalised features; the block is no longer identity.') + '</div>';
+    }
+  }
+
+  function drawCompare() {
+    if (!cmpSetup) return;
+    var d = D.ditBreakdown({ imageSize: 32, patch: 2, layers: ditLayers, d: ditD, ff: 4 * ditD });
+    var u = D.unetBreakdown({ channels: [320, 640, 1280, 1280], blocks: 2 });
+    Guide.drawBars(cmpSetup.ctx, 640, 220, [
+      { label: 'U-Net', value: u.params, valueLabel: Guide.fmtNum(u.params), color: c.accent400 },
+      { label: 'DiT', value: d.params, valueLabel: Guide.fmtNum(d.params), color: c.accent }
+    ], { padL: 90, fontSize: 12 });
+    var el = document.getElementById('dit-compare-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">tokens (32² / 2²)</span> <span class="hi">' + Guide.fmtNum(d.tokens) + '</span></div>' +
+        '<div><span class="k">DiT params</span> ' + Guide.fmtNum(d.params) + '</div>' +
+        '<div><span class="k">DiT FLOPs</span> ' + d.flops.toExponential(2) + '</div>' +
+        '<div><span class="k">adaLN params</span> ' + Guide.fmtNum(d.adaLN) + ' (6·d per block)</div>' +
+        '<div><span class="k">U-Net params</span> ' + Guide.fmtNum(u.params) + '</div>' +
+        '<div><span class="k">DiT / U-Net</span> ' + (d.params / u.params).toFixed(2) + '×</div>';
+    }
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#dit-patch'), function (el) {
+    patchIdx = parseInt(el.value, 10);
+    rOpts.patch = PATCHES[patchIdx];
+    var v = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (v) v.textContent = String(PATCHES[patchIdx]);
+    redrawPatch();
+  });
+  Guide.bindSliders(document.querySelectorAll('#dit-gamma'), function (el) {
+    gamma = parseFloat(el.value);
+    redrawAdaLN();
+  });
+  Guide.bindSliders(document.querySelectorAll('#dit-layers'), function (el) {
+    ditLayers = parseInt(el.value, 10);
+    drawCompare();
+  });
+  Guide.bindSliders(document.querySelectorAll('#dit-d'), function (el) {
+    ditD = parseInt(el.value, 10);
+    drawCompare();
+  });
+
+  redrawPatch();
+  redrawAdaLN();
+  drawCompare();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'dit-token-count',
+      kind: 'numeric',
+      prompt: 'A 32&times;32 latent is patchified with patch size 4&times;4. How many tokens does the transformer receive?',
+      answer: 64,
+      tolerance: 0.5,
+      explanation: 'Each side splits into 32/4 = 8 patches, so the token grid is 8&times;8 = 64. Patch size 2 would give 256 tokens, four times as many, and sixteen times the attention work.'
+    },
+    {
+      id: 'dit-adaln-params',
+      kind: 'numeric',
+      prompt: 'adaLN-Zero adds $6d$ modulation parameters per block. For width $d = 384$ and 12 blocks, how many adaLN parameters are there in total?',
+      answer: 27648,
+      tolerance: 1,
+      explanation: 'Each block contributes $6 \\times 384 = 2304$ parameters, and twelve blocks give $2304 \\times 12 = 27{,}648$. That is small next to the attention and MLP weights, which is why adaptive conditioning is cheap.'
+    },
+    {
+      id: 'dit-adaln-zero-init',
+      kind: 'choice',
+      prompt: 'Why is adaLN-Zero initialised with $\\gamma = \\beta = 0$?',
+      options: [
+        { label: 'So each conditioned block starts as the identity, letting gradients flow through a deep stack before modulation is learned.', correct: true },
+        { label: 'So the block ignores the timestep entirely during training.', correct: false },
+        { label: 'So attention can be skipped, halving the compute at initialisation.', correct: false }
+      ],
+      explanation: 'With $\\gamma=\\beta=0$ the modulation is $x(1+0)+0 = x$, an identity. Deep stacks of identities train stably, and the model learns how much to modulate rather than starting from a random perturbation.'
+    },
+    {
+      id: 'dit-mmdit',
+      kind: 'choice',
+      prompt: 'What does MMDiT change relative to a single-stream DiT?',
+      options: [
+        { label: 'It keeps separate image and text streams, fusing them only inside the attention operation.', correct: true },
+        { label: 'It restores the U-Net pyramid while keeping transformer blocks.', correct: false },
+        { label: 'It removes the timestep conditioning to save parameters.', correct: false }
+      ],
+      explanation: 'Each modality has its own weights, and the two token sequences are concatenated into one key/value set just for attention. Text keeps its own representation, which is why MMDiT conditions on long prompts better than cross-attention bolted onto a single stream.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

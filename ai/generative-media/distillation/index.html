@@ -1,0 +1,369 @@
+---
+title: "Few-step generation"
+description: "Progressive, consistency, adversarial and shortcut distillation, and what collapsing fifty steps into one or four costs in diversity."
+permalink: "/ai/generative-media/distillation/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Few-step generation</h1>
+    <p>Sampling cost is the number of times the network is evaluated, and a large denoiser evaluated fifty times is the reason a diffusion image takes seconds. Distillation attacks the count directly: train a second model whose whole job is to reproduce, in one or four evaluations, what the slow model does in fifty. This part trains a real one-step student in your browser, watches its samples collapse toward the mean as the step count falls, and organises the four families of methods that buy the speed.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="one-step">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>One-step generation</h2></div>
+    <p class="g-eyebrow">Replace the trajectory with a single map</p>
+    <p>A deterministic sampler traces a trajectory from a noise sample to a clean sample, and the trajectory is a function: name a starting noise $\varepsilon$ and the sampler returns an image. Collapsing fifty steps into one means learning that whole function at once. The student takes the noisy input at some time $t$ and predicts the clean sample directly, so a single forward pass substitutes for the rest of the loop.</p>
+    <p>The target is available for free. Run the slow teacher forward from a clean example to get its noisy version $x_t$, and the label is the clean example $x_0$ the teacher started from; the student regresses $x_t \mapsto x_0$ over many times $t$. This is the consistency objective in its simplest form, and it is exactly what the demo below trains. The teacher is an oracle in this page so that the arithmetic stays honest, but the structure is the same one that turns Stable Diffusion into a four-step model.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> name the four families of few-step methods, say what each one distils into the student, and explain why every one of them trades sample diversity for the step count it removes.</span></div>
+    <div class="g-toc">
+      <a href="#train">2 · Training the student</a>
+      <a href="#families">3 · The distillation families</a>
+      <a href="#cost">4 · What the speed costs</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="train">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Training the student</h2></div>
+    <p class="g-eyebrow">A real network, trained here, in one page load</p>
+    <p>The target distribution is the three-cluster mixture used elsewhere in this series: a small set of 2-D points drawn from <code>Diffusion.toy2d</code>. The student is a tiny multilayer perceptron with two inputs and two outputs, trained on pairs built by <code>Diffusion.distillPair</code> &mdash; take a clean point, pick a time, draw the noisy version, and ask the network for the clean point back. The scatter below shows the result of sampling that student with the current step budget.</p>
+    <p>Move the step slider and watch two things at once. The student's samples start as a tight blob near the origin, because when the input carries almost no signal the best prediction is the average of the whole mixture. As the step count grows, the sampling loop feeds the student progressively cleaner inputs, its predictions commit to a cluster, and the samples spread out over the three modes. A one-step student has to make that commitment from pure noise, and it cannot.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="distill-scatter-canvas" width="620" height="360"></canvas>
+        <p class="g-canvas-hint">Grey: the target mixture, and the endpoints of the fifty-step oracle teacher trajectory. Pink: samples from the trained student at the selected step count.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Student steps <span class="val">1</span></label><input type="range" id="distill-k" min="0" max="4" step="1" value="0"></div>
+        <div class="g-readout" id="distill-readout"></div>
+        <p class="g-mini">A one-step generator is a single forward pass. Four steps is the practical target most production few-step models aim for.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Mode averaging is the failure the picture is named after.</b> Asked for the clean sample behind a nearly noise-free input, the squared-error-optimal answer is the conditional mean of the data, which for a multimodal distribution is a location where no data actually live. The student is being honest; the loss is what makes it blurry.</span></div>
+  </section>
+
+  <section class="g-step" id="families">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The distillation families</h2></div>
+    <p class="g-eyebrow">Four ways to move the knowledge</p>
+    <p><em>Progressive distillation</em> halves the count repeatedly. Train a two-step model to match one step of a four-step teacher, then a one-step model to match one step of the two-step model, each stage supervised by the teacher's own trajectories rather than by the data. The division of labour is the point: every stage is an easier approximation than the last, and the student never has to learn a fifty-to-one jump.</p>
+    <p><em>Consistency models</em> and their latent version, the Latent Consistency Model, enforce a single condition instead of a staged one: the map from any point on a trajectory to the trajectory's endpoint must be the same, whether the point is noisy or clean. This self-consistency makes the student a one-step generator by construction, and few-step sampling is just applying the map with a couple of re-noise rounds. The student in this page is the toy version of that idea.</p>
+    <p><em>Adversarial distillation</em> &mdash; ADD and the distribution-matching variant DMD &mdash; drops the regression target and keeps a discriminator or a score-matching term instead. Instead of asking the student to reproduce any single teacher trajectory, it asks the student's whole output distribution to look like the teacher's, which recovers diversity that a squared-error objective averages away. <em>Shortcut</em> and flow-map methods fold the trajectory itself: a shortcut model predicts not the endpoint but a step of a chosen size, and a flow map composes those steps, so the number of evaluations becomes a dial the student was trained to honour.</p>
+    <div class="g-goal">💡 <span>The families differ in what they supervise: a trajectory (progressive), a fixed point (consistency), a distribution (adversarial), or a step-size-parameterised map (shortcut). Choosing between them is choosing which property of the teacher you are unwilling to lose.</span></div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What the speed costs</h2></div>
+    <p class="g-eyebrow">Fifty steps into one</p>
+    <p>The top plot below is the diversity readout made visible: the spread of the student's samples against the step count, with the teacher's spread as a horizontal reference. Every step removed narrows the cloud. Collapsing the whole trajectory into one evaluation is a big win in latency and a real loss in variety, and the loss is not an artefact of this toy &mdash; it is the same averaging that makes a one-step image generator produce a slightly plastic, over-smoothed look.</p>
+    <p>The bottom canvas is the trajectory view of the same idea. A fifty-step teacher walks a curved path down to the clean point; a four-step student approximates that path with four chords; a one-step student replaces the curve with a single straight jump. Each approximation is faithful at the endpoints and coarse in between, which is why the shortest few-step schedules are the ones most sensitive to the schedule's shape.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-plot-stack">
+        <canvas id="distill-div-canvas" width="620" height="280"></canvas>
+        <canvas id="distill-path-canvas" width="620" height="280"></canvas>
+        <p class="g-canvas-hint">Top: sample spread against step count, with the fifty-step teacher as the dashed reference. Bottom: the same trajectory integrated with 50, 4 and 1 steps.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="distill-cost-readout"></div>
+        <p class="g-mini">Diversity is measured as the standard deviation of the generated cloud; coverage is the fraction of target modes that receive at least one sample.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The models built for a latency budget</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">LCM, Turbo and Lightning</h3>
+        <p style="margin-bottom:0;">Latent Consistency Models, SDXL-Turbo and SDXL-Lightning are three answers to the same latency budget, built respectively on the consistency condition, adversarial distillation and progressive distillation. All three are evaluated with the <a href="{{ '/ai/generative-media/samplers/' | relative_url }}">sampler machinery</a> from the previous part, and all three expose a trade between steps and diversity.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Flow &amp; video</div>
+        <h3 style="margin:6px 0;">Schnell and real-time video</h3>
+        <p style="margin-bottom:0;">Flux's schnell variant uses a <a href="{{ '/ai/generative-media/flow-matching/' | relative_url }}">rectified-flow</a> student distilled for four steps, and the same recipe is what makes interactive video and control-rate robot policies feasible. Adversarial and flow-map variants appear where the diversity loss is most visible &mdash; in video, where a collapsed sample reads as a frozen scene.</p>
+      </div>
+    </div>
+    <p>The pattern recurs whenever a generative model is deployed: a slow, faithful teacher for quality and a distilled student for throughput, served side by side. The <a href="{{ '/ai/generative-media/guidance/' | relative_url }}">guidance chapter</a> shows the other half of the same trade, where a scale knob moves quality against diversity at a fixed step count.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers are best read as four attempts at the same problem: how to make one network evaluation stand in for many. Start with the staged method, then the fixed-point method, then the distributional and map-based corrections that recover diversity.</p>
+    <p>Salimans and Ho staged the collapse; Song and coauthors replaced the staging with a self-consistency condition; Luo and coauthors moved that condition into the latent space; Sauer and coauthors added a discriminator; and Frans and coauthors generalised the whole thing to a step-size dial.</p>
+    <ul class="g-refs">
+      <li>Tim Salimans and Jonathan Ho, <a href="https://arxiv.org/abs/2202.00512">"Progressive Distillation for Fast Sampling of Diffusion Models"</a>, 2022 &mdash; halving the step count stage by stage.</li>
+      <li>Yang Song, Prafulla Dhariwal, Mark Chen and Ilya Sutskever, <a href="https://arxiv.org/abs/2303.01469">"Consistency Models"</a>, 2023 &mdash; the fixed-point condition that makes one-step generation possible.</li>
+      <li>Simian Luo, Yiqin Tan, Longbo Huang, Jian Li and Hang Zhao, <a href="https://arxiv.org/abs/2310.04378">"Latent Consistency Models"</a>, 2023 &mdash; consistency in a compressed latent space.</li>
+      <li>Axel Sauer, Dominik Lorenz, Andreas Blattmann and Robin Rombach, <a href="https://arxiv.org/abs/2303.01469">"Adversarial Diffusion Distillation"</a>, 2023 &mdash; a discriminator that restores the diversity regression removes.</li>
+      <li>Kevin Frans, Danijar Hafner, Sergey Levine and Pieter Abbeel, <a href="https://arxiv.org/abs/2410.12557">"One Step Diffusion via Shortcut Models"</a>, 2024 &mdash; step size as a training-time dial.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Teacher</td><td>The slow, faithful sampler whose trajectory the student imitates</td></tr>
+        <tr><td>One-step student</td><td>Predicts $x_0$ from $x_t$ in a single forward pass, for any $t$</td></tr>
+        <tr><td>Progressive distillation</td><td>Halve the step count repeatedly; each stage imitates the previous</td></tr>
+        <tr><td>Consistency model</td><td>Enforce one map from every point of a trajectory to its endpoint</td></tr>
+        <tr><td>LCM</td><td>Consistency enforced in the latent space of a diffusion autoencoder</td></tr>
+        <tr><td>ADD / DMD</td><td>Adversarial or distribution-matching objectives that recover diversity</td></tr>
+        <tr><td>Shortcut / flow map</td><td>Predict a step of a chosen size; compose steps to spend a chosen budget</td></tr>
+        <tr><td>Diversity cost</td><td>Fewer steps narrows the output cloud; regression averages modes away</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A distilled student is faster but no more steerable than the model it came from. The next part keeps the model frozen and moves the control outside it &mdash; low-rank adapters, structural conditioning and image-space editing.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var sch = D.schedule('linear', 1000);
+  var KS = [1, 2, 4, 8, 50];
+  var N_POINTS = 120;
+  var TTS = [120, 500, 950];
+  var X0T = 0.9, EPS_T = 2.5;
+
+  var DATA = D.toy2d('mixture', N_POINTS, 7);
+  var student = GM.net.mlp([2, 32, 2], 4321);
+
+  var xs = [], ys = [];
+  var rt = GM.rng(20260912);
+  var i, j;
+  for (i = 0; i < DATA.length; i++) {
+    for (j = 0; j < TTS.length; j++) {
+      var ab = D.abAt(sch, TTS[j]);
+      var pair = D.distillPair(sch, DATA[i][0], TTS[j], rt);
+      xs.push([pair.xt, D.qSample(rt, DATA[i][1], ab)]);
+      ys.push([DATA[i][0], DATA[i][1]]);
+    }
+  }
+  var trainRes = GM.net.train(student, xs, ys, { lr: 0.06, epochs: 350 });
+
+  function studentSample(seed, k) {
+    var r = GM.rng(seed);
+    var x = [GM.gauss(r), GM.gauss(r)];
+    var ts = D.timesteps(sch.T, k);
+    for (var m = 0; m + 1 < ts.length; m++) {
+      var abNext = ts[m + 1] <= 0 ? 1 : D.abAt(sch, ts[m + 1]);
+      var p = GM.net.forward(student, x);
+      var n0 = GM.gauss(r), n1 = GM.gauss(r);
+      var s = Math.sqrt(Math.max(0, 1 - abNext));
+      x = [Math.sqrt(abNext) * p[0] + s * n0, Math.sqrt(abNext) * p[1] + s * n1];
+    }
+    return x;
+  }
+
+  var SAMPLES = {};
+  KS.forEach(function (k) {
+    var set = [];
+    for (var s = 0; s < 90; s++) set.push(studentSample(2000 + s, k));
+    SAMPLES[k] = set;
+  });
+
+  function spread(pts) {
+    var mx = 0, my = 0, n = pts.length;
+    if (!n) return 0;
+    for (var a = 0; a < n; a++) { mx += pts[a][0]; my += pts[a][1]; }
+    mx /= n; my /= n;
+    var vx = 0, vy = 0;
+    for (a = 0; a < n; a++) { vx += (pts[a][0] - mx) * (pts[a][0] - mx); vy += (pts[a][1] - my) * (pts[a][1] - my); }
+    return Math.sqrt(vx / n + vy / n);
+  }
+  function coverage(pts, radius) {
+    var hit = 0;
+    for (var a = 0; a < DATA.length; a++) {
+      var found = false;
+      for (var b = 0; b < pts.length && !found; b++) {
+        var dx = pts[b][0] - DATA[a][0], dy = pts[b][1] - DATA[a][1];
+        if (dx * dx + dy * dy <= radius * radius) found = true;
+      }
+      if (found) hit++;
+    }
+    return hit / DATA.length;
+  }
+
+  var spreadByK = KS.map(function (k) { return spread(SAMPLES[k]); });
+  var teacherSpread = spread(DATA);
+  var maxSpread = Math.max(teacherSpread, Math.max.apply(null, spreadByK)) * 1.2;
+
+  var kIdx = 0;
+  var K = KS[kIdx];
+
+  var scatterPlot = GM.plot(document.getElementById('distill-scatter-canvas'), {
+    W: 620, H: 360, xRange: [-3.4, 3.4], yRange: [-3.4, 3.4],
+    xLabel: 'x', yLabel: 'y', onResize: function () { redrawScatter(); }
+  });
+  var divPlot = GM.plot(document.getElementById('distill-div-canvas'), {
+    W: 620, H: 280, xRange: [1, 50], yRange: [0, Math.max(0.5, maxSpread)],
+    xLabel: 'student steps K', yLabel: 'sample spread', onResize: function () { redrawDiv(); }
+  });
+  var pathPlot = GM.plot(document.getElementById('distill-path-canvas'), {
+    W: 620, H: 280, xRange: [0, 1000], yRange: [0.4, 2.9],
+    xLabel: 'timestep t', yLabel: 'x_t', onResize: function () { redrawPath(); }
+  });
+
+  function redrawScatter() {
+    if (!scatterPlot) return;
+    scatterPlot.clear();
+    scatterPlot.axes({ xLabel: 'x', yLabel: 'y' });
+    scatterPlot.points(DATA, { color: c.text, r: 2.2 });
+    scatterPlot.points(SAMPLES[K], { color: c.accent2, r: 3.2 });
+    scatterPlot.legend([
+      { label: 'target / 50-step teacher', color: c.text },
+      { label: 'student, K = ' + K, color: c.accent2 }
+    ], { dy: 6 });
+  }
+
+  function redrawDiv() {
+    if (!divPlot) return;
+    divPlot.clear();
+    divPlot.axes({ xLabel: 'student steps K', yLabel: 'sample spread' });
+    divPlot.curve(KS.map(function (k, idx) { return [k, spreadByK[idx]]; }), { color: c.accent2, width: 2.4 });
+    divPlot.points(KS.map(function (k, idx) { return [k, spreadByK[idx]]; }), { color: c.accent2, r: 3.4 });
+    divPlot.hline(teacherSpread, { color: c.text, dashed: true, width: 1.4, label: 'teacher spread', labelX: 2 });
+    divPlot.vline(K, { color: c.accent, width: 1.2, dashed: true });
+  }
+
+  function redrawPath() {
+    if (!pathPlot) return;
+    pathPlot.clear();
+    pathPlot.axes({ xLabel: 'timestep t', yLabel: 'x_t' });
+    var teacher = D.teacherTrajectory(sch, X0T, 50, EPS_T);
+    var four = D.teacherTrajectory(sch, X0T, 4, EPS_T);
+    var one = D.teacherTrajectory(sch, X0T, 1, EPS_T);
+    pathPlot.curve(teacher.map(function (p) { return [p.t, p.x]; }), { color: c.accent400, width: 2.6 });
+    pathPlot.curve(four.map(function (p) { return [p.t, p.x]; }), { color: c.accent, width: 2, dashed: true });
+    pathPlot.curve(one.map(function (p) { return [p.t, p.x]; }), { color: c.accent2, width: 2, dashed: true });
+    pathPlot.points([[0, X0T]], { color: c.text, r: 4 });
+    pathPlot.legend([
+      { label: '50-step teacher', color: c.accent400 },
+      { label: '4-step', color: c.accent, dashed: true },
+      { label: '1-step', color: c.accent2, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('distill-readout');
+    if (!el) return;
+    el.innerHTML =
+      '<div><span class="k">K</span> <span class="hi">' + K + '</span> step' + (K === 1 ? '' : 's') + '</div>' +
+      '<div><span class="k">sample spread</span> ' + spread(SAMPLES[K]).toFixed(3) + '</div>' +
+      '<div><span class="k">teacher spread</span> ' + teacherSpread.toFixed(3) + '</div>' +
+      '<div><span class="k">mode coverage</span> ' + Guide.fmtPct(coverage(SAMPLES[K], 0.9), 0) + '</div>' +
+      '<div class="g-mini">Training loss after ' + trainRes.losses.length + ' epochs: ' + trainRes.loss.toFixed(4) + '.</div>';
+    var ce = document.getElementById('distill-cost-readout');
+    if (ce) {
+      var idx = KS.indexOf(K);
+      ce.innerHTML =
+        '<div><span class="k">spread at K=1</span> ' + spreadByK[0].toFixed(3) + '</div>' +
+        '<div><span class="k">spread at K=50</span> ' + spreadByK[4].toFixed(3) + '</div>' +
+        '<div><span class="k">teacher spread</span> ' + teacherSpread.toFixed(3) + '</div>' +
+        '<div><span class="k">coverage at K=' + K + '</span> <span class="hi">' + Guide.fmtPct(coverage(SAMPLES[K], 0.9), 0) + '</span></div>' +
+        '<div class="g-mini">One step leaves the cloud ' +
+        (spreadByK[4] > 0 ? (100 * (1 - spreadByK[0] / spreadByK[4])).toFixed(0) : '—') +
+        '% narrower than fifty, and covers ' +
+        Guide.fmtPct(coverage(SAMPLES[KS[0]], 0.9), 0) + ' of the modes at K=1.</div>';
+    }
+  }
+
+  function redraw() { redrawScatter(); redrawDiv(); redrawPath(); redrawReadout(); }
+
+  Guide.bindSliders(document.querySelectorAll('#distill-k'), function (el) {
+    kIdx = parseInt(el.value, 10);
+    K = KS[kIdx];
+    var p = el.parentElement;
+    if (p) { var lab = p.querySelector('.val'); if (lab) lab.textContent = String(K); }
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'distill-objective',
+      kind: 'choice',
+      prompt: 'What target does the one-step student in this page regress toward?',
+      options: [
+        { label: 'The clean sample $x_0$ that produced the noisy input $x_t$.', correct: true },
+        { label: 'The noise $\\varepsilon$ that was added to the clean sample.', correct: false },
+        { label: 'The teacher\'s velocity field at the current point.', correct: false }
+      ],
+      explanation: 'The student predicts the clean endpoint directly, which is the consistency objective. A noise-prediction target would be the teacher\'s own job and would still require a full reverse loop.'
+    },
+    {
+      id: 'distill-steps',
+      kind: 'numeric',
+      prompt: 'Starting from a 64-step teacher, how many halvings does progressive distillation need to reach a one-step student?',
+      answer: 6,
+      tolerance: 0.5,
+      explanation: 'Each stage halves the count: 64 to 32, 16, 8, 4, 2, 1. That is six halvings, which is why progressive distillation is described as a sequence of easier approximations rather than one hard one.'
+    },
+    {
+      id: 'distill-adversarial',
+      kind: 'choice',
+      prompt: 'Why do adversarial and distribution-matching distillation methods exist alongside consistency models?',
+      options: [
+        { label: 'A squared-error student averages modes away; a distributional objective restores diversity.', correct: true },
+        { label: 'They reduce the number of training examples needed.', correct: false },
+        { label: 'They remove the need for a teacher model entirely.', correct: false }
+      ],
+      explanation: 'Regressing to a conditional mean is what collapses a multimodal distribution to its average. Adversarial and score-matching objectives compare whole distributions instead, which brings back the variety the regression loss discards.'
+    },
+    {
+      id: 'distill-diversity',
+      kind: 'choice',
+      prompt: 'You drop a sampler from fifty steps to four. What is the characteristic cost?',
+      options: [
+        { label: 'Latency falls sharply, and the spread of distinct outputs narrows.', correct: true },
+        { label: 'Latency falls, and the outputs become more varied because fewer decisions are made.', correct: false },
+        { label: 'There is no cost; few-step models match the teacher exactly.', correct: false }
+      ],
+      explanation: 'Few-step generation is a real trade rather than a free lunch. The narrowing cloud and the mode averaging in the scatter are the same phenomenon, and they are why short schedules pair with guidance or adversarial objectives when variety matters.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

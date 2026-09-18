@@ -1,0 +1,873 @@
+---
+title: "PnP: Camera Resection"
+description: "Recovering absolute camera pose from 2D-3D correspondences: DLT resection, P3P, EPnP, and PnP+RANSAC, the way every new camera enters a reconstruction."
+permalink: "/vision/multi-view-geometry/pnp/"
+section: "vision"
+series: "multi_view_geometry"
+redirect_from:
+  - /multi-view-geometry-pnp.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .mvg { max-width: 1180px; }
+  .mvg .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .mvg-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .mvg-step:first-of-type { border-top: none; }
+  .mvg-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .mvg-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .mvg-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .mvg-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .mvg-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-goal b { color: var(--color-accent-800); }
+  .mvg-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-warn b { color: var(--color-accent-2-800); }
+  .mvg-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .mvg-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .mvg-canvas-wrap { flex: 1 1 380px; min-width: 280px; }
+  .mvg-canvas-wrap canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .mvg-plot3d { width: 100%; height: 380px; background: var(--color-neutral-100); border-radius: var(--radius-sm); cursor: grab; }
+  .mvg-plot3d:active { cursor: grabbing; }
+  .mvg-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .mvg-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .mvg-field { margin-bottom: 14px; }
+  .mvg-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .mvg-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .mvg-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .mvg-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .mvg-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .mvg-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .mvg-btnrow button.mvg-primary:hover { background: var(--color-accent-600); }
+  .mvg-btnrow button:disabled { opacity: 0.45; cursor: default; }
+  .mvg-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .mvg-readout .k { opacity: 0.6; }
+  .mvg-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .mvg-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .mvg-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .mvg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .mvg-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .mvg-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .mvg-cheat th, .mvg-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .mvg-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .mvg-cheat code { white-space: nowrap; }
+  .mvg-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  .mvg-imgplane { position: relative; }
+  .mvg-imgplane canvas { cursor: default; }
+  @media (max-width: 640px) {
+    .mvg-eyebrow { margin-left: 0; }
+    .mvg-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multi_view_geometry %}
+
+<main>
+<div class="wrap mvg">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 11 of {{ site.data.series.multi_view_geometry.parts | size }}</span>
+    <h1>PnP: Absolute Pose from 2D&ndash;3D Correspondences</h1>
+    <p>This is how every <em>new</em> camera enters an existing 3D reconstruction. Once you already have a point cloud with known 3D coordinates — from triangulation (<a href="{{ '/vision/multi-view-geometry/triangulation/' | relative_url }}">Part 10</a>) or an earlier stage of a reconstruction — and a new photo that shows some of those same points, <strong>PnP</strong> (Perspective-<em>n</em>-Point) answers "where was this photo taken from?" It's the absolute-pose counterpart to Part 10's triangulation: there you knew two poses and solved for a point; here you know a cloud of points and solve for one pose. This single step — resection — is the registration engine inside every incremental structure-from-motion pipeline (<a href="{{ '/vision/multi-view-geometry/sfm-pipelines/' | relative_url }}">Part 16</a>).</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="mvg-step" id="setup">
+    <div class="mvg-step-head"><span class="mvg-step-num">0</span><h2>The problem, stated precisely</h2></div>
+    <p class="mvg-eyebrow">Setup</p>
+{% endraw %}    <p>You have <var>N</var> 3D points <var>X&#8321;, &hellip;, X&#8345;</var> whose world coordinates are already known — they came from a prior triangulation, a scan, or an earlier reconstruction. You have one new image, and for at least some of those points you know which pixel <var>x&#8321;, &hellip;, x&#8345;</var> each one landed on — the matching itself isn't this page's job, only what to do once it's done. You also know the camera's calibration <var>K</var> (<a href="{{ '/vision/multi-view-geometry/calibration/' | relative_url }}">Part 5</a>). What you don't know is the camera's pose: the rotation <var>R</var> and position it was sitting at when it took this photo. <strong>PnP</strong> is the problem of finding the <var>(R, t)</var> that makes all of these consistent at once:</p>{% raw %}
+    <div class="mvg-math">x&#771;&#8339; &#8773; K [R | t] X&#771;&#8339;&nbsp;&nbsp;&nbsp;for every correspondence i</div>
+    <div class="mvg-goal">&#128161; <span><b>Contrast with Parts 6 and 10:</b> there, both cameras' positions were unknown and you had only 2D&ndash;2D pixel correspondences between them — you had to solve for <em>relative</em> pose via <var>E</var>/<var>F</var>, and the reconstructed 3D structure only existed up to an unknown overall scale (and, for <var>F</var> alone, an unknown projective distortion). Here the 3D structure is already fixed and metric, and you're solving for <em>one</em> camera against it. That's a fundamentally easier, better-conditioned problem — with enough points, PnP has a closed-form linear solution and no scale ambiguity at all, since the known <var>X&#8339;</var> already fix the scale.</span></div>
+  </section>
+
+  <section class="mvg-step" id="dlt">
+    <div class="mvg-step-head"><span class="mvg-step-num">1</span><h2>DLT resection: the same trick, a third time</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+{% endraw %}    <p>The unknown here is the 3&times;4 camera matrix <var>P = K[R | t]</var> &mdash; 12 numbers, but only 11 independent (it's defined up to an overall scale). Exactly the same cross-product idea used for homography DLT (<a href="{{ '/vision/multi-view-geometry/homography/' | relative_url }}">Part 8</a>) and the 8-point algorithm (<a href="{{ '/vision/multi-view-geometry/epipolar/' | relative_url }}">Part 6, epipolar</a>) applies directly: since <var>x&#771;&#8339;</var> and <var>PX&#771;&#8339;</var> point the same direction, their cross product vanishes.</p>{% raw %}
+    <div class="mvg-math">x&#771;&#8339; &times; (P X&#771;&#8339;) = 0</div>
+    <p>Writing <var>P</var>'s three rows as 4-vectors <var>p&#8321;&#7488;, p&#8322;&#7488;, p&#8323;&#7488;</var> stacked into one 12-vector <var>p</var>, and <var>x&#8339; = (x&#8339;, y&#8339;)</var> for the observed pixel, two of the three cross-product components are independent and linear in <var>p</var>:</p>
+    <div class="mvg-math">[ &minus;X&#771;&#8339;&#7488;&nbsp; 0&#7488;&nbsp;&nbsp; x&#8339;X&#771;&#8339;&#7488; ] p = 0<br>[ 0&#7488;&nbsp;&nbsp; &minus;X&#771;&#8339;&#7488;&nbsp; y&#8339;X&#771;&#8339;&#7488; ] p = 0</div>
+    <p>Two rows per correspondence, 12 unknowns up to scale (11 DOF) &mdash; so <strong>6 correspondences</strong> (12 equations) pin it down exactly; more than 6 gives an overdetermined, noise-averaging system. Stack every correspondence's row pair into one matrix <var>A</var> and the whole problem collapses to the same homogeneous least-squares shape this series keeps returning to &mdash; the 8-point algorithm's <var>Af = 0</var>, the homography DLT's <var>Ah = 0</var>, and now:</p>
+    <div class="mvg-math">A p = 0&nbsp;&nbsp;&mdash;&nbsp;&nbsp;solve by SVD: p = the right-singular vector of the smallest singular value of A</div>
+    <p>Reshape the resulting <var>p</var> back into the 3&times;4 matrix <var>P</var>. Because <var>K</var> is already known here (unlike Part 4's calibration problem, where <var>K</var> is what RQ-decomposition extracts from <var>P</var>'s leading 3&times;3 block), the same decomposition runs in reverse: use <var>K</var> to strip the calibration out of <var>P</var> instead of reading it off. In practice it's simplest to normalize the pixels first &mdash; multiply every observation by <var>K&#8315;&#185;</var> to get calibrated rays &mdash; so the DLT solves directly for <var>[R | t]</var> (up to scale), and only <var>R</var> needs cleaning up:</p>
+    <div class="mvg-math">M = leading 3&times;3 block of the recovered [R | t]&nbsp;&nbsp;(&#8776; s&middot;R for some scale s, but not exactly orthogonal &mdash; noise)<br>R = polar(M) = M (M&#7488;M)&#8315;&#185;&#8260;&#178;&nbsp;&nbsp;&mdash;&nbsp;&nbsp;the nearest proper rotation to M, by SVD/polar decomposition<br>t = p&#8324; / s&nbsp;&nbsp;&nbsp;&nbsp;s = mean singular value of M</div>
+    <div class="mvg-warn">&#9888;&#65039; <span><b>Why polar decomposition, not RQ:</b> Part 4's RQ-decomposition of <var>P</var>'s leading block gives <em>both</em> an upper-triangular <var>K</var> and an orthogonal <var>R</var>, because that block is <var>KR</var> with <var>K</var> unknown. Here <var>K</var> was already divided out before the DLT ran, so the leading block <em>should</em> be exactly <var>s&middot;R</var> for a pure rotation <var>R</var> &mdash; it just isn't, exactly, because of pixel noise. Polar decomposition finds the closest orthogonal matrix in the least-squares sense, which is the right tool once <var>K</var> is no longer part of the unknown.</span></div>
+  </section>
+
+  <section class="mvg-step" id="demo-dlt">
+    <div class="mvg-step-head"><span class="mvg-step-num">2</span><h2>Play: resect a camera from noisy 2D&ndash;3D correspondences</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> the black camera is the (hidden, ground-truth) pose that generated the observations; the colored one is recovered from nothing but the 3D points and their noisy pixels, live, by the DLT + polar-decomposition code above. Crank up the noise or outlier fraction and watch it drift &mdash; then switch on Gauss&ndash;Newton refinement and watch it snap back.</div>
+    <p>14 known 3D points (think: a small patch of an existing reconstruction) are observed by one new camera. Pixel noise and a few injected outliers (mismatches) are added to the observations before the solver ever sees them &mdash; exactly the situation a real resection step is in.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s2-plot3d" class="mvg-plot3d"></div>
+        <p class="mvg-canvas-hint">Drag to orbit, scroll to zoom.</p>
+        <div class="mvg-imgplane">
+          <canvas id="s2-canvas" width="480" height="360"></canvas>
+        </div>
+        <p class="mvg-canvas-hint">Observed pixels fed to the solver (orange = outlier draws).</p>
+        <canvas id="s2-curve" width="480" height="160" style="width:100%; height:auto; display:block; background:var(--color-neutral-100); border-radius:var(--radius-sm);"></canvas>
+        <p class="mvg-canvas-hint">Gauss&ndash;Newton convergence: total reprojection cost vs iteration. Pure least squares dives fast when the outliers are absent &mdash; drag the outlier slider up and watch it plateau at a wrong answer, no matter how many steps it takes.</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-text)"></i>true camera</span>
+          <span><i style="background:#9b9797"></i>DLT-recovered (raw)</span>
+          <span><i style="background:var(--color-accent-2)"></i>after Gauss&ndash;Newton refinement</span>
+        </div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Pixel noise &sigma; <span class="val" id="s2-noiseval"></span></label><input type="range" id="s2-noise" min="0" max="10" step="0.1" value="1.5"></div>
+        <div class="mvg-field"><label>Outlier fraction <span class="val" id="s2-outval"></span></label><input type="range" id="s2-out" min="0" max="0.4" step="0.02" value="0"></div>
+        <div class="mvg-btnrow">
+          <button id="s2-resample" class="mvg-primary">New observations</button>
+        </div>
+        <div class="mvg-readout" id="s2-readout"></div>
+      </div>
+    </div>
+    <p>With zero noise the raw DLT solve is already essentially exact &mdash; there's nothing to refine. Push noise up and the raw estimate drifts measurably; refinement (a handful of Gauss&ndash;Newton steps minimizing true reprojection error, the same machinery as Part 10's nonlinear triangulation) pulls it most of the way back. Add outliers, though, and refinement stops helping &mdash; a few wildly wrong correspondences drag the least-squares solve off no matter how well you polish it afterward. That's the motivation for the RANSAC demo below.</p>
+  </section>
+
+  <section class="mvg-step" id="p3p">
+    <div class="mvg-step-head"><span class="mvg-step-num">3</span><h2>P3P: the minimal solver, and a third instance of a familiar pattern</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>DLT needs 6 points. But given <var>K</var>, the true minimum is <strong>3</strong> &mdash; and getting there means leaving linear algebra behind for plain geometry. Three known 3D points <var>X&#8321;, X&#8322;, X&#8323;</var> and the (unknown) camera center <var>C</var> form a tetrahedron. The three known inter-point distances <var>d&#8339;&#7488;</var> (from the 3D points themselves) are fixed; the three angles <var>&theta;&#8339;&#7488;</var> between the viewing rays <var>C&rarr;X&#8339;</var> and <var>C&rarr;X&#7488;</var> are also known &mdash; they come straight out of <var>K</var> and the observed pixels, with no camera pose needed at all, since an angle between two rays through the same center doesn't depend on where that center is. What's unknown are the three distances from the camera to each point, <var>d&#8321; = |CX&#8321;|</var>, <var>d&#8322;</var>, <var>d&#8323;</var>. The law of cosines in the triangle <var>C, X&#8321;, X&#8322;</var> ties them together:</p>
+    <div class="mvg-math">d&#8321;&#178; + d&#8322;&#178; &minus; 2 d&#8321;d&#8322; cos&thinsp;&theta;&#8321;&#8322; = d&#8321;&#8322;&#178;</div>
+    <p>The same relation holds for the <var>(1,3)</var> and <var>(2,3)</var> pairs, giving three simultaneous quadratics in <var>d&#8321;, d&#8322;, d&#8323;</var> &mdash; known coefficients (<var>&theta;&#8339;&#7488;</var>, <var>d&#8339;&#7488;</var>), three unknowns. Eliminating variables between the three equations produces a single <strong>quartic</strong> polynomial in one of them, which has <strong>up to 4 real roots</strong> &mdash; so P3P alone hands back up to 4 algebraically valid camera poses, all consistent with the same three rays and three distances.</p>
+    <div class="mvg-warn">&#9888;&#65039; <span><b>A pattern you've now seen three times.</b> Part 8's homography decomposition gave 2 candidate poses off a flat scene; Part 6's essential-matrix decomposition gave 4 candidates for relative pose. P3P's quartic is the same story a third time: a minimal solver, working from too little information to be unambiguous by itself, algebraically returns several equally valid answers &mdash; and one extra piece of information (a cheirality check, a positive-depth check, or here a <strong>4th point</strong>) is what picks the physical one. With a 4th correspondence in hand, whichever of the &le;4 candidates reprojects it with the least error wins.</span></div>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> three points + the ray angles from <var>K</var>, solved for camera-to-point distances &mdash; watch the solver hand back every algebraically valid pose as a frustum, then add the 4th point and see it pick the winner. Slide the camera azimuth to change the ray geometry and watch the candidate count change &mdash; the quartic really does have a variable number of real roots.</div>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s3-plot3d" class="mvg-plot3d" style="height:340px;"></div>
+        <p class="mvg-canvas-hint">Drag to orbit. Black frustum = ground truth; colored frustums = P3P candidates (up to 4); the winner by 4th-point reprojection is drawn brighter with a dashed line to the 4th point.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Camera azimuth (ray geometry) <span class="val" id="s3-azval"></span></label><input type="range" id="s3-az" min="0.1" max="1.2" step="0.01" value="0.55"></div>
+        <div class="mvg-readout" id="s3-readout"></div>
+        <p class="mvg-canvas-hint">The three law-of-cosines quadratics are solved numerically here (multi-start Newton on the distance triplet, clustered); the textbook route eliminates them into one closed-form quartic in a single variable. Same roots, either way.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="epnp">
+    <div class="mvg-step-head"><span class="mvg-step-num">4</span><h2>EPnP: linear again, and fast for any N</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>P3P is minimal but ambiguous; DLT is unambiguous but its cost grows with <var>N</var> unknowns tied one-to-one to the points. <strong>EPnP</strong> is the standard middle path used by real systems (it's what OpenCV's <code>solvePnP</code> reaches for by default, and what runs inside <code>solvePnPRansac</code>'s minimal-sample loop for larger samples). The key idea: instead of treating each of the <var>N</var> 3D points as its own unknown, pick just <strong>4 virtual control points</strong> once, and express every real 3D point as a fixed weighted combination of those 4 (barycentric-style coordinates, computed once from the known <var>X&#8339;</var> and frozen for the rest of the solve). The problem of "where is every one of these <var>N</var> points, really, in the camera's frame" becomes "where are these <em>4</em> control points" &mdash; <strong>12 unknowns total, regardless of how large N is.</strong> That turns what would otherwise be an <var>N</var>-scaling problem into a small, fixed-size linear system solved once per image, which is exactly why EPnP is the fast, accurate default for <var>N &ge; 4</var> points in production structure-from-motion and SLAM pipelines.</p>
+  </section>
+
+  <section class="mvg-step" id="ransac">
+    <div class="mvg-step-head"><span class="mvg-step-num">5</span><h2>PnP + RANSAC: how a camera actually gets registered</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+{% endraw %}    <p>Real correspondences come from feature matching, and feature matching produces outliers &mdash; wrong matches that no amount of least-squares polishing will fix, exactly as the demo above showed. The fix is the same one <a href="{{ '/vision/multi-view-geometry/ransac/' | relative_url }}">Part 7</a> used for the 8-point and homography DLT: wrap the minimal solver in <strong>RANSAC</strong>. Draw a minimal sample (3 points for P3P, plus a 4th to disambiguate its candidates &mdash; or, as this page's demo does, 6 points for a minimal DLT solve, which needs no disambiguation step but is otherwise the identical loop), solve for a candidate pose, count how many of the <em>other</em> correspondences it reprojects within a small pixel threshold, and repeat. Whichever candidate wins the most inliers gets refined &mdash; typically with EPnP or a nonlinear reprojection-error minimization like the Gauss&ndash;Newton step above &mdash; on its full inlier set, and that refined pose is the camera's registered position.</p>{% raw %}
+{% endraw %}    <div class="mvg-goal">&#128161; <span><b>This is the actual registration step.</b> Every time an incremental structure-from-motion pipeline (<a href="{{ '/vision/multi-view-geometry/sfm-pipelines/' | relative_url }}">Part 16</a>) adds one more photo to a growing reconstruction, this loop &mdash; match 2D features against the existing 3D point cloud, run PnP+RANSAC, refine &mdash; is how that new camera's pose gets found.</span></div>{% raw %}
+  </section>
+
+  <section class="mvg-step" id="demo-ransac">
+    <div class="mvg-step-head"><span class="mvg-step-num">6</span><h2>Play: PnP + RANSAC against contaminated correspondences</h2></div>
+    <p class="mvg-eyebrow">Interactive</p>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> resect naively on every correspondence (outliers included) and compare it to a RANSAC loop that discovers which correspondences are trustworthy on its own.</div>
+    <div class="mvg-warn">&#9888;&#65039; <span><b>Simplification, stated plainly:</b> this demo's RANSAC loop draws minimal samples of <strong>6</strong> points and solves them with the DLT resection above, not a true 3-point P3P solver with its quartic. The RANSAC logic &mdash; sample, solve, count inliers, keep the best, refine &mdash; is identical either way; only the algebra inside "solve" differs, and P3P's is a further layer this page describes but doesn't implement from scratch.</span></div>
+    <p>Same 14-point cloud and true camera as above, plus a controllable outlier fraction. "Naive DLT" resects on every correspondence at once. "PnP + RANSAC" repeatedly resects on random 6-point samples, scores each by reprojection inliers, and refines the winner on its inlier set.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s6-plot3d" class="mvg-plot3d"></div>
+        <p class="mvg-canvas-hint">Drag to orbit. Point color: green = RANSAC inlier, red = outlier.</p>
+        <div class="mvg-imgplane">
+          <canvas id="s6-canvas" width="480" height="360"></canvas>
+        </div>
+        <p class="mvg-canvas-hint">The image plane: observed pixels colored by the RANSAC verdict (green = inlier, red = outlier, gray = not yet scored).</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-text)"></i>true camera</span>
+          <span><i style="background:#9b9797"></i>naive DLT (all points)</span>
+          <span><i style="background:var(--color-accent-2)"></i>PnP + RANSAC (refined)</span>
+        </div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Outlier fraction <span class="val" id="s6-outval"></span></label><input type="range" id="s6-out" min="0" max="0.5" step="0.02" value="0.25"></div>
+        <div class="mvg-field"><label>Pixel noise &sigma; <span class="val" id="s6-noiseval"></span></label><input type="range" id="s6-noise" min="0" max="4" step="0.1" value="1"></div>
+        <div class="mvg-field"><label>Inlier threshold &#964; (px) <span class="val" id="s6-tauval"></span></label><input type="range" id="s6-tau" min="2" max="25" step="1" value="6"></div>
+        <div class="mvg-btnrow">
+          <button id="s6-resample" class="mvg-primary">New correspondences</button>
+          <button id="s6-run">Run RANSAC</button>
+        </div>
+        <div class="mvg-readout" id="s6-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="cheatsheet">
+    <div class="mvg-step-head"><span class="mvg-step-num">&#10003;</span><h2>Cheat sheet</h2></div>
+    <p class="mvg-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="mvg-cheat">
+      <thead><tr><th>Method</th><th>Core idea</th><th>Min. points</th><th>Ambiguity / notes</th></tr></thead>
+      <tbody>
+        <tr><td>DLT resection</td><td><code>x&#771;&#8339;&times;(PX&#771;&#8339;)=0</code> &rarr; 2 linear rows per point in <var>P</var>'s 12 entries, solved by SVD null vector</td><td>6</td><td>Unique (up to noise); decompose with <var>K</var> known via polar decomposition, not RQ</td></tr>
+        <tr><td>P3P</td><td>Law of cosines on the 3-point&ndash;camera tetrahedron: <code>d&#8321;&#178;+d&#8322;&#178;&minus;2d&#8321;d&#8322;cos&theta;&#8321;&#8322;=d&#8321;&#8322;&#178;</code>, ×3, eliminated to one quartic</td><td>3 (+1 to disambiguate)</td><td>Up to 4 algebraic solutions &mdash; same pattern as H's 2 and E's 4 candidates</td></tr>
+        <tr><td>EPnP</td><td>Express all N points via 4 virtual control points &rarr; 12 unknowns regardless of N &rarr; linear, O(N)</td><td>4</td><td>Standard fast/accurate default (e.g. OpenCV's <code>solvePnP</code>)</td></tr>
+        <tr><td>PnP + RANSAC</td><td>Minimal solver (P3P, or DLT with a larger sample) inside a RANSAC loop; refine the inlier-set winner</td><td>3&ndash;6 per sample</td><td>How every new camera gets registered into a growing SfM reconstruction (Part 16)</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+{% endraw %}
+
+  <div class="mvg-next">
+    <span>Two views constrain a point to a line, then a point. Add a third view and there's an even tighter constraint — one that can predict a point's location without any triangulation at all.</span>
+    <a class="btn btn-secondary" href="{{ '/vision/multi-view-geometry/trifocal/' | relative_url }}">Continue: the trifocal tensor →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.multi_view_geometry %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+
+  function gaussianNoise(std){
+    var u = Math.max(Math.random(), 1e-9), v = Math.random();
+    return std * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v);
+  }
+
+  // ---------- shared multi-view-geometry math (Part 4's MVG namespace) ----------
+  var MVG = {};
+  MVG.sub = function(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; };
+  MVG.add = function(a,b){ return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]; };
+  MVG.scale = function(a,s){ return [a[0]*s,a[1]*s,a[2]*s]; };
+  MVG.dot = function(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; };
+  MVG.cross = function(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; };
+  MVG.norm = function(a){ return Math.hypot(a[0],a[1],a[2]); };
+  MVG.normalize = function(a){ var n=MVG.norm(a)||1; return [a[0]/n,a[1]/n,a[2]/n]; };
+  MVG.matVec = function(R,v){ return [MVG.dot(R[0],v),MVG.dot(R[1],v),MVG.dot(R[2],v)]; };
+  MVG.orbitCamera = function(az, el, dist, lookAt){
+    lookAt = lookAt || [0,0,0];
+    var C = [ lookAt[0] + dist*Math.cos(el)*Math.sin(az), lookAt[1] + dist*Math.sin(el), lookAt[2] + dist*Math.cos(el)*Math.cos(az) ];
+    var forward = MVG.normalize(MVG.sub(lookAt, C));
+    var right = MVG.normalize(MVG.cross(forward, [0,1,0]));
+    var down = MVG.cross(forward, right);
+    return { C: C, R: [right, down, forward] };
+  };
+  MVG.worldToCamera = function(cam, X){ return MVG.matVec(cam.R, MVG.sub(X, cam.C)); };
+  MVG.project = function(K, cam, X){
+    var Xc = MVG.worldToCamera(cam, X);
+    if (Xc[2] <= 1e-6) return null;
+    return { u: K.fx*Xc[0]/Xc[2] + K.cx, v: K.fy*Xc[1]/Xc[2] + K.cy, depth: Xc[2] };
+  };
+
+  // ---------- generic small linear algebra ----------
+  function zeros(n,m){ var A=[]; for (var i=0;i<n;i++) A.push(new Array(m).fill(0)); return A; }
+  function identity3(){ return [[1,0,0],[0,1,0],[0,0,1]]; }
+  function matMulG(A,B){
+    var n=A.length, k=A[0].length, m=B[0].length, C=zeros(n,m);
+    for (var i=0;i<n;i++) for (var j=0;j<m;j++){ var s=0; for (var t=0;t<k;t++) s+=A[i][t]*B[t][j]; C[i][j]=s; }
+    return C;
+  }
+  function transposeG(A){ var n=A.length,m=A[0].length,T=zeros(m,n); for (var i=0;i<n;i++) for (var j=0;j<m;j++) T[j][i]=A[i][j]; return T; }
+  function addMatG(A,B){ return A.map(function(row,i){ return row.map(function(v,j){ return v+B[i][j]; }); }); }
+  function det3(M){ return M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1]) - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0]) + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]); }
+  function diagMat(d){ var n=d.length, A=zeros(n,n); for (var i=0;i<n;i++) A[i][i]=d[i]; return A; }
+
+  // Cyclic Jacobi eigenvalue algorithm for a symmetric n x n matrix.
+  function jacobiEigenSym(Ain, maxSweeps){
+    var n = Ain.length;
+    var A = Ain.map(function(r){ return r.slice(); });
+    var V = identity3().length===n ? identity3() : zeros(n,n);
+    if (n!==3){ V = zeros(n,n); for (var i0=0;i0<n;i0++) V[i0][i0]=1; }
+    maxSweeps = maxSweeps || 100;
+    for (var sweep=0; sweep<maxSweeps; sweep++){
+      var off = 0;
+      for (var i=0;i<n;i++) for (var j=0;j<n;j++) if (i!==j) off += A[i][j]*A[i][j];
+      if (off < 1e-22) break;
+      for (var p=0;p<n-1;p++){
+        for (var q=p+1;q<n;q++){
+          if (Math.abs(A[p][q]) < 1e-16) continue;
+          var theta = (A[q][q]-A[p][p]) / (2*A[p][q]);
+          var sign = theta >= 0 ? 1 : -1;
+          var t = sign / (Math.abs(theta) + Math.sqrt(theta*theta+1));
+          var c = 1/Math.sqrt(t*t+1), s = t*c;
+          var App=A[p][p], Aqq=A[q][q], Apq=A[p][q];
+          A[p][p] = c*c*App - 2*s*c*Apq + s*s*Aqq;
+          A[q][q] = s*s*App + 2*s*c*Apq + c*c*Aqq;
+          A[p][q] = 0; A[q][p] = 0;
+          for (var k=0;k<n;k++){
+            if (k===p || k===q) continue;
+            var Akp=A[k][p], Akq=A[k][q];
+            A[k][p] = c*Akp - s*Akq; A[p][k] = A[k][p];
+            A[k][q] = s*Akp + c*Akq; A[q][k] = A[k][q];
+          }
+          for (var k2=0;k2<n;k2++){
+            var Vkp=V[k2][p], Vkq=V[k2][q];
+            V[k2][p] = c*Vkp - s*Vkq;
+            V[k2][q] = s*Vkp + c*Vkq;
+          }
+        }
+      }
+    }
+    var vals=[]; for (var ii=0;ii<n;ii++) vals.push(A[ii][ii]);
+    return { values: vals, vectors: V };
+  }
+
+  // Null vector of A (rows x 12), via the eigenvector of A^T A with smallest eigenvalue.
+  function nullVector12(rows){
+    var AtA = matMulG(transposeG(rows), rows);
+    var eig = jacobiEigenSym(AtA, 120);
+    var minIdx = 0;
+    for (var i=1;i<eig.values.length;i++) if (eig.values[i] < eig.values[minIdx]) minIdx = i;
+    var v = []; for (var r=0;r<eig.vectors.length;r++) v.push(eig.vectors[r][minIdx]);
+    var norm = Math.sqrt(v.reduce(function(s,x){ return s+x*x; },0)) || 1;
+    return v.map(function(x){ return x/norm; });
+  }
+
+  // Polar decomposition of a 3x3 matrix M = R*S (S symmetric PSD); returns nearest rotation R and mean singular value s.
+  function polarRotation(M){
+    var MtM = matMulG(transposeG(M), M);
+    var eig = jacobiEigenSym(MtM, 100);
+    var lambda = eig.values.map(function(v){ return Math.max(v, 1e-10); });
+    var V = eig.vectors;
+    var sq = lambda.map(Math.sqrt);
+    var Sinv = matMulG(matMulG(V, diagMat(sq.map(function(x){ return 1/x; }))), transposeG(V));
+    var R = matMulG(M, Sinv);
+    var s = (sq[0]+sq[1]+sq[2]) / 3;
+    return { R: R, s: s };
+  }
+
+  // ---------- DLT resection: solve for (R, C) given K, 3D points, and observed pixels ----------
+  function decomposePose(p12, points3D, calibObs){
+    function build(sign){
+      var pp = p12.map(function(x){ return x*sign; });
+      var M = [[pp[0],pp[1],pp[2]],[pp[4],pp[5],pp[6]],[pp[8],pp[9],pp[10]]];
+      var p4 = [pp[3], pp[7], pp[11]];
+      var pol = polarRotation(M);
+      var R = pol.R, s = pol.s;
+      if (det3(R) < 0){ R = R.map(function(row){ return row.map(function(v){ return -v; }); }); s = -s; }
+      var t = p4.map(function(v){ return v/s; });
+      var Rt = transposeG(R);
+      var C = MVG.scale(MVG.matVec(Rt, t), -1);
+      return { R: R, C: C };
+    }
+    function err(cand){
+      var Kid = { fx:1, fy:1, cx:0, cy:0 };
+      var e = 0;
+      for (var i=0;i<points3D.length;i++){
+        var p = MVG.project(Kid, cand, points3D[i]);
+        if (!p){ e += 1e2; continue; }
+        var dx = p.u-calibObs[i][0], dy = p.v-calibObs[i][1];
+        e += dx*dx+dy*dy;
+      }
+      return e / points3D.length;
+    }
+    var candA = build(1), candB = build(-1);
+    return err(candA) <= err(candB) ? candA : candB;
+  }
+
+  // Solve for camera pose (R, C) given known K, 3D points, and their (possibly noisy/wrong) pixel observations.
+  function dltResection(K, points3D, obsPix){
+    var calib = obsPix.map(function(o){ return [ (o[0]-K.cx)/K.fx, (o[1]-K.cy)/K.fy ]; });
+    var rows = [];
+    for (var i=0;i<points3D.length;i++){
+      var X = points3D[i], Xh = [X[0],X[1],X[2],1];
+      var x = calib[i][0], y = calib[i][1];
+      rows.push([-Xh[0],-Xh[1],-Xh[2],-Xh[3], 0,0,0,0, x*Xh[0],x*Xh[1],x*Xh[2],x*Xh[3]]);
+      rows.push([0,0,0,0, -Xh[0],-Xh[1],-Xh[2],-Xh[3], y*Xh[0],y*Xh[1],y*Xh[2],y*Xh[3]]);
+    }
+    var p12 = nullVector12(rows);
+    return decomposePose(p12, points3D, calib);
+  }
+
+  // ---------- Gauss-Newton refinement on reprojection error ----------
+  function reprojResidualsPose(K, cam, points3D, obsPix){
+    var r = [];
+    for (var i=0;i<points3D.length;i++){
+      var p = MVG.project(K, cam, points3D[i]);
+      if (!p){ r.push(1e2, 1e2); continue; }
+      r.push(p.u-obsPix[i][0], p.v-obsPix[i][1]);
+    }
+    return r;
+  }
+  function skew(w){ return [[0,-w[2],w[1]],[w[2],0,-w[0]],[-w[1],w[0],0]]; }
+  function applyPoseDelta(cam, w, dC){
+    var Rraw = matMulG(addMatG(identity3(), skew(w)), cam.R);
+    var pol = polarRotation(Rraw);
+    return { R: pol.R, C: MVG.add(cam.C, dC) };
+  }
+  function solveLinearN(A, b){
+    var n = A.length;
+    var M = A.map(function(row,i){ return row.concat([b[i]]); });
+    for (var col=0; col<n; col++){
+      var piv = col;
+      for (var r=col+1;r<n;r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+      var tmp = M[col]; M[col] = M[piv]; M[piv] = tmp;
+      var pv = M[col][col]; if (Math.abs(pv) < 1e-12) continue;
+      for (var r2=0;r2<n;r2++){
+        if (r2===col) continue;
+        var f = M[r2][col]/pv;
+        for (var c2=col;c2<=n;c2++) M[r2][c2] -= f*M[col][c2];
+      }
+    }
+    return M.map(function(row,i){ return row[i]===0 ? 0 : row[n]/row[i]; });
+  }
+  function refinePoseGN(K, points3D, obsPix, cam0, iters, history){
+    var cam = { R: cam0.R.map(function(r){ return r.slice(); }), C: cam0.C.slice() };
+    iters = iters || 8;
+    if (history) history.push(totalCost(K, cam, points3D, obsPix));
+    for (var it=0; it<iters; it++){
+      var r0 = reprojResidualsPose(K, cam, points3D, obsPix);
+      var m = r0.length;
+      var J = zeros(m, 6);
+      var eps = 1e-5;
+      for (var d=0; d<6; d++){
+        var w=[0,0,0], dC=[0,0,0];
+        if (d<3) w[d]=eps; else dC[d-3]=eps;
+        var camP = applyPoseDelta(cam, w, dC);
+        var rp = reprojResidualsPose(K, camP, points3D, obsPix);
+        for (var k=0;k<m;k++) J[k][d] = (rp[k]-r0[k]) / eps;
+      }
+      var JT = transposeG(J);
+      var H = matMulG(JT, J);
+      var g = matMulG(JT, r0.map(function(v){ return [v]; })).map(function(row){ return row[0]; });
+      for (var i2=0;i2<6;i2++) H[i2][i2] += 1e-6;
+      var delta = solveLinearN(H, g.map(function(v){ return -v; }));
+      cam = applyPoseDelta(cam, [delta[0],delta[1],delta[2]], [delta[3],delta[4],delta[5]]);
+      if (history) history.push(totalCost(K, cam, points3D, obsPix));
+    }
+    return cam;
+  }
+  function totalCost(K, cam, points3D, obsPix){
+    var r = reprojResidualsPose(K, cam, points3D, obsPix);
+    var s = 0;
+    for (var i=0;i<r.length;i++) s += r[i]*r[i];
+    return s;
+  }
+  function poseErrors(camTrue, camEst){
+    var Rtr = matMulG(transposeG(camTrue.R), camEst.R);
+    var tr = Rtr[0][0]+Rtr[1][1]+Rtr[2][2];
+    var ang = Math.acos(Math.max(-1, Math.min(1, (tr-1)/2))) * 180/Math.PI;
+    var dt = MVG.norm(MVG.sub(camTrue.C, camEst.C));
+    return { rotDeg: ang, transErr: dt };
+  }
+
+  // ---------- shared synthetic scene: 14 known 3D points, one hidden true camera ----------
+  var K = { fx: 480, fy: 480, cx: 0, cy: 0 };
+  var POINTS3D = [
+    [-1.0,-0.8,-0.6],[1.0,-0.8,-0.6],[1.0,0.8,-0.6],[-1.0,0.8,-0.6],
+    [-1.0,-0.8,0.6],[1.0,-0.8,0.6],[1.0,0.8,0.6],[-1.0,0.8,0.6],
+    [0.0,0.0,0.9],[0.6,-0.3,0.0],[-0.6,0.3,0.0],[0.3,0.6,-0.3],
+    [-0.3,-0.6,0.3],[0.0,-1.0,0.0]
+  ];
+  var TRUE_CAM = MVG.orbitCamera(0.55, 0.24, 6.5, [0,0,0]);
+
+  function trueObs(){ return POINTS3D.map(function(X){ var p = MVG.project(K, TRUE_CAM, X); return [p.u, p.v]; }); }
+
+  function cameraFrustumTrace(cam, color, size){
+    size = size || 0.6;
+    var right = cam.R[0], down = cam.R[1], fwd = cam.R[2];
+    var corners = [[-1,-1],[1,-1],[1,1],[-1,1]].map(function(s){
+      return MVG.add(MVG.add(cam.C, MVG.scale(fwd, size)),
+        MVG.add(MVG.scale(right, s[0]*size*0.6), MVG.scale(down, s[1]*size*0.6)));
+    });
+    var xs=[], ys=[], zs=[];
+    corners.forEach(function(pt){ xs.push(cam.C[0],pt[0],null); ys.push(cam.C[1],pt[1],null); zs.push(cam.C[2],pt[2],null); });
+    for (var i=0;i<4;i++){ var a=corners[i], b=corners[(i+1)%4]; xs.push(a[0],b[0],null); ys.push(a[1],b[1],null); zs.push(a[2],b[2],null); }
+    return { type:'scatter3d', mode:'lines', x:xs, y:ys, z:zs, line:{ color:color, width:3 }, hoverinfo:'skip' };
+  }
+  function cameraCenterTrace(cam, color){
+    return { type:'scatter3d', mode:'markers', x:[cam.C[0]], y:[cam.C[1]], z:[cam.C[2]], marker:{ size:5, color:color }, hoverinfo:'skip' };
+  }
+  function pointsTrace(pts, colors, size){
+    return { type:'scatter3d', mode:'markers', x:pts.map(function(p){return p[0];}), y:pts.map(function(p){return p[1];}), z:pts.map(function(p){return p[2];}),
+      marker:{ size:size||4, color:colors || COLOR_TEXT }, hoverinfo:'skip' };
+  }
+  function baseLayout(){
+    return {
+      autosize:true, margin:{l:0,r:0,t:0,b:0}, showlegend:false, paper_bgcolor:'transparent',
+      scene: {
+        xaxis:{ range:[-4,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'x' },
+        yaxis:{ range:[-4,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'y' },
+        zaxis:{ range:[-4,4], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'z' },
+        aspectmode:'cube', camera:{ eye:{x:1.4,y:-1.5,z:1.0} }
+      }
+    };
+  }
+
+  // ---------- Step 2: DLT resection demo ----------
+  (function(){
+    var div = document.getElementById('s2-plot3d');
+    var canvas = document.getElementById('s2-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var curveCanvas = document.getElementById('s2-curve'), curveCtx = curveCanvas ? curveCanvas.getContext('2d') : null;
+    var noiseEl = document.getElementById('s2-noise'), outEl = document.getElementById('s2-out');
+    var base = trueObs();
+    var obs = null, outlierMask = null;
+
+    function resample(){
+      var noise = parseFloat(noiseEl.value), outFrac = parseFloat(outEl.value);
+      outlierMask = POINTS3D.map(function(){ return Math.random() < outFrac; });
+      obs = base.map(function(p, i){
+        if (outlierMask[i]) return [ (Math.random()-0.5)*440, (Math.random()-0.5)*320 ];
+        return [ p[0]+gaussianNoise(noise), p[1]+gaussianNoise(noise) ];
+      });
+      render();
+    }
+
+    function drawCurve(history){
+      if (!curveCtx) return;
+      var ctx = curveCtx, CW = curveCanvas.width, CH = curveCanvas.height;
+      ctx.clearRect(0,0,CW,CH);
+      ctx.fillStyle = 'rgba(0,0,0,0.04)'; ctx.fillRect(0,0,CW,CH);
+      var padL = 52, padB = 22, padT = 12, padR = 12;
+      var maxC = Math.max.apply(null, history.concat([1]));
+      function X(i){ return padL + (i/(history.length-1||1))*(CW-padL-padR); }
+      function Y(v){ return CH-padB - (v/maxC)*(CH-padT-padB); }
+      ctx.strokeStyle = COLOR_DIVIDER; ctx.fillStyle = COLOR_TEXT; ctx.lineWidth = 1; ctx.font = '10px monospace';
+      for (var g=0; g<=2; g++){
+        var gy = padT + (g/2)*(CH-padT-padB);
+        ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(CW-padR, gy); ctx.stroke();
+        ctx.globalAlpha = 0.7; ctx.fillText(Math.round(maxC*(1-g/2)), 4, gy+3); ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = COLOR_ACCENT2; ctx.lineWidth = 2;
+      ctx.beginPath();
+      history.forEach(function(v, i){ if (i===0) ctx.moveTo(X(i), Y(v)); else ctx.lineTo(X(i), Y(v)); });
+      ctx.stroke();
+      ctx.fillText('reprojection cost', padL+6, padT+10);
+      ctx.fillText('GN iteration', CW/2-30, CH-6);
+    }
+
+    function render(){
+      var history = [];
+      var camRaw = dltResection(K, POINTS3D, obs);
+      var camRefined = refinePoseGN(K, POINTS3D, obs, camRaw, 10, history);
+      var eRaw = poseErrors(TRUE_CAM, camRaw), eRef = poseErrors(TRUE_CAM, camRefined);
+
+      Plotly.react(div, [
+        pointsTrace(POINTS3D, COLOR_TEXT, 4),
+        cameraFrustumTrace(TRUE_CAM, COLOR_TEXT), cameraCenterTrace(TRUE_CAM, COLOR_TEXT),
+        cameraFrustumTrace(camRaw, '#9b9797'), cameraCenterTrace(camRaw, '#9b9797'),
+        cameraFrustumTrace(camRefined, COLOR_ACCENT2), cameraCenterTrace(camRefined, COLOR_ACCENT2)
+      ], baseLayout(), { displayModeBar:false, responsive:true });
+
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(0,0,0,0.06)'; ctx.fillRect(0,0,W,H);
+      obs.forEach(function(o, i){
+        ctx.fillStyle = outlierMask[i] ? '#e08a1e' : COLOR_ACCENT;
+        ctx.beginPath(); ctx.arc(W/2+o[0], H/2+o[1], 4, 0, 7); ctx.fill();
+      });
+      drawCurve(history);
+
+      document.getElementById('s2-noiseval').textContent = parseFloat(noiseEl.value).toFixed(1) + ' px';
+      document.getElementById('s2-outval').textContent = (parseFloat(outEl.value)*100).toFixed(0) + '%';
+      document.getElementById('s2-readout').innerHTML =
+        '<div><span class="k">raw DLT</span> rotation err <span class="hi">' + eRaw.rotDeg.toFixed(2) + '&deg;</span>, translation err <span class="hi">' + eRaw.transErr.toFixed(3) + '</span></div>' +
+        '<div><span class="k">after Gauss&ndash;Newton</span> rotation err <span class="hi">' + eRef.rotDeg.toFixed(2) + '&deg;</span>, translation err <span class="hi">' + eRef.transErr.toFixed(3) + '</span>' +
+        ' <span class="k">(' + history.length + ' cost evaluations)</span></div>' +
+        '<div><span class="k">true camera C</span> = (' + TRUE_CAM.C.map(function(v){return v.toFixed(2);}).join(', ') + ')</div>';
+    }
+
+    document.getElementById('s2-resample').addEventListener('click', resample);
+    noiseEl.addEventListener('input', resample);
+    outEl.addEventListener('input', resample);
+    resample();
+  })();
+
+  // ---------- Step 3: P3P candidate-poses demo ----------
+  (function(){
+    var div = document.getElementById('s3-plot3d');
+    if (!div) return;
+    var azEl = document.getElementById('s3-az');
+    var readout = document.getElementById('s3-readout');
+    var CAND_COLORS = [COLOR_ACCENT, COLOR_ACCENT2, '#8a5cff', '#e08a1e'];
+
+    function camFor(az){
+      return MVG.orbitCamera(az, 0.24, 6.5, [0,0,0]);
+    }
+    // Solve the three law-of-cosines quadratics for (d1,d2,d3) via multi-start Newton.
+    function solveP3Pdistances(pts, cam){
+      var obs = pts.map(function(X){ return MVG.project(K, cam, X); });
+      var rays = obs.map(function(o){ return MVG.normalize([ (o.u-K.cx)/K.fx, (o.v-K.cy)/K.fy, 1 ]); });
+      var lens = [
+        MVG.norm(MVG.sub(pts[1], pts[2])), // a = |X2-X3| opposite X1
+        MVG.norm(MVG.sub(pts[0], pts[2])), // b = |X1-X3|
+        MVG.norm(MVG.sub(pts[0], pts[1]))  // c = |X1-X2|
+      ];
+      var cosA = MVG.dot(rays[1], rays[2]); // angle between rays to X2,X3 (at camera, opposite a)
+      var cosB = MVG.dot(rays[0], rays[2]);
+      var cosG = MVG.dot(rays[0], rays[1]);
+      function F(d){
+        return [
+          d[0]*d[0] + d[1]*d[1] - 2*d[0]*d[1]*cosG - lens[2]*lens[2],
+          d[0]*d[0] + d[2]*d[2] - 2*d[0]*d[2]*cosB - lens[1]*lens[1],
+          d[1]*d[1] + d[2]*d[2] - 2*d[1]*d[2]*cosA - lens[0]*lens[0]
+        ];
+      }
+      function JF(d){
+        return [
+          [ 2*d[0]-2*d[1]*cosG, 2*d[1]-2*d[0]*cosG, 0 ],
+          [ 2*d[0]-2*d[2]*cosB, 0, 2*d[2]-2*d[0]*cosB ],
+          [ 0, 2*d[1]-2*d[2]*cosA, 2*d[2]-2*d[1]*cosA ]
+        ];
+      }
+      function solve3(A, b){
+        var n=3, M=A.map(function(row,i){ return row.concat([b[i]]); });
+        for (var col=0; col<n; col++){
+          var piv=col;
+          for (var r=col+1;r<n;r++) if (Math.abs(M[r][col])>Math.abs(M[piv][col])) piv=r;
+          var tmp=M[col]; M[col]=M[piv]; M[piv]=tmp;
+          var pv=M[col][col]; if (Math.abs(pv)<1e-14) continue;
+          for (var r2=0;r2<n;r2++){ if (r2===col) continue; var f=M[r2][col]/pv; for (var c2=col;c2<=n;c2++) M[r2][c2]-=f*M[col][c2]; }
+        }
+        return M.map(function(row,i){ return row[i]===0?0:row[n]/row[i]; });
+      }
+      var sols = [];
+      for (var start=0; start<80; start++){
+        var d = [ 0.5+Math.random()*11, 0.5+Math.random()*11, 0.5+Math.random()*11 ];
+        for (var it=0; it<40; it++){
+          var fv = F(d), Jv = JF(d);
+          if (Math.hypot(fv[0],fv[1],fv[2]) < 1e-10) break;
+          var delta = solve3(Jv, fv.map(function(v){ return -v; }));
+          d = [d[0]+delta[0], d[1]+delta[1], d[2]+delta[2]];
+          if (d.some(function(v){ return !isFinite(v) || v <= 0 || v > 60; })) break;
+        }
+        var fin = F(d);
+        if (Math.hypot(fin[0],fin[1],fin[2]) < 1e-6 && d.every(function(v){ return v > 0.05 && v < 60; })){
+          var dup = sols.some(function(s){ return Math.hypot(s[0]-d[0], s[1]-d[1], s[2]-d[2]) < 0.05; });
+          if (!dup) sols.push(d.slice());
+        }
+      }
+      return sols;
+    }
+    // Rigid pose from camera-frame coordinates Yᵢ = dᵢ·rayᵢ to world points Xᵢ.
+    // With exactly 3 points a centered Kabsch/polar solve is rank-deficient (the centered
+    // cloud spans a plane), so build orthonormal triads from the triangle edges instead:
+    // edge vectors transform as ΔY = R ΔX, so triads built by the same Gram–Schmidt in both
+    // frames satisfy Tc = R·Tw exactly — R = Tc·Twᵀ, exact for any non-degenerate triangle.
+    function triadRows(P){
+      var e1 = MVG.normalize(MVG.sub(P[1], P[0]));
+      var v = MVG.sub(P[2], P[0]);
+      var e2 = MVG.normalize(MVG.sub(v, MVG.scale(e1, MVG.dot(v, e1))));
+      var e3 = MVG.cross(e1, e2);
+      return [e1, e2, e3]; // rows of the triad matrix (columns of the frame basis)
+    }
+    function poseFromDepthTriplet(pts, cam, d){
+      var obs = pts.map(function(X){ return MVG.project(K, cam, X); });
+      var Y = obs.map(function(o, i){
+        var r = MVG.normalize([ (o.u-K.cx)/K.fx, (o.v-K.cy)/K.fy, 1 ]);
+        return MVG.scale(r, d[i]);
+      });
+      var Tw = triadRows(pts);       // world triad (rows)
+      var Tc = triadRows(Y);         // camera-frame triad (rows)
+      // C = R W (columns)  ⟹  R = Tcᵀ · Tw
+      var R = matMulG(transposeG(Tc), Tw);
+      var t = MVG.sub(Y[0], mv3(R, pts[0])); // y = R x + t
+      return { R: R, t: t, C: MVG.scale(MVG.matVec(transposeG(R), t), -1) };
+    }
+    function mv3(M, v){ return [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]]; }
+
+    function update(){
+      var az = parseFloat(azEl.value);
+      document.getElementById('s3-azval').textContent = az.toFixed(2);
+      var cam = camFor(az);
+      var pts = POINTS3D.slice(0, 3);      // the P3P triplet
+      var X4 = POINTS3D[9];                // the disambiguating 4th point
+      var sols = solveP3Pdistances(pts, cam);
+      var traces = [
+        pointsTrace(POINTS3D, COLOR_TEXT, 4),
+        cameraFrustumTrace(TRUE_CAM, COLOR_TEXT), cameraCenterTrace(TRUE_CAM, COLOR_TEXT)
+      ];
+      var best = null, bestErr = Infinity;
+      var cands = sols.map(function(d){
+        var pose = poseFromDepthTriplet(pts, cam, d);
+        var p4 = MVG.project(K, pose, X4);
+        var p4true = MVG.project(K, TRUE_CAM, X4);
+        var err = (p4 && p4true) ? Math.hypot(p4.u-p4true.u, p4.v-p4true.v) : Infinity;
+        return { pose: pose, err: err };
+      });
+      cands.forEach(function(c){ if (isFinite(c.err) && c.err < bestErr){ bestErr = c.err; best = c; } });
+      cands.forEach(function(c, i){
+        var isBest = c === best;
+        traces.push(cameraFrustumTrace(c.pose, CAND_COLORS[i % CAND_COLORS.length]));
+        traces.push(cameraCenterTrace(c.pose, CAND_COLORS[i % CAND_COLORS.length]));
+        if (isBest){
+          var p4 = MVG.project(K, c.pose, X4);
+          if (p4){
+            traces.push({ type:'scatter3d', mode:'markers', x:[X4[0]], y:[X4[1]], z:[X4[2]], marker:{ size:7, color:COLOR_ACCENT2, symbol:'diamond-open' }, hoverinfo:'skip' });
+            traces.push({ type:'scatter3d', mode:'lines', x:[c.pose.C[0],X4[0]], y:[c.pose.C[1],X4[1]], z:[c.pose.C[2],X4[2]], line:{ color:COLOR_ACCENT2, width:2, dash:'dot' }, hoverinfo:'skip' });
+          }
+        }
+      });
+      Plotly.react(div, traces, baseLayout(), { displayModeBar:false, responsive:true });
+      readout.innerHTML =
+        '<div><span class="k">distance-triplet solutions (real roots)</span> = <span class="hi">' + sols.length + '</span> <span style="opacity:.6">(the quartic can have 0&ndash;4)</span></div>' +
+        cands.map(function(c, i){
+          return '<div><span class="k" style="color:' + CAND_COLORS[i % CAND_COLORS.length] + '">&#9679;</span> <span class="k">candidate ' + (i+1) + '</span> reprojects 4th point at <span class="hi">' + (isFinite(c.err) ? c.err.toFixed(1) + ' px' : 'off-frame') + '</span>' + (c === best ? ' <span class="hi">&larr; winner</span>' : '') + '</div>';
+        }).join('') +
+        (best ? '<div><span class="hi">The 4th correspondence picks the physical pose</span> <span style="opacity:.6">— exactly the same disambiguation pattern as H&#8217;s 2 and E&#8217;s 4 candidates.</span></div>' : '<div><span class="hi">No valid distance triplet at this geometry — slide the azimuth.</span></div>');
+    }
+    azEl.addEventListener('input', update);
+    update();
+  })();
+
+  // ---------- Step 6: PnP + RANSAC demo ----------
+  (function(){
+    var div = document.getElementById('s6-plot3d');
+    var canvas = document.getElementById('s6-canvas'), imgCtx = canvas ? canvas.getContext('2d') : null;
+    var IW = canvas ? canvas.width : 0, IH = canvas ? canvas.height : 0;
+    var noiseEl = document.getElementById('s6-noise'), outEl = document.getElementById('s6-out'), tauEl = document.getElementById('s6-tau');
+    var base = trueObs();
+    var obs = null, outlierMask = null;
+
+    function resample(){
+      var noise = parseFloat(noiseEl.value), outFrac = parseFloat(outEl.value);
+      outlierMask = POINTS3D.map(function(){ return Math.random() < outFrac; });
+      obs = base.map(function(p, i){
+        if (outlierMask[i]) return [ (Math.random()-0.5)*440, (Math.random()-0.5)*320 ];
+        return [ p[0]+gaussianNoise(noise), p[1]+gaussianNoise(noise) ];
+      });
+      document.getElementById('s6-noiseval').textContent = parseFloat(noiseEl.value).toFixed(1) + ' px';
+      document.getElementById('s6-outval').textContent = (parseFloat(outEl.value)*100).toFixed(0) + '%';
+      document.getElementById('s6-tauval').textContent = tauEl.value + ' px';
+      drawImage(null);
+      render(null);
+    }
+
+    function drawImage(inliers){
+      if (!imgCtx) return;
+      imgCtx.clearRect(0,0,IW,IH);
+      imgCtx.fillStyle = 'rgba(0,0,0,0.06)'; imgCtx.fillRect(0,0,IW,IH);
+      obs.forEach(function(o, i){
+        var col = '#8a8a8a';
+        if (outlierMask[i]) col = '#e08a1e'; // injected outlier draw
+        if (inliers) col = inliers.indexOf(i) >= 0 ? '#2f9e44' : COLOR_ACCENT2;
+        imgCtx.fillStyle = col;
+        imgCtx.beginPath(); imgCtx.arc(IW/2+o[0], IH/2+o[1], 4, 0, 7); imgCtx.fill();
+      });
+    }
+
+    function countInliers(cam, thresh){
+      var idx = [];
+      for (var i=0;i<POINTS3D.length;i++){
+        var p = MVG.project(K, cam, POINTS3D[i]);
+        if (!p){ continue; }
+        var dx = p.u-obs[i][0], dy = p.v-obs[i][1];
+        if (Math.sqrt(dx*dx+dy*dy) < thresh) idx.push(i);
+      }
+      return idx;
+    }
+
+    function runRansac(){
+      var n = POINTS3D.length;
+      var thresh = parseFloat(tauEl.value);
+      var camNaive = dltResection(K, POINTS3D, obs);
+      var bestInliers = [], iters = 250, sampleSize = 6;
+      for (var it=0; it<iters; it++){
+        var idxs = [];
+        while (idxs.length < sampleSize){
+          var r = Math.floor(Math.random()*n);
+          if (idxs.indexOf(r) < 0) idxs.push(r);
+        }
+        var pts = idxs.map(function(i){ return POINTS3D[i]; });
+        var ob = idxs.map(function(i){ return obs[i]; });
+        var cam;
+        try { cam = dltResection(K, pts, ob); } catch(e){ continue; }
+        var inl = countInliers(cam, thresh);
+        if (inl.length > bestInliers.length) bestInliers = inl;
+      }
+      var refitPts = bestInliers.map(function(i){ return POINTS3D[i]; });
+      var refitObs = bestInliers.map(function(i){ return obs[i]; });
+      var camRansac = bestInliers.length >= 6 ? dltResection(K, refitPts, refitObs) : camNaive;
+      camRansac = refinePoseGN(K, refitPts.length ? refitPts : POINTS3D, refitObs.length ? refitObs : obs, camRansac, 10);
+      return { camNaive: camNaive, camRansac: camRansac, inliers: bestInliers, iters: iters, thresh: thresh };
+    }
+
+    function render(result){
+      var colors = POINTS3D.map(function(_, i){
+        if (!result) return COLOR_TEXT;
+        return result.inliers.indexOf(i) >= 0 ? '#2f9e44' : COLOR_ACCENT2;
+      });
+      var traces = [ pointsTrace(POINTS3D, colors, 4), cameraFrustumTrace(TRUE_CAM, COLOR_TEXT), cameraCenterTrace(TRUE_CAM, COLOR_TEXT) ];
+      if (result){
+        traces.push(cameraFrustumTrace(result.camNaive, '#9b9797'), cameraCenterTrace(result.camNaive, '#9b9797'));
+        traces.push(cameraFrustumTrace(result.camRansac, COLOR_ACCENT2), cameraCenterTrace(result.camRansac, COLOR_ACCENT2));
+      }
+      Plotly.react(div, traces, baseLayout(), { displayModeBar:false, responsive:true });
+      drawImage(result ? result.inliers : null);
+
+      if (!result){
+        document.getElementById('s6-readout').innerHTML = '<div class="k">Click "Run RANSAC" to resect.</div>';
+        return;
+      }
+      var eNaive = poseErrors(TRUE_CAM, result.camNaive), eRansac = poseErrors(TRUE_CAM, result.camRansac);
+      document.getElementById('s6-readout').innerHTML =
+        '<div><span class="k">RANSAC</span> ' + result.iters + ' samples of 6, &#964; = ' + result.thresh.toFixed(0) + ' px, best inlier set <span class="hi">' + result.inliers.length + ' / ' + POINTS3D.length + '</span></div>' +
+        '<div><span class="k">naive DLT (all points)</span> rotation err <span class="hi">' + eNaive.rotDeg.toFixed(2) + '&deg;</span>, translation err <span class="hi">' + eNaive.transErr.toFixed(3) + '</span></div>' +
+        '<div><span class="k">PnP + RANSAC (refined)</span> rotation err <span class="hi">' + eRansac.rotDeg.toFixed(2) + '&deg;</span>, translation err <span class="hi">' + eRansac.transErr.toFixed(3) + '</span></div>';
+    }
+
+    document.getElementById('s6-resample').addEventListener('click', resample);
+    document.getElementById('s6-run').addEventListener('click', function(){ render(runRansac()); });
+    noiseEl.addEventListener('input', resample);
+    outEl.addEventListener('input', resample);
+    tauEl.addEventListener('input', function(){ document.getElementById('s6-tauval').textContent = tauEl.value + ' px'; });
+    resample();
+  })();
+
+})();
+</script>
+{% endraw %}
+</body>
+</html>

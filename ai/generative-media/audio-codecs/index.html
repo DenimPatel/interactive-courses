@@ -1,0 +1,359 @@
+---
+title: "Neural audio codecs"
+description: "The encoder, residual vector quantiser and decoder that turn sound into a handful of discrete tokens per second, and the frame-rate, codebook and bitrate trade."
+permalink: "/ai/generative-media/audio-codecs/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Neural audio codecs</h1>
+    <p>The previous part left a twenty-four-thousand-token-per-second waveform on the table. A neural audio codec is the learned front end that replaces it with a few hundred discrete tokens per second, and it does so in three pieces: an encoder that turns the waveform into a short sequence of continuous vectors, a residual vector quantiser that snaps each vector to a stack of codebook entries, and a decoder that turns the codes back into sound. The codes are the interface every modern speech and audio model speaks, so this part is really about the vocabulary of the sound chapter: how big it is, how fast it ticks, and what the frame rate and bitrate knobs actually buy.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="why">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Why a codec</h2></div>
+    <p class="g-eyebrow">A learned front end, not a filterbank</p>
+    <p>A waveform language model that predicts one sample at a time is doomed by the numbers, not by any modelling subtlety: at 24 kHz a ten-second clip is 240,000 tokens, an order of magnitude beyond a long context window, and every one of them is a near-continuous value with almost no redundancy at the sample level. Classical compression solves the redundancy problem but yields a continuous code that is awkward to model as a language. A neural codec solves both: it learns a compact representation and then quantises it so the output is a sequence of integers drawn from a small, fixed vocabulary.</p>
+    <p>The design is an autoencoder with a bottleneck that is deliberately discrete. An encoder &mdash; usually a stack of strided convolutions or a transformer over the waveform &mdash; reduces the 24 kHz signal to a sequence of latent vectors at some much lower <em>frame rate</em>, typically seventy-five vectors per second. A vector quantiser replaces each vector with indices into a codebook. A decoder mirrors the encoder and reconstructs the waveform. The reconstruction is not exact, and that is fine: the model only needs to preserve what a listener can hear.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="codec-spec-canvas" width="660" height="260"></canvas>
+        <p class="g-canvas-hint">The mel spectrogram the encoder effectively has to explain, computed with <code>GenMedia.dsp.melSpectrogram</code>. Compression is judged on how faithfully a decoder reproduces this picture, not the raw samples.</p>
+      </div>
+      <div class="g-controls">
+        <p class="g-mini">Read the heatmap top to bottom as frequency and left to right as time. Each vertical slice becomes one or a few codec frames; the frame rate decides how many slices per second are kept.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> describe the encoder, residual quantiser and decoder of a neural codec, explain how a residual stack of codebooks trades bitrate for fidelity, compute the token rate and bitrate from the frame rate and codebook count, and say when a codec should emit semantic rather than acoustic tokens.</span></div>
+    <div class="g-toc">
+      <a href="#rvq">2 · The encoder and the residual quantiser</a>
+      <a href="#bitrate">3 · Frame rate, codebooks and bitrate</a>
+      <a href="#tokens">4 · Semantic vs acoustic tokens</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="rvq">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The encoder and the residual quantiser</h2></div>
+    <p class="g-eyebrow">A stack of codebooks, each fixing the last one's error</p>
+    <p>One codebook is not enough. Quantising a continuous frame to the nearest of a few thousand entries leaves a residual error, and simply enlarging the codebook to cover the space runs into a lookup and training cost that grows badly. <em>Residual vector quantisation</em> takes the other route: quantise the frame with the first codebook, compute what is left over, quantise <em>that</em> with a second codebook, and repeat. Each stage sees only the error the previous stages could not represent, so the reconstruction improves monotonically as stages are added. The price is one token per stage per frame, which is exactly the trade the next step quantifies.</p>
+    <p>The demo below applies the quantiser directly to a short waveform rather than to encoder latents, so you can see the mechanism without a network in the way. A real codec runs the same arithmetic on a vector of latent features, but the residual structure &mdash; each stage chipping away at what remains &mdash; is identical. The dashed curve is the reconstruction after the current number of stages.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="codec-wave-canvas" width="660" height="230"></canvas>
+        <p class="g-canvas-hint">Original waveform (solid) and the residual-quantised reconstruction (dashed), both from <code>GenMedia.dsp.rvq</code>. Drag the stages slider and watch the dashed curve snap onto the solid one.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>RVQ stages <span class="val">4</span></label><input type="range" id="codec-stages" min="1" max="8" step="1" value="4"></div>
+        <div class="g-readout" id="codec-rvq-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>More stages is not free in a language model.</b> Every extra codebook multiplies the token rate and therefore the sequence length the generator must model. Adaptive codecs spend stages where the signal is hard and skip them where it is easy, which is why an entropy-coded residual stack can reach the same quality at a lower average rate.</span></div>
+  </section>
+
+  <section class="g-step" id="bitrate">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Frame rate, codebooks and bitrate</h2></div>
+    <p class="g-eyebrow">Three knobs, one budget</p>
+    <p>The token rate is the frame rate times the number of codebooks, and the bitrate adds the bits per codebook entry. Those are the three knobs and they are not independent: raise the frame rate and you resolve transients better but spend more tokens per second; add codebooks and you sharpen each frame but spend more tokens too; widen each codebook and the rate climbs without more frames. The reference point for speech is the EnCodec-style setting of seventy-five frames per second, eight residual codebooks and ten bits each, which lands at roughly six kilobits per second &mdash; a few hundred tokens per second, small enough for a language model to generate.</p>
+    <p>Below, the bars show the residual energy after each stage, in decibels relative to the un-quantised signal. The first stage removes the bulk of the error; later stages remove successively less, which is the point of adaptive allocation. Move the frame-rate and codebook sliders to watch the token and bitrate readout change; move the stages slider to watch the reconstruction error fall while the token count stands still.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="codec-rvq-canvas" width="620" height="260"></canvas>
+        <p class="g-canvas-hint">Residual energy after each RVQ stage, in dB below the input variance. Bars are labelled with the stage; the first is the input itself at 0 dB.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Frame rate <span class="val">75</span> Hz</label><input type="range" id="codec-fr" min="25" max="150" step="5" value="75"></div>
+        <div class="g-field"><label>Codebooks <span class="val">8</span></label><input type="range" id="codec-books" min="1" max="16" step="1" value="8"></div>
+        <div class="g-field"><label>Bits per codebook <span class="val">10</span></label><input type="range" id="codec-bits" min="6" max="12" step="1" value="10"></div>
+        <div class="g-readout" id="codec-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The arithmetic to remember.</b> Token rate $= \text{frame rate} \times \text{codebooks}$. Bitrate $= \text{frame rate} \times \text{codebooks} \times \text{bits}$ bits per second. At 75 Hz, eight books and ten bits this is 600 tokens per second and 6 kbps; halving the frame rate halves both, and that is the single most effective lever on the sequence length a generator has to model.</span></div>
+  </section>
+
+  <section class="g-step" id="tokens">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Semantic vs acoustic tokens</h2></div>
+    <p class="g-eyebrow">Two vocabularies, two jobs</p>
+    <p>A single codec gives a token stream that is faithful to the waveform but carries no linguistic structure: neighbouring tokens are acoustic details, and a language model trained on them learns to imitate sound without necessarily learning to say anything. That is why many systems use <em>two</em> streams. <em>Semantic</em> tokens come from a representation distilled from a self-supervised speech model, so they encode phonetic content and vary slowly; <em>acoustic</em> tokens come from the residual codec and carry the fine detail &mdash; timbre, prosody and the exact waveform. A typical pipeline models the semantic stream with a language model and conditions an acoustic stage, or a vocoder, on it.</p>
+    <p>Once sound is a token stream, every technique from the language-model world applies: the sequence can be generated autoregressively, masked, or diffused, and the same vocabulary can be shared across tasks. Speech recognition, synthesis, translation and spoken dialogue can all be framed as prediction over codec tokens, which is why the codec is the hinge of this chapter rather than a preprocessing detail.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The codec is the common interface</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Synthesis</div>
+        <h3 style="margin:6px 0;">Text-to-speech over codec tokens</h3>
+        <p style="margin-bottom:0;">A <a href="{{ '/ai/generative-media/tts/' | relative_url }}">codec language model</a> treats the acoustic token stream as text to be predicted, and a vocoder or diffusion decoder turns the predicted stream back into a waveform. The frame rate chosen here sets how much audio one generated token covers.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Recognition</div>
+        <h3 style="margin:6px 0;">Discrete targets for recognition</h3>
+        <p style="margin-bottom:0;">Speech-to-text models can emit codec or semantic tokens directly, which unifies <a href="{{ '/ai/generative-media/asr-and-duplex/' | relative_url }}">recognition and synthesis</a> in one vocabulary. That is what makes a single model able to both transcribe and speak in a full-duplex conversation.</p>
+      </div>
+    </div>
+    <p>The next part builds on this vocabulary directly. With sound reduced to a few hundred tokens per second, a text-to-speech system becomes a conditional language model over that vocabulary plus a decoder, and the interesting engineering moves from signal processing to alignment, controllability and latency.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers trace the codec from the first neural audio compressor to the multi-codebook designs that modern speech models use. If you take away one thing, take away the residual stack: it is why a codec can be small and faithful at the same time.</p>
+    <ul class="g-refs">
+      <li>D&eacute;fossez, Copet, Synnaeve and Adi, <a href="https://arxiv.org/abs/2210.13438">"High Fidelity Neural Audio Compression"</a>, 2022 &mdash; EnCodec and the 75 Hz, multi-codebook setting quoted throughout.</li>
+      <li>Zeghidour, Luebs, Omran and coauthors, <a href="https://arxiv.org/abs/2107.03312">"SoundStream: An End-to-End Neural Audio Codec"</a>, 2021 &mdash; residual vector quantisation and the quantiser-dropout trick.</li>
+      <li>Borsos, Marinier, Vincent and coauthors, <a href="https://arxiv.org/abs/2301.02111">"AudioLM: A Language Modeling Approach to Audio Generation"</a>, 2022 &mdash; semantic and acoustic tokens in one pipeline.</li>
+      <li>Kumar, Seetharaman, Luebs and coauthors, <a href="https://arxiv.org/abs/2306.06546">"High-Fidelity Audio Compression with Improved RVQGAN"</a>, 2023 &mdash; an improved residual quantiser and discriminator design.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Encoder</td><td>Turns the waveform into a sequence of latent vectors at the frame rate</td></tr>
+        <tr><td>Frame rate</td><td>Latent vectors per second; typically 50&ndash;75 for speech</td></tr>
+        <tr><td>Vector quantiser</td><td>Replaces a latent vector with indices into a codebook</td></tr>
+        <tr><td>Residual quantisation</td><td>Each codebook quantises what the previous stages left over</td></tr>
+        <tr><td>Codebook</td><td>The finite set of entries one stage chooses among</td></tr>
+        <tr><td>Bits per codebook</td><td>Codebook size: 10 bits is 1024 entries</td></tr>
+        <tr><td>Token rate</td><td>frame rate &times; codebooks per second</td></tr>
+        <tr><td>Bitrate</td><td>token rate &times; bits per token; ~6 kbps at the reference setting</td></tr>
+        <tr><td>Semantic tokens</td><td>Slow, phonetic codes distilled from a self-supervised model</td></tr>
+        <tr><td>Acoustic tokens</td><td>Fine-grained codec codes carrying timbre and detail</td></tr>
+        <tr><td>Vocoder</td><td>The decoder that turns codes or spectrograms back into a waveform</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}With sound reduced to a few hundred tokens per second, the next part is a conditional language model over that vocabulary: text in, speech out, with alignment, cloning and first-chunk latency as the open problems.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia;
+  var dsp = GM.dsp;
+  var c = Guide.colors();
+
+  var SR = 24000, DUR_MS = 500, LEVELS = 16;
+
+  var frameRate = 75, codebooks = 8, codeBits = 10, stages = 4;
+
+  var WAVE_W = 660, WAVE_H = 230;
+  var SPEC_W = 660, SPEC_H = 260;
+  var BAR_W = 620, BAR_H = 260;
+
+  function signal() {
+    var n = Math.round(SR * DUR_MS / 1000);
+    var a = dsp.tone(180, SR, n, 0.65);
+    var b = dsp.tone(540, SR, n, 0.24);
+    var d = dsp.chirp(900, 1600, SR, n, 0.18);
+    return dsp.normalize(dsp.add(dsp.add(a, b), d));
+  }
+
+  function wavePoints(x, target) {
+    var n = x.length, step = Math.max(1, Math.floor(n / target));
+    var pts = [];
+    for (var i = 0; i < n; i += step) pts.push({ x: i / SR * 1000, y: x[i] });
+    return pts;
+  }
+
+  var waveSetup = Guide.setupCanvas(document.getElementById('codec-wave-canvas'), WAVE_W, WAVE_H, function () { redraw(); });
+  var specSetup = Guide.setupCanvas(document.getElementById('codec-spec-canvas'), SPEC_W, SPEC_H, function () { redraw(); });
+  var barSetup = Guide.setupCanvas(document.getElementById('codec-rvq-canvas'), BAR_W, BAR_H, function () { redraw(); });
+
+  function buildState() {
+    var x = signal();
+    var q = dsp.rvq(x, { stages: stages, levels: LEVELS });
+    var ms = dsp.melSpectrogram(x, { winSize: 512, hop: 128, sr: SR, nMels: 24 });
+    return { x: x, q: q, ms: ms };
+  }
+
+  function drawWaveRecon(s) {
+    if (!waveSetup) return;
+    var ctx = waveSetup.ctx;
+    Guide.drawLines(ctx, WAVE_W, WAVE_H, [
+      { points: wavePoints(s.x, 1000), color: c.accent, width: 1.3 },
+      { points: wavePoints(s.q.recon, 1000), color: c.accent2, width: 1.3, dashed: true }
+    ], [0, DUR_MS], [-1.05, 1.05], { xLabel: 'time (ms)', yLabel: 'amplitude', padL: 42 });
+  }
+
+  function drawSpec(s) {
+    if (!specSetup) return;
+    var ctx = specSetup.ctx;
+    var ms = s.ms, rows = ms.nMels, frames = ms.frames, cols = frames.length;
+    var matrix = [], m, t;
+    for (m = 0; m < rows; m++) {
+      var row = [];
+      for (t = 0; t < cols; t++) row.push(Math.log(1 + (frames[t] ? frames[t][m] : 0)));
+      matrix.push(row);
+    }
+    var colLabels = [], rowLabels = [];
+    var colEvery = Math.max(1, Math.ceil(cols / 8));
+    var rowEvery = Math.max(1, Math.ceil(rows / 6));
+    for (t = 0; t < cols; t++) colLabels.push(t % colEvery === 0 ? Math.round(t * ms.hop / SR * 1000) + ' ms' : '');
+    for (m = 0; m < rows; m++) rowLabels.push(m % rowEvery === 0 ? m : '');
+    Guide.drawHeatmap(ctx, SPEC_W, SPEC_H, matrix, {
+      rowLabels: rowLabels, colLabels: colLabels, padL: 44, padB: 24,
+      colorLow: [244, 240, 255], colorHigh: [60, 20, 150]
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('mel spectrogram, ' + rows + ' bands × ' + cols + ' frames', 4, 12);
+  }
+
+  function drawBars(s) {
+    if (!barSetup) return;
+    var ctx = barSetup.ctx;
+    var errors = s.q.errors, zero = errors[0] || 1e-12;
+    var data = [];
+    for (var i = 0; i < errors.length; i++) {
+      var rel = Math.max(errors[i], 1e-12) / zero;
+      var db = 10 * Math.log(rel) / Math.LN10;
+      var val = Math.max(0, Math.min(8, -db / 10));
+      data.push({
+        label: i === 0 ? 'input' : ('stage ' + i),
+        value: val,
+        valueLabel: i === 0 ? '0 dB' : (db.toFixed(0) + ' dB'),
+        color: i === 0 ? c.accent400 : (i % 2 ? c.accent : c.accent700)
+      });
+    }
+    Guide.drawBars(ctx, BAR_W, BAR_H, data, { padL: 78, fontSize: 12, maxV: 8 });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('residual energy (log scale, 0–80 dB below input)', 78, 12);
+  }
+
+  function redrawRrqReadout(s) {
+    var el = document.getElementById('codec-rvq-readout');
+    if (!el) return;
+    var errors = s.q.errors, zero = errors[0] || 1e-12;
+    var rel = Math.max(errors[errors.length - 1], 1e-12) / zero;
+    var db = 10 * Math.log(rel) / Math.LN10;
+    var mse = dsp.mse(s.x, s.q.recon);
+    el.innerHTML =
+      '<div><span class="k">stages</span> ' + stages + ' × ' + LEVELS + ' levels</div>' +
+      '<div><span class="k">residual after</span> <span class="hi">' + db.toFixed(0) + ' dB</span></div>' +
+      '<div><span class="k">waveform MSE</span> ' + mse.toExponential(2) + '</div>' +
+      '<div><span class="k">tokens /s</span> ' + dsp.tokenRate(frameRate, stages) + '</div>';
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('codec-readout');
+    if (!el) return;
+    var rate = dsp.tokenRate(frameRate, codebooks);
+    var kbps = dsp.bitrateKbps(frameRate, codebooks, codeBits);
+    el.innerHTML =
+      '<div><span class="k">frame rate</span> ' + frameRate + ' Hz</div>' +
+      '<div><span class="k">codebooks</span> ' + codebooks + ' × ' + codeBits + ' bits</div>' +
+      '<div><span class="k">token rate</span> <span class="hi">' + rate + ' tokens/s</span></div>' +
+      '<div><span class="k">bitrate</span> <span class="hi">' + kbps.toFixed(1) + ' kbps</span></div>' +
+      '<div><span class="k">per minute</span> ' + Guide.fmtNum(rate * 60, 0) + ' tokens</div>' +
+      '<div><span class="k">reference</span> 75 × 8 × 10 ≈ 6 kbps</div>';
+  }
+
+  function redraw() {
+    var s = buildState();
+    drawWaveRecon(s);
+    drawSpec(s);
+    drawBars(s);
+    redrawRrqReadout(s);
+    redrawReadout();
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#codec-stages'), function (el) {
+    stages = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#codec-fr'), function (el) {
+    frameRate = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#codec-books'), function (el) {
+    codebooks = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#codec-bits'), function (el) {
+    codeBits = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'audio-codecs-rvq',
+      kind: 'choice',
+      prompt: 'In residual vector quantisation, what does the second codebook quantise?',
+      options: [
+        { label: 'The residual left after the first codebook, not the original vector.', correct: true },
+        { label: 'The same original vector, at higher precision.', correct: false },
+        { label: 'The output of the decoder, feeding back into the encoder.', correct: false }
+      ],
+      explanation: 'Each stage quantises what the previous stages failed to represent, so the reconstruction improves monotonically as stages are added, at the cost of one more token per frame per stage.'
+    },
+    {
+      id: 'audio-codecs-tokens',
+      kind: 'numeric',
+      prompt: 'A codec runs at 50 frames per second and uses 6 residual codebooks. How many tokens does it emit for one second of audio?',
+      answer: 300,
+      tolerance: 0.5,
+      explanation: 'Token rate is frame rate times codebooks: 50 × 6 = 300 tokens per second. The bitrate would then be 300 times the bits per codebook.'
+    },
+    {
+      id: 'audio-codecs-bitrate',
+      kind: 'numeric',
+      prompt: 'At 75 frames per second, 8 codebooks and 10 bits per codebook, what is the bitrate in kilobits per second?',
+      answer: 6,
+      tolerance: 0.05,
+      explanation: 'Bitrate = 75 × 8 × 10 = 6000 bits per second, which is 6 kbps. This is the EnCodec-style reference setting the chapter quotes.'
+    },
+    {
+      id: 'audio-codecs-semantic',
+      kind: 'choice',
+      prompt: 'Why do many speech systems model semantic and acoustic tokens separately?',
+      options: [
+        { label: 'Semantic tokens carry slow phonetic content; acoustic tokens carry fine timbre and detail.', correct: true },
+        { label: 'Acoustic tokens are always lower bitrate than semantic ones.', correct: false },
+        { label: 'Semantic tokens can only be produced by a vocoder, not a language model.', correct: false }
+      ],
+      explanation: 'Distilling a self-supervised model gives a slow stream that captures what is said, while the codec residual captures how it sounds. Splitting them lets a language model plan content and an acoustic stage render detail.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

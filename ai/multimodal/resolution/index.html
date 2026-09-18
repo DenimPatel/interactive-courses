@@ -1,0 +1,528 @@
+---
+title: "Resolution and the token budget"
+description: "Fixed patches, AnyRes tiling and native dynamic resolution, the merge that compresses tokens, and the prefill cost an image really adds."
+permalink: "/ai/multimodal/resolution/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-btnrow { margin: 6px 0 14px; }
+  .g-legend { font-size: 11.5px; opacity: 0.7; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Resolution and the token budget</h1>
+    <p>An image is not one token. A token is the smallest unit a language model reads and writes &mdash; a small chunk of the signal mapped to an integer id &mdash; and a picture has to be broken into many of them before the model can look at it at all. It is as many tokens as the patch grid says it is, where the patch grid is the chequerboard of equal squares the image is cut into before anything else happens. Every one of those tokens behaves like a word in the prompt. Each one lengthens the attention matrix, the table recording how much every token looks at every other token, whose cost grows with the square of the sequence length. Each one occupies a slot in the KV cache, the running notebook of keys and values the model keeps so that it does not reread the prompt on every new word. And each one is paid for at prefill, the single first pass in which the model reads the whole prompt before it generates anything, and then again on every decode step that follows. Resolution, here, means how many pixels across the image is sampled: a finer sampling gives smaller pieces and more of them, so more tokens. Because the model can hold only a fixed number of tokens at once, the image's share of that allowance is what this part calls the token budget, and it is the fixed-size suitcase every high-resolution request has to be packed into. A vision-language model is therefore always trading spatial detail against sequence length, and the three schemes in use &mdash; a fixed $224^2$ resize, AnyRes tiling, and native dynamic resolution &mdash; are three answers to that trade. The first shrinks every image to one small square. The second cuts a large image into encoder-sized tiles and adds one small view of the whole. The third skips the square and patches the image at its own size, letting the token count float. This part follows the arithmetic from image size to tile count to token count to FLOPs and bytes.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="why">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Why resolution costs</h2></div>
+    <p class="g-eyebrow">Attention is quadratic in the sequence, and an image is a long sequence</p>
+    <p>Start with the arithmetic. A patch transformer is the vision encoder that cuts an image into a grid of square patches and treats each patch as a token, so before anything else the image is chopped into equal squares. It turns an $H \times H$ image into $(H/P)^2$ tokens at patch size $P$, because the grid is $H/P$ patches across and $H/P$ patches down, and each square becomes one token. Dicing an onion works the same way: a finer dice gives more, smaller pieces, and it is the number of pieces you pay for rather than the mass of the onion. At $224^2$ with $P = 14$ that is $16 \times 16 = 256$ tokens; at $448^2$ it is $1024$; at $896^2$ it is $4096$. Doubling the side of the image quadruples the token count, and that is the quadratic the rest of the part keeps running into. The self-attention inside the language model costs time and memory proportional to the square of the total sequence length, so the image's contribution grows quadratically while the text's stays small. Why does that matter so much? Because the context window &mdash; the fixed maximum number of tokens the model can hold in front of it at once &mdash; is a hard ceiling, and an image can spend a large part of it. An image roughly the size of a page of text at $448^2$ is already several paragraphs of prompt, and at native phone-camera resolution it is the whole context window.</p>
+    <p>The reason to pay anyway is that low resolution destroys exactly the information multimodal models are most often asked about. A $224^2$ resize of a dense document is unreadable; a chart's axis labels vanish; small objects become single pixels. Text is the sharpest example of the loss. A character is only a few pixels wide at best, so downscaling a page into a small square averages the strokes of each letter into grey mush, and no amount of language ability can recover a word that is no longer present in the pixels. The whole design space of multimodal resolution is an attempt to keep the fine detail that high resolution provides while refusing to pay the full sequence cost of carrying every patch separately. The knobs are the patch size, the tiling policy, and a learned or fixed merge that groups neighbouring patches into one token. Tiling means splitting the image into several fixed-size pieces and encoding each piece on its own; a merge means combining a small block of neighbouring patches into a single token after the encoder has produced them, which is the compression lever the last step of this part prices. All three knobs trade the same two quantities against each other, and every scheme in the literature is a different setting of them.</p>
+    <p>The rest of the part builds that arithmetic one step at a time, and then prices it. The final step turns the token count into prefill FLOPs and KV cache bytes, which is where <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">LLM Serving, Part 18</a> picks the story up: an image inverts the usual prefill-heavy, decode-light serving profile, because it adds a large amount of prefill work that then persists as cache on every subsequent decode step. Two units appear there and are worth naming now. FLOPs, short for floating-point operations, are the standard way to count how much arithmetic a model performs, so the prefill pass's FLOP count is the work of reading every prompt token once. Bytes are the standard way to measure the memory the KV cache occupies, and that cache is not rebuilt for each new word &mdash; it is reread, which is why a picture is not a one-off cost but a permanent tax on the throughput of everything generated after it.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> compute the token count for a fixed-patch, AnyRes or native-resolution input, say what a 2×2 merge does to the budget, explain why OCR and document tasks force high resolution, and translate an image's tokens into prefill FLOPs and KV bytes. Each of those is one link in the same chain from pixels to tokens to compute.</span></div>
+    <div class="g-toc">
+      <a href="#fixed">2 · Fixed patches</a>
+      <a href="#anyres">3 · AnyRes tiling</a>
+      <a href="#native">4 · Native dynamic resolution</a>
+      <a href="#merge">5 · Compressing the tokens</a>
+      <a href="#cost">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="fixed">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Fixed patches</h2></div>
+    <p class="g-eyebrow">Resize everything to one square and be done</p>
+    <p>The simplest policy is the one CLIP was trained under: resize every image to a fixed square &mdash; typically $224 \times 224$ &mdash; and patchify that. Patchify means cut the square into the grid of patches the encoder expects and flatten each patch into a vector; because the square is always the same size, so is the grid. The token count is then a constant, independent of the input, which makes batching trivial and the language model's context predictable. Batching is running many requests through the model at once, and a constant token count means every image occupies exactly the same number of slots, so requests can be grouped without padding arithmetic. The price is paid in the resize. Aspect ratio, the ratio of an image's width to its height, is discarded, so a wide panorama is squashed, a tall page is shrunk until its text is a blur, and the model sees a downsampled version of the scene that may no longer contain the thing it is being asked about. The flat curve below is that policy's token count; the rising curve is what the same encoder would produce if it were allowed to keep the input's native size.</p>
+    <p>The gap between the two curves is the entire motivation for the next two steps. There are only two ways to behave differently. One way to close it is to stop resizing and let the token count grow, which is native dynamic resolution; the other is to keep the input large but spend fewer tokens on it, which is tiling and merging. Notice that the two answers trade in different currencies. Native resolution spends context to buy detail, while tiling and merging spend extra work on the vision side to buy detail without spending as much context. Neither is free, and the rest of the part is about seeing exactly what each one costs.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="res-fixed-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">Image tokens against input side for the fixed-$224^2$ resize (flat) and for native patchification at the same patch size (rising). The dashed line is the classic $224$ input.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Patch size P <span class="val">14</span></label><input type="range" id="res-patch" min="0" max="2" step="1" value="0"></div>
+        <div class="g-readout" id="res-fixed-readout"></div>
+        <p class="g-mini">Fixed $224^2$ tokens come from <code>Multimodal.cost.imageTokens</code>; the rising curve is the native count at the same patch size.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The resize is the model's blind spot.</b> If a task fails at low resolution it can be a data problem, a prompt problem, or because the pixels carrying the answer did not survive the downscale. Before blaming the language model, check what the vision tower was actually given: if the answer is not in the pixels the encoder received, no prompt or model change can put it back.</span></div>
+  </section>
+
+  <section class="g-step" id="anyres">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>AnyRes tiling</h2></div>
+    <p class="g-eyebrow">Cut the image into encoder-sized tiles, plus a thumbnail</p>
+    <p>AnyRes, the scheme LLaVA-NeXT made standard, refuses to choose between detail and a fixed encoder input. Instead of shrinking the whole image to fit the encoder, it splits a high-resolution image into a grid of tiles that are each the size the encoder was trained on &mdash; $336 \times 336$, say &mdash; encodes every tile separately at full resolution, and additionally encodes a downsampled version of the whole image as a thumbnail. Each tile is therefore seen in the detail it deserves, because nothing inside it was downscaled; the thumbnail is the small global view that shows how the tiles fit together, and it is the only place the whole page appears at once. The language model receives one block of vision tokens per tile plus the thumbnail's block, so the token count is $(\text{tiles} + 1)$ times the per-tile count. A $672 \times 336$ image with $336$ tiles is exactly two tiles plus the thumbnail; a $1344 \times 672$ image is eight plus one. The point of the grid is that the number of tiles is decided by the image's area, so a page of dense text can be given as many tiles as it needs while each individual tile stays at the resolution the encoder understands.</p>
+    <p>The structure has two clear properties, and each is a cost to keep in mind. First, the token count scales with the number of tiles, which scales with area, so a very large image still costs a lot of sequence. A picture twice as wide and twice as tall needs four times the tiles and therefore roughly four times the tokens, exactly as native resolution would. Second, the tiling is a hard cut: an object straddling a tile boundary is seen in two halves, and the thumbnail is the only view that puts it back together. Attention inside one tile cannot see the neighbouring tile, so a face split by a seam is never present whole in any single block of tokens; the low-resolution thumbnail is what tells the model that the two halves belong to one object. The variation of AnyRes used in practice (the "grid pinpoints") picks the tiling layout whose aspect ratio most closely matches the image, which keeps the token count from growing on one axis more than necessary. Choosing the layout well matters, because a mismatched grid wastes tiles on empty margins, and every wasted tile is a full block of tokens that adds nothing.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="res-anyres-canvas" width="470" height="300"></canvas>
+        <p class="g-canvas-hint">The tiling layout from <code>Multimodal.tiles.tiles</code>, with the global thumbnail drawn to scale on the right. Each tile contributes its own block of vision tokens.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Width <span class="val">672</span> px</label><input type="range" id="res-anyw" min="336" max="1344" step="168" value="672"></div>
+        <div class="g-field"><label>Height <span class="val">336</span> px</label><input type="range" id="res-anyh" min="336" max="1344" step="168" value="336"></div>
+        <div class="g-field"><label>Tile side <span class="val">336</span></label><input type="range" id="res-anytile" min="0" max="2" step="1" value="1"></div>
+        <div class="g-readout" id="res-anyres-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The thumbnail is what makes the grid global.</b> Per-tile tokens are local by construction, because attention inside a tile cannot see the neighbouring tile. The downsampled whole-image block, prepended or appended to the tile blocks, is the only place the model can see the layout of the page as a whole. Without it, the model would be reading a stack of unconnected close-ups with no map.</span></div>
+  </section>
+
+  <section class="g-step" id="native">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Native dynamic resolution</h2></div>
+    <p class="g-eyebrow">Keep the aspect ratio, let the token count float</p>
+    <p>Native dynamic resolution, the scheme behind Qwen-VL and InternVL, skips the resizing and the tiling grid entirely. The image is patched at its own size and aspect ratio, so a tall, narrow page is handled as a tall, narrow page rather than being forced into a square, and the token count is area divided by patch area, adjusted by the merge factor: a bigger image produces more tokens, and the merge can pull that count back down. The encoder is modified to accept variable-length patch sequences, which means it can no longer assume a fixed grid of, say, $16 \times 16$ tokens. To keep the model oriented, these encoders usually use a two-dimensional rotary position embedding, a way of writing position into each token by rotating its vector by an angle that depends on the token's row and column. Position embeddings are the addresses that tell an otherwise order-blind transformer where each patch came from; a two-dimensional version encodes both coordinates at once, and because the address is a continuous function of row and column rather than a fixed lookup table, the model can generalise to grids it was never trained on. There is no thumbnail and no boundary cut, so nothing is lost at the seams.</p>
+    <p>What replaces the fixed budget is a decision per image: the pipeline picks a resolution, sometimes rounded up to the nearest multiple of the patch and merge sizes, based on the task and the context available. The rounding matters because the grid has to divide evenly into patches and then into merge blocks; a resolution that leaves a partial row would otherwise have to be dropped or padded. Document and OCR requests get many tokens; casual descriptions get few. OCR stands for optical character recognition, the task of reading text out of an image, and it is the most resolution-hungry request there is, because a single character may occupy only a handful of pixels. The trade is now made at request time rather than fixed once in training, which is the design's main advantage: the same model can spend a couple of hundred tokens on a casual photo and several thousand on a photographed contract. The plot below shows the native count rising with the square of the side, and the effect of the merge from the next step as a dashed line that grows much more slowly.</p>
+    <p>A second lever sits inside the encoder rather than at the token count. Qwen2.5-VL scales its vision transformer with windowed self-attention: most ViT layers attend only inside local $112 \times 112$ windows &mdash; a fixed neighbourhood of patches, so each patch sees its neighbours directly and nothing farther away &mdash; and full attention, the expensive kind that compares every patch with every other, runs at just a few layers. Because the quadratic term in attention grows with the square of the whole token grid, keeping full attention to a handful of layers means the encoder never pays that price over the whole grid at once, so the cost of a large image stops exploding as it scales up. This is a different answer from tiling, which cuts the image into pieces and accepts the seams, and from merging, which shrinks the sequence after the encoder has already paid for it; windowed attention leaves the token grid intact and changes what each layer is allowed to read. Where this shows up is Pixtral 12B, which handles several images in one sequence at their native resolution: each image keeps its own aspect ratio and its own token count rather than being forced into a common square, so a wide panorama, a tall page and a small photo can sit in the same prompt side by side, and the model sees several images of different shapes in one sequence rather than one image at a time.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="res-native-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">Native token count against image side, with and without the merge, from <code>Multimodal.tiles.nativeTokens</code>. The dashed line marks the current input side.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Input side <span class="val">448</span> px</label><input type="range" id="res-size" min="224" max="1344" step="112" value="448"></div>
+        <div class="g-readout" id="res-native-readout"></div>
+        <p class="g-mini">Doubling the side quadruples the token count. That is the quadratic that the merge exists to soften.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="merge">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Compressing the tokens</h2></div>
+    <p class="g-eyebrow">Four patches, one token</p>
+    <p>A merge layer groups a small block of neighbouring patch tokens into a single token before they reach the language model, which cuts the sequence by the square of the block size. This is the dicing-an-onion move in the other direction: rather than handing every grain of the dice to the language model, you pack a $2 \times 2$ cluster of grains into one larger parcel. A $2 \times 2$ merge divides the token count by four; a $4 \times 4$ merge by sixteen. A real model ships at exactly that number: InternVL3.5's dynamic-resolution path encodes each image patch as 1024 visual tokens and pixel-shuffles them to 256 before the language model sees them, the fourfold reduction the $2 \times 2$ block describes. Pooling does this by averaging the block, which is cheap and destroys fine detail. Averaging is a smoothing operation: if one patch carries a small, unique mark and its three neighbours carry background, the mean keeps the background and washes the mark out, and the information is gone before the language model ever sees it. <em>Pixel-shuffle</em> does it by concatenating the block's channels instead of averaging them: a $2 \times 2$ block of $C$-dimensional patches becomes one token of dimension $4C$, so no information is thrown away at the merge itself &mdash; the four patches' features are laid side by side into a wider vector, and the language model is asked to work with wider vectors instead of more of them. Perceiver-style resampling, which is the Q-Former's trick, is the learned version of the same idea, replacing the fixed block with learned queries that decide what to keep. A fixed merge treats every region of the image as equally important; a learned one can spend its tokens where the content actually is.</p>
+    <p>The bars below compare the options at the current input size. The token reduction is real and large, and it is the single most effective lever a practitioner has for fitting high-resolution input into a fixed context. A $4 \times 4$ merge cuts the sequence to a sixteenth of its length, which is the difference between a document that fits in the context window and one that does not. The caveat is the same one that applies to any compression: the detail that disappears at the merge cannot be recovered downstream. Once four patches have been averaged into one vector, no later layer can tell what the individual patches held, so the factor has to be chosen with the task in mind rather than by picking the largest one that fits.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="res-merge-canvas" width="470" height="260"></canvas>
+        <p class="g-canvas-hint">Image tokens at the current input side for each pooling option, from <code>Multimodal.cost.imageTokens</code>. Pixel-shuffle matches pooling on count but keeps the block's channels.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Token compression <span class="val">none (1×)</span></label><input type="range" id="res-merge" min="0" max="3" step="1" value="0"></div>
+        <div class="g-readout" id="res-merge-readout"></div>
+        <p class="g-mini">A learned resampler sits at the same point in the pipeline; it just decides the compression from the image rather than by a fixed block.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Pruning is the other half of compression.</b> Rather than merging every block, an importance-pruning scheme scores patches and drops the ones that carry little information &mdash; blank background, uniform sky, whitespace between paragraphs. It can preserve more detail per token than a fixed merge, at the cost of a scoring pass and an irregular sequence length. The output is a different length for every image, which is the price of being selective.</span></div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Tokens become FLOPs and bytes</p>
+    <p>The token count is the intermediate quantity; what a serving system feels is the prefill cost and the KV cache. Prefill runs the full attention and MLP stack over every prompt token at once, so its FLOP count grows with the sequence linearly in the projections and quadratically in attention. The MLP is the feed-forward block that transforms each token on its own, and the projections are the learned matrices that map a token into its query, key and value; both are per-token work, so they cost a fixed amount per token, whereas attention compares every token with every other and therefore grows with the square of the sequence. The KV cache then stores a key and a value for every token at every layer, so an image's tokens stay resident and are re-read on every decode step. That is the asymmetry to hold on to: prefill is a one-time arithmetic cost, while the cache is a permanent memory cost that is touched again for each new word the model writes. Both are computed here with <code>Multimodal.cost.prefillFlops</code> and <code>Multimodal.cost.kvBytes</code>.</p>
+    <p>The plots make the inversion that <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">LLM Serving, Part 18</a> works out visible: a text-only request is often decode-dominated, but a request with a high-resolution image is a large prefill followed by cache-heavy decode, which is the opposite shape. A text-only prompt is short, so the model spends most of its time generating words one at a time, each step reading a small cache; a high-resolution image makes the prompt long, so the one big read at the start dominates, and every later step has to drag the whole image-shaped cache along with it. That is why multimodal serving tends to be memory-bandwidth bound &mdash; the bottleneck is how fast keys and values can be moved from memory, not how many FLOPs the arithmetic needs &mdash; and why compression at the vision side is worth more than it looks.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="res-cost-canvas" width="470" height="260"></canvas>
+        <canvas id="res-kv-canvas" width="470" height="230"></canvas>
+        <p class="g-canvas-hint">Prefill FLOPs and KV cache bytes against total prompt tokens, with the current image's contribution marked. The text prompt is assumed to be 64 tokens.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Decoder layers <span class="val">32</span></label><input type="range" id="res-layers" min="16" max="80" step="8" value="32"></div>
+        <div class="g-field"><label>KV heads (GQA) <span class="val">32</span></label><input type="range" id="res-gqa" min="0" max="4" step="1" value="0"></div>
+        <div class="g-field"><label>Cache precision <span class="val">fp16</span></label><input type="range" id="res-bytes" min="0" max="1" step="1" value="1"></div>
+        <div class="g-readout" id="res-cost-readout"></div>
+        <p class="g-mini">Head dimension is fixed at 128. Reducing KV heads with grouped-query attention cuts the cache in proportion without touching the FLOPs.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Compression has two bills, not one.</b> A high-resolution image raises prefill FLOPs once and the KV cache forever after, so the cost of a generous token budget is paid on every generated token, not just the first. That is the practical reason a vision front end that outputs a fixed, short token set stays attractive even when a native-resolution encoder is available: shrinking that token set is a recurring saving rather than a one-time one.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>These papers trace the path from a fixed $224^2$ input to native dynamic resolution, and the serving analysis on the other side of the token budget. Read them in order and the design pressure becomes visible: each one is reacting to the resolution limit of the paper before it, and the serving reference is there to show what the accumulated token count costs once the model is actually deployed.</p>
+    <ul class="g-refs">
+      <li>Haotian Liu, Chunyuan Li, Yuheng Li and Yong Jae Lee, <a href="https://arxiv.org/abs/2310.03744">"Improved Baselines with Visual Instruction Tuning"</a>, 2023 &mdash; LLaVA-1.5, and the AnyRes tiling scheme that followed.</li>
+      <li>Haotian Liu, Chunyuan Li, Bo Li and Yong Jae Lee, <a href="https://arxiv.org/abs/2401.06209">"LLaVA-NeXT: Improved reasoning, OCR, and world knowledge"</a>, 2024 &mdash; grid pinpointing and the high-resolution recipe for documents and charts.</li>
+      <li>Shuai Bai, Keqin Chen, Xuejing Liu and coauthors, <a href="https://arxiv.org/abs/2502.13923">"Qwen2.5-VL Technical Report"</a>, 2025 &mdash; windowed ViT attention and native dynamic resolution.</li>
+      <li>Weiyun Wang, Zhangwei Gao, Lixin Gu and coauthors, <a href="https://arxiv.org/abs/2508.18265">"InternVL3.5: Advancing Open-Source Multimodal Models in Versatility, Reasoning, and Efficiency"</a>, 2025 &mdash; 1024-to-256 pixel shuffle and the dynamic high-resolution path.</li>
+      <li>Pravesh Agrawal, Szymon Antoniak, Emma Bou Hanna and coauthors, <a href="https://arxiv.org/abs/2410.07073">"Pixtral 12B"</a>, 2024 &mdash; native resolution with multiple images per sequence.</li>
+      <li>Zhiliang Peng, Wenhui Wang, Li Dong and coauthors, <a href="https://arxiv.org/abs/2306.02816">"Kosmos-2: Grounding Multimodal Large Language Models to the World"</a>, 2023 &mdash; spatial tokens and the resolution questions that grounding raises.</li>
+      <li>LLM Serving, <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">Part 18: Workloads</a> &mdash; the prefill-and-decode accounting that this part's final demo feeds into.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed patches</td><td>Resize to one square, patchify, constant token count; detail lost in the resize</td></tr>
+        <tr><td>Token count</td><td>$(H/P)^2$ before merging; doubles the side, quadruples the tokens</td></tr>
+        <tr><td>AnyRes</td><td>Encode a grid of tiles plus a whole-image thumbnail; tokens scale with tile count</td></tr>
+        <tr><td>Grid pinpoints</td><td>Choosing the tile layout whose aspect ratio best matches the image</td></tr>
+        <tr><td>Native resolution</td><td>Patch at the image's own size and aspect ratio, with 2-D position embeddings</td></tr>
+        <tr><td>2-D RoPE</td><td>Rotary position encoding with separate row and column phases, so unseen grids are usable</td></tr>
+        <tr><td>Merge / pooling</td><td>Group a $k \times k$ block of patches into one token, dividing the budget by $k^2$</td></tr>
+        <tr><td>Pixel-shuffle</td><td>Repack a block into channels instead of averaging, keeping detail at the same token count</td></tr>
+        <tr><td>Pruning</td><td>Score patches and drop the uninformative ones; irregular but detail-preserving</td></tr>
+        <tr><td>Prefill vs decode</td><td>An image adds a large one-time prefill and a permanent KV cache</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The bridge is chosen and the token budget is set. The next part is the training recipe: what is frozen, in what order, on what data, and what breaks along the way. Resolution decides how many tokens the vision tower hands over, but it does not settle the deeper question of which weights move while the model learns to use them, and that is where the story goes next.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var PATCHES = [14, 16, 32];
+  var patchIdx = 0;
+  var MERGES = [
+    { n: 1, label: 'none (1×)' },
+    { n: 2, label: 'pool 2×2' },
+    { n: 4, label: 'pool 4×4' },
+    { n: 2, label: 'shuffle 2×2' }
+  ];
+  var mergeIdx = 0;
+  var TILE_SIDES = [224, 336, 448];
+  var KVHEADS = [32, 16, 8, 4, 1];
+  var BYTES = [1, 2];
+
+  var imgSide = 448;
+  var anyW = 672, anyH = 336, tileIdx = 1;
+  var layers = 32, gqaIdx = 0, bytesIdx = 1;
+
+  function patch() { return PATCHES[patchIdx]; }
+  function mergeN() { return MERGES[mergeIdx].n; }
+  function tileSide() { return TILE_SIDES[tileIdx]; }
+  function textTokens() { return 64; }
+  function imageTokens() { return MM.cost.imageTokens(imgSide, patch(), mergeN()); }
+  function totalTokens() { return textTokens() + imageTokens(); }
+
+  function fmtFlops(v) {
+    if (v >= 1e15) return (v / 1e15).toFixed(2) + ' PFLOP';
+    if (v >= 1e12) return (v / 1e12).toFixed(2) + ' TFLOP';
+    if (v >= 1e9) return (v / 1e9).toFixed(1) + ' GFLOP';
+    return Guide.fmtNum(v, 0) + ' FLOP';
+  }
+
+  // ---- 2. fixed vs native tokens ------------------------------------------
+  var fixedPlot = GM.plot(document.getElementById('res-fixed-canvas'), {
+    W: 460, H: 280, xRange: [224, 896], yRange: [0, 4096],
+    xLabel: 'input side (px)', yLabel: 'image tokens',
+    onResize: function () { drawFixed(); }
+  });
+
+  function drawFixed() {
+    if (!fixedPlot) return;
+    var fixedN = MM.cost.imageTokens(224, patch(), 1);
+    var hi = MM.tiles.nativeTokens(896, 896, patch(), 1);
+    fixedPlot.yRange[0] = 0;
+    fixedPlot.yRange[1] = hi * 1.08;
+    fixedPlot.clear();
+    fixedPlot.axes({ xLabel: 'input side (px)', yLabel: 'image tokens' });
+    fixedPlot.curve(function (x) { return fixedN; }, { color: c.accent2, width: 2.4, samples: 8 });
+    fixedPlot.curve(function (x) { return MM.tiles.nativeTokens(x, x, patch(), 1); }, { color: c.accent, width: 2.4, samples: 48 });
+    fixedPlot.vline(224, { color: c.text, dashed: true, width: 1.2, label: '224²', labelY: fixedPlot.yRange[1] * 0.9 });
+    fixedPlot.legend([
+      { label: 'fixed 224² (constant)', color: c.accent2 },
+      { label: 'native at same patch', color: c.accent }
+    ], { dy: 6 });
+    var el = document.getElementById('res-fixed-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">patch size P</span> <span class="hi">' + patch() + '</span></div>' +
+        '<div><span class="k">fixed 224² tokens</span> ' + fixedN + '</div>' +
+        '<div><span class="k">grid at 224²</span> ' + (224 / patch()) + ' × ' + (224 / patch()) + '</div>' +
+        '<div><span class="k">native at 896²</span> ' + hi + '</div>' +
+        '<div class="g-mini">The fixed policy hides the resolution problem inside the resize; the native curve is what the encoder would see if nothing were downscaled.</div>';
+    }
+  }
+
+  // ---- 3. AnyRes tiling ----------------------------------------------------
+  var anySetup = Guide.setupCanvas(document.getElementById('res-anyres-canvas'), 470, 300, function () { drawAnyRes(); });
+
+  function drawAnyRes() {
+    if (!anySetup) return;
+    var ctx = anySetup.ctx, W = 470, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var tile = tileSide();
+    var nx = Math.max(1, Math.ceil(anyW / tile)), ny = Math.max(1, Math.ceil(anyH / tile));
+    var areaW = 300, areaH = 210, ox = 16, oy = 44;
+    var scale = Math.min(areaW / anyW, areaH / anyH);
+    var dw = anyW * scale, dh = anyH * scale;
+    var x0 = ox + (areaW - dw) / 2, y0 = oy + (areaH - dh) / 2;
+    ctx.save();
+    ctx.fillStyle = 'rgba(43,95,255,0.08)';
+    ctx.fillRect(x0, y0, dw, dh);
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 1.4;
+    ctx.strokeRect(x0, y0, dw, dh);
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1;
+    var cw = dw / nx, chh = dh / ny;
+    for (var i = 1; i < nx; i++) {
+      ctx.beginPath(); ctx.moveTo(x0 + i * cw, y0); ctx.lineTo(x0 + i * cw, y0 + dh); ctx.stroke();
+    }
+    for (var j = 1; j < ny; j++) {
+      ctx.beginPath(); ctx.moveTo(x0, y0 + j * chh); ctx.lineTo(x0 + dw, y0 + j * chh); ctx.stroke();
+    }
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6;
+    ctx.strokeRect(x0 + 1, y0 + 1, Math.max(2, cw - 2), Math.max(2, chh - 2));
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(anyW + ' × ' + anyH + ' · ' + nx + ' × ' + ny + ' tiles of ' + tile + 'px', 16, 24);
+    ctx.restore();
+    var tW = 108, tH = tW * (anyH / anyW);
+    var tx = 348, ty = oy + (areaH - tH) / 2;
+    ctx.save();
+    ctx.fillStyle = 'rgba(214,0,108,0.12)';
+    ctx.fillRect(tx, ty, tW, tH);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.4;
+    ctx.strokeRect(tx, ty, tW, tH);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('thumbnail', tx + tW / 2, ty - 6);
+    ctx.fillText('256 tokens', tx + tW / 2, ty + tH + 14);
+    ctx.restore();
+    var tiles = MM.tiles.tiles(anyW, anyH, tile);
+    var tk = MM.tiles.anyResTokens(anyW, anyH, tile, 256);
+    var el = document.getElementById('res-anyres-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">image</span> ' + anyW + ' × ' + anyH + ' px</div>' +
+        '<div><span class="k">tile</span> ' + tile + ' px → grid ' + nx + ' × ' + ny + '</div>' +
+        '<div><span class="k">tiles</span> <span class="hi">' + tiles + '</span> + 1 thumbnail</div>' +
+        '<div><span class="k">vision tokens</span> <span class="hi">' + tk + '</span></div>' +
+        '<div class="g-mini">' + tiles + ' × 256 + 256. Every tile adds a fixed block; the thumbnail is what gives the model a global view.</div>';
+    }
+  }
+
+  // ---- 4. native dynamic resolution ---------------------------------------
+  var nativePlot = GM.plot(document.getElementById('res-native-canvas'), {
+    W: 460, H: 280, xRange: [224, 1344], yRange: [0, 9216],
+    xLabel: 'image side (px)', yLabel: 'image tokens',
+    onResize: function () { drawNative(); }
+  });
+
+  function drawNative() {
+    if (!nativePlot) return;
+    var hi = MM.tiles.nativeTokens(1344, 1344, patch(), 1);
+    nativePlot.yRange[0] = 0;
+    nativePlot.yRange[1] = hi * 1.08;
+    nativePlot.clear();
+    nativePlot.axes({ xLabel: 'image side (px)', yLabel: 'image tokens' });
+    nativePlot.curve(function (x) { return MM.tiles.nativeTokens(x, x, patch(), 1); }, { color: c.accent400, width: 2.2, dashed: true, samples: 48 });
+    nativePlot.curve(function (x) { return MM.tiles.nativeTokens(x, x, patch(), mergeN()); }, { color: c.accent, width: 2.6, samples: 48 });
+    nativePlot.vline(imgSide, { color: c.text, dashed: true, width: 1.2, label: imgSide + ' px', labelY: nativePlot.yRange[1] * 0.9 });
+    nativePlot.legend([
+      { label: 'no merge', color: c.accent400, dashed: true },
+      { label: MERGES[mergeIdx].label, color: c.accent }
+    ], { dy: 6 });
+    var el = document.getElementById('res-native-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">input side</span> <span class="hi">' + imgSide + ' px</span></div>' +
+        '<div><span class="k">patch / merge</span> ' + patch() + ' px / ' + MERGES[mergeIdx].label + '</div>' +
+        '<div><span class="k">image tokens</span> <span class="hi">' + imageTokens() + '</span></div>' +
+        '<div><span class="k">without merge</span> ' + MM.tiles.nativeTokens(imgSide, imgSide, patch(), 1) + '</div>' +
+        '<div class="g-mini">Native resolution keeps the aspect ratio and lets the count float; the merge is the lever that makes a large input affordable.</div>';
+    }
+  }
+
+  // ---- 5. merge bars -------------------------------------------------------
+  var mergeSetup = Guide.setupCanvas(document.getElementById('res-merge-canvas'), 470, 260, function () { drawMerge(); });
+
+  function drawMerge() {
+    if (!mergeSetup) return;
+    var base = MM.cost.imageTokens(imgSide, patch(), 1);
+    var rows = MERGES.map(function (m, i) {
+      var v = MM.cost.imageTokens(imgSide, patch(), m.n);
+      return {
+        label: m.label,
+        value: v,
+        valueLabel: v + ' tok',
+        color: i === mergeIdx ? c.accent2 : 'rgba(120,120,120,0.35)'
+      };
+    });
+    var maxV = Math.max.apply(null, rows.map(function (r) { return r.value; })) * 1.12;
+    Guide.drawBars(mergeSetup.ctx, 470, 260, rows, { padL: 110, padR: 80, padT: 34, padB: 12, maxV: maxV, fontSize: 12 });
+    var ctx = mergeSetup.ctx;
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('image tokens at ' + imgSide + ' px · patch ' + patch() + ' · no merge = ' + base, 56, 14);
+    ctx.restore();
+    var sel = MERGES[mergeIdx];
+    var selTokens = MM.cost.imageTokens(imgSide, patch(), sel.n);
+    var el = document.getElementById('res-merge-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">option</span> <span class="hi">' + sel.label + '</span></div>' +
+        '<div><span class="k">tokens</span> ' + selTokens + ' (was ' + base + ')</div>' +
+        '<div><span class="k">reduction</span> <span class="hi">' + (base / selTokens).toFixed(1) + '×</span></div>' +
+        '<div><span class="k">token dim</span> ' + (sel.label.indexOf('shuffle') === 0 ? '×4 channels' : 'unchanged') + '</div>' +
+        '<div class="g-mini">Pixel-shuffle matches a 2×2 pool on token count but concatenates the block into channels, so the merge itself loses nothing. Knowing which option is selected is the compression lever.</div>';
+    }
+  }
+
+  // ---- 6. prefill and KV cost ---------------------------------------------
+  var costPlot = GM.plot(document.getElementById('res-cost-canvas'), {
+    W: 470, H: 260, xRange: [0, 2048], yRange: [0, 1],
+    xLabel: 'total prompt tokens', yLabel: 'prefill FLOPs',
+    onResize: function () { drawCost(); }
+  });
+  var kvPlot = GM.plot(document.getElementById('res-kv-canvas'), {
+    W: 470, H: 230, xRange: [0, 2048], yRange: [0, 1],
+    xLabel: 'total prompt tokens', yLabel: 'KV cache bytes',
+    onResize: function () { drawCost(); }
+  });
+
+  function drawCost() {
+    if (!costPlot || !kvPlot) return;
+    var d = 4096, ff = 11008, headDim = 128;
+    var total = totalTokens();
+    var xMax = Math.max(1024, Math.ceil(total * 1.25 / 512) * 512);
+    costPlot.xRange[0] = 0; costPlot.xRange[1] = xMax;
+    kvPlot.xRange[0] = 0; kvPlot.xRange[1] = xMax;
+    var maxF = MM.cost.prefillFlops(xMax, layers, d, ff);
+    costPlot.yRange[1] = maxF * 1.05;
+    costPlot.clear();
+    costPlot.axes({ xLabel: 'total prompt tokens', yLabel: 'prefill FLOPs', yTicks: Guide.niceTicks(0, maxF, 5) });
+    costPlot.curve(function (x) { return MM.cost.prefillFlops(x, layers, d, ff); }, { color: c.accent, width: 2.6, samples: 64 });
+    costPlot.vline(total, { color: c.accent2, width: 2, label: total + ' tok', labelY: costPlot.yRange[1] * 0.9 });
+    var kvNow = MM.cost.kvBytes(total, layers, KVHEADS[gqaIdx], headDim, BYTES[bytesIdx]);
+    var maxKV = MM.cost.kvBytes(xMax, layers, KVHEADS[gqaIdx], headDim, BYTES[bytesIdx]);
+    kvPlot.yRange[1] = maxKV * 1.05;
+    kvPlot.clear();
+    kvPlot.axes({ xLabel: 'total prompt tokens', yLabel: 'KV cache bytes' });
+    kvPlot.curve(function (x) { return MM.cost.kvBytes(x, layers, KVHEADS[gqaIdx], headDim, BYTES[bytesIdx]); }, { color: c.accent2, width: 2.6, samples: 64 });
+    kvPlot.vline(total, { color: c.text, width: 2, label: Guide.fmtBytes(kvNow, 1), labelY: kvPlot.yRange[1] * 0.9 });
+    var flopsNow = MM.cost.prefillFlops(total, layers, d, ff);
+    var el = document.getElementById('res-cost-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">image tokens</span> ' + imageTokens() + ' · text ' + textTokens() + '</div>' +
+        '<div><span class="k">total prompt</span> <span class="hi">' + total + ' tokens</span></div>' +
+        '<div><span class="k">prefill</span> ' + fmtFlops(flopsNow) + '</div>' +
+        '<div><span class="k">KV cache</span> <span class="hi">' + Guide.fmtBytes(kvNow, 1) + '</span></div>' +
+        '<div><span class="k">per decode step</span> re-reads the whole cache</div>' +
+        '<div class="g-mini">GQA heads ' + KVHEADS[gqaIdx] + ' · cache ' + (BYTES[bytesIdx] === 2 ? 'fp16' : 'fp8') + ' · layers ' + layers + '. Compression cuts both plots; GQA cuts only the second.</div>';
+    }
+  }
+
+  function redraw() { drawFixed(); drawAnyRes(); drawNative(); drawMerge(); drawCost(); }
+
+  Guide.bindSliders(document.querySelectorAll('#res-patch'), function (el) {
+    patchIdx = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-anyw'), function (el) {
+    anyW = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-anyh'), function (el) {
+    anyH = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-anytile'), function (el) {
+    tileIdx = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = tileSide();
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-size'), function (el) {
+    imgSide = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-merge'), function (el) {
+    mergeIdx = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = MERGES[mergeIdx].label;
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-layers'), function (el) {
+    layers = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-gqa'), function (el) {
+    gqaIdx = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = KVHEADS[gqaIdx];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#res-bytes'), function (el) {
+    bytesIdx = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = BYTES[bytesIdx] === 2 ? 'fp16' : 'fp8';
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'resolution-token-count',
+      kind: 'numeric',
+      prompt: 'A 448×448 image is patchified at 14-pixel patches with no merge. How many image tokens does it produce?',
+      answer: 1024,
+      tolerance: 1,
+      explanation: 'The grid is 448/14 = 32 patches per side, so the token count is 32 × 32 = 1024. Doubling the side to 896² would give 4096, which is the quadratic.'
+    },
+    {
+      id: 'resolution-merge',
+      kind: 'choice',
+      prompt: 'What does a 2×2 merge do to an image\u2019s token budget?',
+      options: [
+        { label: 'It divides the token count by four, grouping each block of four patches into one token.', correct: true },
+        { label: 'It halves the token count, one row of patches at a time.', correct: false },
+        { label: 'It leaves the count unchanged and widens each token to four times the channels.', correct: false }
+      ],
+      explanation: 'A merge groups a k×k block, so the count falls by k². A 2×2 merge is a factor of four. Pixel-shuffle achieves the same count by concatenating the block into channels rather than averaging it.'
+    },
+    {
+      id: 'resolution-anyres',
+      kind: 'choice',
+      prompt: 'In AnyRes, why is a thumbnail of the whole image included alongside the tiles?',
+      options: [
+        { label: 'Because per-tile attention is local, so the thumbnail is the only global view of the layout.', correct: true },
+        { label: 'Because the thumbnail costs no tokens and is free to add.', correct: false },
+        { label: 'Because it replaces one of the tiles when the aspect ratio is awkward.', correct: false }
+      ],
+      explanation: 'Tokens inside a tile cannot attend across tile boundaries, so an object split by a seam is never seen whole. The downsampled whole-image block restores the global arrangement, at the cost of one extra block of tokens.'
+    },
+    {
+      id: 'resolution-ocr',
+      kind: 'choice',
+      prompt: 'Why do OCR and document tasks push vision-language models toward high resolution?',
+      options: [
+        { label: 'Small text does not survive a downscale to a fixed 224² input; the pixels carrying the answer are gone.', correct: true },
+        { label: 'High resolution changes the language model\u2019s vocabulary to include character tokens.', correct: false },
+        { label: 'Low resolution makes attention non-quadratic, which the language model cannot handle.', correct: false }
+      ],
+      explanation: 'A fixed 224² resize destroys exactly the fine high-frequency structure that characters are made of. Higher-resolution input, tiling or native patchification, is what keeps that structure alive long enough for the language model to read it.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

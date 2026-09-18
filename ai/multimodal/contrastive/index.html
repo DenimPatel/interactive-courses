@@ -1,0 +1,413 @@
+---
+title: "Caption matches picture"
+description: "InfoNCE on the similarity matrix, the temperature and batch size that make contrastive learning work, and SigLIP's pairwise sigmoid alternative."
+permalink: "/ai/multimodal/contrastive/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-demo-stack { display: flex; flex-direction: column; gap: 14px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Caption matches picture</h1>
+    <p>Picture a party where every guest wears a name tag, and someone has to match each guest to the tag that belongs to them. The vision transformer from the previous part turns an image into tokens; a twin transformer turns a caption into tokens. Neither knows about the other &mdash; one has only ever seen pixels and the other only ever seen words &mdash; so on their own their outputs live in two unrelated worlds. Contrastive learning is the trick that makes them meet, and the name comes from the fact that it learns by contrasting right answers against wrong ones rather than by describing anything. Pull the vector of an image and the vector of its caption together, push every image away from every caption it does not belong to, and do it for hundreds of millions of pairs. If the same pair keeps being pulled together while the mismatched pairs keep being pushed apart, the two encoders are forced to agree on a common vocabulary of positions. The result is one embedding space &mdash; a single coordinate system in which both an image and a sentence become vectors, so that anything from either modality can be placed on the same map &mdash; where a picture and a sentence can be compared with a cosine, a measure of how closely two vectors point in the same direction. This part is about the loss that does the pulling, and the two knobs &mdash; temperature and batch size &mdash; that decide whether it works.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="signal">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The training signal</h2></div>
+    <p class="g-eyebrow">No labels, only which caption goes with which picture</p>
+    <p>Contrastive learning uses the cheapest supervision there is: a matched pair. A matched pair is two things that belong together and are known to belong together &mdash; an image and its alt text, a video clip and its transcript, a photo and its caption. Notice that nobody has to write a description of what is in the picture. The label is only the fact that these two items go together, which is why this kind of supervision scales so cheaply: a web page's alt text is already there, and no human has to be paid to annotate it. Think of it as name tags at a party: you do not need a biography of each guest, only the knowledge of which tag belongs to whom. A batch of $N$ pairs &mdash; where $N$ is how many pairs are processed together at one step &mdash; is handed to two encoders, one for images and one for text, producing $N$ image vectors and $N$ text vectors. Both sets are mapped into the same $d$-dimensional space, meaning each image and each caption comes out as a list of $d$ numbers living in one shared coordinate system. The objective does not ask the model to describe anything; it only asks that the correct pairing be the most similar one.</p>
+    <p>The structure that makes this work is the <em>in-batch negative</em>. For each image, every other caption in the batch is a wrong answer; a positive pair is a genuinely matched image and caption, and a negative pair is any image and caption that do not go together. The trick is that you never have to go looking for negatives. Within a batch of $N$ pairs, each image has exactly one correct caption and $N-1$ wrong ones, so the batch supplies $N$ positives and $N(N-1)$ negatives for free, all of them already sitting in memory. The loss for an image is a softmax over its similarity to all $N$ captions &mdash; softmax being the operation that turns a row of raw similarity scores into a set of positive weights that sum to one, so it can be read as a probability distribution over "which caption is mine". The model is trained to put the probability mass on the true one. That is <em>InfoNCE</em>, short for noise-contrastive estimation, the objective that treats retrieval as a classification problem and rewards the model for ranking the true caption highest. Because the image&rarr;text and text&rarr;image directions are both summed, the objective is symmetric: the text encoder is judged on finding its image just as the image encoder is judged on finding its caption.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> read a similarity matrix &mdash; the grid of similarity scores between every image and every caption in a batch &mdash; as a batch of prediction problems, explain what temperature does to the softmax, say why batch size is a model-capacity knob and not just a memory setting, and state what SigLIP changes about the objective.</span></div>
+    <div class="g-toc">
+      <a href="#matrix">2 · The similarity matrix</a>
+      <a href="#temperature">3 · Temperature and batch size</a>
+      <a href="#siglip">4 · The SigLIP alternative</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="matrix">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The similarity matrix</h2></div>
+    <p class="g-eyebrow">A square of predictions, one diagonal of truths</p>
+    <p>Arrange the batch as a matrix: rows are the $N$ images, columns are the $N$ captions, and the entry is the cosine similarity of the two vectors. A concrete entry might read: image 3 against caption 7, scored 0.82. The diagonal holds the matched pairs &mdash; image 1 against caption 1, image 2 against caption 2, and so on &mdash; and every off-diagonal cell is a negative, an image paired with a caption that is not its own. Training is the act of making that matrix as diagonal as possible: each row's softmax should put its mass on the cell it sits on. Read this way, contrastive learning is nothing more than $N$ classification problems on the same matrix, one per row, each asking "which of these $N$ captions belongs to this image?". Top-1 retrieval accuracy is then the fraction of rows whose largest entry is on the diagonal &mdash; the fraction of images whose own caption scored highest.</p>
+    <p>The demo below builds a mini-batch of synthetic pairs &mdash; each concept has one base vector, and the image and text versions are noisy copies of it, so the diagonal should be the brightest &mdash; then draws the cosine matrix. The temperature slider rescales the scores before the softmax. Here it helps to know what the softmax is actually fed: the raw similarity scores that go into it are called logits, and they are the numbers before any normalisation is applied. Temperature is a number that divides those logits first, and because it sits in the denominator it changes how peaked or flat the resulting distribution is. Drag the slider down and the diagonal dominates, with one bright cell per row; drag it up and the matrix goes soft, because a large divisor shrinks the gaps between the cells and every row is normalised into a flatter distribution.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="con-sim-canvas" width="440" height="340"></canvas>
+        <p class="g-canvas-hint">Cosine similarity from <code>GenMedia.attn.simMatrix</code> for the current batch. Diagonal cells are outlined; the readout reports the InfoNCE loss from <code>Multimodal.contrastive.infoNCE</code>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Temperature τ <span class="val">0.07</span></label><input type="range" id="con-tau" min="0" max="7" step="1" value="3"></div>
+        <div class="g-readout" id="con-sim-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>A perfect diagonal is not the goal.</b> If the encoders memorised the batch, the loss would be zero and the features &mdash; the image and text vectors the encoders produce &mdash; useless on anything new. The signal only transfers because the batch changes every step, so the model has to learn what actually makes an image match a caption rather than which index it is.</span></div>
+  </section>
+
+  <section class="g-step" id="temperature">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Temperature and batch size</h2></div>
+    <p class="g-eyebrow">Two knobs that decide how hard the task is</p>
+    <p>Temperature divides the logits before the softmax. A small τ makes the distribution sharp, so the loss punishes even small mistakes and the model is pushed to separate near-misses; a large τ softens the distribution and lets it get away with being sloppy, because the correct caption no longer has to stand out by much. Why is the sharp setting the useful one? Because captions in a batch are often similar to one another &mdash; "a dog on a wooden bench" and "a dog on a metal bench" share almost all their words &mdash; and a model that only ever has to beat plainly wrong answers never learns the fine distinctions that matter in practice. Those confusingly similar captions are the hard negatives: the captions that are almost right. CLIP learns this parameter rather than fixing it, and it settles around $0.07$ &mdash; small, because the useful signal is in the hard negatives. The problem with a very small τ is instability and saturation: as the divisor approaches zero the softmax collapses onto a single cell, its gradients stop changing, and training can wobble or stall. That is why τ is clamped rather than driven to zero.</p>
+    <p>Batch size is the other half. Batch size is how many pairs are processed in one step, and here it does far more than divide the work up. Every extra pair in the batch adds $2(N-1)$ new negatives, one in each direction, and those negatives are what teach fine distinctions: a model that has seen thousands of wrong captions for the same image has had thousands of chances to learn exactly what makes the right one different. That is why contrastive models are trained in enormous batches and why the batch size is described as a capacity parameter: it does not merely change the memory footprint, it changes the difficulty of the task itself, and with it how much the model can learn from each example. The first plot traces the two losses against temperature at the current batch; the second traces them against batch size at the current temperature.</p>
+    <div class="g-demo g-demo-stack">
+      <div class="g-canvas-wrap">
+        <canvas id="con-temp-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">InfoNCE and SigLIP loss against temperature, log-scaled. The dashed line is the current τ.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <canvas id="con-batch-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">Loss against batch size at the current temperature. More pairs means more negatives, so the task is harder and the loss rises.</p>
+      </div>
+      <div class="g-canvas-wrap">
+        <div class="g-controls">
+          <div class="g-field"><label>Batch size N <span class="val">8</span></label><input type="range" id="con-batch" min="4" max="24" step="4" value="8"></div>
+        </div>
+        <div class="g-readout" id="con-batch-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="siglip">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The SigLIP alternative</h2></div>
+    <p class="g-eyebrow">Drop the softmax, keep the pairs</p>
+    <p>InfoNCE is a softmax, and a softmax couples every cell in a row to every other. That coupling is the source of its power and of its cost. The power is that each row becomes a clean competition between the true caption and all the others. The cost is that the denominator has to be computed over the whole batch, so no device can finish its row on its own: it forces an all-gather of every embedding across every device, meaning all the machines training the model must send each other their vectors before any of them can compute a loss. SigLIP removes that step. Each cell gets an independent logistic loss on a binary decision &mdash; is this pair a match or not &mdash; with the diagonal labelled positive and everything else negative. The loss is the logistic, or sigmoid, loss, where the sigmoid is the S-shaped function that squashes any score into a number between 0 and 1 so it can be read as a probability of "match"; it pushes the score for a matching pair up and the score for a non-matching pair down, and nothing more. Because no term is normalised over the batch, the diagonal and the off-diagonal cells are judged individually rather than in competition, so training is cheaper and more parallel, and the loss behaves better at small batch sizes where a row has few negatives to compare against.</p>
+    <p>The trade is that the objective is no longer a proper probability over the batch; it is a pile of pairwise bets, each one placed without knowing what the other cells scored. Why is that acceptable? Because a proper probability was only ever a means to an end: the thing that matters is that matching pairs score higher than mismatched ones, and the pairwise loss optimises exactly that. What is lost is the mutual calibration between cells &mdash; a row no longer sums to one &mdash; but the encoders still end up separating matches from non-matches. In practice that is fine, and SigLIP's pairwise form has become the default for open vision encoders. The bars below compare the two losses at the current settings; note that they are different quantities and are not meant to match in value, only in what they are pushing the encoders to do.</p>
+    <p>The SigLIP generation did not stop there. SigLIP 2 (Tschannen et al., 2025) keeps the pairwise sigmoid loss demonstrated here and adds localization and dense-prediction objectives on top of it, so the same encoder that produces a global embedding also produces usable per-patch features. Localization means the encoder learns where a described thing sits, not only that it is present somewhere in the picture; dense prediction means it is trained to label patches individually rather than to emit one vector for the whole image. That combination is what a modern vision-language model wants: this generation of encoder is what a current open VLM such as Qwen3-VL continues training from, and once the encoder can report detail at the patch level, <a href="{{ '/ai/multimodal/resolution/' | relative_url }}">the next part</a> is where resolution and dense detail become the binding constraint rather than the training objective.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="con-siglip-canvas" width="460" height="180"></canvas>
+        <p class="g-canvas-hint">InfoNCE against SigLIP's pairwise sigmoid loss at the current batch and temperature, with the chance-level InfoNCE value $\ln N$ for scale.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="con-siglip-readout"></div>
+        <p class="g-mini">SigLIP computes one logistic loss per cell, so all $N^2$ pairs contribute independently; InfoNCE normalises each row across the batch.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>The practical summary: if you have a giant batch and fast interconnect &mdash; the network linking your accelerators &mdash; InfoNCE is a strong objective. If you do not, SigLIP's pairwise form gives you much of the benefit without needing every device to see every other device's embeddings.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The objective behind the encoder you actually download</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Pretraining</div>
+        <h3 style="margin:6px 0;">CLIP, SigLIP and their descendants</h3>
+        <p style="margin-bottom:0;">The two towers and the matrix above <em>are</em> CLIP &mdash; that is the whole recipe, with nothing else hiding in it. SigLIP swaps the loss for its pairwise version and becomes the encoder inside most current vision-language models. The vision trunk is the patch transformer from <a href="{{ '/ai/multimodal/vit/' | relative_url }}">the previous part</a>; the architecture did not change here, we only trained it. The contrastive objective is not a new network; it is a training signal wrapped around the encoder you already built.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Downstream</div>
+        <h3 style="margin:6px 0;">Zero-shot, retrieval and rankers</h3>
+        <p style="margin-bottom:0;">Once a shared space exists, building a classifier reduces to a dot product against a class name, and building a retriever reduces to a nearest-neighbour search: embed the query, then find the stored vectors closest to it. That is what makes zero-shot classification possible, where "zero-shot" means the model sorts images into categories it was never given labelled examples of, because it has only ever seen each category as a piece of text. Both are the subject of <a href="{{ '/ai/multimodal/shared-embedding-space/' | relative_url }}">the next part</a>, where the same alignment that makes zero-shot classification possible also makes its failures predictable.</p>
+      </div>
+    </div>
+    <p>Beyond images, the identical machinery aligns audio to text (CLAP), video to text and 3-D shapes to text. Nothing about the objective is specific to pictures: all you need is a matched pair in two modalities and an encoder for each, and the same matrix and the same loss do the rest. That is why the modality zoo in <a href="{{ '/ai/multimodal/modalities/' | relative_url }}">the last part</a> is mostly a list of towers plugged into this one loss.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Contrastive image-text pretraining is the hinge between vision and language: it is the step that gives a picture and a sentence a common coordinate system, so everything downstream can compare the two. These papers introduce the two-tower recipe, scale it to noisy web data, and then replace the softmax with a simpler pairwise loss.</p>
+    <ul class="g-refs">
+      <li>Alec Radford, Jong Wook Kim, Chris Hallacy and coauthors, <a href="https://arxiv.org/abs/2103.00020">"Learning Transferable Visual Models From Natural Language Supervision"</a>, 2021 &mdash; CLIP, the symmetric InfoNCE objective and the learned temperature.</li>
+      <li>Ting Chen, Simon Kornblith, Mohammad Norouzi and Geoffrey Hinton, <a href="https://arxiv.org/abs/2002.05709">"A Simple Framework for Contrastive Learning of Visual Representations"</a>, 2020 &mdash; SimCLR, where the temperature and the role of negatives were first laid out clearly.</li>
+      <li>Chao Jia, Yinfei Yang, Ye Xia and coauthors, <a href="https://arxiv.org/abs/2102.05918">"Scaling Up Visual and Vision-Language Representation Learning With Noisy Text Supervision"</a>, 2021 &mdash; ALIGN, showing that noisy alt text at scale is enough.</li>
+      <li>Xiaohua Zhai, Basil Mustafa, Alexander Kolesnikov and Lucas Beyer, <a href="https://arxiv.org/abs/2303.15343">"Sigmoid Loss for Language Image Pre-Training"</a>, 2023 &mdash; SigLIP, the pairwise sigmoid loss and the removal of the all-gather.</li>
+      <li>Michael Tschannen, Alexey Gritsenko, Xiao Wang and coauthors, <a href="https://arxiv.org/abs/2502.14786">"SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features"</a>, 2025 &mdash; the pairwise loss plus the dense and localization objectives that current encoders inherit.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Positive pair</td><td>An image and its own caption; the diagonal cell of the matrix</td></tr>
+        <tr><td>In-batch negative</td><td>Every other caption in the batch; $N(N-1)$ negatives from $N$ pairs</td></tr>
+        <tr><td>InfoNCE</td><td>Row softmax over the similarity matrix, averaged over rows in both directions</td></tr>
+        <tr><td>Temperature τ</td><td>Divides the logits before the softmax; small sharpens, around $0.07$ in CLIP</td></tr>
+        <tr><td>Hard negative</td><td>A caption that is almost right; the pairs that a small τ forces the model to separate</td></tr>
+        <tr><td>Batch size</td><td>A capacity knob: more pairs means more negatives and a harder task</td></tr>
+        <tr><td>SigLIP</td><td>Pairwise logistic loss per cell, diagonal positive; no softmax, no all-gather</td></tr>
+        <tr><td>Chance</td><td>$\ln N$ for InfoNCE; the loss of a model that guesses uniformly</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}An aligned space is only useful if you do something with it. The next part spends the alignment on zero-shot classification and retrieval, then catalogs the things it cannot do. Those two abilities are the everyday payoff of the loss you just read about, and the same geometry that makes them work is also what explains when they fail.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var DIM = 32, MAXN = 24;
+  var ADJ = ['red', 'blue', 'green', 'yellow', 'large', 'small', 'wooden', 'metal'];
+  var NOUN = ['square', 'circle', 'triangle', 'flower', 'cup'];
+  function label(i) { return ADJ[i % ADJ.length] + ' ' + NOUN[(i * 3 + Math.floor(i / ADJ.length)) % NOUN.length]; }
+
+  var bases = [];
+  for (var b = 0; b < MAXN; b++) {
+    var rb = GM.rng(4200 + b * 97), vb = [];
+    for (var kk = 0; kk < DIM; kk++) vb.push(GM.gauss(rb));
+    bases.push(GM.attn.normalize(vb));
+  }
+  // Make the concept vectors mutually orthogonal so the diagonal is unambiguously
+  // the maximum; the demo is about the loss, not about hard negatives.
+  for (var q = 1; q < bases.length; q++) {
+    var v = bases[q].slice();
+    for (var p = 0; p < q; p++) {
+      var d = GM.attn.dot(v, bases[p]);
+      for (var kx = 0; kx < DIM; kx++) v[kx] -= d * bases[p][kx];
+    }
+    bases[q] = GM.attn.normalize(v);
+  }
+
+  function pairs(n) {
+    var imgs = [], txts = [];
+    for (var i = 0; i < n; i++) {
+      var ri = GM.rng(7000 + i * 313), rt = GM.rng(8000 + i * 617);
+      var im = bases[i].slice(), tx = bases[i].slice();
+      for (var k = 0; k < DIM; k++) { im[k] += 0.15 * GM.gauss(ri); tx[k] += 0.15 * GM.gauss(rt); }
+      imgs.push(GM.attn.normalize(im)); txts.push(GM.attn.normalize(tx));
+    }
+    return { imgs: imgs, txts: txts };
+  }
+
+  function simOf(n) { var pr = pairs(n); return GM.attn.simMatrix(pr.imgs, pr.txts); }
+  function sigLoss(sim, t, n) {
+    return MM.contrastive.sigmoidLoss(sim, { temperature: 1 / t, bias: -Math.log(Math.max(1, n - 1)) });
+  }
+  function top1(sim) {
+    var acc = 0;
+    for (var r = 0; r < sim.length; r++) {
+      var best = 0;
+      for (var j = 1; j < sim[r].length; j++) if (sim[r][j] > sim[r][best]) best = j;
+      if (best === r) acc++;
+    }
+    return acc / sim.length;
+  }
+
+  var TEMPS = [0.01, 0.02, 0.05, 0.07, 0.1, 0.2, 0.5, 1.0];
+  var tauIdx = 3;
+  var tau = TEMPS[tauIdx];
+  var N = 8;
+
+  // ---- similarity matrix ---------------------------------------------------
+  var simSetup = Guide.setupCanvas(document.getElementById('con-sim-canvas'), 440, 340, function () { drawSim(); });
+  function drawSim() {
+    if (!simSetup) return;
+    var sim = simOf(N);
+    var lab = N <= 8 ? label : null;
+    var rowLabels = null, colLabels = null;
+    if (lab) { rowLabels = []; colLabels = []; for (var q = 0; q < N; q++) { rowLabels.push(lab(q)); colLabels.push(lab(q)); } }
+    var geo = Guide.drawHeatmap(simSetup.ctx, 440, 340, sim, {
+      min: -1, max: 1, colorLow: [234, 240, 255], colorHigh: [43, 95, 255],
+      rowLabels: rowLabels, colLabels: colLabels, fontSize: 9
+    });
+    var ctx = simSetup.ctx;
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+    for (var i = 0; i < N; i++) {
+      ctx.strokeRect(geo.padL + i * geo.cellW + 1.5, geo.padT + i * geo.cellH + 1.5,
+        Math.max(1, geo.cellW - 3), Math.max(1, geo.cellH - 3));
+    }
+    ctx.restore();
+    var loss = MM.contrastive.infoNCE(sim, tau);
+    var el = document.getElementById('con-sim-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">batch N</span> ' + N + ' images × ' + N + ' captions</div>' +
+        '<div><span class="k">temperature τ</span> <span class="hi">' + tau + '</span></div>' +
+        '<div><span class="k">InfoNCE loss</span> ' + loss.toFixed(3) + '</div>' +
+        '<div><span class="k">top-1 accuracy</span> <span class="hi">' + Guide.fmtPct(top1(sim), 0) + '</span></div>' +
+        '<div><span class="k">chance</span> ' + Guide.fmtPct(1 / N, 0) + '</div>' +
+        '<div class="g-mini">The diagonal is the matched pairs; every off-diagonal cell is a negative.</div>';
+    }
+  }
+
+  // ---- loss vs temperature -------------------------------------------------
+  var tempPlot = GM.plot(document.getElementById('con-temp-canvas'), {
+    W: 460, H: 280, xRange: [-2.1, 0.05], yRange: [0, 3],
+    xLabel: 'log10 temperature', yLabel: 'loss',
+    onResize: function () { drawTemp(); }
+  });
+  function drawTemp() {
+    if (!tempPlot) return;
+    var pInfo = [], pSig = [], lo = Infinity, hi = -Infinity;
+    for (var i = 0; i <= 40; i++) {
+      var lx = -2 + 2.05 * i / 40, t = Math.pow(10, lx);
+      var sim = simOf(N);
+      var Li = MM.contrastive.infoNCE(sim, t), Ls = sigLoss(sim, t, N);
+      pInfo.push([lx, Li]); pSig.push([lx, Ls]);
+      lo = Math.min(lo, Li, Ls); hi = Math.max(hi, Li, Ls);
+    }
+    tempPlot.yRange[0] = Math.max(0, Math.floor(lo - 0.5));
+    tempPlot.yRange[1] = Math.ceil(hi + 0.5);
+    tempPlot.clear();
+    tempPlot.axes({ xLabel: 'log10 temperature', yLabel: 'loss' });
+    tempPlot.curve(pInfo, { color: c.accent, width: 2.4 });
+    tempPlot.curve(pSig, { color: c.accent2, width: 2.4 });
+    tempPlot.vline(Math.log(tau) / Math.LN10, {
+      color: c.text, dashed: true, width: 1.2, label: 'τ = ' + tau, labelY: tempPlot.yRange[0] + 0.2
+    });
+    tempPlot.legend([
+      { label: 'InfoNCE (softmax over batch)', color: c.accent },
+      { label: 'SigLIP (pairwise sigmoid)', color: c.accent2 }
+    ], { dy: 6 });
+  }
+
+  // ---- loss vs batch -------------------------------------------------------
+  var batchPlot = GM.plot(document.getElementById('con-batch-canvas'), {
+    W: 460, H: 280, xRange: [4, 24], yRange: [0, 3],
+    xLabel: 'batch size N', yLabel: 'loss',
+    onResize: function () { drawBatch(); }
+  });
+  function drawBatch() {
+    if (!batchPlot) return;
+    var pInfo = [], pSig = [], lo = Infinity, hi = -Infinity;
+    for (var n = 4; n <= 24; n++) {
+      var sim = simOf(n);
+      var Li = MM.contrastive.infoNCE(sim, tau), Ls = sigLoss(sim, tau, n);
+      pInfo.push([n, Li]); pSig.push([n, Ls]);
+      lo = Math.min(lo, Li, Ls); hi = Math.max(hi, Li, Ls);
+    }
+    batchPlot.yRange[0] = Math.max(0, Math.floor(lo - 0.5));
+    batchPlot.yRange[1] = Math.ceil(hi + 0.5);
+    batchPlot.clear();
+    batchPlot.axes({ xLabel: 'batch size N', yLabel: 'loss' });
+    batchPlot.curve(pInfo, { color: c.accent, width: 2.4 });
+    batchPlot.curve(pSig, { color: c.accent2, width: 2.4 });
+    batchPlot.vline(N, { color: c.text, dashed: true, width: 1.2, label: 'N = ' + N, labelY: batchPlot.yRange[0] + 0.2 });
+    batchPlot.legend([
+      { label: 'InfoNCE', color: c.accent },
+      { label: 'SigLIP', color: c.accent2 }
+    ], { dy: 6 });
+    var sim2 = simOf(N);
+    var el = document.getElementById('con-batch-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">negatives per anchor</span> <span class="hi">' + (N - 1) + '</span></div>' +
+        '<div><span class="k">InfoNCE loss</span> ' + MM.contrastive.infoNCE(sim2, tau).toFixed(3) + '</div>' +
+        '<div><span class="k">top-1 accuracy</span> ' + Guide.fmtPct(top1(sim2), 0) + '</div>' +
+        '<div class="g-mini">Each extra pair adds 2(N−1) negatives. The task gets harder and the loss rises; what improves is the quality of the representation.</div>' +
+        '<div class="g-mini">Loss at chance is ln N = ' + Math.log(N).toFixed(2) + '.</div>';
+    }
+  }
+
+  // ---- SigLIP bars ---------------------------------------------------------
+  var sigSetup = Guide.setupCanvas(document.getElementById('con-siglip-canvas'), 460, 180, function () { drawSig(); });
+  function drawSig() {
+    if (!sigSetup) return;
+    var sim = simOf(N);
+    var info = MM.contrastive.infoNCE(sim, tau);
+    var sig = sigLoss(sim, tau, N);
+    var chance = Math.log(N);
+    var maxV = Math.max(info, sig, chance) * 1.15 || 1;
+    Guide.drawBars(sigSetup.ctx, 460, 180, [
+      { label: 'InfoNCE', value: info, valueLabel: info.toFixed(3), color: c.accent },
+      { label: 'SigLIP', value: sig, valueLabel: sig.toFixed(3), color: c.accent2 },
+      { label: 'chance ln N', value: chance, valueLabel: chance.toFixed(3), color: c.accent400 }
+    ], { padL: 110, maxV: maxV });
+    var el = document.getElementById('con-siglip-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">batch N</span> ' + N + '</div>' +
+        '<div><span class="k">pairwise terms</span> <span class="hi">' + (N * N) + '</span> (N² cells)</div>' +
+        '<div><span class="k">positives</span> ' + N + ' · negatives ' + (N * N - N) + '</div>' +
+        '<div class="g-mini">SigLIP labels the diagonal positive and every other cell negative, then applies one logistic loss per cell independently.</div>';
+    }
+  }
+
+  function redraw() { drawSim(); drawTemp(); drawBatch(); drawSig(); }
+
+  Guide.bindSliders(document.querySelectorAll('#con-tau'), function (el) {
+    tauIdx = parseInt(el.value, 10);
+    tau = TEMPS[tauIdx];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#con-batch'), function (el) {
+    N = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'contrastive-positives',
+      kind: 'choice',
+      prompt: 'In the similarity matrix for a batch of N image-caption pairs, which cells are the positives?',
+      options: [
+        { label: 'The diagonal, where each image is paired with its own caption.', correct: true },
+        { label: 'The whole first row, since the first image is the anchor.', correct: false },
+        { label: 'Only the single most similar cell in the matrix.', correct: false }
+      ],
+      explanation: 'Each image has exactly one correct caption, so the matched pairs sit on the diagonal. Every off-diagonal cell is an in-batch negative, and the loss makes each row put its softmax mass on the diagonal.'
+    },
+    {
+      id: 'contrastive-negatives',
+      kind: 'numeric',
+      prompt: 'A batch contains 8 image-caption pairs. How many negative captions does each image see?',
+      answer: 7,
+      tolerance: 0.5,
+      explanation: 'Each image is compared against all 8 captions in the batch. One of them is its own, so the other 7 are negatives. In total the batch supplies N(N-1) = 56 negative pairs.'
+    },
+    {
+      id: 'contrastive-temperature',
+      kind: 'choice',
+      prompt: 'What does a small temperature τ do in InfoNCE?',
+      options: [
+        { label: 'It sharpens the softmax, so near-miss captions are punished and the model must separate hard negatives.', correct: true },
+        { label: 'It adds more negatives to the batch, making the task harder.', correct: false },
+        { label: 'It smooths the similarity matrix so training is more stable without changing the objective.', correct: false }
+      ],
+      explanation: 'τ divides the logits before the softmax. Small τ concentrates each row, which punishes small mistakes; CLIP learns τ and settles near 0.07. Temperature does not change the number of negatives — that is the batch size.'
+    },
+    {
+      id: 'contrastive-siglip',
+      kind: 'choice',
+      prompt: 'What is the key change SigLIP makes to the contrastive objective?',
+      options: [
+        { label: 'It replaces the row softmax with an independent logistic loss per pair, so no all-gather over the batch is needed.', correct: true },
+        { label: 'It removes negatives entirely and trains only on matched pairs.', correct: false },
+        { label: 'It adds a second temperature so the two towers can be sharpened separately.', correct: false }
+      ],
+      explanation: 'SigLIP labels each cell as match or non-match and applies a pairwise sigmoid loss with a learnable temperature and bias. Without the softmax denominator, each device can compute its own terms and the batch need not be gathered.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

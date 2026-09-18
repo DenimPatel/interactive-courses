@@ -1,0 +1,818 @@
+---
+title: "Agents in Action, Interactively — Part 17: Reliability, cost and latency engineering"
+description: "Timeouts, backoff, circuit breakers and degraded modes for a probabilistic dependency; the ordered cost-lever list; three cache layers and semantic caching's correctness cost; routing and when not to cascade; streaming and speculative UX."
+permalink: "/ai/agents-in-action/reliability-cost/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Reliability, cost and latency engineering</h1>
+    <p>An agent in production depends on something that is slow, occasionally wrong, and priced per token — and it depends on that thing many times per task. That combination is exactly the shape of a distributed-systems problem, and the standard tools apply once you accept the premise: the model is a fallible remote dependency, not a function you own. This part is about the three budgets that decide whether the product is viable — reliability under failure, dollars per task, and milliseconds to a useful answer — and about the order in which to spend effort on each.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="reliability">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Patterns for a probabilistic dependency</h2></div>
+    <p class="g-eyebrow">Timeouts, backoff, breakers, bulkheads, degraded modes</p>
+    <p>The moment a call can hang, fail, or return slowly, the client needs the same defenses it would need against any unreliable RPC. A <strong>timeout</strong> is a deadline with a purpose: without one, a slow dependency consumes the request's whole latency budget and hides its own failure. <strong>Exponential backoff with jitter</strong> makes a retry cheap when the dependency recovers and rare when it does not, and the jitter is not decoration — it is what stops every client retrying on the same tick. A <strong>circuit breaker</strong> counts consecutive failures and, past a threshold, fails fast for a cooldown instead of queueing retries against something that is already down. A <strong>bulkhead</strong> gives the dependency its own pool so a stall cannot consume every worker in the process. And an explicit <strong>degraded mode</strong> decides in advance what "unavailable" means: a smaller model, a cached answer, or an honest "try again in a minute".</p>
+    <p>The simulator below runs 140 seeded requests through timeout, retry and breaker policy. Raise the retry count and average latency improves until the timeout is the binding constraint; lower the breaker threshold and watch the run trip into degraded mode earlier. The important readout is the error rate <em>after</em> the fallback, not before it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rel-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Top: the outcome of each seeded request. Bottom: its latency, with the timeout drawn as the dashed ceiling.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Retries on failure <span class="val">1</span></label><input type="range" id="rel-retries" min="0" max="3" step="1" value="1"></div>
+        <div class="g-field"><label>Breaker: consecutive failures <span class="val">5</span></label><input type="range" id="rel-breaker" min="0" max="10" step="1" value="5"></div>
+        <div class="g-field"><label>Timeout (ms) <span class="val">2000</span></label><input type="range" id="rel-timeout" min="500" max="4000" step="250" value="2000"></div>
+        <div class="g-btnrow">
+          <button id="rel-degraded" class="g-primary">Degraded mode: on</button>
+        </div>
+        <div class="g-readout" id="rel-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="reliability-cost-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> decide what "down" means <em>before</em> it happens. A timeout, a breaker and a stated degraded mode convert an unbounded stall into a bounded, observable failure with a known fallback — and the fallback is what the user actually experiences.</span></div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The ordered cost-lever list</h2></div>
+    <p class="g-eyebrow">Do the big things first, in this order</p>
+    <p>Cost optimisation usually fails because it is attempted in the wrong order: teams spend a week hand-tuning a prompt to shave 8% of input tokens while the output is four times the price of the input and twice as long as it needs to be. The levers are not equal, and they are not independent. Applied in order, from largest to smallest and cheapest to hardest:</p>
+    <ol>
+      <li><strong>Shorten the output.</strong> Output is the expensive side at every vendor — three to five times the input price in the dated pricing table this page cites. A tighter answer format, a cap on the completion, or a template instead of prose moves the biggest number first.</li>
+      <li><strong>Cache the prefix.</strong> Stable content first, volatile content last, so the provider's prefix cache hits and the repeated input is billed at a fraction of the rate.</li>
+      <li><strong>Route easy traffic to a smaller model.</strong> Most requests do not need the frontier model; a cheap classifier or a confidence rule sends the easy majority down a cheaper path.</li>
+      <li><strong>Batch.</strong> Offline and bulk work trades latency for a discount, often a large one.</li>
+      <li><strong>Optimise the prompt.</strong> Finally — and only after the arithmetic above — trim the instructions and examples. It is real work and it is the smallest lever, which is why it goes last.</li>
+    </ol>
+    <p>The waterfall applies the levers in that order to a baseline monthly bill. Move the request volume, move the share of easy traffic, and step through the levers; the final bar is the bill you would actually pay.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cost-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Baseline, then each lever's saving as a step down, then the final bill. Levers apply in order — the labels are the order.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Requests per month <span class="val">1000000</span></label><input type="range" id="cost-requests" min="200000" max="5000000" step="100000" value="1000000"></div>
+        <div class="g-field"><label>Easy-traffic share routed cheap <span class="val">55</span></label><input type="range" id="cost-cheap" min="0" max="90" step="5" value="55"></div>
+        <div class="g-field"><label>Levers applied <span class="val">5</span></label><input type="range" id="cost-levers" min="0" max="5" step="1" value="5"></div>
+        <div class="g-readout" id="cost-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="reliability-pricing-source"></p>
+    <div class="g-warn">⚠️ <span><b>The numbers are dated and move.</b> The prices below are historical list prices, not current quotes; the <em>order</em> of the levers is the durable part, not the dollar amounts. Verify against live vendor pages before you put any of these figures in a budget.</span></div>
+  </section>
+
+  <section class="g-step" id="caches">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Three cache layers, and the correctness cost of semantic caching</h2></div>
+    <p class="g-eyebrow">Prefix, result, semantic — one of them can be wrong</p>
+    <p>Caching an LLM application happens at three different layers, and they have different hit conditions and different failure modes.</p>
+    <ul>
+      <li><strong>Provider prefix cache.</strong> The provider reuses the attention state of a byte-identical prompt prefix and bills the repeat at a fraction of the input price. The hit condition is exact at the token level, so it is always correct — the only cost is that your prompt layout must keep stable content first.</li>
+      <li><strong>Application result cache.</strong> Your own key-value store keyed on the request. It skips the model entirely on an exact repeat, which is correct by construction and is the best value when requests genuinely repeat.</li>
+      <li><strong>Semantic cache.</strong> Embed the request, look up the nearest cached request, and return its answer when the similarity passes a threshold. It buys the highest hit rate, because paraphrases count as hits — and it is the only layer that can be <strong>wrong</strong>. A near-miss returns a plausible answer to a question nobody asked, and the user cannot tell.</li>
+    </ul>
+    <p>The demo counts exactly that. It runs the same request stream through all three layers, then adds a wrong-answer counter to the semantic layer, driven by a near-miss rate you can move. The hit-rate bar rises with the rate; so does the damage.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cache-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Hit rates for the three layers, then what the semantic layer did to cost, latency and correctness.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Semantic near-miss rate <span class="val">12</span></label><input type="range" id="cache-wrong" min="0" max="30" step="1" value="12"></div>
+        <div class="g-readout" id="cache-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="reliability-cache-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> a cache is a correctness decision disguised as a cost decision. Prefix and result caches are exact, so their only risk is staleness. A semantic cache trades a measurable hit rate for an unmeasurable-by-the-user wrong-answer rate, so it needs a similarity threshold you have tuned against labelled near-misses — not one you guessed.</span></div>
+  </section>
+
+  <section class="g-step" id="routing">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Routing, cascades, and streaming</h2></div>
+    <p class="g-eyebrow">Cheap-first is not free; perceived latency is a real latency</p>
+    <p>Routing sends each request to a model chosen for it: easy traffic cheap, hard traffic expensive. A <strong>cascade</strong> is the special case where the cheap model tries first and escalates on a signal — low confidence, a failed check, a retry. Cascades are popular because they sound like getting the expensive model's quality at the cheap model's price, and that is true only under a condition worth stating precisely: <em>every escalated request pays for both calls.</em> A cascade that escalates most of its traffic is not a cheap path with an expensive fallback; it is the expensive path with a tax.</p>
+    <p>Move the escalation share below and watch where the cascade's cost crosses the cost of simply calling the good model. The crossover sits where the cheap call stops being a saving and becomes a surcharge. Latency crosses over much earlier, because an escalated request waits for the cheap model before it waits for the good one.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="route-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: cost per request. Right: latency per request. Both compare a cascade with calling the good model directly.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Escalation share <span class="val">40</span></label><input type="range" id="route-escalate" min="0" max="100" step="5" value="40"></div>
+        <div class="g-readout" id="route-readout"></div>
+      </div>
+    </div>
+    <p>Streaming is the last lever, and it is about perception rather than throughput. The end-to-end time to a complete answer does not change when you stream; what changes is the time to the <em>first</em> useful token, and users judge responsiveness by that. Speculative UX pushes the same idea further: show a skeleton or a draft that is likely to be right while the model works, then reconcile. Both are ways of spending engineering effort on the latency the user feels rather than the latency you can measure at the API boundary.</p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> optimise the latency the user perceives. Time-to-first-token, streaming and a speculative draft all reduce the interval between asking and seeing something useful, without pretending to make the model faster.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What is a timeout for?</td><td>Bounding a stall, so a slow dependency cannot consume the request's latency budget or hide its own failure.</td></tr>
+        <tr><td>Why does backoff need jitter?</td><td>Without it, every client retries on the same tick and the dependency is hit by a synchronised wave.</td></tr>
+        <tr><td>What does a circuit breaker buy?</td><td>It fails fast once failures are consecutive, instead of queueing retries against something already down.</td></tr>
+        <tr><td>What is a degraded mode?</td><td>A pre-decided fallback — smaller model, cached answer, or an honest "try later" — so "unavailable" has a defined behaviour.</td></tr>
+        <tr><td>Which cost lever comes first?</td><td>Shorten the output. Output is the expensive side at every vendor in the dated table.</td></tr>
+        <tr><td>And last?</td><td>Optimise the prompt — real work, smallest saving, so it goes after caching, routing and batching.</td></tr>
+        <tr><td>Which cache is always correct?</td><td>Provider prefix and application result caches: both key on an exact match. Only staleness can hurt you.</td></tr>
+        <tr><td>What does a semantic cache cost?</td><td>Correctness. A near-miss returns a plausible answer to a question nobody asked, invisibly to the user.</td></tr>
+        <tr><td>When does a cascade cost more?</td><td>When the escalation share is high enough that the cheap call becomes a surcharge on top of the expensive one.</td></tr>
+        <tr><td>When does cascade latency cross over?</td><td>Much earlier than cost — every escalated request waits for the cheap model before the good one.</td></tr>
+        <tr><td>Does streaming make the model faster?</td><td>No. It shortens time-to-first-token, which is the part users actually perceive.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Prompt caching</a> — cache-read and cache-write multipliers and the 5-minute TTL, which is why prompt layout is a cost decision.</li>
+      <li>OpenAI, <a href="https://platform.openai.com/docs/guides/prompt-caching">Prompt caching guide</a>, October 2024 — automatic prefix caching, and reporting cached input tokens back to you.</li>
+      <li>Nygard, <em><a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a></em>, 2nd edition, 2018 — circuit breakers, bulkheads and the stability patterns this part borrows wholesale.</li>
+      <li>Dean &amp; Barroso, <a href="https://research.google/pubs/pub40801/">"The Tail at Scale"</a>, Communications of the ACM, 2013 — why the 99th percentile dominates a fan-out, and why hedged requests and jitter exist.</li>
+      <li>Brooker, <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">"Timeouts, retries and backoff with jitter"</a>, Amazon Builders' Library — the practical version of the reliability half of this part.</li>
+      <li>Khattab et al., <a href="https://arxiv.org/abs/2401.14021">"Don't Break the Cache"</a>, 2024 — prompt structure and prefix-cache hit rates measured end to end.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A working, affordable, reliable agent is still not a product. The last step is the one most teams skip: shipping it as software, where a prompt is a deploy and uncertainty is a user-interface problem. Next: shipping probabilistic products.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Cache discounts are vendor-specific (see prompt_cache). Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD, standard, non-batch). These rot fast and are labelled historical reference points, not current quotes. Verify against live vendor pages before relying on any number. Offline fallback constants.",
+      as_of: "2025-02",
+      items: [
+        { model: "GPT-4o", inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25 },
+        { model: "GPT-4o mini", inputPerMUSD: 0.15, outputPerMUSD: 0.6, cachedInputPerMUSD: 0.075 },
+        { model: "Claude 3.5 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "DeepSeek-V3", inputPerMUSD: 0.27, outputPerMUSD: 1.1, cachedInputPerMUSD: 0.07 }
+      ],
+      outputInputRatio: "Output is the expensive side at every vendor in this table. The lever is almost always shortening the output, not the input."
+    },
+    prompt_cache: {
+      source: "Anthropic prompt-caching docs (2024-08; 5-minute TTL, cache read 0.1x base input, cache write 1.25x) and OpenAI prompt-caching docs (2024-10; automatic for prompts over 1,024 tokens, cached input 0.5x). Provider implementations differ in block size, TTL and eviction, so the hit rate is a property of your prompt layout. Offline fallback constants.",
+      anthropicCacheReadMultiplier: 0.1,
+      openaiCachedInputMultiplier: 0.5,
+      minCacheableTokens: 1024
+    }
+  };
+
+  var PRICES = {
+    big: { inputPerM: 3, outputPerM: 15, cachedPerM: 0.3 },
+    small: { inputPerM: 0.15, outputPerM: 0.6, cachedPerM: 0.075 }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — timeout, retry, breaker, degraded mode
+  // ------------------------------------------------------------------
+  var A = { retries: el('rel-retries'), breaker: el('rel-breaker'), timeout: el('rel-timeout'), degraded: true };
+  var setupA = Guide.setupCanvas(el('rel-canvas'), 640, 380, drawA);
+  var NREQ = 140, COOLDOWN = 24;
+  function simulateA() {
+    var retries = parseInt(A.retries.value, 10); if (!isFinite(retries)) retries = 1;
+    var bth = parseInt(A.breaker.value, 10); if (!isFinite(bth)) bth = 5;
+    var timeout = parseInt(A.timeout.value, 10); if (!isFinite(timeout)) timeout = 2000;
+    var r = AppSim.rng(17);
+    var ev = [], consecutive = 0, open = false, openUntil = -1, opens = 0, firstOpen = null;
+    var retriesUsed = 0, fails = 0, degradedServed = 0, ok = 0, retriedOk = 0;
+    for (var i = 0; i < NREQ; i++) {
+      if (open && i >= openUntil) { open = false; consecutive = 0; }
+      if (open) {
+        degradedServed++;
+        ev.push({ i: i, kind: 'degraded', lat: 55 });
+        continue;
+      }
+      var slow = r() < 0.05;
+      var attempt = 0, success = false, lat = 0;
+      while (attempt <= retries) {
+        var pFail = 0.045 + (slow ? 0.18 : 0);
+        var fail = r() < pFail;
+        var attemptLat = 320 + Math.max(0, AppSim.gaussian(r)) * 70 + (slow ? 2200 : 0);
+        if (attemptLat > timeout) fail = true;
+        lat = attemptLat;
+        if (!fail) { success = true; break; }
+        if (attempt < retries) { retriesUsed++; lat += 260; }
+        attempt++;
+      }
+      if (success) {
+        if (attempt === 0) { ok++; ev.push({ i: i, kind: 'ok', lat: lat }); }
+        else { retriedOk++; ev.push({ i: i, kind: 'retried', lat: lat }); }
+        consecutive = 0;
+      } else {
+        fails++;
+        consecutive++;
+        ev.push({ i: i, kind: 'fail', lat: lat });
+        if (bth > 0 && consecutive >= bth && !open) {
+          open = true; openUntil = i + COOLDOWN; opens++;
+          if (firstOpen == null) firstOpen = i;
+        }
+      }
+    }
+    var served = ok + retriedOk + (A.degraded ? degradedServed : 0);
+    var errors = fails + (A.degraded ? 0 : degradedServed);
+    var lats = ev.map(function (e) { return e.lat; }).sort(function (x, y) { return x - y; });
+    var p95 = lats.length ? lats[Math.min(lats.length - 1, Math.floor(lats.length * 0.95))] : 0;
+    return {
+      ev: ev, ok: ok, retriedOk: retriedOk, fails: fails, retriesUsed: retriesUsed,
+      degradedServed: degradedServed, opens: opens, firstOpen: firstOpen,
+      served: served, errors: errors, errorRate: errors / NREQ, p95: p95,
+      retries: retries, bth: bth, timeout: timeout
+    };
+  }
+  var KIND_COLOR = {};
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    KIND_COLOR = { ok: c.accent, retried: c.accent400, fail: c.accent2, degraded: '#c9a227' };
+    var s = simulateA();
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('140 requests · retries ' + s.retries + ' · breaker at ' + (s.bth === 0 ? 'off' : s.bth + ' consecutive failures') +
+      ' · timeout ' + s.timeout + ' ms', 14, 18);
+
+    // outcome strip
+    var stripX = 20, stripW = 604, cellW = stripW / NREQ, stripY = 40, stripH = 30;
+    s.ev.forEach(function (e) {
+      ctx.fillStyle = KIND_COLOR[e.kind];
+      ctx.fillRect(stripX + e.i * cellW, stripY, Math.max(1, cellW - 0.4), stripH);
+    });
+    var legend = [['ok', 'ok'], ['retried', 'retry'], ['fail', 'failed'], ['degraded', 'degraded']];
+    legend.forEach(function (l, i) {
+      var lx = 20 + i * 118;
+      ctx.fillStyle = KIND_COLOR[l[0]];
+      ctx.fillRect(lx, stripY + stripH + 10, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(l[1], lx + 13, stripY + stripH + 18);
+    });
+    if (s.firstOpen != null) {
+      var ox = stripX + s.firstOpen * cellW;
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(ox, stripY - 6); ctx.lineTo(ox, stripY + stripH + 4); ctx.stroke();
+      ctx.fillStyle = c.accent700; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('breaker opens at request ' + s.firstOpen + (A.degraded ? ' → degraded mode' : ' → hard failures'), Math.min(ox + 4, 420), stripY - 10);
+    }
+
+    // latency trace
+    var padL = 52, padR = 16, padT = 128, padB = 34;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var maxLat = Math.max.apply(null, s.ev.map(function (e) { return e.lat; }));
+    var yMax = Math.max(maxLat * 1.08, s.timeout * 1.08);
+    function px(i) { return padL + plotW * i / (NREQ - 1); }
+    function py(v) { return padT + plotH * (1 - v / yMax); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    s.ev.forEach(function (e, i) {
+      var X = px(i), Y = py(e.lat);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke();
+    var ty = py(s.timeout);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(padL, ty); ctx.lineTo(padL + plotW, ty); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('timeout ' + s.timeout + ' ms', padL + 4, ty - 4);
+    ctx.fillStyle = c.text;
+    ctx.save(); ctx.translate(12, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center'; ctx.fillText('latency (ms)', 0, 0); ctx.restore();
+
+    el('rel-readout').innerHTML =
+      '<div><span class="k">served</span> <span class="hi">' + s.served + '/' + NREQ + '</span>' +
+      ' &nbsp; <span class="k">error rate after fallback</span> <span class="' + (s.errorRate > 0.02 ? 'bad' : 'hi') + '">' +
+      (s.errorRate * 100).toFixed(1) + '%</span>' +
+      ' &nbsp; <span class="k">p95</span> ' + Guide.fmtMs(s.p95) + '</div>' +
+      '<div><span class="k">first-try ok</span> ' + s.ok + ' &nbsp; <span class="k">recovered by retry</span> ' + s.retriedOk +
+      ' &nbsp; <span class="k">retries spent</span> ' + s.retriesUsed + ' &nbsp; <span class="k">hard failures</span> <span class="' + (s.fails ? 'bad' : 'hi') + '">' + s.fails + '</span></div>' +
+      '<div><span class="k">degraded mode</span> ' + (A.degraded ? '<span class="hi">on</span>' : '<span class="bad">off</span>') +
+      ' &nbsp; <span class="k">served degraded</span> ' + s.degradedServed +
+      ' &nbsp; <span class="k">breaker trips</span> ' + s.opens + (s.firstOpen != null ? ' (first at ' + s.firstOpen + ')' : '') + '</div>' +
+      '<div class="k">' + (A.degraded
+        ? 'a degraded answer at full speed is usually better than a perfect one that never arrives — but it is a product decision, so make it deliberately'
+        : 'with no fallback, every request the breaker sheds becomes a hard error the user sees') + '</div>';
+  }
+  Guide.bindSliders([A.retries, A.breaker, A.timeout], drawA);
+  el('rel-degraded').addEventListener('click', function () {
+    A.degraded = !A.degraded;
+    this.className = A.degraded ? 'g-primary' : '';
+    this.textContent = A.degraded ? 'Degraded mode: on' : 'Degraded mode: off';
+    drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — the cost-lever waterfall
+  // ------------------------------------------------------------------
+  var B = { requests: el('cost-requests'), cheap: el('cost-cheap'), levers: el('cost-levers') };
+  var setupB = Guide.setupCanvas(el('cost-canvas'), 640, 380, drawB);
+  var LEVER_LABELS = [
+    'baseline',
+    '1 · shorten output',
+    '2 · cache prefix',
+    '3 · route easy traffic',
+    '4 · batch',
+    '5 · optimise prompt'
+  ];
+  function billAt(R, outT, cachedFrac, inTok, cheap) {
+    var cheapCost = AppSim.costModel({ inputTokens: R * cheap * inTok, outputTokens: R * cheap * outT, prices: PRICES.small }).total;
+    var bigCost = AppSim.costModel({
+      inputTokens: R * (1 - cheap) * inTok,
+      cachedInputTokens: R * (1 - cheap) * inTok * cachedFrac,
+      outputTokens: R * (1 - cheap) * outT,
+      prices: PRICES.big
+    }).total;
+    return cheapCost + bigCost;
+  }
+  function costStages(R, cheapShare) {
+    return [
+      billAt(R, 400, 0, 1200, 0),
+      billAt(R, 240, 0, 1200, 0),
+      billAt(R, 240, 0.65, 1200, 0),
+      billAt(R, 240, 0.65, 1200, cheapShare),
+      billAt(R, 240, 0.65, 1200, cheapShare) * 0.75,
+      billAt(R, 240, 0.65, 980, cheapShare) * 0.75
+    ];
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 380;
+    ctx.clearRect(0, 0, W, H);
+    var R = parseInt(B.requests.value, 10); if (!isFinite(R)) R = 1000000;
+    var cheapShare = parseInt(B.cheap.value, 10) / 100; if (!isFinite(cheapShare)) cheapShare = 0.55;
+    var applied = parseInt(B.levers.value, 10); if (!isFinite(applied)) applied = 5;
+    var st = costStages(R, cheapShare);
+    var baseline = st[0];
+    var current = st[applied];
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('monthly bill · ' + Guide.fmtNum(R) + ' requests · ' + Math.round(cheapShare * 100) + '% of traffic routed cheap', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('the levers apply in order; each step\'s saving is the drop to the next bar', 14, 34);
+
+    var padL = 56, padR = 18, padT = 66, padB = 84;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var yMax = baseline * 1.08;
+    function px(i) { return padL + plotW * (i + 0.5) / 6; }
+    function barY(v) { return padT + plotH * (1 - v / yMax); }
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    for (var g = 0; g <= 4; g++) {
+      var gv = baseline * g / 4;
+      var gy = barY(gv);
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(padL + plotW, gy); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText('$' + Guide.fmtNum(gv), padL - 5, gy + 3);
+    }
+
+    var bw = 54;
+    // baseline bar
+    ctx.fillStyle = c.accent700;
+    ctx.fillRect(px(0) - bw / 2, barY(baseline), bw, padT + plotH - barY(baseline));
+    ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('$' + Guide.fmtNum(baseline), px(0), barY(baseline) - 6);
+
+    // waterfall steps: each saving drops the running bill
+    var running = baseline;
+    var savings = [];
+    for (var k = 1; k <= 5; k++) {
+      var saving = st[k - 1] - st[k];
+      savings.push(saving);
+      var next = st[k];
+      if (k <= applied) {
+        // the step: a connector from running to next, drawn as a filled slab of the saving
+        ctx.fillStyle = 'rgba(43,95,255,0.16)';
+        var top = barY(running), bot = barY(next);
+        ctx.fillRect(px(k) - bw / 2 - 12, Math.min(top, bot), 12 + 6, Math.abs(bot - top));
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(px(k - 1) + bw / 2, top); ctx.lineTo(px(k) - bw / 2 - 12, top); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = c.accent2; ctx.font = '600 9.5px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('−$' + Guide.fmtNum(saving), px(k), Math.min(top, bot) - 5);
+        ctx.fillStyle = c.accent700;
+        ctx.fillRect(px(k) - bw / 2, bot, bw, padT + plotH - bot);
+        ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font;
+        ctx.fillText('$' + Guide.fmtNum(next), px(k), bot - 6);
+      } else {
+        ctx.fillStyle = 'rgba(120,120,120,0.10)';
+        ctx.fillRect(px(k) - bw / 2, barY(running), bw, padT + plotH - barY(running));
+        ctx.fillStyle = c.text; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('not applied', px(k), barY(running) + 16);
+      }
+      running = next;
+    }
+
+    LEVER_LABELS.forEach(function (lab, i) {
+      ctx.fillStyle = i <= applied ? c.text : 'rgba(120,120,120,0.55)';
+      ctx.font = (i === applied ? '600 ' : '') + '9.5px ' + c.font;
+      ctx.textAlign = 'center';
+      var parts = lab.split(' · ');
+      if (parts.length > 1) {
+        ctx.fillText(parts[0], px(i), H - 34);
+        ctx.fillText(parts[1], px(i), H - 22);
+      } else {
+        ctx.fillText(lab, px(i), H - 28);
+      }
+    });
+
+    var totalSaving = baseline - current;
+    el('cost-readout').innerHTML =
+      '<div><span class="k">baseline</span> $' + Guide.fmtNum(baseline) +
+      ' &nbsp; <span class="k">current</span> <span class="hi">$' + Guide.fmtNum(current) + '</span>' +
+      ' &nbsp; saved <span class="hi">' + (100 * totalSaving / baseline).toFixed(0) + '%</span></div>' +
+      '<div><span class="k">levers applied</span> ' + applied + '/5 &nbsp; ' +
+      savings.map(function (sv, i) {
+        return '<span class="' + (i < applied ? 'hi' : 'k') + '">' + (i + 1) + ': $' + Guide.fmtNum(sv) + '</span>';
+      }).join(' · ') + '</div>' +
+      '<div class="k">output is the expensive side: lever 1 alone typically beats every input-side lever combined, which is why it is first</div>' +
+      '<div class="k">prices are historical list prices, not current quotes — the order is the durable part</div>';
+  }
+  Guide.bindSliders([B.requests, B.cheap, B.levers], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — three cache layers, and semantic's correctness cost
+  // ------------------------------------------------------------------
+  var C = { wrong: el('cache-wrong') };
+  var setupC = Guide.setupCanvas(el('cache-canvas'), 640, 340, drawC);
+  function prefixRequests() {
+    var out = [];
+    for (var i = 0; i < 40; i++) {
+      var blocks = ['sys', 'tools', 'task'];
+      if (i % 3 !== 0) blocks.push('policy');
+      blocks.push('q' + i);
+      out.push({ id: 'p' + i, blocks: blocks });
+    }
+    return out;
+  }
+  function resultRequests() {
+    // Exact repeats only: a result cache keys on the identical request.
+    var out = [];
+    for (var i = 0; i < 40; i++) {
+      out.push({ id: 'r' + i, key: (i >= 12 && i % 2 === 0) ? 'q' + (i % 6) : 'r' + i });
+    }
+    var seen = {};
+    out.forEach(function (q) { q.hit = !!seen[q.key]; seen[q.key] = true; });
+    return out;
+  }
+  function semanticRequests() {
+    var out = [];
+    for (var i = 0; i < 40; i++) {
+      out.push({ id: 's' + i, cluster: i % 12, paraphrase: (i >= 12 && i % 3 === 2) ? false : true });
+    }
+    return out;
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var wrongRate = parseInt(C.wrong.value, 10) / 100; if (!isFinite(wrongRate)) wrongRate = 0.12;
+
+    var prefix = AppSim.cacheSim(prefixRequests(), { type: 'prefix', capacityBlocks: 64, seed: 9 });
+    var sem = AppSim.cacheSim(semanticRequests(), { type: 'semantic', ttl: 30, wrongAnswerRate: wrongRate, seed: 9 });
+    var res = resultRequests();
+    var resultHits = res.filter(function (q) { return q.hit; }).length;
+    var resultHitRate = resultHits / res.length;
+
+    var rows = [
+      { name: 'provider prefix cache', hit: prefix.hitRate, color: c.accent, detail: Guide.fmtPct(prefix.tokenHitRate, 0) + ' of tokens reused' },
+      { name: 'application result cache', hit: resultHitRate, color: c.accent700, detail: resultHits + ' exact repeats of 40' },
+      { name: 'semantic cache', hit: sem.hitRate, color: c.accent2, detail: sem.wrongAnswers + ' wrong answers returned' }
+    ];
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('hit rate by cache layer — 40 requests', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('prefix and result caches are exact; only the semantic layer can be wrong', 14, 34);
+
+    var padL = 172, padR = 190, top = 52, rowH = 40;
+    rows.forEach(function (row, i) {
+      var y = top + i * rowH;
+      ctx.fillStyle = c.text; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(row.name, padL - 10, y + 16);
+      var w = (W - padL - padR) * row.hit;
+      ctx.fillStyle = row.color;
+      ctx.fillRect(padL, y, Math.max(2, w), 20);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.strokeRect(padL, y, W - padL - padR, 20);
+      ctx.fillStyle = '#fff'; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      if (w > 50) ctx.fillText(Guide.fmtPct(row.hit, 0), padL + 6, y + 14);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.textAlign = 'left';
+      ctx.fillText(Guide.fmtPct(row.hit, 0) + ' hit rate', padL + W - padL - padR + 8, y + 9);
+      ctx.fillStyle = c.accent700; ctx.font = '9.5px ' + c.font;
+      ctx.fillText(row.detail, padL + W - padL - padR + 8, y + 22);
+    });
+
+    // cost / latency / quality effect, per 1,000 requests
+    var perCall = AppSim.costModel({ inputTokens: 1200, outputTokens: 400, prices: PRICES.big });
+    var lat = AppSim.latencyModel({ prefixTokens: 1200, cachedPrefixTokens: 0, outputTokens: 400 });
+    var K = 1000;
+    var noCacheCost = perCall.total * K;
+    var prefixCost = AppSim.costModel({ inputTokens: 1200, cachedInputTokens: 1200 * prefix.tokenHitRate, outputTokens: 400, prices: PRICES.big }).total * K;
+    var resultCost = perCall.total * K * (1 - resultHitRate);
+    var semCost = perCall.total * K * (1 - sem.hitRate);
+    var semQuality = 1 - (sem.wrongAnswers / 40);
+
+    var barsY = 196, barsH = 96;
+    ctx.fillStyle = c.text; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('cost per 1,000 requests', 14, barsY - 8);
+    var groups = [
+      { label: 'no cache', v: noCacheCost, color: 'rgba(120,120,120,0.55)' },
+      { label: 'prefix', v: prefixCost, color: c.accent },
+      { label: 'result', v: resultCost, color: c.accent700 },
+      { label: 'semantic', v: semCost, color: c.accent2 }
+    ];
+    var gx = 20, gW = 130, gGap = 14;
+    var cMax = noCacheCost || 1;
+    groups.forEach(function (g, i) {
+      var x = gx + i * (gW + gGap);
+      var h = barsH * (g.v / cMax);
+      ctx.fillStyle = g.color;
+      ctx.fillRect(x, barsY + barsH - h, gW - 30, h);
+      ctx.fillStyle = c.text; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(g.label, x, barsY + barsH + 12);
+      ctx.fillStyle = c.accent700; ctx.font = '600 9.5px ' + c.font;
+      ctx.fillText('$' + g.v.toFixed(2), x, barsY + barsH - h - 4);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('p95 latency', 20 + 4 * (gW + gGap) + 6, barsY + 12);
+    ctx.fillStyle = c.accent700; ctx.font = '600 11px ' + c.font;
+    ctx.fillText(Guide.fmtMs(lat.e2eMs), 20 + 4 * (gW + gGap) + 6, barsY + 30);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('cached ≈ ' + Guide.fmtMs(60), 20 + 4 * (gW + gGap) + 6, barsY + 52);
+    ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+    ctx.fillText('semantic quality ' + (semQuality * 100).toFixed(1) + '%', 20 + 4 * (gW + gGap) + 6, barsY + 78);
+    ctx.fillStyle = c.accent2; ctx.font = '9.5px ' + c.font;
+    ctx.fillText('−' + sem.wrongAnswers + ' plausible wrong', 20 + 4 * (gW + gGap) + 6, barsY + 92);
+
+    el('cache-readout').innerHTML =
+      '<div><span class="k">hit rates</span> prefix <span class="hi">' + Guide.fmtPct(prefix.hitRate, 0) + '</span>' +
+      ' · result ' + Guide.fmtPct(resultHitRate, 0) +
+      ' · semantic <span class="hi">' + Guide.fmtPct(sem.hitRate, 0) + '</span></div>' +
+      '<div><span class="k">monthly cost per 1,000</span> none $' + noCacheCost.toFixed(2) +
+      ' · prefix $' + prefixCost.toFixed(2) + ' · result $' + resultCost.toFixed(2) + ' · semantic $' + semCost.toFixed(2) + '</div>' +
+      '<div><span class="k">semantic near-miss rate</span> ' + (wrongRate * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">wrong answers returned</span> <span class="' + (sem.wrongAnswers ? 'bad' : 'hi') + '">' + sem.wrongAnswers + '</span>' +
+      ' &nbsp; <span class="k">quality</span> ' + (semQuality * 100).toFixed(1) + '%</div>' +
+      '<div class="k">' + (wrongRate === 0
+        ? 'with a zero near-miss rate semantic caching is safe — but real paraphrase traffic always has near-misses, so the threshold must be tuned on labelled pairs'
+        : 'the semantic cache bought the highest hit rate and returned wrong answers doing it; the user cannot see which ones') + '</div>';
+  }
+  Guide.bindSliders([C.wrong], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — routing vs cascade
+  // ------------------------------------------------------------------
+  var D = { escalate: el('route-escalate') };
+  var setupD = Guide.setupCanvas(el('route-canvas'), 640, 340, drawD);
+  var CHEAP_LAT = 420, GOOD_LAT = 1100, CHEAP_Q = 0.74, GOOD_Q = 0.94;
+  function routeMath() {
+    var e = parseInt(D.escalate.value, 10) / 100; if (!isFinite(e)) e = 0.4;
+    var cheap = AppSim.costModel({ inputTokens: 1200, outputTokens: 400, prices: PRICES.small }).total;
+    var good = AppSim.costModel({ inputTokens: 1200, outputTokens: 400, prices: PRICES.big }).total;
+    return {
+      e: e, cheap: cheap, good: good,
+      cascadeCost: cheap + e * good, goodCost: good,
+      cascadeLat: CHEAP_LAT + e * GOOD_LAT, goodLat: GOOD_LAT,
+      cascadeQ: CHEAP_Q + e * (GOOD_Q - CHEAP_Q), goodQ: GOOD_Q,
+      crossCost: 1 - cheap / good,
+      crossLat: 1 - CHEAP_LAT / GOOD_LAT
+    };
+  }
+  function panel(ctx, x0, y0, w, h, xr, yr, title, xLabel, yLabel) {
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    function X(x) { return x0 + w * (x - xr[0]) / (xr[1] - xr[0]); }
+    function Y(y) { var v = Math.max(yr[0], Math.min(yr[1], y)); return y0 + h * (1 - (v - yr[0]) / (yr[1] - yr[0])); }
+    ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(title, x0, y0 - 8);
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.fillText(xLabel, x0 + w / 2, y0 + h + 22);
+    ctx.save(); ctx.translate(x0 - 30, y0 + h / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center'; ctx.fillText(yLabel, 0, 0); ctx.restore();
+    return { X: X, Y: Y };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var m = routeMath();
+
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('cascade vs just calling the good model', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('every escalated request pays for both calls', 14, 34);
+
+    var costC = [], latC = [];
+    for (var i = 0; i <= 40; i++) {
+      var e = i / 40;
+      costC.push({ x: e, y: m.cheap + e * m.good });
+      latC.push({ x: e, y: CHEAP_LAT + e * GOOD_LAT });
+    }
+    var costPanel = panel(ctx, 52, 62, 250, 200, [0, 1], [0, m.good * 1.15], 'cost per request', 'escalation share', 'USD');
+    var latPanel = panel(ctx, 350, 62, 258, 200, [0, 1], [0, 1400], 'latency per request', 'escalation share', 'ms');
+
+    function drawSeries(p, pts, color, dashed) {
+      ctx.strokeStyle = color; ctx.lineWidth = 2.4;
+      if (dashed) ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      pts.forEach(function (pt, i) { var X = p.X(pt.x), Y = p.Y(pt.y); if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y); });
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    drawSeries(costPanel, costC, c.accent2, false);
+    drawSeries(costPanel, [{ x: 0, y: m.good }, { x: 1, y: m.good }], c.accent700, true);
+    drawSeries(latPanel, latC, c.accent2, false);
+    drawSeries(latPanel, [{ x: 0, y: GOOD_LAT }, { x: 1, y: GOOD_LAT }], c.accent700, true);
+
+    // crossovers
+    var cx = costPanel.X(m.crossCost);
+    ctx.strokeStyle = c.accent2; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(cx, costPanel.Y(0) ); ctx.lineTo(cx, 62); ctx.stroke();
+    ctx.strokeStyle = c.accent700;
+    var lx = latPanel.X(m.crossLat);
+    ctx.beginPath(); ctx.moveTo(lx, latPanel.Y(0)); ctx.lineTo(lx, 62); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    ctx.fillStyle = c.accent2; ctx.font = '9.5px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('cost crossover ' + (m.crossCost * 100).toFixed(0) + '%', Math.min(cx + 3, 200), 78);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('latency crossover ' + (m.crossLat * 100).toFixed(0) + '%', Math.min(lx + 3, 480), 78);
+
+    var mx = costPanel.X(m.e);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.3; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(mx, 62); ctx.lineTo(mx, 262); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('cascade', 60, 282);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('good model only', 120, 282);
+    ctx.fillStyle = c.text;
+    ctx.fillText('cheap: ' + Guide.fmtMs(CHEAP_LAT) + ' · quality ' + (CHEAP_Q * 100).toFixed(0) + '%' +
+      '   good: ' + Guide.fmtMs(GOOD_LAT) + ' · quality ' + (GOOD_Q * 100).toFixed(0) + '%', 20, 306);
+
+    var verdict = m.cascadeCost > m.goodCost
+      ? 'cascade costs more than calling the good model directly'
+      : (m.cascadeLat > m.goodLat ? 'cheaper, but slower per request than the good model alone' : 'cascade is both cheaper and faster at this escalation share');
+    el('route-readout').innerHTML =
+      '<div><span class="k">escalation share</span> <span class="hi">' + (m.e * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">cascade cost</span> $' + m.cascadeCost.toFixed(5) +
+      ' vs <span class="k">good only</span> $' + m.goodCost.toFixed(5) + '</div>' +
+      '<div><span class="k">cascade latency</span> ' + Guide.fmtMs(m.cascadeLat) +
+      ' vs <span class="k">good only</span> ' + Guide.fmtMs(m.goodLat) + '</div>' +
+      '<div><span class="k">cascade quality</span> ' + (m.cascadeQ * 100).toFixed(1) + '% vs ' + (m.goodQ * 100).toFixed(1) + '%</div>' +
+      '<div class="' + (m.cascadeCost > m.goodCost || m.cascadeLat > m.goodLat ? 'bad' : 'hi') + '">' + verdict + '</div>' +
+      '<div class="k">cost crossover at ' + (m.crossCost * 100).toFixed(0) + '% escalation — above it the cheap call is a surcharge, not a saving</div>';
+  }
+  Guide.bindSliders([D.escalate], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function priceFrom(items, model) {
+    var found = (items || []).filter(function (it) { return it.model === model; })[0];
+    if (!found) return null;
+    return { inputPerM: found.inputPerMUSD, outputPerM: found.outputPerMUSD, cachedPerM: found.cachedInputPerMUSD };
+  }
+  function applyNumbers(data) {
+    var cl = (data && data.cost_latency) || FALLBACK.cost_latency;
+    var pr = (data && data.pricing) || FALLBACK.pricing;
+    var pc = (data && data.prompt_cache) || FALLBACK.prompt_cache;
+    var big = priceFrom(pr.items, 'Claude 3.5 Sonnet');
+    var small = priceFrom(pr.items, 'GPT-4o mini');
+    if (big) PRICES.big = big;
+    if (small) PRICES.small = small;
+
+    el('reliability-cost-source').textContent = cl.source +
+      (cl.cacheLayers && cl.cacheLayers.length ? ' The three cache layers: ' + cl.cacheLayers.join(', ') + '.' : '');
+    el('reliability-pricing-source').textContent = pr.source +
+      (pr.outputInputRatio ? ' ' + pr.outputInputRatio : '');
+    el('reliability-cache-source').textContent = pc.source +
+      (pc.minCacheableTokens ? ' Minimum cacheable prefix: ' + Guide.fmtNum(pc.minCacheableTokens) + ' tokens.' : '') +
+      ' Cache read multiplier on this page: ' + (pc.anthropicCacheReadMultiplier != null ? pc.anthropicCacheReadMultiplier : 0.1) + 'x.';
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'reliability-cost-lever-order',
+      kind: 'choice',
+      prompt: 'In the ordered cost-lever list, which lever comes first, and why?',
+      options: [
+        { label: 'Shorten the output — output is the expensive side at every vendor, so it is the largest and easiest saving.', correct: true },
+        { label: 'Optimise the prompt — it is the most work, so start early.', correct: false },
+        { label: 'Batch — the discount is the largest available.', correct: false },
+        { label: 'Cache the prefix — it is the only lever that is correct by construction.', correct: false }
+      ],
+      explanation: 'Output is billed at three to five times the input price in the dated table this page cites, so shortening it moves the biggest number first. Prompt optimisation is real work with the smallest saving, which is why it goes last.'
+    },
+    {
+      id: 'reliability-cost-output-saving',
+      kind: 'numeric',
+      prompt: 'At 1,000,000 requests a month, shortening the completion from 400 to 240 output tokens, with output priced at $15 per 1M tokens — what is the monthly saving in dollars?',
+      answer: 2400,
+      unit: "USD",
+      tolerance: 10,
+      explanation: 'The shortening removes 160 output tokens per request: 160 × 1,000,000 = 160,000,000 fewer output tokens, and 160 × $15 = $2,400 per month. About a cent per request, but it is the first lever because output is the expensive side.'
+    },
+    {
+      id: 'reliability-cost-semantic',
+      kind: 'choice',
+      prompt: 'What is the specific risk of a semantic cache that a prefix or result cache does not carry?',
+      options: [
+        { label: 'A near-miss returns a plausible wrong answer, and the user cannot tell it was a different question.', correct: true },
+        { label: 'It cannot be invalidated when content changes.', correct: false },
+        { label: 'It leaks the prompt to the embedding provider.', correct: false },
+        { label: 'It increases latency on every request.', correct: false }
+      ],
+      explanation: 'Prefix and result caches key on an exact match, so their only risk is staleness. A semantic cache keys on similarity, so it can answer the wrong question correctly-sounding; the similarity threshold has to be tuned against labelled near-misses.'
+    },
+    {
+      id: 'reliability-cost-breaker',
+      kind: 'choice',
+      prompt: 'What does a circuit breaker plus an explicit degraded mode give you that retries alone do not?',
+      options: [
+        { label: 'A bounded, observable failure with a decided fallback, instead of retries piling onto a dependency that is already down.', correct: true },
+        { label: 'A guarantee that each request eventually succeeds.', correct: false },
+        { label: 'Lower token prices from the provider.', correct: false },
+        { label: 'Deterministic model outputs.', correct: false }
+      ],
+      explanation: 'Retries help when failures are independent. Once a dependency is down, retries queue and inflate latency. A breaker fails fast for a cooldown, and a degraded mode decides in advance what the user sees instead.'
+    },
+    {
+      id: 'reliability-cost-cascade',
+      kind: 'choice',
+      prompt: 'When should you not use a cheap-first cascade?',
+      options: [
+        { label: 'When the escalation share is high: every escalated request pays for both calls, so the cheap call becomes a surcharge.', correct: true },
+        { label: 'Never — a cascade is always cheaper than the good model alone.', correct: false },
+        { label: 'Only when the cheap model is more expensive than the good one.', correct: false },
+        { label: 'When the traffic is entirely easy.', correct: false }
+      ],
+      explanation: 'A cascade wins by avoiding the expensive call on the easy majority. When most traffic escalates, you pay the cheap call and then the expensive one — and latency crossed over even earlier, because the escalated request waits for both.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

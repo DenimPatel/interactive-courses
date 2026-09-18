@@ -1,0 +1,589 @@
+---
+title: "Building with LLMs, Interactively — Part 16: Hybrid search, fusion and reranking"
+description: "RRF versus score normalisation, learned sparse retrieval with SPLADE, cross-encoders and ColBERT late interaction, MUVERA's compression, and the retrieve-wide-then-rerank-narrow shape that production systems converge on."
+permalink: "/ai/building-with-llms/hybrid-rerank/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Hybrid search, fusion and reranking</h1>
+    <p>No single retriever is right. Dense vectors miss the rare identifier, the error code and the exact phrase; BM25 misses the paraphrase that shares no words at all. So production systems run both and combine them — which raises the real question: how do you combine two rankings that do not share a scale? This part answers that with reciprocal rank fusion, then follows the pipeline to its canonical shape: retrieve wide, rerank narrow, and put only the survivors in the context.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="why-hybrid">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Two retrievers, two failure modes</h2></div>
+    <p class="g-eyebrow">Dense is fuzzy, lexical is brittle, and the failures do not overlap</p>
+    <p>Lexical retrieval scores documents by the terms they share with the query. It is unbeatable on the things that must match <em>exactly</em> — a part number, a function name, an error string, a surname, a rare acronym — because those tokens have high inverse document frequency and a sparse retriever finds them immediately. Its failure is vocabulary mismatch: ask for "how to make training faster" and it will not match a passage that only says "reducing step time".</p>
+    <p>Dense retrieval embeds query and passage and compares vectors, so it handles paraphrase, synonymy and abstraction. Its failure is the mirror image. A rare identifier that appears once in the corpus has a weak, uninformative embedding; a query that turns on one exact token ("error E1042", "section 4.2(a)") is exactly the case where similarity search tends to blur the distinction away. The two systems are wrong about different things, which is the whole argument for hybrid retrieval.</p>
+    <p><strong>Learned sparse</strong> models occupy the middle. <a href="https://arxiv.org/abs/2107.05720">SPLADE</a> learns a sparse vector over the vocabulary, with weights that can expand a query to related terms and contract away ones that do not help. It keeps the inverted index and the exact-match strength of BM25 while buying the synonymy of a dense model — a middle path, not a replacement for either side.</p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> hybrid retrieval is not about two mediocre retrievers averaging out. It is about covering two disjoint recall surfaces, then letting fusion decide which candidate survived both.</span></div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> combining scores as if they were comparable. A BM25 score is unbounded and corpus-dependent; a cosine similarity is bounded and means something else entirely. Adding them is a silent bug that looks like a tuning problem.</span></div>
+  </section>
+
+  <section class="g-step" id="pipeline">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The pipeline, stage by stage</h2></div>
+    <p class="g-eyebrow">Lexical, vector, fused, reranked</p>
+    <p>A hybrid query produces two independent rankings, fuses them into one candidate list, and then hands that list to a reranker. <code>AppSim.hybridRetrieve</code> returns every stage, so the columns on the right show the same query moving through the pipeline: the BM25 order, the vector order, the reciprocal-rank-fusion of the two, and finally the cross-encoder's order over the wide set. The 2-D space on the left is the vector view, with the query's position and the top vector hit connected.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pipe-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Left: the corpus in 2-D with the query point. Right: four rankings of the same query — lexical, vector, RRF-fused and reranked — with rank movement drawn from fused to reranked.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query <span class="val">kv cache</span></label><input type="text" id="pipe-query" value="kv cache" autocomplete="off"></div>
+        <div class="g-field"><label>Wide set for reranking <span class="val">10</span></label><input type="range" id="pipe-wide" min="6" max="20" step="1" value="10"></div>
+        <div class="g-field"><label>Rerank depth (kept) <span class="val">5</span></label><input type="range" id="pipe-narrow" min="1" max="10" step="1" value="5"></div>
+        <div class="g-btnrow">
+          <button id="pipe-q-kv">kv cache</button>
+          <button id="pipe-q-pm">paged memory</button>
+          <button id="pipe-q-frag">fragmentation</button>
+          <button id="pipe-q-att">attention</button>
+        </div>
+        <div class="g-readout" id="pipe-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Try “fragmentation” or “paged memory”.</b> BM25 locks onto the document that literally contains the rare term; the vector centroid drifts toward a neighbouring cluster. Fusion keeps both candidates, and the cross-encoder then picks the one that actually answers the query — cover two recall surfaces, then let ranking decide.</span></div>
+  </section>
+
+  <section class="g-step" id="fusion">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Fusion: normalise the scores, or ignore them</h2></div>
+    <p class="g-eyebrow">Reciprocal rank fusion, k = 60</p>
+    <p>There are two families. <strong>Score normalisation</strong> tries to make the two score distributions comparable — min-max to [0, 1], or a z-score — and then sums. It can work, but it inherits the brittleness of the scores: min-max is set entirely by the largest value, so a single outlier flattens everything else toward zero, and the result depends on which retriever happened to produce a runaway score.</p>
+    <p><strong>Reciprocal rank fusion</strong> throws the scores away and uses only the ranks. Each document's fused score is the sum, over every list it appears in, of <code>1 / (k + rank)</code>, with <var>k</var> = 60 in the original paper. A document at rank 1 in one list and rank 2 in another scores <code>1/61 + 1/62 ≈ 0.0325</code>. RRF needs no tuning, cannot be broken by an incompatible scale, and is remarkably hard to beat — which is why it is the default in so many systems.</p>
+    <p>Below, the same two rankings are fused four ways while a slider magnifies one score into an outlier. Watch the raw sum chase the outlier, min-max flatten under it, and RRF not move at all.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fusion-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Four fusion methods over the same lexical and vector rankings. The slider exaggerates one vector score; only the rank-based method is invariant.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Score outlier (×10^d) <span class="val">0</span></label><input type="range" id="fusion-disp" min="0" max="6" step="0.5" value="0"></div>
+        <div class="g-btnrow">
+          <button id="fusion-q-kv">kv cache</button>
+          <button id="fusion-q-pm">paged memory</button>
+        </div>
+        <div class="g-readout" id="fusion-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="hybrid-src-fusion"></p>
+    <div class="g-warn">⚠️ <span><b>When normalisation is still worth it:</b> when the two retrievers are the same kind of model and their scores are already calibrated to one another — two dense models, or a dense model and a learned-sparse one trained together. Otherwise, prefer rank fusion and stop tuning constants.</span></div>
+  </section>
+
+  <section class="g-step" id="shape">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Retrieve wide, rerank narrow</h2></div>
+    <p class="g-eyebrow">Cheap recall first, expensive precision second</p>
+    <p>A bi-encoder embeds the query and every document independently, which is what makes it fast enough to search millions of vectors — the query and document never meet. A cross-encoder feeds the query and a single document through the model <em>together</em>, so it can attend to their interaction, which makes it far more accurate and far too slow to run over the corpus. The pipeline shape follows directly: use the cheap retriever to fetch a wide set of candidates, then use the expensive model to rerank a narrow slice of them.</p>
+    <p>The two sliders below are the whole design. Fetching more candidates raises the chance the answer is somewhere in the wide set; reranking deeper raises the chance the cross-encoder sees it. Both cost latency, and past a point both stop helping — the heatmap is the tradeoff, seeded rather than measured.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="shape-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">End-to-end accuracy over the wide-set size (columns) and the rerank depth (rows). The ring is your current setting; the readout prices it in latency.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Wide set size <span class="val">50</span></label><input type="range" id="shape-wide" min="10" max="150" step="10" value="50"></div>
+        <div class="g-field"><label>Rerank depth <span class="val">8</span></label><input type="range" id="shape-depth" min="1" max="20" step="1" value="8"></div>
+        <div class="g-readout" id="shape-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The canonical numbers:</b> retrieve roughly 50–100 candidates with the cheap retriever, rerank the top 5–20 with the cross-encoder, and put only the final few in the context. Wider than that buys recall you cannot afford to re-score; deeper than that buys precision the model has already given you.</span></div>
+  </section>
+
+  <section class="g-step" id="rerankers">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Bi-encoders, cross-encoders and late interaction</h2></div>
+    <p class="g-eyebrow">Accuracy against latency against memory</p>
+    <p>Three architectures sit on a spectrum. The <strong>bi-encoder</strong> produces one vector per text and compares them with a dot product: fastest, cheapest in memory, and unable to see the query and document together. The <strong>cross-encoder</strong> reads the pair jointly: the most accurate and the most expensive, with no index at all — it must score each candidate at query time. <strong>ColBERT</strong>'s late interaction sits between them: it keeps one vector <em>per token</em> and scores a pair by a cheap max-similarity operation, which is much more expressive than a single vector and much cheaper than a full cross-encoder.</p>
+    <p>ColBERT's cost is storage, because a document is many vectors rather than one. <a href="https://arxiv.org/abs/2405.19504">MUVERA</a> attacks exactly that: it turns multi-vector similarity into a single-vector maximum-inner-product search, recovering most of the quality with the index footprint of an ordinary dense system.</p>
+    <p>The bars below compare the three at illustrative operating points. They are a shape, not a benchmark: exact numbers depend on the model, the corpus and the hardware.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rank-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Relative accuracy, latency and memory for each architecture. Select one to read its role and its cost.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="rank-b0">bi-encoder</button>
+          <button id="rank-b1">ColBERT</button>
+          <button id="rank-b2" class="g-primary">cross-encoder</button>
+        </div>
+        <div class="g-readout" id="rank-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="hybrid-src-ann"></p>
+    <p class="g-source" id="hybrid-src-ctx"></p>
+    <div class="g-goal">💡 <span><b>They are not alternatives.</b> A production stack uses a bi-encoder or a hybrid lexical+dense retriever to fetch wide, an optional late-interaction stage to re-rank cheaply, and a cross-encoder on the narrow set. Each stage's cost buys the next stage a better candidate list.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>Why hybrid?</td><td>Dense and lexical fail on different inputs; the union of their candidates is better than either alone.</td></tr>
+        <tr><td>When does BM25 win?</td><td>Exact identifiers, rare tokens, error codes, names — high-IDF terms a dense vector blurs.</td></tr>
+        <tr><td>When does dense win?</td><td>Paraphrase and synonymy, where the query shares no vocabulary with the answer.</td></tr>
+        <tr><td>What is SPLADE?</td><td>Learned sparse retrieval: an inverted index with learned term weights and query expansion — the middle path.</td></tr>
+        <tr><td>How do you fuse scores?</td><td>Carefully. Add unlike scales and you get a silent bug; normalise, or avoid scores entirely.</td></tr>
+        <tr><td>What is RRF?</td><td><code>Σ 1/(k + rank)</code> with k = 60 by default. Rank-only, robust, no tuning, hard to beat.</td></tr>
+        <tr><td>Bi- vs cross-encoder?</td><td>Bi-encoders embed independently and index; cross-encoders read the pair jointly and cannot.</td></tr>
+        <tr><td>What is ColBERT?</td><td>Late interaction: per-token vectors scored by cheap max-similarity — between bi- and cross-encoders, at a storage cost.</td></tr>
+        <tr><td>What is MUVERA?</td><td>Compresses multi-vector late interaction into single-vector MIPS, recovering quality at dense-index cost.</td></tr>
+        <tr><td>What is the pipeline shape?</td><td>Retrieve ~50–100 wide, rerank ~5–20 narrow, put the final few in the context.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Cormack, Clarke &amp; Buettcher, <a href="https://dl.acm.org/doi/10.1145/1571941.1572114">"Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods"</a>, SIGIR 2009 — the k = 60 fusion rule.</li>
+      <li>Formal et al., <a href="https://arxiv.org/abs/2107.05720">"SPLADE: Sparse Lexical and Expansion Model for First Stage Ranking"</a>, SIGIR 2021 — learned sparse retrieval with query expansion.</li>
+      <li>Khattab &amp; Zaharia, <a href="https://arxiv.org/abs/2004.12832">"ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT"</a>, SIGIR 2020 — late interaction.</li>
+      <li>Santhanam et al., <a href="https://arxiv.org/abs/2112.01488">"ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction"</a>, 2021 — the storage-savings follow-up.</li>
+      <li>Jégou et al. / Cormack et al. as cited; and <a href="https://arxiv.org/abs/2405.19504">"MUVERA: Multi-Vector Retrieval via Fixed Dimensional Encodings"</a>, 2024 — compressing multi-vector search into single-vector MIPS.</li>
+      <li>Nogueira &amp; Cho, <a href="https://arxiv.org/abs/1901.04085">"Passage Re-ranking with BERT"</a>, 2019 — the cross-encoder reranker that fixed the retrieve-wide-rerank-narrow shape.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Chunks, an index and a reranker cover the common case. Next: what to do when the answer is not in any chunk at all — structural retrieval, graph retrieval, multimodal pages, and the questions flat retrieval cannot answer.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    fusion: {
+      source: "Reciprocal Rank Fusion (Cormack, Clarke & Buettcher, SIGIR 2009), k=60 as the paper's default. SPLADE (Formal et al., arXiv:2107.05720, SIGIR 2021). ColBERT late interaction (Khattab & Zaharia, arXiv:2004.12832, SIGIR 2020) and ColBERTv2 (Santhanam et al., arXiv:2112.01488, 2021); MUVERA (arXiv:2405.19504, 2024). Offline fallback constants.",
+      rrfK: 60,
+      patterns: ["lexical + dense fused with RRF", "SPLADE or other learned sparse", "cross-encoder rerank of the top 50-100", "ColBERT late interaction as a middle ground"]
+    },
+    ann: {
+      source: "HNSW (Malkov & Yashunin, arXiv:1603.09320); IVF + product quantization (Jégou et al., arXiv:1102.3828, IEEE TPAMI 2011); DiskANN (Subramanya et al., NeurIPS 2019). Offline fallback constants.",
+      methods: [{ method: "HNSW", recall: "0.95-0.99" }, { method: "IVF + PQ", recall: "0.80-0.95" }]
+    },
+    retrieval_contextual: {
+      source: "Anthropic, 'Introducing Contextual Retrieval' (2024-09-19). Absolute top-20 failure rate: 5.7% → 3.7% → 2.9% → 1.9%; the 35%/49%/67% figures are relative reductions. Offline fallback constants.",
+      baselineFailurePct: 5.7, contextualEmbeddingsFailurePct: 3.7,
+      plusBM25FailurePct: 2.9, plusRerankFailurePct: 1.9
+    }
+  };
+  var NUM = FALLBACK;
+
+  var GUIDE_ORDER = Object.keys(AppSim.GUIDE_LABELS);
+  var PAL = ['#2b5fff', '#d6006c', '#c9a227', '#5f8a3a', '#7a5c9e', '#b0552d', '#0b3cd0', '#5d85fd'];
+  function guideColor(g) {
+    var i = GUIDE_ORDER.indexOf(g);
+    return PAL[(i < 0 ? 0 : i) % PAL.length];
+  }
+  function titleOf(id) {
+    var d = AppSim.CORPUS_BY_ID[id];
+    return d ? d.title : String(id);
+  }
+  function shortTitle(t) {
+    t = String(t || '');
+    return t.length > 22 ? t.slice(0, 21) + '…' : t;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — the pipeline, stage by stage
+  // ------------------------------------------------------------------
+  var A = { query: 'kv cache', wide: el('pipe-wide'), narrow: el('pipe-narrow') };
+  var setupA = Guide.setupCanvas(el('pipe-canvas'), 640, 380, drawA);
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 380;
+    var wide = +A.wide.value, narrow = +A.narrow.value;
+    var res = AppSim.hybridRetrieve(A.query, { wide: wide, narrow: narrow });
+    ctx.clearRect(0, 0, W, H);
+    // left: 2-D space
+    var SL = 34, SR = 296, ST = 26, SB = H - 30;
+    function spx(x) { return SL + (x + 1) / 2 * (SR - SL); }
+    function spy(y) { return SB - (y + 1) / 2 * (SB - ST); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(spx(-1), spy(0)); ctx.lineTo(spx(1), spy(0)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(spx(0), spy(-1)); ctx.lineTo(spx(0), spy(1)); ctx.stroke();
+    AppSim.CORPUS.forEach(function (d) {
+      ctx.beginPath(); ctx.arc(spx(d.x), spy(d.y), 3, 0, 2 * Math.PI);
+      ctx.fillStyle = guideColor(d.guide); ctx.globalAlpha = 0.6; ctx.fill(); ctx.globalAlpha = 1;
+    });
+    var qv = res.queryVector;
+    res.vector.slice(0, 5).forEach(function (e) {
+      var d = AppSim.CORPUS_BY_ID[e.id];
+      if (!d) return;
+      ctx.strokeStyle = c.accent2; ctx.globalAlpha = 0.4; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(spx(qv.x), spy(qv.y)); ctx.lineTo(spx(d.x), spy(d.y)); ctx.stroke();
+      ctx.globalAlpha = 1;
+    });
+    ctx.beginPath(); ctx.arc(spx(qv.x), spy(qv.y), 6, 0, 2 * Math.PI);
+    ctx.fillStyle = c.accent2; ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('query "' + A.query + '"', SL, 16);
+    // right: four ranking columns
+    var stages = [
+      { name: 'lexical', list: res.lexical },
+      { name: 'vector', list: res.vector },
+      { name: 'fused', list: res.fused },
+      { name: 'reranked', list: res.reranked }
+    ];
+    var colX = [312, 396, 480, 564], colW = 78;
+    var rowY0 = 44, rowH = 30;
+    stages.forEach(function (st, si) {
+      ctx.fillStyle = c.text; ctx.font = '600 10.5px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(st.name, colX[si], 30);
+      st.list.slice(0, 8).forEach(function (e, ri) {
+        var d = AppSim.CORPUS_BY_ID[e.id];
+        var y = rowY0 + ri * rowH;
+        if (d) {
+          ctx.fillStyle = guideColor(d.guide); ctx.globalAlpha = 0.9;
+          ctx.fillRect(colX[si] - 8, y - 9, 7, 7); ctx.globalAlpha = 1;
+        }
+        ctx.fillStyle = ri === 0 ? c.accent700 : c.text;
+        ctx.font = (ri === 0 ? '600 ' : '') + '9px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText((ri + 1) + '. ' + shortTitle(titleOf(e.id)), colX[si], y);
+      });
+    });
+    // rank movement fused -> reranked
+    var fusedPos = {};
+    res.fused.forEach(function (e, i) { fusedPos[e.id] = i; });
+    res.reranked.forEach(function (e, i) {
+      var fp = fusedPos[e.id];
+      if (fp == null || fp > 7) return;
+      var x0 = colX[2] + colW - 8, y0 = rowY0 + fp * rowH - 3;
+      var x1 = colX[3] - 10, y1 = rowY0 + i * rowH - 3;
+      ctx.strokeStyle = fp === i ? c.divider : c.accent2; ctx.lineWidth = fp === i ? 1 : 1.4;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    });
+    ctx.fillStyle = c.accent400; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('rank movement: fused → reranked', colX[2] - 8, H - 10);
+    var rerankedInLex = res.reranked.filter(function (e) {
+      return res.lexical.slice(0, wide).some(function (l) { return l.id === e.id; });
+    }).length;
+    el('pipe-readout').innerHTML =
+      '<div><span class="k">top-1</span> lexical "' + titleOf(res.lexical[0] && res.lexical[0].id) + '" · vector "' + titleOf(res.vector[0] && res.vector[0].id) + '" · reranked "' + titleOf(res.reranked[0] && res.reranked[0].id) + '"</div>' +
+      '<div><span class="k">candidates reranked</span> <span class="hi">' + res.candidates.length + '</span> · kept ' + res.reranked.length + ' · ' + rerankedInLex + ' of the kept came from the lexical top list</div>' +
+      '<div><span class="k">RRF k</span> ' + ((NUM.fusion && NUM.fusion.rrfK) || 60) + ' · query point (' + qv.x.toFixed(2) + ', ' + qv.y.toFixed(2) + ')</div>' +
+      '<div class="k">RRF keeps a document that ranks well in either list; the cross-encoder then reads query and document together.</div>';
+  }
+  Guide.bindSliders([A.wide, A.narrow], drawA);
+  function setAQuery(q) {
+    A.query = q; el('pipe-query').value = q; drawA();
+    var v = el('pipe-query').parentElement && el('pipe-query').parentElement.querySelector('.val');
+    if (v) v.textContent = q;
+  }
+  el('pipe-query').addEventListener('input', function () {
+    A.query = this.value; drawA();
+    var v = this.parentElement && this.parentElement.querySelector('.val');
+    if (v) v.textContent = this.value || '—';
+  });
+  el('pipe-q-kv').addEventListener('click', function () { setAQuery('kv cache'); });
+  el('pipe-q-pm').addEventListener('click', function () { setAQuery('paged memory'); });
+  el('pipe-q-frag').addEventListener('click', function () { setAQuery('fragmentation'); });
+  el('pipe-q-att').addEventListener('click', function () { setAQuery('attention'); });
+
+  // ------------------------------------------------------------------
+  // Demo B — RRF vs score normalisation
+  // ------------------------------------------------------------------
+  var B = { query: 'kv cache', disp: el('fusion-disp') };
+  var setupB = Guide.setupCanvas(el('fusion-canvas'), 640, 340, drawB);
+  function mapOf(arr) { var m = {}; arr.forEach(function (e) { m[e.id] = e.s; }); return m; }
+  function minmaxMap(arr) {
+    var vals = arr.map(function (e) { return e.s; });
+    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    var m = {};
+    arr.forEach(function (e) { m[e.id] = hi > lo ? (e.s - lo) / (hi - lo) : 1; });
+    return m;
+  }
+  function zMap(arr) {
+    var vals = arr.map(function (e) { return e.s; });
+    var mean = vals.reduce(function (a, b) { return a + b; }, 0) / Math.max(1, vals.length);
+    var sd = Math.sqrt(vals.reduce(function (a, b) { return a + (b - mean) * (b - mean); }, 0) / Math.max(1, vals.length)) || 1;
+    var m = {};
+    arr.forEach(function (e) { m[e.id] = (e.s - mean) / sd; });
+    return m;
+  }
+  function rankFrom(scoreById, ids) {
+    return ids.map(function (id) { return { id: id, score: scoreById[id] || 0 }; })
+      .sort(function (a, b) { return b.score - a.score; });
+  }
+  function methodsB() {
+    var res = AppSim.hybridRetrieve(B.query, { wide: 12, narrow: 5 });
+    var lexArr = res.lexical.slice(0, 10).map(function (e) { return { id: e.id, s: e.score }; });
+    var d = +B.disp.value;
+    var vecArr = res.vector.slice(0, 10).map(function (e) { return { id: e.id, s: e.score }; });
+    if (vecArr.length) vecArr[0].s = vecArr[0].s * Math.pow(10, d);
+    var seen = {};
+    lexArr.concat(vecArr).forEach(function (e) { seen[e.id] = 1; });
+    var ids = Object.keys(seen);
+    var lm = mapOf(lexArr), vm = mapOf(vecArr);
+    var lmm = minmaxMap(lexArr), vmm = minmaxMap(vecArr);
+    var lz = zMap(lexArr), vz = zMap(vecArr);
+    var raw = rankFrom((function () { var s = {}; ids.forEach(function (id) { s[id] = (lm[id] || 0) + (vm[id] || 0); }); return s; })(), ids);
+    var mm = rankFrom((function () { var s = {}; ids.forEach(function (id) { s[id] = (lmm[id] || 0) + (vmm[id] || 0); }); return s; })(), ids);
+    var z = rankFrom((function () { var s = {}; ids.forEach(function (id) { s[id] = (lz[id] || 0) + (vz[id] || 0); }); return s; })(), ids);
+    var rrf = AppSim.rrf([res.lexical.map(function (e) { return e.id; }), res.vector.map(function (e) { return e.id; })], (NUM.fusion && NUM.fusion.rrfK) || 60);
+    return {
+      res: res, d: d,
+      methods: [
+        { name: 'raw sum', list: raw },
+        { name: 'min-max sum', list: mm },
+        { name: 'z-score sum', list: z },
+        { name: 'RRF (k=' + ((NUM.fusion && NUM.fusion.rrfK) || 60) + ')', list: rrf }
+      ]
+    };
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    var M = methodsB();
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('fusing lexical + vector for "' + B.query + '" · one vector score ×10^' + M.d, 14, 16);
+    var colX = [14, 170, 326, 482], colW = 150;
+    var rowY0 = 52, rowH = 26;
+    M.methods.forEach(function (m, mi) {
+      ctx.fillStyle = mi === 3 ? c.accent700 : c.text; ctx.font = '600 11px ' + c.font;
+      ctx.fillText(m.name, colX[mi], 40);
+      m.list.slice(0, 8).forEach(function (e, ri) {
+        var doc = AppSim.CORPUS_BY_ID[e.id];
+        var y = rowY0 + ri * rowH;
+        if (doc) {
+          ctx.fillStyle = guideColor(doc.guide); ctx.globalAlpha = 0.9;
+          ctx.fillRect(colX[mi] - 8, y - 9, 7, 7); ctx.globalAlpha = 1;
+        }
+        ctx.fillStyle = ri === 0 ? (mi === 3 ? c.accent700 : c.text) : c.text;
+        ctx.font = (ri === 0 ? '600 ' : '') + '10px ' + c.font;
+        ctx.fillText((ri + 1) + '. ' + shortTitle(titleOf(e.id)), colX[mi], y);
+      });
+    });
+    var tops = M.methods.map(function (m) { return m.list[0] ? titleOf(m.list[0].id) : '—'; });
+    var stable = M.methods.every(function (m) { return m.list[0] && M.methods[3].list[0] && m.list[0].id === M.methods[3].list[0].id; });
+    el('fusion-readout').innerHTML =
+      M.methods.map(function (m, i) {
+        return '<div><span class="k">' + m.name + '</span> top-1 ' + tops[i] + '</div>';
+      }).join('') +
+      '<div>' + (stable
+        ? '<span class="hi">all four agree</span> at this disparity — push the slider and they separate.'
+        : '<span class="bad">the score-based methods have diverged</span> from RRF: raw sum chases the outlier, min-max flattens under it. RRF is unmoved because it never read the scores.') + '</div>';
+  }
+  Guide.bindSliders([B.disp], drawB);
+  function setBQuery(q) { B.query = q; drawB(); }
+  el('fusion-q-kv').addEventListener('click', function () { setBQuery('kv cache'); });
+  el('fusion-q-pm').addEventListener('click', function () { setBQuery('paged memory'); });
+
+  // ------------------------------------------------------------------
+  // Demo C — retrieve wide, rerank narrow
+  // ------------------------------------------------------------------
+  var C = { wide: el('shape-wide'), depth: el('shape-depth') };
+  var WIDES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150];
+  var DEPTHS = [1, 2, 3, 5, 8, 12, 16, 20];
+  var setupC = Guide.setupCanvas(el('shape-canvas'), 640, 320, drawC);
+  function accuracyAt(w, dep) {
+    var r = AppSim.rng(Math.round(w) * 131 + dep * 17 + 7);
+    var p = (1 - Math.exp(-w / 28)) * (1 - Math.exp(-dep / 3.5)) * 0.97;
+    return Math.max(0, Math.min(1, p + (r() - 0.5) * 0.02));
+  }
+  function latencyAt(w, dep) { return 15 + w * 0.25 + dep * 7; }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    var selW = +C.wide.value, selD = +C.depth.value;
+    var matrix = DEPTHS.map(function (dep) {
+      return WIDES.map(function (w) { return accuracyAt(w, dep) * 100; });
+    });
+    Guide.drawHeatmap(ctx, W, H, matrix, {
+      rowLabels: DEPTHS.map(function (d) { return 'd' + d; }),
+      colLabels: WIDES.map(function (w, i) { return (i % 2 === 0 ? String(w) : ''); }),
+      min: 0, max: 100, padL: 42, padB: 30, padT: 26, fontSize: 9,
+      colorLow: [238, 242, 255], colorHigh: [43, 95, 255]
+    });
+    var padL = 42, padB = 30, padT = 26, padR = 6;
+    var cellW = (W - padL - padR) / WIDES.length, cellH = (H - padT - padB) / DEPTHS.length;
+    var ci = Math.max(0, WIDES.indexOf(WIDES.reduce(function (b, w) { return Math.abs(w - selW) < Math.abs(b - selW) ? w : b; }, WIDES[0])));
+    var ri = Math.max(0, DEPTHS.indexOf(DEPTHS.reduce(function (b, d) { return Math.abs(d - selD) < Math.abs(b - selD) ? d : b; }, DEPTHS[0])));
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.4;
+    ctx.strokeRect(padL + ci * cellW + 1, padT + ri * cellH + 1, cellW - 2, cellH - 2);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('end-to-end accuracy (%) · columns = wide set, rows = rerank depth', padL, 16);
+    var acc = accuracyAt(selW, selD), lat = latencyAt(selW, selD);
+    el('shape-readout').innerHTML =
+      '<div><span class="k">wide</span> ' + selW + ' · <span class="k">rerank depth</span> ' + selD + ' · accuracy <span class="hi">' + Guide.fmtPct(acc, 0) + '</span></div>' +
+      '<div><span class="k">latency model</span> 15 ms + ' + selW + '×0.25 ms retrieval + ' + selD + '×7 ms cross-encoder = <span class="hi">' + Guide.fmtMs(lat) + '</span></div>' +
+      '<div class="k">more wide buys recall, more depth buys precision, both buy latency — past the plateau you are paying for nothing.</div>';
+  }
+  Guide.bindSliders([C.wide, C.depth], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — bi-encoder vs ColBERT vs cross-encoder
+  // ------------------------------------------------------------------
+  var D = { chosen: 2 };
+  var RERANKERS = [
+    { name: 'bi-encoder', role: 'retriever', acc: 0.72, lat: 1, mem: 70, note: 'One vector per text, dot product. Indexes millions; cannot see the pair.' },
+    { name: 'ColBERT (late interaction)', role: 'middle', acc: 0.86, lat: 4, mem: 100, note: 'Per-token vectors, cheap max-similarity. Between the two, at a storage cost MUVERA attacks.' },
+    { name: 'cross-encoder', role: 'reranker', acc: 0.94, lat: 22, mem: 8, note: 'Reads query and document together. Most accurate, no index, one forward pass per candidate.' }
+  ];
+  var setupD = Guide.setupCanvas(el('rank-canvas'), 640, 340, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var maxLat = Math.max.apply(null, RERANKERS.map(function (m) { return m.lat; }));
+    var maxMem = Math.max.apply(null, RERANKERS.map(function (m) { return m.mem; }));
+    var rowH = 86, y0 = 44;
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('relative accuracy, latency and memory (illustrative operating points)', 16, 18);
+    RERANKERS.forEach(function (m, i) {
+      var y = y0 + i * rowH;
+      if (i === D.chosen) {
+        ctx.fillStyle = c.accent100 || 'rgba(43,95,255,0.10)';
+        ctx.fillRect(10, y - 20, W - 20, rowH - 10);
+      }
+      ctx.fillStyle = i === D.chosen ? c.accent700 : c.text;
+      ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(m.name, 20, y - 2);
+      ctx.font = '9.5px ' + c.font; ctx.fillStyle = c.accent400;
+      ctx.fillText(m.role, 20, y + 11);
+      var bars = [
+        { label: 'accuracy', v: m.acc, max: 1, colour: c.accent, text: Guide.fmtPct(m.acc, 0) },
+        { label: 'latency', v: m.lat, max: maxLat, colour: c.accent2, text: m.lat + '×' },
+        { label: 'memory', v: m.mem, max: maxMem, colour: '#c9a227', text: m.mem + '×' }
+      ];
+      bars.forEach(function (b, bi) {
+        var by = y + 24 + bi * 14;
+        ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'right';
+        ctx.fillText(b.label, 90, by + 8);
+        var bw = (W - 150) * (b.v / b.max);
+        ctx.fillStyle = b.colour; ctx.globalAlpha = i === D.chosen ? 0.95 : 0.45;
+        ctx.fillRect(96, by, Math.max(1, bw), 10); ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(b.text, 96 + bw + 6, by + 8);
+      });
+    });
+    var m = RERANKERS[D.chosen];
+    el('rank-readout').innerHTML =
+      '<div><span class="k">selected</span> <span class="hi">' + m.name + '</span> (' + m.role + ')</div>' +
+      '<div><span class="k">accuracy</span> ' + Guide.fmtPct(m.acc, 0) + ' · <span class="k">latency</span> ' + m.lat + '× · <span class="k">memory</span> ' + m.mem + '× (relative)</div>' +
+      '<div>' + m.note + '</div>' +
+      '<div class="k">they are stages, not rivals: retrieve wide with the bi-encoder, optionally re-rank with late interaction, then cross-encode the narrow set.</div>';
+  }
+  function setChosen(i) {
+    D.chosen = i;
+    for (var k = 0; k < 3; k++) {
+      var b = el('rank-b' + k);
+      if (b) b.className = k === i ? 'g-primary' : '';
+    }
+    drawD();
+  }
+  el('rank-b0').addEventListener('click', function () { setChosen(0); });
+  el('rank-b1').addEventListener('click', function () { setChosen(1); });
+  el('rank-b2').addEventListener('click', function () { setChosen(2); });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var f = el('hybrid-src-fusion'), a = el('hybrid-src-ann'), x = el('hybrid-src-ctx');
+    if (f) f.textContent = (NUM.fusion && NUM.fusion.source) || FALLBACK.fusion.source;
+    if (a) a.textContent = (NUM.ann && NUM.ann.source) || FALLBACK.ann.source;
+    if (x) x.textContent = (NUM.retrieval_contextual && NUM.retrieval_contextual.source) || FALLBACK.retrieval_contextual.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (resp) { return resp.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'hybrid-rerank-why',
+      kind: 'choice',
+      prompt: 'Why run hybrid retrieval instead of picking the better of dense and lexical?',
+      options: [
+        { label: 'Their failures are different: dense blurs rare exact tokens, lexical misses paraphrase, so each covers what the other misses.', correct: true },
+        { label: 'Because BM25 is always more accurate and dense is only a tiebreaker.' },
+        { label: 'Because two retrievers are cheaper than one at the same recall.' },
+        { label: 'Because the reranker requires exactly two candidate lists.' }
+      ],
+      explanation: 'A rare identifier or error code has high IDF and BM25 nails it; a paraphrase shares no terms and a dense model nails it. Fusing the two rankings widens recall against both failure modes.'
+    },
+    {
+      id: 'hybrid-rerank-rrf-numeric',
+      kind: 'numeric',
+      prompt: 'A document is rank 1 in one list and rank 2 in another. With reciprocal rank fusion and k = 60, what is its fused score? Give four decimal places.',
+      answer: 0.0325,
+      tolerance: 0.0005,
+      explanation: 'RRF sums 1/(k + rank): 1/61 + 1/62 = 0.016393 + 0.016129 = 0.032522, so 0.0325 to four decimal places. Rank-only, so incompatible score scales cannot affect it.'
+    },
+    {
+      id: 'hybrid-rerank-shape',
+      kind: 'choice',
+      prompt: 'Why is the canonical pipeline "retrieve wide, rerank narrow"?',
+      options: [
+        { label: 'A bi-encoder is fast enough to search the corpus but cannot read query and document together; a cross-encoder is accurate but too slow to run over the corpus.', correct: true },
+        { label: 'Because cross-encoders require the candidate list to be at most ten documents.' },
+        { label: 'Because reranking improves recall, so the wide set can be small.' },
+        { label: 'Because fusion is only defined for narrow candidate sets.' }
+      ],
+      explanation: 'The two models have complementary cost profiles: cheap recall first over the whole corpus, expensive precision second over a shortlist of roughly 50–100 candidates, with the final 5–20 kept for the context.'
+    },
+    {
+      id: 'hybrid-rerank-colbert',
+      kind: 'choice',
+      prompt: 'Where does ColBERT sit, and what does MUVERA change?',
+      options: [
+        { label: 'ColBERT is late interaction — per-token vectors scored cheaply — between bi- and cross-encoders; MUVERA compresses it to single-vector MIPS.', correct: true },
+        { label: 'ColBERT is a cross-encoder with a smaller model; MUVERA is its training recipe.' },
+        { label: 'ColBERT is a learned sparse model; MUVERA is its quantisation scheme.' },
+        { label: 'ColBERT replaces BM25 in the first stage; MUVERA replaces the reranker.' }
+      ],
+      explanation: 'Late interaction keeps per-token vectors and scores a pair with a cheap max-similarity, sitting between the bi-encoder and the cross-encoder. Its cost is storage; MUVERA turns the multi-vector similarity into a single-vector maximum-inner-product search, cutting that cost.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

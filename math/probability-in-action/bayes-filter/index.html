@@ -1,0 +1,646 @@
+---
+title: "Probability in Action, Interactively — Part 16: The Bayes filter"
+description: "Track a hidden state from noisy motion and noisy sensors: the predict–update recursion that folds each reading into a belief, run by hand on a corridor that loops."
+permalink: "/math/probability-in-action/bayes-filter/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #bf-ring-canvas, #bf-hist-canvas, #bf-ent-canvas { margin-bottom: 2px; }
+  #wf-canvas, #bf-predict-canvas, #bf-update-canvas { margin-bottom: 2px; }
+  .bf-keys { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-600); }
+  .bf-bar { text-decoration: overline; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>The Bayes filter</h1>
+    <p>Nothing you measure is exactly what you want to know. A wheel encoder tells you how far the robot thinks it moved; a rangefinder tells you how far the wall probably is. Where is it, really? The Bayes filter answers by carrying an entire probability distribution over the hidden state and updating it in place, one motion model and one sensor model at a time. Each step is short: push the belief through the motion model to get a prediction, then fold in the reading. The old readings never have to be revisited, because the belief is a running summary of everything seen so far. That same recursion is underneath the Kalman filter, the hidden Markov model, and every particle filter you will meet; this part runs it by hand on a corridor that loops.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">A state you cannot see, from data you cannot trust</p>
+    <p>A robot drives along a corridor. Its true position, a single number along the corridor, is a <strong>hidden state</strong>: no sensor reports it directly. What you get instead are two weak signals. The first is a <strong>control</strong>, the command you sent &mdash; go forward about a metre &mdash; whose real effect is corrupted by wheel slip and a slightly uneven floor. The second is a <strong>measurement</strong>, a range reading to a wall or a landmark, which is corrupted by sensor noise and by the fact that several positions can produce similar readings. Neither signal is good enough alone, and you want them to combine.</p>
+    <p>It is tempting to keep a point estimate: start at the believed position, add the commanded motion, then nudge toward whatever the sensor says. That is what a great many robots do, and it fails in a specific and instructive way. Adding motions accumulates error, and the error accumulates faster than any single reading can correct for. Nudge too hard toward a noisy reading and you chase noise; nudge too softly and you drift. A point estimate throws away the one thing you need to set that balance: how uncertain you are.</p>
+    <p>The Bayes filter keeps uncertainty explicitly. Instead of one number it keeps a whole probability distribution over the state, written <var>bel(x<sub>t</sub>)</var>, the belief at time <var>t</var>. It is the probability of each possible position given every control and every measurement so far. A sharp spike means you know where you are; a broad smear means you do not. The width of that distribution is not a side note, it is the quantity that decides how much the next reading should be trusted.</p>
+    <p>The corridor in this part is a loop, a ring of known length. That choice is not just scenery. On a loop there is no boundary: position <var>x = L</var> is the same place as position <var>x = 0</var>, so probability that leaves one end of the number line re-enters at the other. If the state lives on a circle, the arithmetic has to respect that, and watching it happen is the clearest way to see why the filter is a convolution. By the end you will have watched the belief locate itself, and understood why the same two lines of reasoning run every filter in this volume.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> the filter is just Bayes' rule applied in a loop, where uncertainty grows in the predict step and shrinks in the update step, and why the corridor being a loop makes the predict step a wrapped convolution.</span></div>
+    <div class="g-toc">
+      <a href="#recursion">2 · The recursive Bayes filter</a>
+      <a href="#predict">3 · The predict step</a>
+      <a href="#update">4 · The update step</a>
+      <a href="#corridor">5 · Histogram filters and the corridor</a>
+      <a href="#shows">6 · Where this shows up</a>
+      <a href="#cheat">7 · Cheat sheet</a>
+      <a href="#reading">8 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="recursion">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The recursive Bayes filter</h2></div>
+    <p class="g-eyebrow">Two lines of Bayes, applied forever</p>
+    <p>Name the three objects. The state is <var>x<sub>t</sub></var>, the thing we want. The control is <var>u<sub>t</sub></var>, the action taken between the last step and this one. The measurement is <var>z<sub>t</sub></var>, the reading that arrives now. All we ever want is the belief, the posterior over the current state given the whole history of controls and measurements.</p>
+    <div class="g-math g-katex">$$bel(x_t)=p\!\left(x_t\mid z_{1:t},\,u_{1:t}\right).$$</div>
+    <p>Applied naively, that posterior is a nightmare: the history grows without limit, so each new step would require re-deriving the joint distribution over every past state. The recursion escapes the nightmare with two assumptions, each of which is a modelling decision you can check against the world. First, the <strong>Markov property</strong>: the current state is a sufficient summary of the past, so once you condition on <var>x<sub>t</sub></var>, older states add nothing. Second, the measurement depends only on the current state, not on how you got there. Under those two assumptions, the whole history collapses into the previous belief.</p>
+    <p>Write <var><span class="bf-bar">bel</span>(x<sub>t</sub>)</var> for the prediction, the belief before the new measurement is used, and <var>bel(x<sub>t</sub>)</var> for the belief after. The filter is then exactly two equations, repeated forever: propagate the previous belief through the motion model, then correct it with the measurement model.</p>
+    <div class="g-math g-katex">$$\overline{bel}(x_t)=\int p\!\left(x_t\mid u_t,\,x_{t-1}\right)bel(x_{t-1})\,dx_{t-1},\qquad bel(x_t)=\eta\,p\!\left(z_t\mid x_t\right)\overline{bel}(x_t).$$</div>
+    <p>The symbol <var>η</var> is a normalising constant, chosen so the corrected belief integrates to one. It is not arbitrary: it equals one over the total probability of the measurement, the evidence, and it is the number that would tell you how surprising this reading was under your model. The first equation is the law of total probability; the second is Bayes' rule. Nothing else is going on. Every named filter in this volume is a decision about how to represent the distribution and how to compute these two integrals.</p>
+    <p>That is the punchline of the whole subject, so it is worth saying slowly. Prediction adds uncertainty and moves probability with the motion. Correction removes uncertainty and pulls probability toward the measurement. Whatever representation you choose &mdash; a list of histograms, a mean and a covariance, a cloud of particles &mdash; the loop is the same, and the belief at time <var>t</var> is always a complete summary of the data up to time <var>t</var>. The animation below is this loop run eight times on the looped corridor, with the true position drawn as a dashed tick at each step.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="wf-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Each ridge is one full predict&ndash;then&ndash;update step. The filled shape is <var>bel(x)</var> across the corridor; the dashed tick inside it is the true position. The shapes start broad and settle onto the truth as measurements accumulate.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button type="button" id="wf-reseed">New run</button></div>
+        <div class="g-readout" id="wf-readout"></div>
+      </div>
+    </div>
+    <p>Watch the order of operations. Each ridge is a posterior: the prediction already happened, then the reading was folded in. The motion shifts each ridge slightly forward and blurs it; the reading sharpens it again around the true position. When the two happen in the other order the result is nearly identical, because the multiply and the convolution commute, but the standard order is predict then update because the world moves before it is measured.</p>
+  </section>
+
+  <section class="g-step" id="predict">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The predict step</h2></div>
+    <p class="g-eyebrow">Motion is a convolution, and it costs certainty</p>
+    <p>The motion model is the distribution <var>p(x<sub>t</sub> | u<sub>t</sub>, x<sub>t&minus;1</sub>)</var>: given that you were at <var>x<sub>t&minus;1</sub></var> and you applied control <var>u<sub>t</sub></var>, where could you be now? The control says where you tried to go; the model adds the spread of everything that could have gone wrong. The predict equation sums this over every place you might have started, weighted by how much you believed you were there. That weighted sum is a <strong>convolution</strong> of the belief with the motion kernel.</p>
+    <p>On a discretised corridor the integral becomes a sum over cells. If cell <var>j</var> is centred at <var>x<sub>j</sub></var> and cell <var>i</var> at <var>x<sub>i</sub></var>, the motion kernel is a probability over the displacement, and the new belief is the sum over old cells of old belief times kernel.</p>
+    <div class="g-math g-katex">$$\overline{bel}(x_i)=\sum_{j=1}^{n}p\!\left(x_i\mid u_t,\,x_j\right)bel(x_j),\qquad p\!\left(x_i\mid u_t,\,x_j\right)\propto\exp\!\left(-\frac{(x_i-x_j-u_t)^2}{2\sigma_u^2}\right).$$</div>
+    <p>Two effects are visible in that one line. The kernel is centred on the displacement <var>u<sub>t</sub></var>, so the belief translates: a step forward moves the whole shape forward. The kernel has width <var>σ<sub>u</sub></var>, so the belief blurs: a spread of possible displacements smears the shape outward. Translation is the signal you wanted, blur is the uncertainty you paid. Add up independent sources of motion noise and their variances add, so the belief only ever loses sharpness in this step. Nothing in the predict step can make you more certain.</p>
+    <p>The demo below applies exactly one predict to a known starting belief. Drag the shift to translate, drag the motion noise to blur, and toggle the wrap to see what the loop does. With wrap off, mass that crosses the right edge falls off the end of the corridor and is discarded; with wrap on it reappears at the left. That single toggle is the difference between a line and a circle, and it is the reason the state space in the next section is written modulo the corridor length.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="bf-predict-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Grey is the belief before motion, blue is the prediction <var><span class="bf-bar">bel</span></var> after one convolution. The dashed lines mark the old and new centres.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Motion noise σ<sub>u</sub> <span class="val">0.35</span></label><input type="range" id="bf-p-sigma" min="0" max="0.9" step="0.01" value="0.35"></div>
+        <div class="g-field"><label>Control shift u<sub>t</sub> <span class="val">0.90</span></label><input type="range" id="bf-p-shift" min="-1.5" max="1.5" step="0.05" value="0.9"></div>
+        <div class="g-btnrow"><button type="button" id="bf-p-wrap" class="active">Wrap on</button></div>
+        <div class="g-readout" id="bf-predict-readout"></div>
+      </div>
+    </div>
+    <p>One subtlety hides inside the kernel: real motion is rarely a pure translation with symmetric Gaussian noise. A differential-drive robot turning while it drives rotates the belief as well as shifting it, and the kernel becomes a rotation of the state space. For richer models the convolution is still the right mental picture, but the kernel is no longer a shift-invariant blur and the tidy sum above generalises to a matrix of transition probabilities. That matrix is a Markov chain, which is why the Markov-chains part of this volume and the hidden-Markov-model part are the same idea in different clothing.</p>
+  </section>
+
+  <section class="g-step" id="update">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The update step</h2></div>
+    <p class="g-eyebrow">A reading is a multiplication, and it buys certainty</p>
+    <p>The measurement model is the distribution <var>p(z<sub>t</sub> | x<sub>t</sub>)</var>: how likely would this reading be if the state were here? For a range sensor it is a bell centred at the true distance with width set by the sensor noise, plus whatever outliers your model allows. Bayes' rule turns that likelihood into a posterior by multiplying it into the prediction, cell by cell, and rescaling.</p>
+    <div class="g-math g-katex">$$bel(x_t)=\eta\,p\!\left(z_t\mid x_t\right)\overline{bel}(x_t),\qquad \eta=\left(\sum_{i}p\!\left(z_t\mid x_i\right)\overline{bel}(x_i)\right)^{-1}.$$</div>
+    <p>The word to hold onto is <strong>pointwise</strong>. This is not another convolution; it does not move probability around at all. Each cell keeps its own argument and is simply multiplied by how well that cell explains the reading. Cells where the sensor says the state cannot be get a small factor and shrink; cells where the sensor says the state would fit nicely get a large factor and grow. Then <var>η</var> rescales the whole array so it sums to one, and the belief is again a probability distribution.</p>
+    <p>The effect on sharpness is the mirror image of the predict step. For a Gaussian belief and a Gaussian sensor, the posterior is Gaussian, and its precision &mdash; one over the variance &mdash; is the sum of the two precisions. Sharp likelihood times sharp belief gives an even sharper posterior; a broad, noisy likelihood barely changes the shape. That is the quantitative version of an intuition you already have: a vague sensor tells you little, and the belief should not move much for it. It also explains a failure mode. If the likelihood is broad because the sensor is noisy, the update cannot re-sharpen a belief that motion keeps blurring, and the filter settles into a wide steady state.</p>
+    <div class="g-math g-katex">$$\frac{1}{\sigma_{\text{post}}^2}=\frac{1}{\sigma_{\text{prior}}^2}+\frac{1}{\sigma_{z}^2},\qquad H(bel)=-\sum_i bel(x_i)\log_2 bel(x_i)\ \text{bits}.$$</div>
+    <p>The demo below isolates the multiplication. The grey bars are a broad prior, the dashed curve is the sensor likelihood for one reading, and the blue bars are their pointwise product after normalisation. Move the reading and it slides the posterior toward itself; make the sensor noisier and the posterior relaxes back toward the prior. Nothing here is specific to corridors or robots. The update equation is Bayes' rule, so every Bayesian inference you have done is a one-step, one-cell update of this filter.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="bf-update-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Grey: the prediction <var><span class="bf-bar">bel</span></var>. Dashed: the likelihood <var>p(z|x)</var>, scaled to fit. Blue: the posterior, the pointwise product renormalised.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Reading z <span class="val">6.60</span></label><input type="range" id="bf-u-z" min="0" max="10" step="0.05" value="6.6"></div>
+        <div class="g-field"><label>Sensor noise σ<sub>z</sub> <span class="val">0.45</span></label><input type="range" id="bf-u-s" min="0.1" max="2" step="0.01" value="0.45"></div>
+        <div class="g-readout" id="bf-update-readout"></div>
+      </div>
+    </div>
+    <p>There is a reason this looks so much like the likelihood part of this volume. Index the cells and hold the reading fixed, and the array <var>p(z | x<sub>i</sub>)</var> is exactly a likelihood as a function of the unknown state. The filter is doing maximum-likelihood-flavoured inference at every step, except that it keeps the whole distribution and lets the motion model supply the prior from the previous instant. Priors made from yesterday's data, updated by today's: that is the recursion, and it is why the same code handles a static parameter and a moving robot.</p>
+  </section>
+
+  <section class="g-step" id="corridor">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Histogram filters and the corridor</h2></div>
+    <p class="g-eyebrow">Discretise the state, then let the loop do the work</p>
+    <p>The simplest representation of a belief is a list of numbers. Cut the corridor into <var>n</var> cells, store a probability for each, and require the list to sum to one. This is a <strong>histogram filter</strong>, and it makes both equations concrete. Prediction becomes a discrete convolution: each cell sprays its probability across nearby cells according to the motion kernel, and the wrapped index arithmetic keeps the loop closed. Correction becomes a pointwise multiply by the likelihood evaluated at each cell centre, followed by a divide so the list sums to one again.</p>
+    <div class="g-math g-katex">$$\overline{bel}(x_i)=\sum_{j=1}^{n}k\!\left(\tfrac{(i-j)\,\Delta x-u_t}{\sigma_u}\right)bel(x_j)\pmod n,\qquad bel(x_i)=\eta\,p\!\left(z_t\mid x_i\right)\overline{bel}(x_i).$$</div>
+    <p>The cell size <var>Δx = L/n</var> is the one real design choice. Finer cells resolve a sharper belief and let the reading pull the shape around more precisely, but the array grows and the convolution costs more. Coarser cells are cheap but pile up position error within each cell, and a belief narrower than a cell is smeared out almost immediately. The slider below lets you change the resolution and watch that trade-off directly: too few cells and the filter cannot express how sure it is.</p>
+    <p>The corridor being a loop changes the predict step from a truncation to a wrap. In the sum above, indices are taken modulo <var>n</var>, so probability that would have left the right-hand end of the array reappears at the left-hand end instead of vanishing. That is exactly what a circular corridor requires: walking off the end of the corridor puts you back at the start. If you forget the wrap and use a straight line instead, the belief quietly loses probability at the edges and the filter becomes confidently wrong near the seam. The wrap arrow drawn across the top of the histogram, and the ring below it, are the same statement in two pictures.</p>
+    <p>The final ingredient is a way to say how much the filter knows, and entropy answers it. A uniform belief over <var>n</var> cells has entropy <var>log<sub>2</sub> n</var> bits, the maximum possible; a belief concentrated on one cell has entropy zero. Predict blurs, so it raises entropy; update multiplies, so it lowers it. Run the loop and the entropy trace falls as readings accumulate, until it levels off at the point where the information each reading brings is exactly cancelled by the uncertainty each motion adds. That plateau is the best the filter can do with this sensor and this motion, and it is the honest answer to "how well do we know where the robot is?"</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="bf-ring-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">The ring is the corridor: it has no ends, so position <var>L</var> is the same place as position <var>0</var>. Bars point inward to show <var>bel(x)</var>; the dot marks the true position, the triangle marks the sensor reading.</p>
+        <canvas id="bf-hist-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">The same belief as a flat histogram. The two dashed lines are the true position and the reading; the arrow across the top is the wrap from <var>x = L</var> back to <var>x = 0</var>.</p>
+        <canvas id="bf-ent-canvas" width="640" height="180"></canvas>
+        <p class="g-canvas-hint">Entropy of the belief in bits after each step. It starts at the uniform maximum and falls as readings sharpen the belief, then plateaus.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="bf-predict" class="g-primary">Predict</button>
+          <button type="button" id="bf-update" class="g-primary">Update</button>
+          <button type="button" id="bf-step">Predict + update</button>
+          <button type="button" id="bf-reset">Reset</button>
+        </div>
+        <div class="g-field"><label>Motion noise σ<sub>u</sub> <span class="val">0.35</span></label><input type="range" id="bf-msigma" min="0.05" max="0.8" step="0.01" value="0.35"></div>
+        <div class="g-field"><label>Control shift u<sub>t</sub> <span class="val">0.80</span></label><input type="range" id="bf-shift" min="-1.2" max="1.2" step="0.05" value="0.8"></div>
+        <div class="g-field"><label>Sensor noise σ<sub>z</sub> <span class="val">0.40</span></label><input type="range" id="bf-zsigma" min="0.05" max="1.2" step="0.01" value="0.4"></div>
+        <div class="g-field"><label>Corridor cells n <span class="val">40</span></label><input type="range" id="bf-cells" min="10" max="80" step="5" value="40"></div>
+        <div class="g-readout" id="bf-readout"></div>
+        <p class="bf-keys">Keys: <b>P</b> predict · <b>U</b> update · <b>R</b> reset</p>
+      </div>
+    </div>
+    <p>Step it by hand and watch the story unfold. Press <em>Predict</em> a few times with the shift positive and the robot marches forward while the belief smears and slides; press <em>Update</em> and the reading snaps it back to a peak, occasionally to the wrong place on the loop when the sensor is noisy. Then raise the sensor noise slider and repeat: each reading now barely reshapes the belief, so the smear from the motion wins, the entropy plateau rises, and the dot and the triangle drift apart. Lower it again and the peak tightens. That single slider is the whole trade-off between trusting your model and trusting your senses, and the entropy trace is the ledger that records it.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One recursion, many filters</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Odometry fused with sensors</h3>
+        <p style="margin-bottom:0;">Every mobile robot fuses <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">odometry</a> with range and bearing readings through exactly this recursion. Odometry is the motion model; the rangefinder is the measurement model; the belief over pose is what the navigation stack consumes.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">SLAM is this filter, plus a map</h3>
+        <p style="margin-bottom:0;">Simultaneous localisation and mapping in <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">nonlinear optimization</a> runs the Bayes filter over a joint state of robot pose and landmark positions. The predict step is the motion model, and the update step conditions on every observed feature at once.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Hidden Markov models</h3>
+        <p style="margin-bottom:0;">A <a href="{{ '/math/probability-in-action/hmm/' | relative_url }}">hidden Markov model</a> is this filter on a finite state set. The forward algorithm is the predict&ndash;update recursion in matrix form, and <var><span class="bf-bar">bel</span></var> before normalisation is the forward message the next part of the trellis builds on.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Kalman filters are the Gaussian special case</h3>
+        <p style="margin-bottom:0;">If the belief and both models are Gaussian, the convolution and the pointwise product have closed forms, and the <a href="{{ '/math/probability-in-action/kalman/' | relative_url }}">Kalman filter</a> tracks a mean and a covariance instead of an array. The next part of this volume derives it directly from these two equations.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Intuition</th></tr></thead>
+      <tbody>
+        <tr><td>Belief</td><td><var>bel(x<sub>t</sub>) = p(x<sub>t</sub> | z<sub>1:t</sub>, u<sub>1:t</sub>)</var></td><td>The full posterior over the hidden state; a running summary of all data.</td></tr>
+        <tr><td>Predict</td><td><var><span class="bf-bar">bel</span>(x<sub>t</sub>) = ∫ p(x<sub>t</sub> | u<sub>t</sub>, x<sub>t&minus;1</sub>) bel(x<sub>t&minus;1</sub>) dx<sub>t&minus;1</sub></var></td><td>Convolve with the motion model: translates the belief and blurs it.</td></tr>
+        <tr><td>Update</td><td><var>bel(x<sub>t</sub>) = &eta; p(z<sub>t</sub> | x<sub>t</sub>) <span class="bf-bar">bel</span>(x<sub>t</sub>)</var></td><td>Multiply pointwise by the likelihood, then renormalise.</td></tr>
+        <tr><td>Discrete predict</td><td><var><span class="bf-bar">bel</span>(x<sub>i</sub>) = &Sigma;<sub>j</sub> p(x<sub>i</sub> | u<sub>t</sub>, x<sub>j</sub>) bel(x<sub>j</sub>)</var></td><td>A sum over source cells; the transition kernel spreads each cell.</td></tr>
+        <tr><td>Discrete update</td><td><var>bel(x<sub>i</sub>) = &eta; p(z<sub>t</sub> | x<sub>i</sub>) <span class="bf-bar">bel</span>(x<sub>i</sub>)</var></td><td>Cell by cell multiplication; no probability moves between cells.</td></tr>
+        <tr><td>Normaliser</td><td><var>&eta; = 1 / &Sigma;<sub>i</sub> p(z<sub>t</sub> | x<sub>i</sub>) <span class="bf-bar">bel</span>(x<sub>i</sub>)</var></td><td>One over the evidence; makes the posterior sum to one.</td></tr>
+        <tr><td>Gaussian fusion</td><td><var>1/&sigma;<sub>post</sub><sup>2</sup> = 1/&sigma;<sub>prior</sub><sup>2</sup> + 1/&sigma;<sub>z</sub><sup>2</sup></var></td><td>Fusing sharpens: precisions add, so uncertainty shrinks.</td></tr>
+        <tr><td>Wrap</td><td><var>i &rarr; (i mod n)</var></td><td>On a loop, mass leaving one end re-enters at the other.</td></tr>
+        <tr><td>Entropy</td><td><var>H(bel) = &minus;&Sigma;<sub>i</sub> bel(x<sub>i</sub>) log<sub>2</sub> bel(x<sub>i</sub>)</var></td><td>Predict raises it, update lowers it; the plateau is the best achievable.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>Sebastian Thrun, Wolfram Burgard, Dieter Fox, <em>Probabilistic Robotics</em>, 2005, chapters 2&ndash;4 &mdash; the recursive Bayes filter, the histogram filter, and the looped-corridor example this part is built on.</li>
+      <li>Stuart Russell and Peter Norvig, <em>Artificial Intelligence: A Modern Approach</em>, chapter 14 &mdash; the same recursion written for a computer-science audience, with the HMM as a special case.</li>
+      <li>Dieter Fox, Wolfram Burgard, Frank Dellaert, <em>Monte Carlo Localization: Efficient Position Estimation for Mobile Robots</em>, 1999 &mdash; the particle-filter version of this filter, with the same predict and update steps.</li>
+      <li>Simo Särkkä, <em>Bayesian Filtering and Smoothing</em>, 2013 &mdash; the continuous-state story and the Kalman, extended Kalman and sigma-point filters derived from the same two lines.</li>
+      <li>David MacKay, <em>Information Theory, Inference, and Learning Algorithms</em>, chapters 23&ndash;24 &mdash; the HMM forward algorithm and the view of the filter as message passing on a chain.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Keep the belief Gaussian and both steps collapse to closed-form updates of a mean and a covariance &mdash; that is the Kalman filter, and its nonlinear cousin the EKF.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var CORR = { L: 10, n: 40 };
+  function el(id) { return document.getElementById(id); }
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+  function gauss(x, mu, s) { var z = (x - mu) / s; return Math.exp(-0.5 * z * z); }
+  function wrapX(x) { var L = CORR.L; return ((x % L) + L) % L; }
+  function circDist(a, b) { var d = Math.abs(a - b); return Math.min(d, CORR.L - d); }
+  function like(z, s) { return function (x) { return gauss(circDist(x, z), 0, s); }; }
+  function bits(bel) { return Prob.info.entropy(bel, { base: 2 }); }
+  function meanOf(bel, centers) {
+    var s = 0, i;
+    for (i = 0; i < bel.length; i++) s += bel[i] * centers[i];
+    return s;
+  }
+  function sdOf(bel, centers) {
+    var m = meanOf(bel, centers), s = 0, i;
+    for (i = 0; i < bel.length; i++) s += bel[i] * (centers[i] - m) * (centers[i] - m);
+    return Math.sqrt(Math.max(s, 0));
+  }
+  // ==================================================================
+  // Demo A — one predict-then-update per ridge, eight steps
+  // ==================================================================
+  var wf = { seed: 20260914, snap: [], trues: [] };
+  var wfCv = null;
+  function buildWaterfall() {
+    var f = Prob.filters.histogramFilter({ n: CORR.n, x0: 0, x1: CORR.L });
+    f.setPrior(function (x) { return gauss(x, 5, 0.6); });
+    var r = Prob.rng(wf.seed);
+    var xt = wrapX(5 + r.normal(0, 0.25));
+    var snap = [], trues = [];
+    for (var k = 0; k < 8; k++) {
+      var u = 0.9 + r.normal(0, 0.05);
+      xt = wrapX(xt + u);
+      f.predict({ sigma: 0.28, shift: u, wrap: true });
+      var z = wrapX(xt + r.normal(0, 0.32));
+      f.update(like(z, 0.32));
+      snap.push(f.bel.slice());
+      trues.push(xt);
+    }
+    wf.snap = snap;
+    wf.trues = trues;
+  }
+  function drawWaterfall() {
+    if (!wfCv) return;
+    var ctx = wfCv.ctx, W = 640, H = 360, i, k;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 56, padR = 22, padT = 26, padB = 34;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var K = wf.snap.length;
+    if (!K) return;
+    function X(x) { return padL + plotW * x / CORR.L; }
+    var gm = 1e-6;
+    for (k = 0; k < K; k++) for (i = 0; i < wf.snap[k].length; i++) gm = Math.max(gm, wf.snap[k][i]);
+    var rowGap = plotH / K;
+    var scale = rowGap * 0.86 / gm;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    for (k = 0; k < K; k++) {
+      var bel = wf.snap[k], n = bel.length, baseY = padT + rowGap * (k + 1);
+      ctx.beginPath();
+      ctx.moveTo(X(0), baseY);
+      for (i = 0; i < n; i++) ctx.lineTo(X((i + 0.5) * CORR.L / n), baseY - bel[i] * scale);
+      ctx.lineTo(X(CORR.L), baseY);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(43,95,255,' + (0.10 + 0.11 * k).toFixed(2) + ')';
+      ctx.fill();
+      ctx.strokeStyle = c.accent; ctx.lineWidth = 1.1; ctx.stroke();
+      var tx = X(wf.trues[k]);
+      ctx.strokeStyle = c.accent2; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(tx, baseY); ctx.lineTo(tx, baseY - rowGap * 0.86); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('t = ' + (k + 1), padL + 3, baseY - 4);
+    }
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6; ctx.beginPath();
+    for (k = 0; k < K; k++) {
+      var yy = padT + rowGap * (k + 1) - rowGap * 0.86;
+      if (k === 0) ctx.moveTo(X(wf.trues[k]), yy); else ctx.lineTo(X(wf.trues[k]), yy);
+    }
+    ctx.setLineDash([5, 4]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    for (i = 0; i <= 4; i++) { ctx.fillRect(X(i * CORR.L / 4), padT + plotH, 1, 4); ctx.fillText(String(i * CORR.L / 4), X(i * CORR.L / 4), padT + plotH + 16); }
+    ctx.fillText('position x along the corridor', padL + plotW / 2, H - 6);
+    ctx.textAlign = 'left'; ctx.fillText('dashed line: true position', padL, padT - 10);
+    var cen = wf.snap[K - 1].map(function (_v, ii) { return (ii + 0.5) * CORR.L / CORR.n; });
+    el('wf-readout').innerHTML =
+      '<div><span class="k">steps</span> <span class="hi">' + K + '</span> &nbsp; <span class="k">final entropy</span> ' + bits(wf.snap[K - 1]).toFixed(2) + ' bits &nbsp; <span class="k">final sd</span> ' + sdOf(wf.snap[K - 1], cen).toFixed(3) + '</div>' +
+      '<div style="margin-top:6px;">Motion blurs and shifts each ridge; the reading sharpens it back around the truth.</div>';
+  }
+  wfCv = Guide.setupCanvas(el('wf-canvas'), 640, 360, drawWaterfall);
+  buildWaterfall();
+  drawWaterfall();
+  el('wf-reseed').addEventListener('click', function () {
+    wf.seed = (wf.seed * 1103515245 + 12345) % 2147483647;
+    buildWaterfall();
+    drawWaterfall();
+  });
+  // ==================================================================
+  // Demo B — one predict: convolution = shift plus blur, optionally wrapped
+  // ==================================================================
+  var pf = { sigma: 0.35, shift: 0.9, wrap: true };
+  var pfPlot = null;
+  function pfBase() {
+    var f = Prob.filters.histogramFilter({ n: CORR.n, x0: 0, x1: CORR.L });
+    f.setPrior(function (x) { return gauss(x, 5, 0.45); });
+    return f;
+  }
+  function drawPredict() {
+    if (!pfPlot) return;
+    var pl = pfPlot, i;
+    var base = pfBase();
+    var pred = pfBase();
+    pred.predict({ sigma: pf.sigma, shift: pf.shift, wrap: pf.wrap });
+    var mx = 1e-9;
+    for (i = 0; i < base.bel.length; i++) mx = Math.max(mx, base.bel[i], pred.bel[i]);
+    pl.yRange[0] = 0;
+    pl.yRange[1] = mx * 1.3;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var dx = pred.dx, b1 = [], b2 = [];
+    for (i = 0; i < base.bel.length; i++) {
+      b1.push({ x0: i * dx, x1: (i + 1) * dx, y: base.bel[i] });
+      b2.push({ x0: i * dx, x1: (i + 1) * dx, y: pred.bel[i] });
+    }
+    pl.bars(b1, { color: 'rgba(32,30,29,0.14)', label: 'bel before motion' });
+    pl.bars(b2, { color: 'rgba(43,95,255,0.58)', label: 'prediction' });
+    pl.vline(5, { color: c.text, dash: [4, 3], labelText: 'centre' });
+    pl.vline(wrapX(5 + pf.shift), { color: c.accent2, dash: [4, 3], labelText: 'after shift' });
+    pl.axes({ step: 1, xLabel: 'position x', yLabel: 'probability per cell' });
+    pl.legend();
+    var before = bits(base.bel), after = bits(pred.bel);
+    el('bf-predict-readout').innerHTML =
+      '<div><span class="k">u</span> <span class="hi">' + pf.shift.toFixed(2) + '</span> &nbsp; <span class="k">σ<sub>u</sub></span> ' + pf.sigma.toFixed(2) + ' &nbsp; <span class="k">wrap</span> ' + (pf.wrap ? 'on' : 'off') + '</div>' +
+      '<div><span class="k">entropy before &rarr; after</span> ' + before.toFixed(2) + ' &rarr; ' + after.toFixed(2) + ' bits</div>' +
+      '<div style="margin-top:6px;">A convolution cannot sharpen: it translates the belief and widens it by the motion noise.</div>';
+  }
+  pfPlot = Prob.plot(el('bf-predict-canvas'), { W: 640, H: 300, xRange: [0, CORR.L], yRange: [0, 1], onResize: drawPredict });
+  Guide.bindSliders([el('bf-p-sigma')], function (s) { pf.sigma = parseFloat(s.value); drawPredict(); });
+  Guide.bindSliders([el('bf-p-shift')], function (s) { pf.shift = parseFloat(s.value); drawPredict(); });
+  el('bf-p-wrap').addEventListener('click', function () {
+    pf.wrap = !pf.wrap;
+    this.classList.toggle('active', pf.wrap);
+    this.textContent = pf.wrap ? 'Wrap on' : 'Wrap off';
+    drawPredict();
+  });
+  drawPredict();
+  // ==================================================================
+  // Demo C — one update: pointwise product, then renormalise
+  // ==================================================================
+  var up = { z: 6.6, s: 0.45 };
+  var upPlot = null;
+  function drawUpdate() {
+    if (!upPlot) return;
+    var pl = upPlot, i;
+    var f = Prob.filters.histogramFilter({ n: CORR.n, x0: 0, x1: CORR.L });
+    f.setPrior(function (x) { return gauss(x, 5, 1.1); });
+    var prior = f.bel.slice(), centers = f.centers, dx = f.dx;
+    var lv = [], lmax = 1e-9, post = [], sum = 0;
+    for (i = 0; i < centers.length; i++) {
+      var v = like(up.z, up.s)(centers[i]);
+      lv.push(v); lmax = Math.max(lmax, v);
+    }
+    for (i = 0; i < centers.length; i++) { var p = prior[i] * lv[i]; post.push(p); sum += p; }
+    for (i = 0; i < centers.length; i++) post[i] = sum > 0 ? post[i] / sum : 1 / centers.length;
+    var mx = 1e-9;
+    for (i = 0; i < centers.length; i++) mx = Math.max(mx, prior[i], post[i]);
+    pl.yRange[0] = 0;
+    pl.yRange[1] = mx * 1.3;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var bp = [], bq = [];
+    for (i = 0; i < centers.length; i++) {
+      bp.push({ x0: i * dx, x1: (i + 1) * dx, y: prior[i] });
+      bq.push({ x0: i * dx, x1: (i + 1) * dx, y: post[i] });
+    }
+    pl.bars(bp, { color: 'rgba(32,30,29,0.13)', label: 'prior prediction' });
+    pl.curve(function (x) { return (like(up.z, up.s)(x) / lmax) * mx * 0.9; },
+      { color: c.accent2, width: 2, dash: [6, 4], from: 0, to: CORR.L, samples: 240, label: 'likelihood p(z|x), scaled' });
+    pl.bars(bq, { color: 'rgba(43,95,255,0.62)', label: 'posterior bel' });
+    pl.vline(up.z, { color: c.accent2, dash: [3, 3], labelText: 'z' });
+    pl.axes({ step: 1, xLabel: 'position x', yLabel: 'probability per cell' });
+    pl.legend();
+    var hp = bits(prior), hq = bits(post);
+    var sp = sdOf(prior, centers), sq = sdOf(post, centers);
+    var postVar = 1 / (1 / (sp * sp + 1e-9) + 1 / (up.s * up.s));
+    el('bf-update-readout').innerHTML =
+      '<div><span class="k">z</span> <span class="hi">' + up.z.toFixed(2) + '</span> &nbsp; <span class="k">σ<sub>z</sub></span> ' + up.s.toFixed(2) + '</div>' +
+      '<div><span class="k">prior sd &rarr; posterior sd</span> ' + sp.toFixed(3) + ' &rarr; ' + sq.toFixed(3) + ' (predicted ' + Math.sqrt(Math.max(postVar, 0)).toFixed(3) + ')</div>' +
+      '<div><span class="k">entropy prior &rarr; posterior</span> ' + hp.toFixed(2) + ' &rarr; ' + hq.toFixed(2) + ' bits</div>' +
+      '<div style="margin-top:6px;">The posterior is the pointwise product; a wider likelihood leaves the prior almost untouched.</div>';
+  }
+  upPlot = Prob.plot(el('bf-update-canvas'), { W: 640, H: 300, xRange: [0, CORR.L], yRange: [0, 1], onResize: drawUpdate });
+  Guide.bindSliders([el('bf-u-z')], function (s) { up.z = parseFloat(s.value); drawUpdate(); });
+  Guide.bindSliders([el('bf-u-s')], function (s) { up.s = parseFloat(s.value); drawUpdate(); });
+  drawUpdate();
+  // ==================================================================
+  // Demo D — the full histogram filter on the looped corridor
+  // ==================================================================
+  var bf = { seed: 20260914, n: 40, motionSigma: 0.35, shift: 0.8, measSigma: 0.4, truePos: 5, z: 5, steps: 0, hist: [], filter: null, rng: null };
+  var ringCv = null, histPlot = null, entPlot = null;
+  function bfReset(newSeed) {
+    if (newSeed) bf.seed = (bf.seed * 1103515245 + 12345) % 2147483647;
+    bf.filter = Prob.filters.histogramFilter({ n: bf.n, x0: 0, x1: CORR.L });
+    bf.filter.setPrior(function () { return 1; });
+    bf.rng = Prob.rng(bf.seed);
+    bf.truePos = 5;
+    bf.z = wrapX(bf.truePos + bf.rng.normal(0, bf.measSigma));
+    bf.steps = 0;
+    bf.hist = [bits(bf.filter.bel)];
+  }
+  function bfPush() {
+    bf.steps += 1;
+    bf.hist.push(bits(bf.filter.bel));
+    if (bf.hist.length > 60) bf.hist.shift();
+  }
+  function bfPredict() {
+    var u = bf.shift + bf.rng.normal(0, bf.motionSigma);
+    bf.truePos = wrapX(bf.truePos + u);
+    bf.filter.predict({ sigma: bf.motionSigma, shift: u, wrap: true });
+    bfPush();
+  }
+  function bfUpdate() {
+    var z = wrapX(bf.truePos + bf.rng.normal(0, bf.measSigma));
+    bf.z = z;
+    bf.filter.update(like(z, bf.measSigma));
+    bfPush();
+  }
+  function bfAngle(x) { return -Math.PI / 2 + 2 * Math.PI * (wrapX(x) / CORR.L); }
+  function drawRing() {
+    if (!ringCv) return;
+    var ctx = ringCv.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var cx = W / 2, cy = 182, R = 112, gap = 0.07, maxLen = 62;
+    var bel = bf.filter.bel, n = bel.length, dx = CORR.L / n, i;
+    var mx = 1e-9;
+    for (i = 0; i < n; i++) mx = Math.max(mx, bel[i]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, -Math.PI / 2 + gap, -Math.PI / 2 + 2 * Math.PI - gap);
+    ctx.lineWidth = 16; ctx.strokeStyle = 'rgba(32,30,29,0.08)'; ctx.stroke();
+    for (i = 0; i < n; i++) {
+      var a0 = bfAngle((i + 0.06) * dx), a1 = bfAngle((i + 0.94) * dx);
+      var len = Math.max(1.5, (bel[i] / mx) * maxLen);
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, a0, a1);
+      ctx.arc(cx, cy, R - len, a1, a0, true);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(43,95,255,0.55)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(11,60,208,0.7)'; ctx.lineWidth = 0.6; ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, 2 * Math.PI);
+    ctx.lineWidth = 0.8; ctx.strokeStyle = 'rgba(32,30,29,0.18)'; ctx.stroke();
+    var x0 = cx - 28, x1 = cx + 28, ySeam = cy - R - 26;
+    ctx.strokeStyle = 'rgba(214,0,108,0.7)'; ctx.lineWidth = 1.4; ctx.setLineDash([5, 3]);
+    ctx.beginPath(); ctx.moveTo(x0, ySeam); ctx.lineTo(x1, ySeam); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(214,0,108,0.9)'; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('wrap: x = L enters at x = 0', cx, ySeam - 7);
+    ctx.fillText('x = 0 / x = L', cx, ySeam + 17);
+    function mark(x, rad, color, tri) {
+      var a = bfAngle(x), pxp = cx + rad * Math.cos(a), pyp = cy + rad * Math.sin(a);
+      ctx.fillStyle = color; ctx.beginPath();
+      if (tri) { ctx.moveTo(pxp + 7 * Math.sin(a), pyp - 7 * Math.cos(a)); ctx.lineTo(pxp - 7 * Math.sin(a), pyp + 7 * Math.cos(a)); ctx.lineTo(cx + (rad - 3) * Math.cos(a), cy + (rad - 3) * Math.sin(a)); }
+      else ctx.arc(pxp, pyp, 6, 0, 2 * Math.PI);
+      ctx.closePath(); ctx.fill();
+    }
+    mark(bf.truePos, R + 22, c.accent2, false);
+    mark(bf.z, R + 44, c.accent700, true);
+    var m = meanOf(bel, bf.filter.centers), a = bfAngle(m);
+    ctx.beginPath();
+    ctx.arc(cx + R * Math.cos(a), cy + R * Math.sin(a), 4, 0, 2 * Math.PI);
+    ctx.fillStyle = '#ffffff'; ctx.fill();
+    ctx.lineWidth = 1.6; ctx.strokeStyle = c.accent; ctx.stroke();
+    var legX = 14, legY = 18;
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(legX + 4, legY - 4, 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.text; ctx.fillText('true position', legX + 14, legY);
+    ctx.fillStyle = c.accent700; ctx.beginPath();
+    ctx.moveTo(legX + 6, legY + 12); ctx.lineTo(legX, legY + 24); ctx.lineTo(legX + 12, legY + 24);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = c.text; ctx.fillText('measurement z', legX + 14, legY + 22);
+    ctx.textAlign = 'center';
+  }
+  function drawHist() {
+    if (!histPlot) return;
+    var pl = histPlot, bel = bf.filter.bel, n = bel.length, dx = CORR.L / n, i;
+    var mx = 1e-9;
+    for (i = 0; i < n; i++) mx = Math.max(mx, bel[i]);
+    pl.yRange[0] = 0;
+    pl.yRange[1] = mx * 1.35;
+    pl.clear();
+    pl.grid({ step: 1 });
+    var items = [];
+    for (i = 0; i < n; i++) items.push({ x0: i * dx, x1: (i + 1) * dx, y: bel[i], color: 'rgba(43,95,255,0.6)' });
+    pl.bars(items, {});
+    pl.vline(bf.truePos, { color: c.accent2, dash: [5, 4], labelText: 'true x' });
+    pl.vline(bf.z, { color: c.accent700, dash: [2, 3], labelText: 'z' });
+    pl.vline(meanOf(bel, bf.filter.centers), { color: c.accent, labelText: 'E[x]' });
+    pl.axes({ step: 1, xLabel: 'corridor position x', yLabel: 'bel(x)' });
+    var ctx = pl.ctx, yT = 28;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(214,0,108,0.45)'; ctx.lineWidth = 1.3; ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pl.px(CORR.L), yT);
+    ctx.bezierCurveTo(pl.px(7.5), yT + 12, pl.px(2.5), yT + 12, pl.px(0), yT);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(214,0,108,0.85)'; ctx.font = '11px ' + c.font;
+    ctx.textAlign = 'right'; ctx.fillText('to x = 0', pl.px(CORR.L), yT + 24);
+    ctx.textAlign = 'left'; ctx.fillText('from x = L', pl.px(0), yT + 24);
+    ctx.restore();
+  }
+  function drawEnt() {
+    if (!entPlot) return;
+    var pl = entPlot, i;
+    pl.clear();
+    pl.grid({ step: 1 });
+    pl.hline(Math.log(bf.n) / Math.LN2, { color: c.divider, dash: [4, 4], labelText: 'uniform maximum' });
+    var items = [];
+    for (i = 0; i < bf.hist.length; i++) items.push({ x: i + 0.5, y: bf.hist[i] });
+    pl.bars(items, { color: 'rgba(43,95,255,0.55)', width: 0.7 });
+    pl.axes({ step: 1, xLabel: 'step (most recent 60)', yLabel: 'entropy (bits)' });
+  }
+  function drawMain() { drawRing(); drawHist(); drawEnt(); updateBfReadout(); }
+  function updateBfReadout() {
+    if (!bf.filter) return;
+    var bel = bf.filter.bel, centers = bf.filter.centers;
+    var H = bits(bel), Hmax = Math.log(bf.n) / Math.LN2;
+    el('bf-readout').innerHTML =
+      '<div><span class="k">true x / z</span> <span class="hi">' + bf.truePos.toFixed(2) + '</span> / ' + bf.z.toFixed(2) + ' &nbsp; <span class="k">mean E[x]</span> ' + meanOf(bel, centers).toFixed(3) + ' &nbsp; <span class="k">sd</span> ' + sdOf(bel, centers).toFixed(3) + '</div>' +
+      '<div><span class="k">entropy</span> <span class="hi">' + H.toFixed(2) + '</span> / ' + Hmax.toFixed(2) + ' bits &nbsp; <span class="k">steps</span> ' + bf.steps + ' &nbsp; <span class="k">cells</span> ' + bf.n + '</div>' +
+      '<div style="margin-top:6px;">Predict blurs and shifts the belief; update multiplies by the likelihood and sharpens it. Raise the sensor noise and watch the entropy plateau rise.</div>';
+  }
+  bfReset(false);
+  Guide.bindSliders([el('bf-msigma')], function (s) { bf.motionSigma = parseFloat(s.value); });
+  Guide.bindSliders([el('bf-shift')], function (s) { bf.shift = parseFloat(s.value); });
+  Guide.bindSliders([el('bf-zsigma')], function (s) { bf.measSigma = parseFloat(s.value); });
+  Guide.bindSliders([el('bf-cells')], function (s) {
+    bf.n = parseInt(s.value, 10);
+    bfReset(true);
+    drawMain();
+  });
+  ringCv = Guide.setupCanvas(el('bf-ring-canvas'), 640, 360, drawRing);
+  histPlot = Prob.plot(el('bf-hist-canvas'), { W: 640, H: 300, padT: 22, xRange: [0, CORR.L], yRange: [0, 1], onResize: drawMain });
+  entPlot = Prob.plot(el('bf-ent-canvas'), { W: 640, H: 180, xRange: [0, 60], yRange: [0, 6.5], onResize: drawMain });
+  el('bf-predict').addEventListener('click', function () { bfPredict(); drawMain(); });
+  el('bf-update').addEventListener('click', function () { bfUpdate(); drawMain(); });
+  el('bf-step').addEventListener('click', function () { bfPredict(); bfUpdate(); drawMain(); });
+  el('bf-reset').addEventListener('click', function () { bfReset(true); drawMain(); });
+  document.addEventListener('keydown', function (e) {
+    var tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === 'p' || e.key === 'P') { bfPredict(); drawMain(); }
+    else if (e.key === 'u' || e.key === 'U') { bfUpdate(); drawMain(); }
+    else if (e.key === 'r' || e.key === 'R') { bfReset(true); drawMain(); }
+  });
+  drawMain();
+  // ==================================================================
+  // Check your understanding
+  // ==================================================================
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'bayes-filter-predict-op',
+      kind: 'choice',
+      prompt: 'What does the predict step do to the belief?',
+      options: [{ label: 'It convolves the belief with the motion model, which translates it and widens it.', correct: true }, { label: 'It multiplies the belief by the measurement likelihood, which sharpens it.', correct: false }, { label: 'It resets the belief to the uniform distribution over the corridor.', correct: false }],
+      explanation: 'Prediction is the law of total probability: the belief is spread by the motion kernel. The kernel centre is the control, so the belief shifts, and the kernel width is the motion noise, so the belief blurs. Uncertainty can only grow here.'
+    },
+    {
+      id: 'bayes-filter-uniform-entropy',
+      kind: 'numeric',
+      prompt: 'A belief is uniform over 8 corridor cells. Its entropy is <var>log<sub>2</sub> 8</var> bits. What is that value?',
+      answer: 3,
+      tolerance: 0.01,
+      explanation: 'Entropy of a uniform distribution over N equally likely cells is log2 N = log2 8 = 3 bits, the maximum for 8 cells. A belief concentrated on one cell has entropy 0.'
+    },
+    {
+      id: 'bayes-filter-update-op',
+      kind: 'choice',
+      prompt: 'Which operation is the measurement update?',
+      options: [{ label: 'Multiply the prediction pointwise by <var>p(z|x)</var>, then renormalise so the result sums to one.', correct: true }, { label: 'Convolve the prediction with the sensor noise kernel.', correct: false }, { label: 'Shift the prediction by the reading z.', correct: false }],
+      explanation: 'The update is Bayes rule: bel(x) = η p(z|x) bel̄(x). It is pointwise because each cell keeps its own position and is only reweighted by how well it explains the reading. The convolution belongs to the predict step.'
+    },
+    {
+      id: 'bayes-filter-precision',
+      kind: 'numeric',
+      prompt: 'A Gaussian belief has variance 4 and a Gaussian sensor has variance 4. The posterior variance is <var>(1/4 + 1/4)<sup>&minus;1</sup></var>. What is it?',
+      answer: 2,
+      tolerance: 0.01,
+      explanation: 'Precisions add: 1/4 + 1/4 = 1/2, so the posterior variance is 2 and the posterior precision is 0.5. Fusing two equally uncertain Gaussians halves the variance; uncertainty shrinks rather than grows.'
+    },
+    {
+      id: 'bayes-filter-eta',
+      kind: 'choice',
+      prompt: 'What is the normaliser <var>&eta;</var> in <var>bel(x) = &eta; p(z|x) bel&#773;(x)</var>?',
+      options: [{ label: 'One over the sum of the unnormalised product, so the posterior sums to one.', correct: true }, { label: 'The prior probability of the state before the reading.', correct: false }, { label: 'The variance of the motion noise.', correct: false }],
+      explanation: 'η = 1 / Σ p(z|xi) bel̄(xi) is the reciprocal of the evidence, the total probability of seeing this reading. It cancels the arbitrary scale of the multiplication and makes the result a genuine distribution.'
+    },
+    {
+      id: 'bayes-filter-wrap',
+      kind: 'choice',
+      prompt: 'Why does the corridor being a loop matter for the predict step?',
+      options: [{ label: 'Probability that leaves one end of the corridor re-enters at the other end, so the convolution wraps.', correct: true }, { label: 'It means the state never changes, so prediction is unnecessary.', correct: false }, { label: 'It forces the belief to stay uniform at all times.', correct: false }],
+      explanation: 'On a loop, x = L and x = 0 are the same place, so the convolution indices are taken modulo the number of cells. Omit the wrap and the belief silently loses probability at the seam, leaving the filter confidently wrong at the ends.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

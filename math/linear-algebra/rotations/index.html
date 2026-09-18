@@ -1,0 +1,451 @@
+---
+title: "Linear Algebra, Interactively — Part 20: Rotations, SO(3) and the exponential map"
+description: "Orthonormal matrices with determinant one, angle-axis rotations and the matrix exponential, gimbal lock, and how slerp keeps interpolation on the manifold."
+permalink: "/math/linear-algebra/rotations/"
+section: "math"
+series: "linear_algebra"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true plotly=true %}
+<style>
+  .g-plot3d { width: 100%; height: 380px; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-rot-readout .row { display: flex; gap: 10px; align-items: baseline; }
+  .g-rot-readout .row b { min-width: 118px; }
+  .g-alpha { font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.linear_algebra %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Linear algebra</span>
+    <h1>Rotations, SO(3) and the exponential map</h1>
+    <p>Every rotation of three-dimensional space preserves lengths and angles, and there is exactly one class of matrix that does that without reflecting: an orthonormal matrix with determinant <var>+1</var>. Those matrices form a group called <var>SO(3)</var>, and it is not a vector space &mdash; you cannot add two rotations and expect a rotation, and a straight line between two of them leaves the set entirely. This part shows the two coordinates on <var>SO(3)</var> that actually work: an angle and a unit axis, which is the matrix exponential of a skew matrix, and quaternions, which are the same object in four numbers. It also shows where the familiar Euler angles fail, and why the fix is to move along a curve that stays on the manifold.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">Why a rotation is a curve, not a vector</p>
+    <p>By now you have met matrices as transformations and eigenvectors as the directions they leave alone. A rotation is a transformation with no preferred direction at all: there is no real eigenvector with eigenvalue <var>1</var> pointing somewhere interesting, because every vector moves. What a rotation does keep is much stronger than any single direction. It keeps <em>every</em> length and <em>every</em> angle, which is what it means to move rigidly. That single requirement pins the matrix down almost completely.</p>
+    <p>The catch is that the set of all rotations is curved. Take two rotations, average their matrices entry by entry, and the average is almost never a rotation &mdash; it shears, it scales, it can even collapse the cube you were turning. So everything that works for vectors stops working here: no straight-line interpolation, no simple subtraction of one orientation from another, no ordinary calculus of the form <var>x(t) = x₀ + t v</var>. The story of this part is how to put coordinates on a curved set so that the ordinary machinery can be recovered.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a rotation is an orthonormal matrix with determinant <var>+1</var>; why every one of them is a spin by some angle about some unit axis, <var>R = exp(θ[û]×)</var>; why the three Euler angles you meet in robotics break down at gimbal lock; and why the exponential map, slerp and quaternions are three views of the same geodesic that keeps interpolation where it belongs.</span></div>
+    <div class="g-toc">
+      <a href="#so3">2 · The group SO(3)</a>
+      <a href="#axis">3 · Axis, angle and exp</a>
+      <a href="#gimbal">4 · Gimbal lock</a>
+      <a href="#geodesic">5 · Interpolation</a>
+      <a href="#shows">6 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="so3">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Rotations are orthonormal matrices with determinant +1</h2></div>
+    <p class="g-eyebrow">The definition that does all the work</p>
+    <p>Write the rotation as a matrix <var>R</var> whose columns are the images of the three basis vectors. Preserving length and angle is the statement that the columns stay unit length and stay mutually perpendicular, which is exactly the pair of conditions <var>RᵀR = I</var>. A matrix with that property is called <em>orthogonal</em>, and its columns form an orthonormal frame &mdash; an orientation of space. The three rotated axes are still a rigid tripod, just pointed somewhere new.</p>
+    <div class="g-math g-katex">$$R^{\top} R = I, \qquad R^{-1} = R^{\top}, \qquad \det R = \pm 1.$$</div>
+    <p>That determinant is the last bit of freedom. Orthogonality forces <var>|det R| = 1</var>, so the determinant is either <var>+1</var> or <var>&minus;1</var>. The <var>&minus;1</var> case is a rotation composed with a mirror: it preserves lengths, but it turns a right hand into a left hand. The proper rotations, the ones a rigid body can actually perform, are the ones with <var>det R = +1</var>. This set is closed under multiplication, contains the identity, and every element has an inverse in the set; mathematicians call it the special orthogonal group, <var>SO(3)</var>. The word <em>group</em> matters because it says the composition of rotations is again a rotation, while nothing guarantees that a sum is.</p>
+    <p>You can check both identities numerically on any rotation you like in the demo below: the readout keeps <var>RᵀR</var> within a hair of the identity and the determinant within a hair of <var>+1</var>, no matter how you drag the axis and the angle.</p>
+    <p>One warning before you go further: rotations do not commute. Turn a book a quarter turn about the vertical, then a quarter turn about the axis pointing away from you, and note where the spine ends up. Now do the two turns in the opposite order. The book finishes in a different orientation both times, and no amount of care with the numbers changes that. So the composition of rotations is a non-abelian group operation, and the habit from earlier parts of treating a transformation as a matrix you can reorder has to be set aside. This non-commutativity is the reason a sequence of Euler angles depends on its order, and it is the reason the logarithm of a product of rotations is not the sum of their logarithms.</p>
+  </section>
+
+  <section class="g-step" id="axis">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Spin by θ about a unit axis û</h2></div>
+    <p class="g-eyebrow">Euler's theorem, Rodrigues' formula, and the exponential map</p>
+    <p>Euler's rotation theorem says something surprising for a curved, three-parameter family: every single rotation, no matter how it was built from a sequence of turns, is a turn about <em>one</em> fixed axis. Pick a unit vector <var>û</var> &mdash; the direction that does not move &mdash; and an angle <var>θ</var>, and you have named the rotation completely. The axis is an eigenvector with eigenvalue <var>1</var>, and the angle is how far the plane perpendicular to it turns. This angle-axis description is the first coordinate system on <var>SO(3)</var> that never lies to you about what is happening.</p>
+    <p>To turn that sentence into a matrix, write the cross-product operation as a matrix. The skew-symmetric matrix <var>[û]×</var> is defined by <var>[û]× v = û &times; v</var>, and it is the infinitesimal generator of rotations about <var>û</var>. Compose it with itself and the pattern closes: successive powers only ever return to <var>K</var> or <var>K²</var> with alternating signs, so the familiar infinite series for the matrix exponential collapses to three terms. This is Rodrigues' formula, and it is the exponential map from the Lie algebra <var>so(3)</var> to the group <var>SO(3)</var>:</p>
+    <div class="g-math g-katex">$$K = [\hat{u}]_\times = \begin{bmatrix} 0 & -\hat{u}_z & \hat{u}_y \\ \hat{u}_z & 0 & -\hat{u}_x \\ -\hat{u}_y & \hat{u}_x & 0 \end{bmatrix}, \qquad R = \exp(\theta K) = I + \sin\theta\,K + (1-\cos\theta)\,K^{2}.$$</div>
+    <p>Read the formula as a recipe. The identity does nothing; the <var>K</var> term is the first-order spin; the <var>K²</var> term is the correction that keeps the result orthonormal for large angles. Because the axis is a unit vector, only two numbers are needed to choose it and one to choose the angle &mdash; three numbers for a three-dimensional group, which is why this is a good coordinate system and not just a convenient one. The demo below builds <var>R</var> exactly this way, with the axis set by two sliders and the angle by a third.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div id="rot-plot" class="g-plot3d"></div>
+        <p class="g-canvas-hint">The magenta arrow is the axis <b>û</b>; the cube is the standard basis cube turned by <var>R = exp(θ[û]×)</var>. Drag the axis angles and the spin angle.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Axis azimuth φ° <span class="val">35</span></label><input type="range" id="rot-az" min="-180" max="180" step="1" value="35"></div>
+        <div class="g-field"><label>Axis tilt ψ° <span class="val">45</span></label><input type="range" id="rot-tilt" min="-90" max="90" step="1" value="45"></div>
+        <div class="g-field"><label>Spin angle θ° <span class="val">60</span></label><input type="range" id="rot-theta" min="-180" max="180" step="1" value="60"></div>
+        <div id="rot-matrix"></div>
+        <div class="g-readout g-rot-readout" id="rot-readout"></div>
+      </div>
+    </div>
+    <p><b>A quaternion is the same rotation in four numbers.</b> From the axis and angle, form <var>q = (cos(θ/2), sin(θ/2) û)</var> &mdash; one scalar part and a three-vector part. The half angle is not a trick: applying <var>q</var> twice composes the rotation twice, which is exactly why half angles appear. The label below shows the quaternion alongside the matrix, and it reveals the double cover: <var>q</var> and <var>&minus;q</var> name the same rotation, so the quaternion sphere wraps the space of rotations twice. That redundancy is also the reason quaternions never hit a coordinate singularity, and it is why robotics code usually stores orientation as a unit quaternion and only converts to a matrix once per frame.</p>
+  </section>
+
+  <section class="g-step" id="gimbal">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Euler angles and gimbal lock</h2></div>
+    <p class="g-eyebrow">Three familiar sliders that collide</p>
+    <p>The other way to name an orientation is the one every flight sim and robot arm uses: three angles applied in a fixed order, say yaw about the world <var>z</var>, then pitch about the new <var>y</var>, then roll about the newest <var>x</var>, giving <var>R = R_z(&gamma;) R_y(&beta;) R_x(&alpha;)</var>. Each slider feels independent, which is why the representation is so popular. The problem is that the three axes are not fixed in space; each rotation carries the next axis with it, and for one particular pitch the carried axis lands exactly on top of the first one.</p>
+    <p>Rotate the pitch to <var>&plusmn;90&deg;</var> in the demo and watch. The roll axis, which started as the body <var>x</var> direction, ends up parallel to the world <var>z</var> axis that yaw already rotates about. Two of the three sliders now turn the body about the same line, so their effects add and subtract rather than acting independently: a whole degree of freedom has been swallowed, and the mapping from angles to rotations loses rank. This is gimbal lock. It is not a numerical accident; it is a genuine singularity of the coordinates, the place where the chart on <var>SO(3)</var> folds over.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div id="gim-plot" class="g-plot3d"></div>
+        <p class="g-canvas-hint">Faint arrows are the fixed world axes; bright arrows are the body axes. The magenta body <b>x</b> axis is the roll axis. Push pitch to ±90° and it lines up with the highlighted world <b>z</b>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Yaw γ° <span class="val">30</span></label><input type="range" id="gim-yaw" min="-180" max="180" step="1" value="30"></div>
+        <div class="g-field"><label>Pitch β° <span class="val">25</span></label><input type="range" id="gim-pitch" min="-90" max="90" step="1" value="25"></div>
+        <div class="g-field"><label>Roll α° <span class="val">40</span></label><input type="range" id="gim-roll" min="-180" max="180" step="1" value="40"></div>
+        <div id="gim-matrix"></div>
+        <div class="g-readout g-rot-readout" id="gim-readout"></div>
+      </div>
+    </div>
+    <p>Notice that no cube ever becomes non-rigid here &mdash; every value of the three sliders still produces a perfectly good rotation, because the product of rotations is always a rotation. What breaks is the ability to move smoothly through orientations using the three angles as coordinates. Near the lock, a small change in roll and a small change in yaw produce almost the same motion, so a controller that differentiates with respect to the angles sees a nearly singular Jacobian and commands enormous, jittery corrections. The cure is to leave Euler angles for anything that has to be interpolated, differentiated or optimised, and use the axis-angle or quaternion coordinates instead.</p>
+    <p>It helps to see the singularity as a rank statement rather than a drawing. The derivative of the orientation with respect to the three angles is a <var>3&times;3</var> matrix built from the three instantaneous rotation axes; when two of those axes become parallel, two of its columns become parallel too, and the matrix drops rank. At that point the map from angle-space to <var>SO(3)</var> is locally two-to-one in one direction, which is why an inverse-kinematics or attitude solver stalls. Every three-angle convention has such points &mdash; changing the order or the axis set only moves them around, it never removes them, because three numbers cannot smoothly parametrise a curved three-dimensional set without at least one fold.</p>
+    <h3 style="margin-top:22px;">Four ways to name the same orientation</h3>
+    <div class="g-table-wrap">
+    <table class="g-cheat">
+      <thead><tr><th>Coordinates</th><th>Size</th><th>Strength</th><th>Where it fails</th></tr></thead>
+      <tbody>
+        <tr><td>Rotation matrix</td><td>9 numbers, 6 constraints</td><td>Compose and apply directly; no trigonometry in the hot loop</td><td>Over-parametrised; drifts off <var>SO(3)</var> under floating-point error</td></tr>
+        <tr><td>Euler angles</td><td>3 numbers</td><td>Human-readable; matches how gimbals and joints are physically built</td><td>Gimbal lock at the singular pitch; interpolation is not a geodesic</td></tr>
+        <tr><td>Axis-angle</td><td>3 numbers plus a unit axis</td><td>Exactly the exponential map; every rotation has one</td><td>The axis is undefined at <var>θ = 0</var>; angle wraps at <var>2π</var></td></tr>
+        <tr><td>Unit quaternion</td><td>4 numbers, 1 constraint</td><td>No singularity; slerp is the geodesic and is cheap</td><td>Double cover: <var>q</var> and <var>&minus;q</var> are the same rotation, so signs must be normalised</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>As a rule of thumb: store the state as a matrix or a quaternion, expose Euler angles only at the user interface, and do every increment, derivative and interpolation in the tangent space with an exponential and a logarithm.</p>
+  </section>
+
+  <section class="g-step" id="geodesic">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>exp, log and interpolation on the manifold</h2></div>
+    <p class="g-eyebrow">Staying on SO(3) instead of cutting through it</p>
+    <p>To move between two orientations, you first need the <em>logarithm</em>, the inverse of the exponential map. Given a rotation <var>R</var>, its trace gives the angle through <var>tr R = 1 + 2 cos θ</var>, and the antisymmetric part gives the axis: the vector <var>(R &minus; Rᵀ)</var> is <var>2 sin θ</var> times the skew matrix of the axis. Together they recover the pair <var>(θ, û)</var> that the exponential map consumes. Composing the two maps, <var>log(R₀ᵀR₁)</var> gives the single rotation that carries one orientation to the other, as an axis and an angle.</p>
+    <p>Now the geodesic is easy to write down. Take a fraction <var>t</var> of that relative angle along the same axis and rebuild a rotation: <var>R(t) = R₀ \exp(t \log(R₀ᵀR₁))</var>. Every value of <var>t</var> is a genuine rotation, the cube turns rigidly, and the path is the shortest one on the manifold &mdash; the analogue of a straight line, bent to live on the curved set. Averaging the matrices directly, <var>(1-t)R₀ + tR₁</var>, does something else entirely: it takes a chord through the interior, and the result has determinant less than one and columns that are no longer orthogonal, so the cube shears and shrinks. The demo draws both, so you can see the rotation and the impostor at the same time.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <div id="interp-plot" class="g-plot3d"></div>
+        <p class="g-canvas-hint">Solid cube: the geodesic <var>R(t)</var>. Faded cube: the entrywise average, which is not a rotation. Slide <b>t</b> from one orientation to the other.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Interpolation t <span class="val">0.5</span></label><input type="range" id="interp-t" min="0" max="1" step="0.01" value="0.5"></div>
+        <div id="interp-matrix"></div>
+        <div class="g-readout g-rot-readout" id="interp-readout"></div>
+      </div>
+    </div>
+    <p>This is exactly what spherical linear interpolation, slerp, computes when it is written with quaternions instead of matrices: shortest-arc interpolation between two unit quaternions traces the same geodesic. The quaternion version is cheap, has no <var>90&deg;</var> singularity, and chooses the short way around by flipping the sign of one quaternion when their dot product is negative. Matrix log and quaternion slerp are two implementations of one geometric idea, and the exponential map is the bridge between them.</p>
+    <p>There is a second reason the exponential map is the right primitive, and it is the one optimisation code cares about. Around any orientation, the tangent space at that point is a genuine vector space: small increments can be added, scaled, and solved for with the linear-algebra machinery of the rest of this series. A solver keeps its estimate on the manifold and its <em>error</em> in the tangent space, updates the estimate by <var>R &larr; R \exp(\delta)</var>, and recomputes the local linearisation at the new point. That single pattern &mdash; retract with an exponential, linearise in the tangent space, repeat &mdash; is what makes pose-graph optimisation, bundle adjustment and attitude estimation tractable despite the curvature. The non-commutativity from earlier shows up here as a correction term in the composition of two exponentials, which is small when the increments are small, and is exactly why these methods iterate rather than solve in one shot.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One manifold, two worlds</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Robotics</div>
+        <h3 style="margin:6px 0;">Attitude estimation and pose on the manifold</h3>
+        <p style="margin-bottom:0;">A robot's orientation is an element of <var>SO(3)</var>, and every good estimator keeps it as one &mdash; a unit quaternion or a rotation matrix updated by an exponential of an increment &mdash; rather than as Euler angles that can lock. The increments themselves are tangent vectors, and optimising over them is what makes pose graphs and SLAM solvable. See <a href="{{ '/vision/nonlinear-optimization/3d-rotations/' | relative_url }}">3D rotations</a> for the geometry and <a href="{{ '/vision/nonlinear-optimization/3d-rotations-math/' | relative_url }}">SO(3) from scratch</a> for the full derivation, with the dedicated <a href="{{ 'https://denimpatel.github.io/AI/vision/notes/quaternions/' | relative_url }}">quaternions note</a> for the four-number view.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Symmetry and flows on curved spaces</h3>
+        <p style="margin-bottom:0;">A model that respects rotation is built to commute with <var>SO(3)</var>, which cuts the parameters it needs to learn; the same exponentials appear in normalising flows whose densities live on manifolds rather than in flat space. The <a href="{{ '/ai/llm-training/architecture/' | relative_url }}">architecture chapter</a> shows how geometry and symmetry shape the layers of a modern network, and the group language here is what those constructions are written in.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <ul class="g-refs">
+      <li>Grant Sanderson, <a href="https://www.youtube.com/watch?v=TgKwz5Ikpc8">"Abstract vector spaces"</a>, <em>Essence of Linear Algebra</em>, 3Blue1Brown &mdash; the chapter that makes the jump from arrows to sets closed under the same operations, the frame this part uses for a group.</li>
+      <li>Gilbert Strang, <a href="https://ocw.mit.edu/courses/18-06-linear-algebra-spring-2010/">18.06 Linear Algebra</a>, MIT OpenCourseWare &mdash; the lectures on orthogonal matrices and the singular-value decomposition; Lecture 21 and the following lectures are where the orthonormal frame is developed.</li>
+      <li>Denim Patel, <a href="{{ 'https://denimpatel.github.io/AI/vision/notes/quaternions/' | relative_url }}">Quaternions</a> &mdash; the site's own note on the four-number representation, double cover and why it dodges gimbal lock.</li>
+      <li>Denim Patel, <a href="{{ '/vision/nonlinear-optimization/3d-rotations/' | relative_url }}">Optimization with rotations</a> and <a href="{{ '/vision/nonlinear-optimization/3d-rotations-math/' | relative_url }}">SO(3) from scratch</a> &mdash; the applied companion pages where these matrices meet real estimators.</li>
+      <li>Joan Sol&agrave;, <em>Quaternion kinematics for the error-state Kalman filter</em> (arXiv) &mdash; the reference for treating orientation as a manifold with a tangent-space error, the pattern behind most modern attitude filters.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Coordinates on a manifold let us move without leaving it; the next part takes the derivative of that motion, gradient by gradient.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.linear_algebra teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-plot3d.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  var LA = LinAlg;
+  var GM = GuideMath;
+
+  function el(id) { return document.getElementById(id); }
+  function fmt(x, d) {
+    if (d == null) d = 3;
+    var v = Math.abs(x) < 1e-12 ? 0 : x;
+    var s = v.toFixed(d);
+    if (s.indexOf('.') !== -1) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s;
+  }
+  function vecStr(v, d) {
+    return '(' + v.map(function (x) { return fmt(x, d); }).join(', ') + ')';
+  }
+
+  // ------------------------------------------------------------------
+  // 3x3 linear algebra, on top of GuideMath's 3-vector helpers
+  // ------------------------------------------------------------------
+  function I3() { return [[1, 0, 0], [0, 1, 0], [0, 0, 1]]; }
+  function T3(A) {
+    return [[A[0][0], A[1][0], A[2][0]],
+            [A[0][1], A[1][1], A[2][1]],
+            [A[0][2], A[1][2], A[2][2]]];
+  }
+  function mul3(A, B) {
+    var C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++) {
+      var s = 0;
+      for (var k = 0; k < 3; k++) s += A[i][k] * B[k][j];
+      C[i][j] = s;
+    }
+    return C;
+  }
+  function skew(u) {
+    return [[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]];
+  }
+  // Rodrigues: R = I + sin(theta) K + (1 - cos(theta)) K^2
+  function rodrigues(u, theta) {
+    var K = skew(u), K2 = mul3(K, K);
+    var s = Math.sin(theta), v = 1 - Math.cos(theta);
+    var R = I3();
+    for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++) R[i][j] += s * K[i][j] + v * K2[i][j];
+    return R;
+  }
+  function orthoErr(R) {
+    var M = mul3(T3(R), R), e = 0;
+    for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++) {
+      e = Math.max(e, Math.abs(M[i][j] - (i === j ? 1 : 0)));
+    }
+    return e;
+  }
+  function Rx(a) { var co = Math.cos(a), s = Math.sin(a); return [[1, 0, 0], [0, co, -s], [0, s, co]]; }
+  function Ry(a) { var co = Math.cos(a), s = Math.sin(a); return [[co, 0, s], [0, 1, 0], [-s, 0, co]]; }
+  function Rz(a) { var co = Math.cos(a), s = Math.sin(a); return [[co, -s, 0], [s, co, 0], [0, 0, 1]]; }
+  function column(R, j) { return [R[0][j], R[1][j], R[2][j]]; }
+
+  // ------------------------------------------------------------------
+  // Plotly scene helpers
+  // ------------------------------------------------------------------
+  function cubeTrace(R, color, width, opacity) {
+    var V = GuidePlot3D.CUBE_VERTS, E = GuidePlot3D.CUBE_EDGES;
+    var xs = [], ys = [], zs = [];
+    E.forEach(function (e) {
+      var a = GM.matVec(R, V[e[0]]), b = GM.matVec(R, V[e[1]]);
+      xs.push(a[0], b[0], null); ys.push(a[1], b[1], null); zs.push(a[2], b[2], null);
+    });
+    return { type: 'scatter3d', mode: 'lines', x: xs, y: ys, z: zs,
+      line: { color: color, width: width || 4 }, opacity: opacity == null ? 1 : opacity, hoverinfo: 'skip' };
+  }
+  // A line from the origin plus a marker at the tip: an arrow without a cone's fuss.
+  function arrowTraces(dir, color, len, width, markerSize) {
+    var t = GM.scale(dir, len);
+    return [
+      { type: 'scatter3d', mode: 'lines', x: [0, t[0]], y: [0, t[1]], z: [0, t[2]],
+        line: { color: color, width: width || 5 }, hoverinfo: 'skip' },
+      { type: 'scatter3d', mode: 'markers', x: [t[0]], y: [t[1]], z: [t[2]],
+        marker: { size: markerSize || 7, color: color }, hoverinfo: 'skip' }
+    ];
+  }
+  var EYE = { x: 1.5, y: -1.6, z: 1.1 };
+  function sceneTraces(div, traces) {
+    if (!div || !window.Plotly) return;
+    Plotly.react(div, traces,
+      GuidePlot3D.baseLayout({ range: [-2.5, 2.5], eye: EYE }),
+      { displayModeBar: false, responsive: true });
+  }
+
+  // ==================================================================
+  // Demo A — axis + angle, Rodrigues, and the verification readout
+  // ==================================================================
+  var A = { az: 35, tilt: 45, theta: 60 };
+  function axisFromAngles(azDeg, tiltDeg) {
+    var az = GM.deg2rad(azDeg), tl = GM.deg2rad(tiltDeg);
+    return GM.normalize([Math.cos(tl) * Math.cos(az), Math.cos(tl) * Math.sin(az), Math.sin(tl)]);
+  }
+  function renderA() {
+    var u = axisFromAngles(A.az, A.tilt);
+    var th = GM.deg2rad(A.theta);
+    var R = rodrigues(u, th);
+    var traces = [cubeTrace(R, c.accent, 5, 1)];
+    // world axes, faint, for orientation
+    traces = traces.concat(arrowTraces([1, 0, 0], 'rgba(32,30,29,0.25)', 1.35, 2, 4));
+    traces = traces.concat(arrowTraces([0, 1, 0], 'rgba(32,30,29,0.25)', 1.35, 2, 4));
+    traces = traces.concat(arrowTraces([0, 0, 1], 'rgba(32,30,29,0.25)', 1.35, 2, 4));
+    // the rotation axis
+    traces = traces.concat(arrowTraces(u, c.accent2, 1.7, 6, 8));
+    sceneTraces(el('rot-plot'), traces);
+
+    LA.setMatrix(el('rot-matrix'), R, { digits: 3, label: 'R =' });
+    var d = LA.mat.det(R);
+    var e = orthoErr(R);
+    var qw = Math.cos(th / 2), qs = Math.sin(th / 2);
+    var q = [qw, u[0] * qs, u[1] * qs, u[2] * qs];
+    el('rot-readout').innerHTML =
+      '<div class="row"><b>axis û</b><span class="g-alpha">' + vecStr(u, 3) + '</span></div>' +
+      '<div class="row"><b>angle θ</b><span class="hi">' + fmt(A.theta, 1) + '&deg;</span></div>' +
+      '<div class="row"><b>det R</b><span class="hi">' + fmt(d, 6) + '</span></div>' +
+      '<div class="row"><b>max |RᵀR &minus; I|</b>' + fmt(e, 6) + '</div>' +
+      '<div class="row"><b>quaternion (w,x,y,z)</b><span class="g-alpha">' + vecStr(q, 3) + '</span></div>' +
+      '<div style="margin-top:6px;opacity:.75;">RᵀR stays at I and det R stays at +1 for every slider value: this is the group SO(3).</div>';
+  }
+  Guide.bindSliders([el('rot-az'), el('rot-tilt'), el('rot-theta')], function () {
+    A.az = parseFloat(el('rot-az').value);
+    A.tilt = parseFloat(el('rot-tilt').value);
+    A.theta = parseFloat(el('rot-theta').value);
+    renderA();
+  });
+  renderA();
+
+  // ==================================================================
+  // Demo B — Euler yaw/pitch/roll and gimbal lock
+  // ==================================================================
+  var G = { yaw: 30, pitch: 25, roll: 40 };
+  function renderB() {
+    var a = GM.deg2rad(G.roll), b = GM.deg2rad(G.pitch), g = GM.deg2rad(G.yaw);
+    var R = mul3(Rz(g), mul3(Ry(b), Rx(a)));
+    var traces = [cubeTrace(R, 'rgba(32,30,29,0.55)', 4, 1)];
+    // fixed world axes
+    traces = traces.concat(arrowTraces([1, 0, 0], 'rgba(32,30,29,0.22)', 1.5, 2, 4));
+    traces = traces.concat(arrowTraces([0, 1, 0], 'rgba(32,30,29,0.22)', 1.5, 2, 4));
+    // highlight world z (the yaw axis)
+    traces = traces.concat(arrowTraces([0, 0, 1], c.accent, 1.55, 4, 6));
+    // body axes = columns of R
+    var c1 = column(R, 0), c2 = column(R, 1), c3 = column(R, 2);
+    traces = traces.concat(arrowTraces(c1, c.accent2, 1.6, 6, 8));   // roll axis
+    traces = traces.concat(arrowTraces(c2, c.accent400, 1.5, 4, 6)); // pitch axis
+    traces = traces.concat(arrowTraces(c3, c.accent700, 1.5, 4, 6)); // yaw/body z
+    sceneTraces(el('gim-plot'), traces);
+
+    LA.setMatrix(el('gim-matrix'), R, { digits: 3, label: 'R =' });
+    var cosb = Math.abs(Math.cos(b));
+    var align = Math.acos(Math.min(1, cosb)) * 180 / Math.PI;
+    var locked = cosb < Math.cos(GM.deg2rad(5));
+    el('gim-readout').innerHTML =
+      '<div class="row"><b>yaw γ, pitch β, roll α</b><span class="g-alpha">' + fmt(G.yaw, 0) + '&deg;, ' + fmt(G.pitch, 0) + '&deg;, ' + fmt(G.roll, 0) + '&deg;</span></div>' +
+      '<div class="row"><b>|cos β|</b><span class="hi">' + fmt(cosb, 4) + '</span></div>' +
+      '<div class="row"><b>angle(roll axis, world z)</b>' + fmt(align, 1) + '&deg;</div>' +
+      '<div class="row"><b>gimbal lock</b>' + (locked
+        ? '<span class="hi">axes aligned &mdash; one degree of freedom lost</span>'
+        : 'free &mdash; the three axes stay distinct') + '</div>' +
+      '<div style="margin-top:6px;opacity:.75;">The condition is |cos β| = 0, i.e. pitch = ±90°.</div>';
+  }
+  Guide.bindSliders([el('gim-yaw'), el('gim-pitch'), el('gim-roll')], function () {
+    G.yaw = parseFloat(el('gim-yaw').value);
+    G.pitch = parseFloat(el('gim-pitch').value);
+    G.roll = parseFloat(el('gim-roll').value);
+    renderB();
+  });
+  renderB();
+
+  // ==================================================================
+  // Demo C — exp/log geodesic versus the entrywise average
+  // ==================================================================
+  var R0 = rodrigues(GM.normalize([0.2, 0.9, 0.35]), GM.deg2rad(55));
+  var R1 = rodrigues(GM.normalize([-0.7, 0.25, -0.6]), GM.deg2rad(125));
+
+  function logMap(R) {
+    var tr = R[0][0] + R[1][1] + R[2][2];
+    var cosTh = Math.max(-1, Math.min(1, (tr - 1) / 2));
+    var th = Math.acos(cosTh);
+    var axis;
+    if (th < 1e-6) {
+      axis = [0, 0, 1];
+    } else {
+      var s = 2 * Math.sin(th);
+      axis = GM.normalize([(R[2][1] - R[1][2]) / s, (R[0][2] - R[2][0]) / s, (R[1][0] - R[0][1]) / s]);
+    }
+    return { axis: axis, angle: th };
+  }
+
+  var C = { t: 0.5 };
+  var REL = logMap(mul3(T3(R0), R1));
+  function renderC() {
+    var Rt = mul3(R0, rodrigues(REL.axis, C.t * REL.angle));
+    var Mavg = LA.lerpMat(R0, R1, C.t);
+    var traces = [cubeTrace(Rt, c.accent, 5, 1)];
+    traces = traces.concat(arrowTraces([1, 0, 0], 'rgba(32,30,29,0.2)', 1.4, 2, 4));
+    traces = traces.concat(arrowTraces([0, 1, 0], 'rgba(32,30,29,0.2)', 1.4, 2, 4));
+    traces = traces.concat(arrowTraces([0, 0, 1], 'rgba(32,30,29,0.2)', 1.4, 2, 4));
+    traces = traces.concat(cubeTrace(Mavg, c.accent2, 3, 0.35));
+    sceneTraces(el('interp-plot'), traces);
+
+    LA.setMatrix(el('interp-matrix'), Rt, { digits: 3, label: 'R(t) =' });
+    el('interp-readout').innerHTML =
+      '<div class="row"><b>geodesic angle</b>' + fmt(REL.angle * 180 / Math.PI, 1) + '&deg; end to end</div>' +
+      '<div class="row"><b>t</b><span class="hi">' + fmt(C.t, 2) + '</span></div>' +
+      '<div class="row"><b>det R(t) / max |RᵀR&minus;I|</b>' + fmt(LA.mat.det(Rt), 6) + ' / ' + fmt(orthoErr(Rt), 6) + '</div>' +
+      '<div class="row"><b>det average / max |MᵀM&minus;I|</b>' + fmt(LA.mat.det(Mavg), 4) + ' / ' + fmt(orthoErr(Mavg), 4) + '</div>' +
+      '<div style="margin-top:6px;opacity:.75;">The average is never a rotation: its determinant drops below 1 and its columns stop being orthogonal. The geodesic stays exactly on SO(3).</div>';
+  }
+  Guide.bindSliders([el('interp-t')], function (s) {
+    C.t = parseFloat(s.value);
+    renderC();
+  });
+  renderC();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'rot-so3-definition',
+      kind: 'choice',
+      prompt: 'Which pair of conditions makes a matrix <var>R</var> a proper rotation, an element of <var>SO(3)</var>?',
+      options: [
+        { label: '<var>R&#7488;R = I</var> (orthogonal — preserves length and angle) and <var>det R = +1</var> (no mirror flip).', correct: true },
+        { label: '<var>R&#7488;R = I</var> and <var>det R = &minus;1</var>.', correct: false },
+        { label: 'Every entry of R is between &minus;1 and 1.', correct: false }
+      ],
+      explanation: 'Orthogonality (RᵀR = I) alone only guarantees |det R| = 1, so it allows both proper rotations and mirror reflections. Requiring det R = +1 specifically picks out the rotations a rigid body can actually perform — the −1 case preserves lengths but turns a right hand into a left hand.'
+    },
+    {
+      id: 'rot-average-fails',
+      kind: 'choice',
+      prompt: 'Why can you not interpolate between two rotations by averaging their matrices entrywise, <var>(1&minus;t)R&#8320; + tR&#8321;</var>?',
+      options: [
+        { label: 'The entrywise average is generally not orthogonal at all — its determinant drops below 1 and its columns stop being perpendicular, so the result is not a rotation.', correct: true },
+        { label: 'The average is always a valid rotation, just a slower one than the geodesic.', correct: false },
+        { label: 'Entrywise averaging only fails when the two rotations share the same axis.', correct: false }
+      ],
+      explanation: 'The set of rotations is curved, not flat, so a straight-line chord through the interior of SO(3) leaves the set. The demo shows this directly: the averaged matrix has determinant less than one and columns that are no longer orthonormal, so the "cube" it draws shears and shrinks instead of turning rigidly.'
+    },
+    {
+      id: 'rot-quaternion-half-angle',
+      kind: 'numeric',
+      prompt: 'A quaternion is built as <var>q = (cos(&theta;/2), sin(&theta;/2)&nbsp;&#251;)</var>. For a spin angle <var>&theta; = 180&deg;</var>, what is the scalar part, <var>cos(&theta;/2)</var>?',
+      answer: 0,
+      tolerance: 0.001,
+      explanation: 'cos(180°/2) = cos(90°) = 0. The half-angle is not a trick: applying q twice composes the rotation twice, which is exactly why it is θ/2 rather than θ that appears inside the quaternion.'
+    },
+    {
+      id: 'rot-gimbal-lock-pitch',
+      kind: 'numeric',
+      prompt: 'In the yaw–pitch–roll convention, gimbal lock happens exactly when <var>|cos&nbsp;&beta;| = 0</var>, where <var>&beta;</var> is the pitch. At what pitch angle, in degrees (between 0 and 90), does this occur?',
+      answer: 90,
+      tolerance: 0,
+      explanation: 'cos β = 0 at β = 90°, where the roll axis swings around to line up exactly with the world yaw axis. At that pitch, two of the three Euler sliders turn the body about the same line, so one degree of freedom is lost — the mapping from angles to rotations drops rank.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

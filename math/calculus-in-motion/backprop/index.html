@@ -1,0 +1,553 @@
+---
+title: "Backpropagation is the chain rule"
+description: "Build a small computation graph, run it forward, and watch the adjoints fill in backwards - the chain rule as an algorithm."
+permalink: "/math/calculus-in-motion/backprop/"
+section: "math"
+series: "calculus_in_motion"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  canvas { width: 100%; height: auto; display: block; }
+  .g-canvas-wrap canvas { background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-verdict { font-family: var(--font-mono); font-size: 12px; margin-top: 8px; }
+  .g-verdict .ok { color: var(--color-accent-700); font-weight: 600; }
+  .g-verdict .no { color: var(--color-accent-2-700); font-weight: 600; }
+  .g-cheat code { white-space: normal; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.calculus_in_motion %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 9 of 14</span>
+    <h1>Backpropagation is the chain rule</h1>
+    <p>A network is a long composition of small functions, and training it means differentiating that composition with respect to every parameter. The chain rule supplies one factor per step; backpropagation is that multiplication scheduled so no factor is computed twice. Build the graph, push a value through it, then turn around and watch the adjoints flow back.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="graph">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A computation graph</h2></div>
+    <p class="g-eyebrow">Every value is a node; every operation an edge</p>
+    <p>A derivative is a local statement: how does one number move when another moves? For a composition the data comes in pieces, and the cleanest way to hold them is a <strong>computation graph</strong>. Our running example is the smallest network that still has every ingredient. An input $x$ feeds an affine map, then a ReLU, then a second affine map, and finally a squared error against a target $t$:</p>
+    <div class="g-math g-katex">$$ z_1 = w_1 x + b_1,\qquad a_1 = \mathrm{relu}(z_1),\qquad z_2 = w_2 a_1 + b_2,\qquad L = (z_2 - t)^2. $$</div>
+    <p>Each box below is one of those values; each arrow carries a number in the forward direction and, later, a sensitivity in the backward direction. Slide the five parameters and watch the forward values move along the graph. The whole representation is $2\times2$ weights plus biases, but nothing about the argument depends on the size.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="graph-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">The network as a graph. Node boxes hold the current forward values; edge labels hold the weights and the fixed operations.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Input x <span class="val">0.8</span></label><input type="range" id="g-x" min="-2" max="2" step="0.05" value="0.8"></div>
+        <div class="g-field"><label>Weight w₁ <span class="val">1.40</span></label><input type="range" id="g-w1" min="-3" max="3" step="0.05" value="1.4"></div>
+        <div class="g-field"><label>Bias b₁ <span class="val">-0.50</span></label><input type="range" id="g-b1" min="-2" max="2" step="0.05" value="-0.5"></div>
+        <div class="g-field"><label>Weight w₂ <span class="val">-0.90</span></label><input type="range" id="g-w2" min="-3" max="3" step="0.05" value="-0.9"></div>
+        <div class="g-field"><label>Bias b₂ <span class="val">0.20</span></label><input type="range" id="g-b2" min="-2" max="2" step="0.05" value="0.2"></div>
+        <div class="g-readout" id="graph-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="forward">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The forward pass</h2></div>
+    <p class="g-eyebrow">Evaluate the composition one edge at a time</p>
+    <p>Running the network forward is just substituting left to right. The input and the biases are <em>leaves</em>: they have no incoming arrows and their values are given. A node with incoming arrows holds the value its parents produced. Step through the evaluation and the active set grows until the loss is reached — no calculus yet, only arithmetic, but every intermediate is being kept because the backward pass will need it.</p>
+    <p>Note the ReLU: $a_1 = \max(0, z_1)$. It is the one non-smooth piece, and everything about it is decided by the sign of $z_1$. When $z_1 \le 0$ the node is switched off, the forward value is zero, and — as the next step shows — so is its local derivative.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="fwd-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Visited nodes light up in evaluation order. <b>Step</b> advances one node; <b>Play</b> runs it on a timer.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Input x <span class="val">0.8</span></label><input type="range" id="fwd-x" min="-2" max="2" step="0.05" value="0.8"></div>
+        <div class="g-btnrow">
+          <button id="fwd-step">Step →</button>
+          <button id="fwd-play" class="g-primary">Play</button>
+        </div>
+        <div class="g-readout" id="fwd-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="adjoint">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Adjoints and the backward recursion</h2></div>
+    <p class="g-eyebrow">What must the output move for each node to move?</p>
+    <p>Fix a scalar output $L$ — here the loss — and ask for its sensitivity to every node. Define the <strong>adjoint</strong> of a node $v$ to be that sensitivity,</p>
+    <div class="g-math g-katex">$$ \bar v \;=\; \frac{\partial L}{\partial v}. $$</div>
+    <p>For the output itself the adjoint is $1$. For any other node, $L$ reaches it only through the nodes that consume it, so the sensitivities add along every outgoing route. That is the chain rule written once per node:</p>
+    <div class="g-math g-katex">$$ \bar v \;=\; \sum_{u \,\in\, \mathrm{children}(v)} \bar u \, \frac{\partial u}{\partial v}. $$</div>
+    <p>The factor $\partial u/\partial v$ is <em>local</em>: it depends only on the edge from $v$ to $u$ and on the forward values already stored. Multiplying it by the incoming adjoint $\bar u$ hands the sensitivity to $v$, and the recursion proceeds from the output back to the leaves. Step through it: each node shows its local derivative, the incoming adjoint, and their product. The magenta path traces one complete chain, say $\partial L/\partial x$.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="bwd-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Reverse sweep. The highlighted path is the chain rule for one derivative; each node reports local × incoming = product.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Input x <span class="val">0.8</span></label><input type="range" id="bwd-x" min="-2" max="2" step="0.05" value="0.8"></div>
+        <div class="g-btnrow">
+          <button id="bwd-step">Step ←</button>
+          <button id="bwd-play" class="g-primary">Play</button>
+        </div>
+        <div class="g-readout" id="bwd-readout"></div>
+        <div class="g-verdict" id="bwd-verdict"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="check">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Checking one derivative against a finite difference</h2></div>
+    <p class="g-eyebrow">Agreement is the only honest test</p>
+    <p>Backprop returns a product of local factors, and a sign error in any one of them is invisible until training misbehaves. The independent check is the definition from <a href="{{ '/math/calculus/derivative/' | relative_url }}">The derivative</a>: nudge the parameter and measure. For a scalar parameter $p$,</p>
+    <div class="g-math g-katex">$$ \frac{\partial L}{\partial p} \;\approx\; \frac{L(p+h) - L(p-h)}{2h}, $$</div>
+    <p>which is exactly <code>CalcViz.numericDeriv</code>. Pick a parameter with the buttons and change the step $h$; the plot shows the loss curve, the backprop slope as a tangent, and the finite-difference secant. The two slopes are drawn from completely different information — one from the graph, one from re-running the forward pass twice — and they should agree to several digits. That agreement is what authorises the backward sweep.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="chk-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Loss against the chosen parameter. Solid tangent slope = backprop; dashed secant slope = central finite difference over ±h.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="chk-w1" class="g-primary" data-p="w1">w₁</button>
+          <button id="chk-b1" data-p="b1">b₁</button>
+          <button id="chk-w2" data-p="w2">w₂</button>
+          <button id="chk-b2" data-p="b2">b₂</button>
+        </div>
+        <div class="g-field"><label>Finite-difference step h <span class="val">0.050</span></label><input type="range" id="chk-h" min="0.001" max="0.5" step="0.001" value="0.05"></div>
+        <div class="g-readout" id="chk-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>One reverse sweep for every parameter</h2></div>
+    <p class="g-eyebrow">Why reverse mode is the right direction for a scalar loss</p>
+    <p>The check above costs two forward evaluations to differentiate one parameter. Training needs the gradient with respect to <em>all</em> of them, and the count explodes: central differences over $N$ parameters need $2N$ forward passes, so a million-parameter model would need two million passes for a single step. Backpropagation is independent of $N$ — one forward pass stores the values, one backward pass computes every adjoint — because each node's adjoint is reused by all of its parents.</p>
+    <div class="g-math g-katex">$$ \text{forward-mode cost} \;\sim\; 2N \text{ passes},\qquad \text{reverse-mode cost} \;\sim\; 2 \text{ passes}. $$</div>
+    <p>This is the asymmetry that makes deep learning possible. Reverse mode is cheap exactly when the output is a scalar and the inputs are many, which is the shape of every training problem; forward mode wins in the mirror case of few inputs and many outputs. Slide the parameter count and watch the two lines separate on the log scale.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cost-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Forward passes needed for a full gradient against parameter count, on log–log axes. Finite differences (magenta) grow with N; one reverse sweep (blue) stays flat.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Parameters N (10<sup>k</sup>) <span class="val">3.0</span></label><input type="range" id="cost-n" min="0" max="7" step="0.1" value="3"></div>
+        <div class="g-readout" id="cost-readout"></div>
+        <div class="g-verdict" id="cost-verdict"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="where">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The algorithm behind every training loop</p>
+    <p>Every weight update in a modern model is one term of this sweep. <a href="{{ '/ai/llm-training/' | relative_url }}">LLM Training</a>, whose fifth part follows a loss backward through attention and the feed-forward blocks, is precisely this recursion applied to a larger graph. The single-variable version is <a href="{{ '/math/calculus/chain-rule/' | relative_url }}">The chain rule</a>; the bookkeeping for whole matrices of parameters rather than single numbers is <a href="{{ '/math/calculus-in-motion/matrix-calculus/' | relative_url }}">Matrix calculus</a>, where the local factors become Jacobians and the products become matrix multiplies. Read together, those three pages are one idea at three scales.</p>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Notation to carry forward</h2></div>
+    <table class="g-cheat">
+      <thead><tr><th>Object</th><th>Reads as</th><th>Where it is used</th></tr></thead>
+      <tbody>
+        <tr><td><code>v, z, a, L</code></td><td>Node values in the graph: pre-activation, activation, scalar loss</td><td>Step 1, Step 2</td></tr>
+        <tr><td><code>∂u/∂v</code></td><td>Local derivative on the edge v → u; fixed by the operation</td><td>Step 3, Step 4</td></tr>
+        <tr><td><code>v̄ = ∂L/∂v</code></td><td>Adjoint: sensitivity of the scalar output to a node</td><td>Step 3</td></tr>
+        <tr><td><code>v̄ = Σᵤ ū · ∂u/∂v</code></td><td>The backward recursion — the chain rule summed over consumers</td><td>Step 3</td></tr>
+        <tr><td><code>2N</code> vs <code>2</code></td><td>Forward passes for a full finite-difference gradient versus one reverse sweep</td><td>Step 5</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Further reading</h2></div>
+    <ul class="g-refs">
+      <li><a href="https://www.3blue1brown.com/lessons/backpropagation">3Blue1Brown, <em>What is backpropagation really doing?</em></a> — the same reverse sweep as a picture.</li>
+      <li><a href="https://cs231n.github.io/optimization-2/">Stanford CS231n, <em>Backpropagation, intuitions</em></a> — worked gate-by-gate examples and the local-gradient pattern.</li>
+      <li><a href="https://www.nature.com/articles/323533a0">Rumelhart, Hinton &amp; Williams (1986), <em>Learning representations by back-propagating errors</em></a> — the paper that made the algorithm standard.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/3 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Backprop gives the gradient. The next part asks how to use it — and why some directions slow a solver to a crawl.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.calculus_in_motion teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/calc-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function fmt(v, d) { return (v == null || !isFinite(v)) ? '\u2014' : v.toFixed(d == null ? 3 : d); }
+
+  var DEFAULTS = { x: 0.8, w1: 1.4, b1: -0.5, w2: -0.9, b2: 0.2, t: 0.5 };
+
+  function forward(P) {
+    var z1 = P.w1 * P.x + P.b1;
+    var a1 = z1 > 0 ? z1 : 0;
+    var z2 = P.w2 * a1 + P.b2;
+    var L = (z2 - P.t) * (z2 - P.t);
+    return { z1: z1, a1: a1, z2: z2, L: L };
+  }
+  function gradOf(P) {
+    var f = forward(P);
+    var gz2 = 2 * (f.z2 - P.t);
+    var ga1 = gz2 * P.w2;
+    var gz1 = ga1 * (f.z1 > 0 ? 1 : 0);
+    return {
+      z1: f.z1, a1: f.a1, z2: f.z2, L: f.L,
+      gz2: gz2, ga1: ga1, gz1: gz1,
+      gw2: gz2 * f.a1, gb2: gz2, gw1: gz1 * P.x, gb1: gz1, gx: gz1 * P.w1
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Graph geometry and drawing
+  // ------------------------------------------------------------------
+  var G = {
+    x: { x: 64, y: 118, label: 'x' },
+    b1: { x: 64, y: 250, label: 'b\u2081' },
+    z1: { x: 214, y: 184, label: 'z\u2081' },
+    a1: { x: 354, y: 184, label: 'a\u2081' },
+    b2: { x: 354, y: 312, label: 'b\u2082' },
+    z2: { x: 490, y: 184, label: 'z\u2082' },
+    L: { x: 594, y: 184, label: 'L' }
+  };
+  var RAD = 24;
+  var ORDER = ['x', 'b1', 'z1', 'a1', 'b2', 'z2', 'L'];
+  var EDGES = [
+    { f: 'x', to: 'z1', lab: 'w\u2081' },
+    { f: 'b1', to: 'z1', lab: '1' },
+    { f: 'z1', to: 'a1', lab: 'relu' },
+    { f: 'a1', to: 'z2', lab: 'w\u2082' },
+    { f: 'b2', to: 'z2', lab: '1' },
+    { f: 'z2', to: 'L', lab: '(\u00b7\u2212t)\u00b2' }
+  ];
+  var CHAIN = ['z2>L', 'a1>z2', 'z1>a1', 'x>z1'];
+
+  function drawArrow(ctx, a, b, color, width, dash) {
+    var dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+    var ux = dx / d, uy = dy / d;
+    var x1 = a.x + ux * (RAD + 4), y1 = a.y + uy * (RAD + 4);
+    var x2 = b.x - ux * (RAD + 8), y2 = b.y - uy * (RAD + 8);
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash || []);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.setLineDash([]);
+    var hs = 7, ang = Math.atan2(y2 - y1, x2 - x1);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - hs * Math.cos(ang - 0.4), y2 - hs * Math.sin(ang - 0.4));
+    ctx.lineTo(x2 - hs * Math.cos(ang + 0.4), y2 - hs * Math.sin(ang + 0.4));
+    ctx.closePath(); ctx.fill();
+  }
+
+  function drawNode(ctx, g, label, valText, st) {
+    ctx.beginPath(); ctx.arc(g.x, g.y, RAD, 0, Math.PI * 2);
+    ctx.fillStyle = st.fill; ctx.fill();
+    ctx.lineWidth = st.lw || 2; ctx.strokeStyle = st.stroke; ctx.stroke();
+    ctx.fillStyle = st.text; ctx.font = '600 13px ' + c.font;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, g.x, g.y - 4);
+    if (valText) { ctx.font = '10px ' + c.mono; ctx.fillStyle = st.sub; ctx.fillText(valText, g.x, g.y + 10); }
+    if (st.adjText) { ctx.font = '600 10px ' + c.mono; ctx.fillStyle = c.accent2; ctx.fillText(st.adjText, g.x, g.y - RAD - 9); }
+  }
+
+  function drawGraph(ctx, P, opts) {
+    opts = opts || {};
+    ctx.clearRect(0, 0, 640, 360);
+    var f = forward(P);
+    EDGES.forEach(function (e) {
+      var a = G[e.f], b = G[e.to];
+      var id = e.f + '>' + e.to;
+      var chain = !!opts.chain && CHAIN.indexOf(id) >= 0;
+      var active = opts.active && (opts.active[e.f] || opts.active[e.to]);
+      var col = chain ? c.accent : (active ? c.accent500 : c.divider);
+      drawArrow(ctx, a, b, col, chain ? 3 : 1.6, chain ? [6, 4] : []);
+      var lab = e.lab;
+      if (id === 'x>z1') lab = 'w\u2081=' + fmt(P.w1, 2);
+      if (id === 'a1>z2') lab = 'w\u2082=' + fmt(P.w2, 2);
+      ctx.font = '10px ' + c.mono;
+      ctx.fillStyle = chain ? c.accent700 : c.text;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(lab, (a.x + b.x) / 2, (a.y + b.y) / 2 - 9);
+    });
+    var vals = { x: P.x, b1: P.b1, z1: f.z1, a1: f.a1, b2: P.b2, z2: f.z2, L: f.L };
+    ORDER.forEach(function (id) {
+      var g = G[id];
+      var isCur = opts.current === id;
+      var isAct = opts.active && opts.active[id];
+      drawNode(ctx, g, g.label, fmt(vals[id], 2), {
+        fill: isCur ? c.accent : (isAct ? '#e8f5fa' : '#ffffff'),
+        stroke: isCur ? c.accent700 : (isAct ? c.accent500 : c.divider),
+        text: isCur ? '#ffffff' : c.text,
+        sub: isCur ? '#ffffff' : c.text,
+        adjText: opts.adj && opts.adj[id]
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Demo 1 — build the graph
+  // ------------------------------------------------------------------
+  var D1 = { x: el('g-x'), w1: el('g-w1'), b1: el('g-b1'), w2: el('g-w2'), b2: el('g-b2') };
+  var setup1 = Guide.setupCanvas(el('graph-canvas'), 640, 360, draw1);
+  function p1() {
+    return {
+      x: parseFloat(D1.x.value), w1: parseFloat(D1.w1.value), b1: parseFloat(D1.b1.value),
+      w2: parseFloat(D1.w2.value), b2: parseFloat(D1.b2.value), t: DEFAULTS.t
+    };
+  }
+  function draw1() {
+    if (!setup1) return;
+    var P = p1(), f = forward(P);
+    drawGraph(setup1.ctx, P, {});
+    el('graph-readout').innerHTML =
+      '<div><span class="k">x</span> ' + fmt(P.x, 2) + ' &nbsp; <span class="k">b\u2081</span> ' + fmt(P.b1, 2) + ' &nbsp; <span class="k">b\u2082</span> ' + fmt(P.b2, 2) + '</div>' +
+      '<div><span class="k">z\u2081 = w\u2081x + b\u2081</span> ' + fmt(f.z1, 3) + ' &nbsp; <span class="k">a\u2081 = relu(z\u2081)</span> ' + fmt(f.a1, 3) + '</div>' +
+      '<div><span class="k">z\u2082 = w\u2082a\u2081 + b\u2082</span> ' + fmt(f.z2, 3) + ' &nbsp; <span class="k">L = (z\u2082 \u2212 t)\u00b2</span> <span class="hi">' + fmt(f.L, 4) + '</span></div>';
+  }
+  Guide.bindSliders([D1.x, D1.w1, D1.b1, D1.w2, D1.b2], draw1);
+
+  // ------------------------------------------------------------------
+  // Demo 2 — forward step-through
+  // ------------------------------------------------------------------
+  var D2 = { x: el('fwd-x') };
+  var FWD = ORDER.slice();
+  var fwdIdx = 0;
+  var setup2 = Guide.setupCanvas(el('fwd-canvas'), 640, 360, draw2);
+  function p2() {
+    return { x: parseFloat(D2.x.value), w1: DEFAULTS.w1, b1: DEFAULTS.b1, w2: DEFAULTS.w2, b2: DEFAULTS.b2, t: DEFAULTS.t };
+  }
+  function draw2() {
+    if (!setup2) return;
+    var P = p2(), f = forward(P);
+    var active = {};
+    FWD.forEach(function (id, i) { if (i <= fwdIdx) active[id] = true; });
+    drawGraph(setup2.ctx, P, { active: active, current: FWD[fwdIdx] });
+    var vals = { x: P.x, b1: P.b1, z1: f.z1, a1: f.a1, b2: P.b2, z2: f.z2, L: f.L };
+    el('fwd-readout').innerHTML =
+      '<div><span class="k">stage</span> ' + FWD[fwdIdx] + ' = <span class="hi">' + fmt(vals[FWD[fwdIdx]], 3) + '</span> &nbsp; (' + fwdIdx + ' / ' + (FWD.length - 1) + ')</div>' +
+      '<div><span class="k">z\u2081</span> ' + fmt(f.z1, 3) + ' &nbsp; <span class="k">a\u2081</span> ' + fmt(f.a1, 3) + ' &nbsp; <span class="k">z\u2082</span> ' + fmt(f.z2, 3) + ' &nbsp; <span class="k">L</span> ' + fmt(f.L, 4) + '</div>';
+  }
+  Guide.bindSliders([D2.x], draw2);
+  el('fwd-step').addEventListener('click', function () { fwdIdx = (fwdIdx + 1) % FWD.length; draw2(); });
+  Guide.loop({ onStep: function () { fwdIdx = (fwdIdx + 1) % FWD.length; draw2(); }, button: el('fwd-play'), interval: 900 });
+
+  // ------------------------------------------------------------------
+  // Demo 3 — backward adjoints
+  // ------------------------------------------------------------------
+  var D3 = { x: el('bwd-x') };
+  var BWD = ['L', 'z2', 'a1', 'z1', 'x'];
+  var bwdIdx = 0;
+  var setup3 = Guide.setupCanvas(el('bwd-canvas'), 640, 360, draw3);
+  function p3() {
+    return { x: parseFloat(D3.x.value), w1: DEFAULTS.w1, b1: DEFAULTS.b1, w2: DEFAULTS.w2, b2: DEFAULTS.b2, t: DEFAULTS.t };
+  }
+  function draw3() {
+    if (!setup3) return;
+    var P = p3(), g = gradOf(P);
+    var active = {};
+    BWD.forEach(function (id, i) { if (i <= bwdIdx) active[id] = true; });
+    var adj = {};
+    if (bwdIdx >= 0) adj.L = fmt(1, 2);
+    if (bwdIdx >= 1) adj.z2 = fmt(g.gz2, 2);
+    if (bwdIdx >= 2) adj.a1 = fmt(g.ga1, 2);
+    if (bwdIdx >= 3) adj.z1 = fmt(g.gz1, 2);
+    if (bwdIdx >= 4) adj.x = fmt(g.gx, 2);
+    drawGraph(setup3.ctx, P, { active: active, current: BWD[bwdIdx], adj: adj, chain: true });
+
+    var local, inc, prod, lname;
+    if (bwdIdx === 0) { local = 1; inc = 1; prod = 1; lname = '\u2202L/\u2202L'; }
+    else if (bwdIdx === 1) { local = g.gz2; inc = 1; prod = g.gz2; lname = '\u2202L/\u2202z\u2082'; }
+    else if (bwdIdx === 2) { local = P.w2; inc = g.gz2; prod = g.ga1; lname = '\u2202z\u2082/\u2202a\u2081'; }
+    else if (bwdIdx === 3) { local = (g.z1 > 0 ? 1 : 0); inc = g.ga1; prod = g.gz1; lname = '\u2202a\u2081/\u2202z\u2081'; }
+    else { local = P.w1; inc = g.gz1; prod = g.gx; lname = '\u2202z\u2081/\u2202x'; }
+
+    el('bwd-readout').innerHTML =
+      '<div><span class="k">node</span> ' + BWD[bwdIdx] + ' &nbsp; <span class="k">local</span> ' + lname + ' = ' + fmt(local, 3) + '</div>' +
+      '<div><span class="k">incoming adjoint</span> ' + fmt(inc, 3) + ' &nbsp; <span class="k">product</span> <span class="hi">' + fmt(prod, 4) + '</span></div>' +
+      '<div><span class="k">\u2202L/\u2202w\u2081</span> ' + fmt(g.gw1, 3) + ' &nbsp; <span class="k">\u2202L/\u2202b\u2081</span> ' + fmt(g.gb1, 3) + ' &nbsp; <span class="k">\u2202L/\u2202w\u2082</span> ' + fmt(g.gw2, 3) + ' &nbsp; <span class="k">\u2202L/\u2202b\u2082</span> ' + fmt(g.gb2, 3) + '</div>';
+    el('bwd-verdict').innerHTML = g.z1 > 0
+      ? 'relu is open (z\u2081 = ' + fmt(g.z1, 3) + ' > 0): its local derivative is 1'
+      : 'relu is shut (z\u2081 = ' + fmt(g.z1, 3) + ' \u2264 0): its local derivative is 0 and the sweep stops';
+  }
+  Guide.bindSliders([D3.x], draw3);
+  el('bwd-step').addEventListener('click', function () { bwdIdx = (bwdIdx + 1) % BWD.length; draw3(); });
+  Guide.loop({ onStep: function () { bwdIdx = (bwdIdx + 1) % BWD.length; draw3(); }, button: el('bwd-play'), interval: 1100 });
+
+  // ------------------------------------------------------------------
+  // Demo 4 — finite-difference check of one parameter
+  // ------------------------------------------------------------------
+  var D4 = { h: el('chk-h') };
+  var which = 'w1';
+  var setup4 = Guide.setupCanvas(el('chk-canvas'), 640, 360, draw4);
+  function baseP() {
+    return { x: DEFAULTS.x, w1: DEFAULTS.w1, b1: DEFAULTS.b1, w2: DEFAULTS.w2, b2: DEFAULTS.b2, t: DEFAULTS.t };
+  }
+  function lossOf(q, p) { var P = baseP(); P[q] = p; return forward(P).L; }
+  function paramSym(q) { return q === 'w1' ? 'w\u2081' : q === 'b1' ? 'b\u2081' : q === 'w2' ? 'w\u2082' : 'b\u2082'; }
+  function paramName(q) { return q === 'w1' ? 'weight w\u2081' : q === 'b1' ? 'bias b\u2081' : q === 'w2' ? 'weight w\u2082' : 'bias b\u2082'; }
+  function draw4() {
+    if (!setup4) return;
+    var P = baseP();
+    var p0 = P[which];
+    var h = parseFloat(D4.h.value);
+    var lo = p0 - 2, hi = p0 + 2;
+    var ctx = setup4.ctx, W = 640, H = 360;
+    var L0 = lossOf(which, p0);
+    var ymax = Math.max(lossOf(which, lo), lossOf(which, hi), L0) * 1.15 + 1e-9;
+    var ax = CalcViz.plotAxes(ctx, W, H, [lo, hi], [0, ymax], { xLabel: 'parameter ' + paramSym(which), yLabel: 'loss L', title: 'Loss against ' + paramName(which), padL: 56, padB: 40, tickTarget: 6 });
+    CalcViz.plotFunction(ax, function (p) { return lossOf(which, p); }, { ctx: ctx, color: c.accent700, width: 2.4 });
+
+    var g = gradOf(P);
+    var bp = which === 'w1' ? g.gw1 : which === 'b1' ? g.gb1 : which === 'w2' ? g.gw2 : g.gb2;
+    var num = CalcViz.numericDeriv(function (p) { return lossOf(which, p); }, p0, h);
+
+    // Backprop tangent.
+    var t0 = p0 - 1.0, t1 = p0 + 1.0;
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(ax.px(t0), ax.py(CalcViz.clamp(L0 + bp * (t0 - p0), 0, ymax)));
+    ctx.lineTo(ax.px(t1), ax.py(CalcViz.clamp(L0 + bp * (t1 - p0), 0, ymax)));
+    ctx.stroke();
+
+    // Finite-difference secant over [p0-h, p0+h].
+    var sec = CalcViz.secantLine(function (p) { return lossOf(which, p); }, p0 - h, p0 + h);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(ax.px(p0 - h), ax.py(CalcViz.clamp(sec.at(p0 - h), 0, ymax)));
+    ctx.lineTo(ax.px(p0 + h), ax.py(CalcViz.clamp(sec.at(p0 + h), 0, ymax)));
+    ctx.stroke(); ctx.setLineDash([]);
+
+    ctx.beginPath(); ctx.arc(ax.px(p0), ax.py(L0), 5, 0, Math.PI * 2);
+    ctx.fillStyle = c.accent700; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+
+    var err = Math.abs(bp - num);
+    var rel = Math.abs(bp) > 1e-9 ? err / Math.abs(bp) : err;
+    el('chk-readout').innerHTML =
+      '<div><span class="k">parameter</span> ' + paramSym(which) + ' = ' + fmt(p0, 3) + ' &nbsp; <span class="k">h</span> ' + h.toFixed(3) + '</div>' +
+      '<div><span class="k">backprop product</span> <span class="hi">' + fmt(bp, 6) + '</span></div>' +
+      '<div><span class="k">numericDeriv</span> ' + fmt(num, 6) + '</div>' +
+      '<div><span class="k">|difference|</span> ' + err.toExponential(2) + ' &nbsp; <span class="k">relative</span> ' + (rel < 1e-6 ? rel.toExponential(1) : rel.toFixed(6)) + '</div>';
+  }
+  Guide.bindSliders([D4.h], draw4);
+  ['chk-w1', 'chk-b1', 'chk-w2', 'chk-b2'].forEach(function (id) {
+    el(id).addEventListener('click', function () {
+      which = this.getAttribute('data-p');
+      ['chk-w1', 'chk-b1', 'chk-w2', 'chk-b2'].forEach(function (other) {
+        el(other).className = other === id ? 'g-primary' : '';
+      });
+      draw4();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo 5 — cost of finite differences versus one reverse sweep
+  // ------------------------------------------------------------------
+  var D5 = { n: el('cost-n') };
+  var setup5 = Guide.setupCanvas(el('cost-canvas'), 640, 360, draw5);
+  function draw5() {
+    if (!setup5) return;
+    var N = Math.max(1, Math.round(Math.pow(10, parseFloat(D5.n.value))));
+    var ctx = setup5.ctx, W = 640, H = 360;
+    var ax = CalcViz.plotAxes(ctx, W, H, [1, 1e7], [1, 3e7], { xLabel: 'parameters N (log)', yLabel: 'forward passes (log)', title: 'Passes for a full gradient', logX: true, logY: true, padL: 60, padB: 40, tickTarget: 5 });
+
+    function line(fn, color, width) {
+      ctx.strokeStyle = color; ctx.lineWidth = width;
+      ctx.beginPath();
+      for (var i = 0; i <= 120; i++) {
+        var x = Math.pow(10, 7 * i / 120);
+        var X = ax.px(x), Y = ax.py(fn(x));
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.stroke();
+    }
+    line(function (n) { return 2 * n; }, c.accent2, 2.4);
+    line(function () { return 2; }, c.accent, 2.4);
+
+    // Deterministic "measured" sample points on the finite-difference line.
+    var rnd = Guide.seededRandom(90210);
+    for (var s = 0; s < 10; s++) {
+      var x = Math.pow(10, rnd() * 7);
+      var y = 2 * x * Math.pow(10, (rnd() - 0.5) * 0.18);
+      ctx.beginPath(); ctx.arc(ax.px(x), ax.py(y), 3, 0, Math.PI * 2);
+      ctx.fillStyle = c.accent2; ctx.fill();
+    }
+
+    // Marker at the current parameter count.
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(ax.px(N), ax.plot.padT); ctx.lineTo(ax.px(N), ax.plot.padT + ax.plot.plotH); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(ax.px(N), ax.py(2 * N), 5, 0, Math.PI * 2); ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.beginPath(); ctx.arc(ax.px(N), ax.py(2), 5, 0, Math.PI * 2); ctx.fillStyle = c.accent; ctx.fill();
+
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = c.accent2; ctx.fillText('finite differences: 2N', ax.plot.padL + 8, ax.plot.padT + 14);
+    ctx.fillStyle = c.accent; ctx.fillText('one reverse sweep: 2', ax.plot.padL + 8, ax.plot.padT + 30);
+
+    el('cost-readout').innerHTML =
+      '<div><span class="k">parameters N</span> <span class="hi">' + Guide.fmtNum(N) + '</span></div>' +
+      '<div><span class="k">finite-difference passes</span> ' + Guide.fmtNum(2 * N) + '</div>' +
+      '<div><span class="k">reverse-mode passes</span> 2</div>' +
+      '<div><span class="k">fewer passes by a factor of</span> ' + Guide.fmtNum(N) + '\u00d7</div>';
+    el('cost-verdict').innerHTML = '<span class="ok">' + Guide.fmtNum(N) + '\u00d7</span> fewer evaluations for the same gradient, and the ratio grows with the model.';
+  }
+  Guide.bindSliders([D5.n], draw5);
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'bp-forward-z1',
+      kind: 'numeric',
+      prompt: 'Using the graph\'s default parameters (x = 0.8, w\u2081 = 1.4, b\u2081 = \u22120.5), what is z\u2081 = w\u2081x + b\u2081?',
+      answer: 0.62,
+      tolerance: 0.01,
+      explanation: '1.4 \u00d7 0.8 + (\u22120.5) = 1.12 \u2212 0.5 = 0.62. Since z\u2081 > 0, the ReLU is open here (a\u2081 = z\u2081), which matters for the backward pass because the ReLU\'s local derivative is 1 rather than 0.'
+    },
+    {
+      id: 'bp-adjoint-z2',
+      kind: 'numeric',
+      prompt: 'Continuing forward from z\u2081 = 0.62 with w\u2082 = \u22120.9, b\u2082 = 0.2, the pre-loss value is z\u2082 = w\u2082a\u2081 + b\u2082 = \u22120.358. With target t = 0.5 and L = (z\u2082 \u2212 t)\u00b2, what is the adjoint z\u0304\u2082 = \u2202L/\u2202z\u2082 = 2(z\u2082 \u2212 t)?',
+      answer: -1.716,
+      tolerance: 0.01,
+      explanation: '2 \u00d7 (\u22120.358 \u2212 0.5) = 2 \u00d7 (\u22120.858) = \u22121.716. This is the first adjoint computed in the backward sweep \u2014 the output\'s own adjoint is always 1, so this is the local derivative of the loss times that 1.'
+    },
+    {
+      id: 'bp-reverse-cost',
+      kind: 'choice',
+      prompt: 'Backpropagation computes the gradient of a scalar loss with respect to N parameters using roughly how many forward/backward passes, compared to 2N passes for central finite differences?',
+      options: [
+        { label: 'About 2 total \u2014 one forward pass, one backward pass, independent of N.', correct: true },
+        { label: 'Also about 2N \u2014 the same cost as finite differences.', correct: false },
+        { label: 'About N\u00b2 \u2014 it scales worse than finite differences.', correct: false }
+      ],
+      explanation: 'This is the asymmetry that makes deep learning possible: each node\'s adjoint is computed once and reused by all of its parents, so one forward pass plus one backward pass yields every parameter\'s gradient at once, regardless of how many parameters there are.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

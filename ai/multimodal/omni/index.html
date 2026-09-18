@@ -1,0 +1,548 @@
+---
+title: "Omni models and the real-time loop"
+description: "Interleaved token streams, the thinker-and-talker split, listening while speaking, barge-in, and the latency accounting a full-duplex model must meet."
+permalink: "/ai/multimodal/omni/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-demo-stack { display: flex; flex-direction: column; gap: 14px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Omni models and the real-time loop</h1>
+    <p>The last step is to put every modality into one model and run it live. A <em>modality</em> here means one kind of data &mdash; written text, an image, a recording of speech &mdash; and an <em>omni model</em> is a single model that handles all of them together instead of handing each one to its own specialist sub-model. That means text tokens and audio tokens in a single <em>interleaved</em> stream, a running sequence in which the two kinds of token alternate rather than sitting in separate pipelines: picture two people passing notes in a relay, each one handing the next a short message in the order it arrives, so no single person ever holds the whole conversation. It also means an input stream and an output stream open at the same time, so the model is still hearing the user while it is already speaking, and a reply that begins while the user is still able to interrupt it. None of that is a modelling flourish: <em>full duplex</em> &mdash; both directions live at once, the way a phone call works but a walkie-talkie does not &mdash; turns the whole problem into a latency budget, a running total of the milliseconds spent before the reply can be heard. Every stage &mdash; recognition, network, the first text token, the first audio token &mdash; spends from that budget, and the budget is only the few hundred milliseconds a listener will tolerate before the pause stops feeling like a conversation. This part assembles the loop and does the accounting.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="streams">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>One model, many streams</h2></div>
+    <p class="g-eyebrow">Interleaved tokens in one sequence</p>
+    <p>An omni model does not concatenate modalities at the edges &mdash; gluing a transcript on to a description, say &mdash; it <em>interleaves</em> them, so a single sequence alternates text subwords, image patches and codec audio tokens in whatever order the task requires. A <em>subword</em> is one word piece from a text tokeniser; a <em>patch</em> is one small tile an image is cut into; and a <em>codec audio token</em> is one symbol from a fixed list that a neural codec &mdash; a pair of networks that compresses sound down to a compact code and reconstructs it again &mdash; emits for a short slice of audio. Interleaving means all three kinds of token live in one running sequence, one after another, in the order they actually occurred. The training objective is unchanged &mdash; predict the next token &mdash; but the vocabulary is shared, meaning the same fixed list of symbols covers every modality, and the model has to learn when a text token should follow an audio token and when it should not. That single sequence is what lets a model answer a question about a recording, quote a phrase it just heard, or switch from describing a picture to reading a caption aloud, without a routing layer deciding which sub-model to call.</p>
+    <p>The cost is a shared budget again, this time for output as well as input: audio tokens are far more numerous per second than text, so a stream that talks spends its context on sound. <em>Context</em> here means the fixed window of tokens the model can hold in mind at once, and once that window is full something has to be dropped, so every audio token the reply spends is a token the reasoning cannot use. Concretely, one second of speech is hundreds of codec tokens, while a sentence of the same duration is a few dozen subwords, which is why a spoken reply costs far more of the window than the same answer typed out. The strip below shows the interleaving as a token sequence, with the slider setting how many audio tokens accompany each text token.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="om-stream-canvas" width="520" height="230"></canvas>
+        <p class="g-canvas-hint">One interleaved token stream, wrapped onto two rows. Each square is a token; the slider sets how many audio tokens accompany each text token, which is what makes speech-heavy output so expensive.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Audio tokens per text token <span class="val">3</span></label><input type="range" id="om-rate" min="1" max="8" step="1" value="3"></div>
+        <div class="g-readout" id="om-stream-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> explain what an interleaved token stream buys over a cascade, describe the thinker-and-talker split and why it helps latency, say what full duplex and barge-in demand of the model, and compute the latency budget a conversational reply has to meet. Four questions run through it: what the tokens share, who does the talking, who is allowed to interrupt, and how fast the answer must start.</span></div>
+    <div class="g-toc">
+      <a href="#split">2 · The thinker and the talker</a>
+      <a href="#duplex">3 · Speaking while listening</a>
+      <a href="#budget">4 · The realtime budget</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="split">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The thinker and the talker</h2></div>
+    <p class="g-eyebrow">Text for reasoning, audio for delivery</p>
+    <p>One way to keep the quality of a language model while producing speech natively is to split the decoding into two stages that share the same trunk. The <em>trunk</em> is the shared backbone network &mdash; the stack of transformer layers that both stages read from &mdash; and <em>decoding</em> is the act of generating output one token at a time. A <em>thinker</em> decodes text tokens as an ordinary language model, which is where the reasoning, the factual grounding and the instruction following live; grounding here means tying the words to facts and to the input rather than letting the language model drift on its own. A <em>talker</em> takes the thinker's <em>hidden states</em> &mdash; the internal vectors the thinker computes at each position, not just the tokens it finally samples out &mdash; and emits audio codec tokens for the reply. Those hidden states are richer than the finished text, because they carry the thinker's partial intent before it has settled into words. The talker is small relative to the thinker, and because it <em>conditions on</em> hidden states &mdash; that is, uses them as its input &mdash; rather than on finished text, it can start before the sentence is complete.</p>
+    <p>The split buys three things. First, text stays inspectable and controllable, since you can read what the model "meant" to say and catch a bad plan before it is spoken. Second, the audio rate can be chosen independently of the text rate, so the talker can <em>stream</em> &mdash; emit its tokens incrementally as they are produced, instead of waiting for the whole reply and releasing it in one block &mdash; in whatever codec the deployment uses. Third, and most important for a conversation, the two can overlap: the thinker writes ahead while the talker catches up, which shortens the time to the first audible syllable &mdash; the number the user actually feels. A system that waited for the complete sentence before starting to speak would pay for every extra word in the thinker's plan, and that added delay is exactly what makes a reply feel sluggish.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="om-split-canvas" width="500" height="240"></canvas>
+        <p class="g-canvas-hint">The thinker-and-talker split: audio tokens in, a text decoder that reasons, and a small audio decoder reading the thinker's hidden states to emit speech tokens in parallel.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="om-split-readout"></div>
+        <p class="g-mini">A single-model alternative exists: one transformer emitting text and audio tokens in one sequence, as Moshi does with parallel user and model streams. The split is a practical compromise that keeps a strong text backbone intact.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Streaming audio decode is not free.</b> The talker emits hundreds of codec tokens per second of speech, which is a token rate no text model ever faces. Splitting the decoders keeps that load out of the reasoning path, but it is still compute &mdash; and on one GPU it competes with the thinker for the same silicon. The reason the load is so large is that audio is denser than text: the same second of speech that a text model would render as a handful of subwords arrives from the talker as hundreds of symbols.</span></div>
+  </section>
+
+  <section class="g-step" id="duplex">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Speaking while listening</h2></div>
+    <p class="g-eyebrow">Full duplex and the interrupt</p>
+    <p>A <em>turn-based</em> system alternates: listen, decode, answer. This strict <em>turn-taking</em> is the walkie-talkie pattern &mdash; one side talks, then the other, and nobody may speak until the channel is handed over. A <em>full-duplex</em> model keeps both streams open, so it can be listening for a new <em>utterance</em> (one stretch of speech from the user) while it is still producing the current reply. That is what makes <em>barge-in</em> work, barge-in being the user cutting in before the model has finished. When the user starts talking mid-reply, the model must not merely stop &mdash; it must keep the audio it heard, revise its plan and respond to the interruption. This is harder than it sounds, because the microphone is also picking up the model's own voice: the system has to separate the user's speech from its own output, which is the job usually called <em>echo cancellation</em>, and it has to notice when a human voice has actually started, which is what <em>voice activity detection</em> does. A turn-based pipeline handles an interrupt poorly, because the interrupt arrives while its <em>synthesis</em> stage &mdash; the stage that turns the planned answer into sound &mdash; is mid-sentence and its <em>recogniser</em>, the model that turns incoming audio into words, has not been running.</p>
+    <p>The timeline below models one turn: the user's speech, recognition overlapping its end, the reply gap assembled from the network hop, the time to first text token and the time to first audio token, and the assistant's reply. The <em>reply gap</em> is the stretch a listener actually hears as silence, and it is built from stages that each cost time: the <em>network hop</em> is the round trip that carries the audio to the server, the time to the first text token is how long the thinker takes to produce its first word, and the time to the first audio token is how long the talker then needs to turn that word into sound. Flip the barge-in switch and a reply that has not started yet is cancelled, which is the cheap case; a reply already in flight &mdash; audio already playing &mdash; is the expensive one, because the model has committed to a sentence it now has to abandon.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="om-turn-canvas" width="640" height="250"></canvas>
+        <p class="g-canvas-hint">One turn from <code>GenMedia.timeline.turn</code>, with the reply gap's stages assembled by <code>GenMedia.timeline.budget</code>. The barge-in marker cancels a reply that has not yet begun.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Speech <span class="val">2000</span> ms</label><input type="range" id="om-speech" min="500" max="4000" step="100" value="2000"></div>
+        <div class="g-field"><label>ASR finalize <span class="val">60</span> ms</label><input type="range" id="om-asr" min="20" max="400" step="10" value="60"></div>
+        <div class="g-field"><label>Network <span class="val">30</span> ms</label><input type="range" id="om-net" min="5" max="200" step="5" value="30"></div>
+        <div class="g-field"><label>Time to first text token <span class="val">120</span> ms</label><input type="range" id="om-ttft" min="30" max="600" step="10" value="120"></div>
+        <div class="g-field"><label>Time to first audio token <span class="val">40</span> ms</label><input type="range" id="om-tts" min="10" max="300" step="10" value="40"></div>
+        <div class="g-field"><label><input type="checkbox" id="om-barge"> Barge-in <span class="val">off</span></label></div>
+        <div class="g-readout" id="om-turn-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>Full duplex is a policy, not just a speed. Keeping the input stream open while speaking means the model can be interrupted gracefully, and it also means the model can be trained on overlapping speech &mdash; the back-channels, the "mm-hm", the false starts &mdash; that a turn-based interface throws away. Graceful here means the interruption becomes training signal rather than an error, because in a real conversation overlap is normal and a pause is not an invitation to keep talking.</span></div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The realtime budget</h2></div>
+    <p class="g-eyebrow">Everything on one GPU</p>
+    <p>The latency a listener feels is not the sum of the pipeline's work; it is the gap between the end of their speech and the first sound of the reply. That felt gap is what "real-time" means here: not that the whole answer is instantaneous, but that the reply begins soon enough to read as an answer rather than a delay. <em>Streaming</em> recognition overlaps the speech &mdash; it emits words while the user is still talking &mdash; so it does not sit in that gap, but the network hop, the time to the first text token and the time to the first audio token all do, and together they have to fit inside roughly 200&ndash;300 ms. Why that number? Below it the exchange reads as a reflex; above it the pause starts to read as hesitation, or as a connection that has dropped. Under load that arithmetic breaks, because the audio decoders, the recogniser and the thinker share one accelerator &mdash; the single GPU doing all of the computation &mdash; and every extra concurrent conversation, another user being served at the same moment, multiplies the work on the same silicon.</p>
+    <p>The budget bar below sums the stages and scales the compute-bound ones &mdash; the stages whose cost grows with how much work the GPU is being asked to do &mdash; by the load slider, so you can watch a comfortable budget cross the 300 ms line without any single stage becoming unreasonable. That crossing is the reason serving a real-time voice model is a scheduling problem as much as a modelling one: the model can be perfectly accurate and still feel broken if the server cannot admit the next conversation without pushing this one past the limit. Scheduling here means deciding which requests share the accelerator and when, and that decision shows up directly in the pause the user hears.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="om-budget-canvas" width="640" height="210"></canvas>
+        <p class="g-canvas-hint">The reply budget from <code>GenMedia.timeline.budget</code>, drawn with <code>Guide.drawStacked</code>. The dashed line is the 300 ms target; the load slider scales every compute-bound stage together.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>GPU load <span class="val">100</span> %</label><input type="range" id="om-gpu" min="40" max="240" step="10" value="100"></div>
+        <div class="g-readout" id="om-budget-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Average latency hides the tail.</b> A model can average 250 ms and still feel broken if one reply in twenty takes 900 ms, so the budget is set against a percentile, not a mean. Batching several conversations together improves throughput and worsens exactly the tail the voice interface is judged on. The reason is that a conversation is a sequence of judgements rather than one: a single slow turn is enough to make the whole assistant feel unreliable, so what matters is the slow end of the latency distribution, not its middle.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The loop, closed</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Speech in, speech out</div>
+        <h3 style="margin:6px 0;">One model, no cascade</h3>
+        <p style="margin-bottom:0;">Moshi models the user's audio and its own audio as parallel streams in one transformer and drops explicit speaker turns &mdash; that is, it never waits for a formal hand-off between the two sides, so both voices sit in the same sequence at once. Qwen2.5-Omni pairs a thinker writing text with a talker emitting speech tokens. Both are the architecture this part has been assembling, and both are described in more detail alongside the recognition machinery in <a href="{{ '/ai/generative-media/asr-and-duplex/' | relative_url }}">the audio volume</a>.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Serving</div>
+        <h3 style="margin:6px 0;">Realtime voice as a workload</h3>
+        <p style="margin-bottom:0;">A duplex conversation is a serving problem before it is a modelling one: long-lived streaming requests, very small batches, a hard tail-latency objective and a prefix cache that turns over every turn. A <em>prefix cache</em> is the model's running notebook: it keeps a note of the tokens it has already processed so it does not redo that work when the next token arrives, and because a conversation keeps adding turns, that notebook is rewritten constantly rather than held steady. Serving voice means holding many such notebooks open at once, each one small in batch size but long in duration. The workload treatment of realtime voice, with the same budget numbers, is <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">LLM Serving, workloads</a>.</p>
+      </div>
+    </div>
+    <p>That closes the arc. It began with cutting an image into patches and ends with one trunk reading text, images, video and audio in a single interleaved sequence while a conversation runs at the speed of speech. Each earlier idea was a prerequisite for this one: without a shared embedding space the modalities could not be compared at all, without the bridge there was no first way to connect them, and without knowing the token cost of an image, a clip or a second of audio there would be no way to fit the streams into one budget. The pieces in between &mdash; the shared space, the bridge, resolution, hallucination, video's token arithmetic, audio's two front ends &mdash; are all in service of this loop.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The omni literature is young and moves fast, which is why the list below is short and recent rather than canonical. These papers cover the two-stream speech-text model &mdash; one transformer holding the user's voice and the model's voice at once &mdash; the thinker-talker split, and the first attempts to put speech into a language model's own token space, so that listening and speaking use the same kind of symbol as reading and writing.</p>
+    <ul class="g-refs">
+      <li>Alexandre Défossez, Laurent Mazaré, Manu Orsini and coauthors, <a href="https://arxiv.org/abs/2410.00037">"Moshi: a speech-text foundation model for real-time dialogue"</a>, 2024 &mdash; full-duplex speech-to-speech with parallel user and model streams in one transformer.</li>
+      <li>Jin Xu, Zhifang Guo, Jinzheng He and coauthors, <a href="https://arxiv.org/abs/2503.20215">"Qwen2.5-Omni Technical Report"</a>, 2025 &mdash; a thinker writing text and a talker emitting speech tokens, stream-decoded for low first-package latency.</li>
+      <li>Dong Zhang, Shimin Li, Xin Zhang and coauthors, <a href="https://arxiv.org/abs/2305.11000">"SpeechGPT: Empowering Large Language Models with Intrinsic Cross-Modal Conversational Abilities"</a>, 2023 &mdash; discrete speech units placed in a language model's token space.</li>
+      <li>Paul K. Rubenstein, Chulayuth Asawaroengchai, Duc Dung Nguyen and coauthors, <a href="https://arxiv.org/abs/2306.12925">"AudioPaLM: A Large Language Model That Can Speak and Listen"</a>, 2023 &mdash; one model over joint text and audio token vocabularies.</li>
+      <li>Qingkai Fang, Shoutao Guo, Yan Zhou and coauthors, <a href="https://arxiv.org/abs/2409.06666">"LLaMA-Omni: Seamless Speech Interaction with Large Language Models"</a>, 2024 &mdash; the thinker-talker decomposition for low-latency spoken replies.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Interleaved stream</td><td>One sequence mixing text, image and audio tokens under a next-token objective</td></tr>
+        <tr><td>Thinker</td><td>The text decoder where reasoning, grounding and instruction following live</td></tr>
+        <tr><td>Talker</td><td>A smaller audio decoder that reads the thinker's hidden states and emits codec tokens</td></tr>
+        <tr><td>Full duplex</td><td>Input and output streams open at once, so the model can listen while it speaks</td></tr>
+        <tr><td>Barge-in</td><td>The user interrupts; the model stops, keeps what it heard and revises</td></tr>
+        <tr><td>Felt latency</td><td>The gap from the end of the user's speech to the first sound of the reply</td></tr>
+        <tr><td>TTFT vs TTFA</td><td>Time to the first text token versus the first audio token; the talker's extra hop</td></tr>
+        <tr><td>The budget</td><td>Roughly 200&ndash;300 ms, set against a tail percentile, not an average</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}That is the end of the volume's account of models that read every modality at once. The next part turns to unifying the architectures themselves: one recipe, one objective and one trunk shared across images, video, audio and beyond. The question it answers is whether the separate front ends this volume has built &mdash; the patch projector, the audio codec, the video sampler &mdash; can be replaced by a single way of turning any signal into tokens, so that adding a new modality stops meaning designing a new front end.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, c = Guide.colors();
+
+  var omRate = 3;
+  var speechMs = 2000, asrMs = 60, netMs = 30, ttftMs = 120, ttsMs = 40;
+  var barge = false, gpuLoad = 100;
+  var SLOTS = 56, COLS = 28;
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---- 1. interleaved token stream -----------------------------------------
+  var streamSetup = Guide.setupCanvas(document.getElementById('om-stream-canvas'), 520, 230, function () { drawStream(); });
+  function streamPattern() {
+    var out = [];
+    while (out.length < SLOTS) {
+      out.push('text');
+      for (var k = 0; k < omRate; k++) out.push('audio');
+    }
+    return out.slice(0, SLOTS);
+  }
+  function drawStream() {
+    if (!streamSetup) return;
+    var ctx = streamSetup.ctx, W = 520, H = 230;
+    ctx.clearRect(0, 0, W, H);
+    var pat = streamPattern();
+    var padL = 16, padT = 54, gap = 5;
+    var cellW = (W - 2 * padL - gap * (COLS - 1)) / COLS;
+    var cellH = 40;
+    var textN = 0, audioN = 0;
+    for (var i = 0; i < pat.length; i++) {
+      var row = Math.floor(i / COLS), col = i % COLS;
+      var x = padL + col * (cellW + gap);
+      var y = padT + row * (cellH + 22);
+      ctx.fillStyle = pat[i] === 'text' ? c.accent : c.accent2;
+      ctx.fillRect(x, y, cellW, cellH);
+      if (pat[i] === 'text') textN++; else audioN++;
+    }
+    ctx.fillStyle = c.text;
+    ctx.font = 'bold 12px ' + c.font;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('one interleaved sequence', padL, 22);
+    ctx.fillStyle = c.accent;
+    ctx.fillRect(padL, 32, 10, 10);
+    ctx.fillStyle = c.text;
+    ctx.font = '10px ' + c.font;
+    ctx.fillText('text token', padL + 14, 41);
+    ctx.fillStyle = c.accent2;
+    ctx.fillRect(padL + 96, 32, 10, 10);
+    ctx.fillStyle = c.text;
+    ctx.fillText('audio token', padL + 110, 41);
+    ctx.fillText('→ time', W - 64, 41);
+    var el = document.getElementById('om-stream-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">tokens shown</span> ' + SLOTS + '</div>' +
+        '<div><span class="k">text tokens</span> ' + textN + '</div>' +
+        '<div><span class="k">audio tokens</span> <span class="hi">' + audioN + '</span></div>' +
+        '<div><span class="k">audio share</span> ' + Guide.fmtPct(audioN / SLOTS, 0) + '</div>' +
+        '<div class="g-mini">At ' + omRate + ' audio tokens per text token, most of the sequence is sound. Talking is expensive in a way writing is not.</div>';
+    }
+  }
+
+  // ---- 2. thinker and talker split -----------------------------------------
+  function chip(ctx, x, y, w, h, fill, label, sub) {
+    ctx.fillStyle = fill;
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 11px ' + c.font;
+    ctx.fillText(label, x + w / 2, y + h / 2 - (sub ? 6 : 0));
+    if (sub) {
+      ctx.font = '9.5px ' + c.font;
+      ctx.fillText(sub, x + w / 2, y + h / 2 + 8);
+    }
+  }
+  var splitSetup = Guide.setupCanvas(document.getElementById('om-split-canvas'), 500, 240, function () { drawSplit(); });
+  function drawSplit() {
+    if (!splitSetup) return;
+    var ctx = splitSetup.ctx, W = 500, H = 240;
+    ctx.clearRect(0, 0, W, H);
+    chip(ctx, 12, 96, 78, 46, c.accent400, 'audio in', 'codec tokens');
+    chip(ctx, 122, 84, 116, 70, c.accent, 'thinker', 'text decoder');
+    chip(ctx, 270, 150, 116, 58, c.accent2, 'talker', 'audio decoder');
+    chip(ctx, 412, 42, 78, 44, c.accent400, 'text out', null);
+    chip(ctx, 412, 158, 78, 44, c.accent400, 'audio out', null);
+    Guide.drawArrow(ctx, 90, 119, 122, 119, { color: c.text, width: 1.8, head: 9 });
+    Guide.drawArrow(ctx, 238, 100, 412, 62, { color: c.accent700, width: 1.8, head: 9, label: 'tokens' });
+    Guide.drawArrow(ctx, 238, 132, 270, 170, { color: c.accent2, width: 1.8, head: 9, label: 'hidden states' });
+    Guide.drawArrow(ctx, 386, 178, 412, 178, { color: c.text, width: 1.8, head: 9 });
+    ctx.fillStyle = c.text;
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('reasons and grounds the answer', 122, 60);
+    ctx.fillText('streams speech tokens as the thinker writes ahead', 270, 226);
+    var el = document.getElementById('om-split-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">thinker</span> text decoder (large)</div>' +
+        '<div><span class="k">talker</span> audio decoder (small)</div>' +
+        '<div><span class="k">conditioning</span> thinker hidden states, not just tokens</div>' +
+        '<div><span class="k">overlap</span> <span class="hi">talker starts before the sentence ends</span></div>' +
+        '<div class="g-mini">The split keeps text inspectable and lowers the time to first audio, at the cost of a second decoder sharing the same accelerator.</div>';
+    }
+  }
+
+  // ---- 3. duplex turn ------------------------------------------------------
+  var turnSetup = Guide.setupCanvas(document.getElementById('om-turn-canvas'), 640, 250, function () { drawTurn(); });
+  function turnModel() {
+    return GM.timeline.turn({
+      speechMs: speechMs, asrMs: asrMs, netMs: netMs, ttftMs: ttftMs,
+      ttsFirstMs: ttsMs, bargeInMs: barge ? speechMs + 90 : null
+    });
+  }
+  function drawTurn() {
+    if (!turnSetup) return;
+    var ctx = turnSetup.ctx, W = 640, H = 250;
+    ctx.clearRect(0, 0, W, H);
+    var t = turnModel();
+    var totalMs = Math.max(t.replyStart + 1400, 2600);
+    var padL = 116, padR = 18, padT = 36, padB = 40;
+    var plotW = W - padL - padR;
+    function X(ms) { return padL + plotW * clamp(ms, 0, totalMs) / totalMs; }
+    var rowH = 24, rgap = 14;
+    function rowY(i) { return padT + i * (rowH + rgap); }
+    var labels = ['user speech', 'streaming ASR', 'reply gap', 'assistant'];
+
+    for (var m = 0; m <= totalMs; m += 500) {
+      ctx.strokeStyle = c.divider;
+      ctx.globalAlpha = 0.35;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(X(m), padT - 8);
+      ctx.lineTo(X(m), rowY(3) + rowH + 6);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text;
+      ctx.font = '10px ' + c.font;
+      ctx.textAlign = 'center';
+      ctx.fillText(m + ' ms', X(m), rowY(3) + rowH + 20);
+    }
+    ctx.strokeStyle = c.divider;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, padT - 8);
+    ctx.lineTo(padL, rowY(3) + rowH + 6);
+    ctx.stroke();
+
+    ctx.fillStyle = c.accent400;
+    ctx.fillRect(X(0), rowY(0), Math.max(1, X(speechMs) - X(0)), rowH);
+
+    var asrStart = Math.max(0, speechMs - asrMs);
+    ctx.fillStyle = 'rgba(214,0,108,0.55)';
+    ctx.fillRect(X(asrStart), rowY(1), Math.max(1, X(speechMs) - X(asrStart)), rowH);
+
+    var b = GM.timeline.budget([
+      { name: 'network', ms: netMs, color: c.accent2 },
+      { name: 'first text token', ms: ttftMs, color: c.accent700 },
+      { name: 'first audio token', ms: ttsMs, color: c.accent }
+    ]);
+    var at = speechMs;
+    for (var k = 0; k < b.segments.length; k++) {
+      var seg = b.segments[k];
+      ctx.fillStyle = seg.color;
+      ctx.fillRect(X(at), rowY(2), Math.max(1, X(at + seg.ms) - X(at)), rowH);
+      at += seg.ms;
+    }
+
+    var replyEnd = t.replyStart + 1400;
+    if (t.interrupted) {
+      ctx.fillStyle = 'rgba(200,60,60,0.20)';
+      ctx.fillRect(X(t.replyStart), rowY(3), Math.max(1, X(replyEnd) - X(t.replyStart)), rowH);
+      ctx.fillStyle = '#c83232';
+      ctx.font = '11px ' + c.font;
+      ctx.textAlign = 'left';
+      ctx.fillText('reply cancelled', X(t.replyStart) + 6, rowY(3) + rowH * 0.68);
+    } else {
+      ctx.fillStyle = c.accent;
+      ctx.fillRect(X(t.replyStart), rowY(3), Math.max(1, X(replyEnd) - X(t.replyStart)), rowH);
+    }
+
+    if (barge) {
+      var bx = X(speechMs + 90);
+      ctx.save();
+      ctx.strokeStyle = '#c83232';
+      ctx.lineWidth = 1.8;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(bx, padT - 8);
+      ctx.lineTo(bx, rowY(3) + rowH + 6);
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = '#c83232';
+      ctx.font = '10px ' + c.font;
+      ctx.textAlign = 'left';
+      ctx.fillText('barge-in', bx + 4, padT - 12);
+    }
+
+    for (var i = 0; i < labels.length; i++) {
+      ctx.fillStyle = c.text;
+      ctx.font = '11px ' + c.font;
+      ctx.textAlign = 'right';
+      ctx.fillText(labels[i], padL - 8, rowY(i) + rowH * 0.68);
+    }
+    ctx.textAlign = 'left';
+    ctx.fillText('one turn, from speech to first reply sound', 4, 16);
+
+    var el = document.getElementById('om-turn-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">user speaks</span> ' + speechMs + ' ms</div>' +
+        '<div><span class="k">ASR finalize</span> ' + asrMs + ' ms (concurrent)</div>' +
+        '<div><span class="k">gap to reply</span> <span class="' + (t.gapMs > 300 ? 'bad' : 'hi') + '">' + Guide.fmtMs(t.gapMs) + '</span></div>' +
+        '<div><span class="k">reply starts at</span> ' + t.replyStart + ' ms</div>' +
+        '<div><span class="k">barge-in</span> ' + (barge ? (t.interrupted ? 'cancels the pending reply' : 'too late to cancel') : 'off') + '</div>' +
+        '<div class="g-mini">The felt gap is network + first text token + first audio token. Recognition runs under the speech, so it is not added on top.</div>';
+    }
+  }
+
+  // ---- 4. realtime budget --------------------------------------------------
+  var gpuFactor = function () { return gpuLoad / 100; };
+  var budgetSetup = Guide.setupCanvas(document.getElementById('om-budget-canvas'), 640, 210, function () { drawBudget(); });
+  function drawBudget() {
+    if (!budgetSetup) return;
+    var ctx = budgetSetup.ctx, W = 640, H = 210;
+    var f = gpuFactor();
+    var b = GM.timeline.budget([
+      { name: 'ASR', ms: asrMs * f, color: c.accent400 },
+      { name: 'network', ms: netMs, color: c.accent2 },
+      { name: 'first text token', ms: ttftMs * f, color: c.accent700 },
+      { name: 'first audio token', ms: ttsMs * f, color: c.accent }
+    ]);
+    var scaleMax = Math.max(400, Math.ceil(b.total / 100) * 100);
+    var rows = [{
+      label: 'reply path',
+      segments: b.segments.map(function (s) { return { value: s.ms, color: s.color, name: s.name }; })
+    }];
+    var geo = Guide.drawStacked(ctx, W, H, rows, { padL: 96, padT: 40, padB: 70, maxTotal: scaleMax });
+    var x300 = geo.padL + geo.scale * 300;
+    ctx.save();
+    ctx.strokeStyle = c.text;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x300, geo.padT - 6);
+    ctx.lineTo(x300, geo.padT + geo.barH + 6);
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = c.text;
+    ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'right';
+    ctx.fillText('300 ms target', x300 - 4, geo.padT - 10);
+    var lx = geo.padL;
+    for (var i = 0; i < b.segments.length; i++) {
+      var s = b.segments[i];
+      ctx.fillStyle = s.color;
+      ctx.fillRect(lx, geo.padT + geo.barH + 18, 10, 10);
+      ctx.fillStyle = c.text;
+      ctx.font = '10px ' + c.font;
+      ctx.textAlign = 'left';
+      var label = s.name + ' ' + Math.round(s.ms) + 'ms';
+      ctx.fillText(label, lx + 14, geo.padT + geo.barH + 27);
+      lx += 22 + ctx.measureText(label).width + 14;
+    }
+    var felt = netMs + ttftMs * f + ttsMs * f;
+    var el = document.getElementById('om-budget-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">GPU load</span> ' + gpuLoad + '%</div>' +
+        '<div><span class="k">total work</span> ' + Guide.fmtMs(b.total) + '</div>' +
+        '<div><span class="k">felt gap</span> <span class="' + (felt > 300 ? 'bad' : 'hi') + '">' + Guide.fmtMs(felt) + '</span></div>' +
+        '<div><span class="k">verdict</span> ' + (felt > 300 ? 'reads as hesitation' : 'reflex-like') + '</div>' +
+        '<div class="g-mini">Compute-bound stages scale with load while the network hop does not, so a comfortable budget crosses 300 ms from the accelerator alone.</div>';
+    }
+  }
+
+  function redraw() { drawStream(); drawSplit(); drawTurn(); drawBudget(); }
+
+  Guide.bindSliders(document.querySelectorAll('#om-rate'), function (el) {
+    omRate = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#om-speech'), function (el) {
+    speechMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#om-asr'), function (el) {
+    asrMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#om-net'), function (el) {
+    netMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#om-ttft'), function (el) {
+    ttftMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#om-tts'), function (el) {
+    ttsMs = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#om-gpu'), function (el) {
+    gpuLoad = parseInt(el.value, 10);
+    redraw();
+  });
+
+  var bargeEl = document.getElementById('om-barge');
+  if (bargeEl) {
+    bargeEl.addEventListener('change', function () {
+      barge = bargeEl.checked;
+      var valEl = bargeEl.parentElement ? bargeEl.parentElement.querySelector('.val') : null;
+      if (valEl) valEl.textContent = barge ? 'on' : 'off';
+      redraw();
+    });
+  }
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'omni-gap',
+      kind: 'numeric',
+      prompt: 'A full-duplex model runs recognition under the user speech, then needs 30 ms of network, 120 ms to the first text token and 40 ms to the first audio token. What is the felt gap, in milliseconds?',
+      answer: 190,
+      tolerance: 1,
+      explanation: 'Recognition overlaps the speech, so it is not added. The felt gap is network + time to first text token + time to first audio token = 30 + 120 + 40 = 190 ms, comfortably inside the 200–300 ms band.'
+    },
+    {
+      id: 'omni-thinker-talker',
+      kind: 'choice',
+      prompt: 'What does the talker condition on to emit audio tokens?',
+      options: [
+        { label: 'The thinker hidden states, so speech decoding can start before the text sentence is finished.', correct: true },
+        { label: 'Only the final assistant text string, once generation has finished.', correct: false },
+        { label: 'The raw user waveform, bypassing the trunk entirely.', correct: false }
+      ],
+      explanation: 'The talker reads the thinker hidden states rather than waiting for a completed string. That lets the two overlap, keeps the strong text backbone doing the reasoning, and shortens the time to the first audible syllable.'
+    },
+    {
+      id: 'omni-duplex',
+      kind: 'choice',
+      prompt: 'What does full duplex require of the model?',
+      options: [
+        { label: 'Input and output streams stay open at once, so it listens while it speaks and can be interrupted.', correct: true },
+        { label: 'It must batch many conversations together to keep latency low.', correct: false },
+        { label: 'It must discard its own audio output once the reply has started.', correct: false }
+      ],
+      explanation: 'A turn-based system alternates listen and speak. Full duplex keeps both streams open, which is what makes barge-in graceful: the model stops, keeps what it heard and revises instead of finishing a sentence nobody wants.'
+    },
+    {
+      id: 'omni-budget',
+      kind: 'choice',
+      prompt: 'Why is the latency objective set against a tail percentile rather than an average?',
+      options: [
+        { label: 'A low average with an occasional very slow reply still feels broken to a listener.', correct: true },
+        { label: 'Averages cannot be measured for streaming systems.', correct: false },
+        { label: 'Only the tail matters because the network is constant.', correct: false }
+      ],
+      explanation: 'A model can average a comfortable 250 ms and still feel unreliable if one reply in twenty takes nearly a second. Voice interfaces are judged on the worst turns, so the budget is written against a high percentile of the latency distribution.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

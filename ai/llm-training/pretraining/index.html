@@ -1,0 +1,432 @@
+---
+title: "LLM Training, Interactively — Part 5: Pretraining, the Training Loop"
+description: "A real gradient-descent training loop you can step through by hand, learning-rate schedules (cosine vs WSD), gradient clipping and loss spikes, mid-training annealing, and how OLMo's public checkpoints show the process happening."
+permalink: "/ai/llm-training/pretraining/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-pretraining.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .pack-row { display:flex; gap:2px; margin-bottom:3px; }
+  .pack-tok { width:16px; height:16px; border-radius:2px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 5 of 15</span>
+    <h1>Pretraining: the Training Loop</h1>
+    <p>With a cleaned, trillion-token dataset from Part 4 and the transformer block from Part 3, pretraining is the process that turns them into a base model: the network is shown token sequences over and over, scored on how well it predicts the next token, and nudged to do slightly better each time — repeated for hundreds of thousands of steps across thousands of GPUs. This part builds the actual training loop, including one you can step through yourself, and checks each piece against what Ai2 published for OLMo.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="loop">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>A real training loop, small enough to run in this page</h2></div>
+    <p class="llmt-eyebrow">Foundations</p>
+    <p>Each training step: take a batch of token sequences, run the forward pass to get a predicted next-token distribution at every position, compare it against the actual next token using <strong>cross-entropy loss</strong>, then use backpropagation to compute how every parameter should change to reduce that loss, and apply an update via an optimizer — almost always <strong>AdamW</strong> for language models.</p>
+    <div class="llmt-math llmt-katex">$$L = -\frac{1}{T}\sum_t \log P_\theta(x_t \mid x_{<t})$$</div>
+    <p>Below is a genuine (if tiny) instance of this loop: a linear "neural bigram" model — one learned row of logits per previous word, no hand-coded counting table — trained by real gradient descent on Part 1's toy corpus. Click step repeatedly and watch the loss actually fall and the weight row for a chosen word actually shift.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow">
+        <button id="loop-step" class="llmt-primary">Step ▸ (1 gradient update)</button>
+        <button id="loop-step10">Step ×10</button>
+        <button id="loop-reset">Reset weights</button>
+      </div>
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;"><canvas id="loop-canvas" width="600" height="180"></canvas></div>
+      <div class="llmt-readout" id="loop-readout"></div>
+    </div>
+    <p class="llmt-canvas-hint">This model has no attention, no depth, no context beyond one word — it's the smallest possible thing that "trains" in the sense Part 1 through Part 3 describe. Everything else in this series scales this exact loop up: bigger model, more context, vastly more data.</p>
+  </section>
+
+  <section class="llmt-step" id="schedule">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>The learning-rate schedule</h2></div>
+    <p class="llmt-eyebrow">Training dynamics</p>
+    <p>The optimizer's step size — the <strong>learning rate</strong> — isn't fixed through training. The classic recipe is <strong>linear warmup</strong> followed by <strong>cosine decay</strong>: ramp up over the first ~1–2% of steps (starting at full learning rate on randomly-initialized weights is unstable), hold near a peak, then decay smoothly toward a small final value. A newer alternative, <strong>WSD (warmup–stable–decay)</strong>, holds a constant peak rate for most of training and only decays sharply at the very end — its appeal is that you can extend a run (train on more tokens) without having pre-committed to a total step count the way cosine's smooth decay curve requires.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <canvas id="s2-canvas" width="900" height="240"></canvas>
+      </div>
+      <div class="llmt-controls" style="flex-basis:100%; display:flex; gap:24px; flex-wrap:wrap;">
+        <div class="llmt-btnrow"><button id="s2-cosine" class="llmt-primary">Cosine</button><button id="s2-wsd">WSD</button></div>
+        <div class="llmt-field" style="flex:1 1 220px;"><label>Warmup steps (% of total) <span class="val" id="s2-wval"></span></label><input type="range" id="s2-warmup" min="1" max="15" step="1" value="3"></div>
+        <div class="llmt-field" style="flex:1 1 220px;"><label>Peak learning rate <span class="val" id="s2-pval"></span></label><input type="range" id="s2-peak" min="1" max="10" step="0.5" value="3"></div>
+      </div>
+    </div>
+    <div class="llmt-goal">💡 <span>Too little warmup and early training can blow up; too high a peak learning rate and loss oscillates or diverges later; decaying too early wastes the compute budget on preventable under-training. Published training reports like OLMo's include the exact schedule used, which is part of what makes a run reproducible rather than folklore.</span></div>
+  </section>
+
+  <section class="llmt-step" id="batching">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Batch size, gradient accumulation, and packing</h2></div>
+    <p class="llmt-eyebrow">Making one "step" efficient</p>
+    <p>A training step's batch is rarely one GPU's worth of data — <strong>gradient accumulation</strong> runs several smaller forward/backward passes, sums their gradients, and applies one optimizer update, simulating a much larger batch than fits in memory at once. Separately, since real documents rarely divide evenly into fixed-length training sequences, <strong>sequence packing</strong> concatenates multiple documents (with a separator token) to fill each sequence completely rather than wasting compute on padding.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-field"><label>Micro-batches accumulated <span class="val" id="ga-n-val">4</span></label><input type="range" id="ga-n" min="1" max="16" step="1" value="4"></div>
+      <div id="pack-viz"></div>
+      <div class="llmt-readout" id="ga-readout"></div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="spikes">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Gradient clipping and loss spikes</h2></div>
+    <p class="llmt-eyebrow">Stability at scale</p>
+    <p>Occasionally a batch produces an unusually large gradient — a rare, weirdly-formatted document, or accumulated numerical drift in mixed precision — and an uncontrolled update can knock the model's weights into a bad region, visible as a sudden loss spike. <strong>Gradient clipping</strong> caps the gradient's norm before the update is applied, the single cheapest stability measure available. OLMo's training reports are unusually candid about this: published loss curves show real spikes and recoveries, not a manicured monotone line.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="spike-canvas" width="520" height="220"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Gradient clip norm <span class="val" id="spike-clip-val">1.0</span></label><input type="range" id="spike-clip" min="0.1" max="5" step="0.1" value="1.0"></div>
+        <div class="llmt-btnrow"><button id="spike-new" class="llmt-primary">Simulate a new run</button></div>
+        <div class="llmt-readout" id="spike-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="anneal">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>Mid-training: OLMo 3's stage 2</h2></div>
+    <p class="llmt-eyebrow">A distinct stage between pretraining and fine-tuning</p>
+    <p>OLMo 2 introduced the anneal; OLMo 3 turns it into a full, measured stage. After roughly 5.9T tokens of pretraining, the model trains on <strong>Dolmino Mix 2</strong> — 100B high-quality tokens blending top-quality web and PDF data with synthetic math and code, QA, instruction data, and thinking traces. The goal isn't only a lower loss: midtraining deliberately lays the groundwork for post-training, so the base model already contains the raw material that SFT and RL will later sharpen.</p>
+    <p><b>Microanneals</b> are the fast loop: sample 5B tokens of a candidate source, mix with 5B web tokens, anneal, and compare against a web-only baseline. They let a team test dozens of datasets in parallel and decide what deserves a slot in the mix. <b>Integration tests</b> are the slow loop: a full 100B-token anneal of the whole candidate mixture, followed by SFT, to see whether a dataset still helps <em>next to everything else</em>. OLMo 3 ran five rounds; the average base score climbed <span class="lc-note">49.7 → 50.7 → 53.1</span> from the first candidate mix to the last, and the gain carried through to post-SFT evals.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p5-anneal" width="560" height="260"></canvas>
+        <p class="llmt-canvas-hint">Compute spent testing candidate datasets. A microanneal is ~10× cheaper per dataset; a full integration test costs far more but reveals interactions.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Candidate datasets to evaluate <span class="val" id="anneal-n-val">8</span></label>
+          <input type="range" id="anneal-n" min="1" max="20" step="1" value="8"></div>
+        <div class="llmt-readout" id="p5-anneal-readout"></div>
+      </div>
+    </div>
+    <p>Midtraining also exposes hard <b>domain tradeoffs</b>. An exploratory math/code/thinking-heavy mix raised Math (57.3 → 60.8) and Code (31.2 → 35.6) but cost MCQA-STEM (66.4 → 62.5) and GenQA (73.1 → 65.9); a GenQA-heavy mix did the reverse. There is no free lunch, which is precisely why the mix is chosen by integration tests rather than a single benchmark. And there is a formatting trap: including <strong>chat special tokens</strong> (<span class="lc-note">&lt;|im_start|&gt;</span>) in midtraining data makes the base model <em>emit</em> them at inference. GSM8K collapsed from 49.43 to 0 with special tokens, versus 46.02 with a plain chat template — so OLMo 3 strips both from midtraining and leaves them for SFT.</p>
+    <p><b>Model souping</b> closes the stage. Merging two independent 32B midtraining runs (different seeds) added roughly 1 point on MCQA-STEM, 0.4 on GenQA, 2.9/1.6 on Math versus the two runs, ~1 on MMLU, and 5/2 on GSM-Symbolic — enough that the merged checkpoint became the final 32B midtrained model. The 7B saw no such gain and stayed a single run.</p>
+    <div class="llmt-goal">💡 <span><b>Where this feeds:</b> the long-context extension of Part 13 starts from this midtrained checkpoint, and the whole post-training recipe of Part 15 consumes it. Midtraining is the hinge between the base model and everything that makes it an assistant.</span></div>
+  </section>
+
+  <section class="llmt-step" id="checkpoints">
+    <div class="llmt-step-head"><span class="llmt-step-num">6</span><h2>Watching it happen: loss curves and checkpoints</h2></div>
+    <p class="llmt-eyebrow">Evidence, not folklore</p>
+    <p>Most labs report a final loss number, if that. Ai2 published OLMo's <strong>entire loss curve</strong>, along with model checkpoints saved roughly every 1,000 training steps — so instead of taking "capability emerges gradually" on faith, you can download a checkpoint from any point in training and test it yourself. Drag the slider below through a representative (illustrative, shape-matched, including the late anneal drop from Section 5) training run.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <canvas id="s4-canvas" width="900" height="260"></canvas>
+      </div>
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-field"><label>Training step <span class="val" id="s4-sval"></span></label><input type="range" id="s4-step" min="0" max="1000" step="1" value="0"></div>
+        <div class="llmt-readout" id="s4-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-goal">💡 <span><b>OlmoTrace</b> takes this further at inference time: given a specific generated response, it searches back through the training corpus for documents whose text plausibly shaped that output — turning "the model said X" into "the model said X, and here's training text that looks like why."</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Piece</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td>Cross-entropy loss</td><td>Scores how well predicted next-token probabilities match the true next token</td></tr>
+        <tr><td>AdamW</td><td>Adaptive optimizer used to turn loss gradients into parameter updates</td></tr>
+        <tr><td>Warmup + cosine / WSD</td><td>Learning-rate schedules that stabilize early training and control late-training decay</td></tr>
+        <tr><td>Gradient accumulation</td><td>Simulates a larger batch than fits in memory by summing several micro-batch gradients</td></tr>
+        <tr><td>Sequence packing</td><td>Concatenates documents to fill training sequences without padding waste</td></tr>
+        <tr><td>Gradient clipping</td><td>Caps gradient norm to prevent a single bad batch from destabilizing training</td></tr>
+        <tr><td>Mid-training anneal</td><td>Late-training shift to a smaller, higher-quality data mixture (OLMo 2's Dolmino, OLMo 3's Dolmino Mix 2)</td></tr>
+        <tr><td>Microanneal</td><td>~10B-token test of one candidate dataset against a web-only baseline, run in parallel across many candidates</td></tr>
+        <tr><td>Integration test</td><td>Full 100B-token midtraining run on a candidate mix plus SFT, revealing how sources interact</td></tr>
+        <tr><td>Model souping</td><td>Averaging weights of independent runs; OLMo 3 used it for the 32B midtrained and long-context checkpoints</td></tr>
+        <tr><td>Special tokens at midtraining</td><td>Chat tokens make the base model emit them at inference (GSM8K 49.43 → 0); leave them for SFT</td></tr>
+        <tr><td>Checkpoints</td><td>Snapshots of the model at intervals through training, enabling inspection of how capability develops</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Kingma &amp; Ba, <a href="https://arxiv.org/abs/1412.6980">"Adam: A Method for Stochastic Optimization"</a> (2014); Loshchilov &amp; Hutter, <a href="https://arxiv.org/abs/1711.05101">"Decoupled Weight Decay Regularization"</a> (AdamW, 2017).</li>
+      <li>Hu et al., <a href="https://arxiv.org/abs/2404.06395">"MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies"</a> (2024) — WSD schedule.</li>
+      <li>OLMo 2 Team (Ai2), <a href="https://arxiv.org/abs/2501.00656">"2 OLMo 2 Furious"</a> (2024) — Dolmino mid-training mix, loss spikes, checkpoint souping.</li>
+      <li>Ai2, <a href="https://allenai.org/blog/olmotrace">OlmoTrace announcement</a> — tracing model outputs to training data.</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>Before scaling any of this up, it's worth knowing the actual math for how much compute a given model-and-data size costs, and how to fit it on real hardware.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/scaling/' | relative_url }}">Continue: scaling laws &amp; training systems →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+
+  var CORPUS = "the small robot rolled across the quiet lab and stopped by the window the window was open and the cold air moved the curtain the robot raised its arm and closed the window then the robot returned to the workbench where a dataset of text waited to be read the robot read the text one token at a time and learned to guess the next token after every word the small model inside the robot updated its numbers a little the more text it read the better its guesses became until one day the robot could finish a sentence someone else had started";
+  var words = CORPUS.split(/\s+/);
+  var vocab = Array.from(new Set(words));
+  var vocabIdx = {}; vocab.forEach(function(w,i){ vocabIdx[w]=i; });
+  var pairs = [];
+  for (var i=0;i<words.length-1;i++) pairs.push([vocabIdx[words[i]], vocabIdx[words[i+1]]]);
+
+  // ---- Section 1: real gradient-descent "neural bigram" ----
+  (function(){
+    var V = vocab.length;
+    var W_; // V x V logit matrix
+    var lossHistory = [];
+    var canvas = document.getElementById('loop-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('loop-readout');
+    var Wc = canvas.width, Hc = canvas.height;
+
+    function initWeights(){ W_ = []; for (var i=0;i<V;i++){ var row=[]; for (var j=0;j<V;j++) row.push(0); W_.push(row); } lossHistory=[]; }
+    initWeights();
+
+    function stepOnce(){
+      var lr = 0.5;
+      var totalLoss = 0;
+      var grad = []; for (var i=0;i<V;i++) grad.push(new Array(V).fill(0));
+      // sample a mini-batch of 32 random pairs each step
+      for (var b=0;b<32;b++){
+        var p = pairs[Math.floor(Math.random()*pairs.length)];
+        var ctxIdx = p[0], targetIdx = p[1];
+        var logits = W_[ctxIdx];
+        var probs = G.softmax(logits, 1);
+        totalLoss += -Math.log(probs[targetIdx]+1e-9);
+        for (var j=0;j<V;j++){
+          var indicator = (j===targetIdx) ? 1 : 0;
+          grad[ctxIdx][j] += (probs[j]-indicator);
+        }
+      }
+      for (var r=0;r<V;r++) for (var cIdx=0;cIdx<V;cIdx++) W_[r][cIdx] -= lr*grad[r][cIdx]/32;
+      var avgLoss = totalLoss/32;
+      lossHistory.push(avgLoss);
+      if (lossHistory.length > 200) lossHistory.shift();
+      return avgLoss;
+    }
+
+    function render(){
+      var lines = [{ points: lossHistory.map(function(l,i){ return {x:i, y:l}; }), color: c.accent }];
+      G.drawLines(ctx, Wc, Hc, lines, [0, Math.max(50,lossHistory.length)], [0, Math.max(2, Math.max.apply(null, lossHistory.concat([2])))], {xLabel:'gradient steps', yLabel:'loss (nats)'});
+      var idx = vocabIdx['robot'];
+      var topLogits = W_[idx].map(function(v,i){return {w:vocab[i], v:v};}).sort(function(a,b){return b.v-a.v;}).slice(0,3);
+      readout.innerHTML = '<span class="k">steps taken:</span> '+lossHistory.length+
+        (lossHistory.length ? '<br><span class="k">latest loss:</span> <span class="hi">'+lossHistory[lossHistory.length-1].toFixed(3)+'</span>' : '') +
+        '<br><span class="k">learned top continuations of "robot" so far:</span> '+topLogits.map(function(t){return t.w+' ('+t.v.toFixed(2)+')';}).join(', ');
+    }
+    document.getElementById('loop-step').addEventListener('click', function(){ stepOnce(); render(); });
+    document.getElementById('loop-step10').addEventListener('click', function(){ for (var i=0;i<10;i++) stepOnce(); render(); });
+    document.getElementById('loop-reset').addEventListener('click', function(){ initWeights(); render(); });
+    render();
+  })();
+
+  // ---- Section 2: LR schedule (cosine vs WSD) ----
+  (function(){
+    var canvas = document.getElementById('s2-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var warmupEl = document.getElementById('s2-warmup'), wval = document.getElementById('s2-wval');
+    var peakEl = document.getElementById('s2-peak'), pval = document.getElementById('s2-pval');
+    var cosineBtn = document.getElementById('s2-cosine'), wsdBtn = document.getElementById('s2-wsd');
+    var mode = 'cosine';
+
+    function lr(step, totalSteps, warmupFrac, peak){
+      var warmupSteps = totalSteps * warmupFrac;
+      if (step < warmupSteps) return peak * (step/warmupSteps);
+      var t = (step-warmupSteps)/(totalSteps-warmupSteps);
+      if (mode==='cosine') return peak * 0.5 * (1 + Math.cos(Math.PI*t)) * 0.98 + peak*0.02;
+      // WSD: stable until 80% of post-warmup, then linear decay
+      if (t < 0.8) return peak;
+      var decayT = (t-0.8)/0.2;
+      return peak*(1-decayT)*0.98 + peak*0.02;
+    }
+    function draw(){
+      var warmupFrac = warmupEl.value/100, peak = parseFloat(peakEl.value);
+      wval.textContent = warmupEl.value + '%';
+      pval.textContent = peak.toFixed(1) + 'e-4';
+      var pts = [];
+      for (var s=0; s<=1000; s+=4) pts.push({x:s, y: lr(s,1000,warmupFrac,peak)});
+      G.drawLines(ctx, W, H, [{points:pts, color:c.accent}], [0,1000], [0,10], {xLabel:'training steps', yLabel:'learning rate (×1e-4)'});
+    }
+    warmupEl.addEventListener('input', draw);
+    peakEl.addEventListener('input', draw);
+    cosineBtn.addEventListener('click', function(){ mode='cosine'; cosineBtn.className='llmt-primary'; wsdBtn.className=''; draw(); });
+    wsdBtn.addEventListener('click', function(){ mode='wsd'; wsdBtn.className='llmt-primary'; cosineBtn.className=''; draw(); });
+    draw();
+  })();
+
+  // ---- Section 3: gradient accumulation / packing ----
+  (function(){
+    var slider = document.getElementById('ga-n'), val = document.getElementById('ga-n-val');
+    var viz = document.getElementById('pack-viz');
+    var readout = document.getElementById('ga-readout');
+    var microBatchSize = 8, seqLen = 12;
+    var docLens = [5,3,9,2,7,4,11,6,3,8,5,10];
+
+    function render(){
+      var n = parseInt(slider.value,10);
+      val.textContent = n;
+      var effectiveBatch = n*microBatchSize;
+      viz.innerHTML = '';
+      var docIdx = 0;
+      for (var row=0; row<3; row++){
+        var rowEl = document.createElement('div'); rowEl.className='pack-row';
+        var filled = 0, d = 0;
+        while (filled < seqLen){
+          var len = Math.min(docLens[docIdx % docLens.length], seqLen-filled);
+          for (var k=0;k<len;k++){
+            var tok = document.createElement('div'); tok.className='pack-tok';
+            tok.style.background = (docIdx%2===0)? c.accent : c.accent2;
+            rowEl.appendChild(tok);
+          }
+          filled += len; docIdx++;
+        }
+        viz.appendChild(rowEl);
+      }
+      readout.innerHTML = '<span class="k">micro-batch size:</span> '+microBatchSize+'  <span class="k">accumulation steps:</span> '+n+'  <span class="k">effective batch size:</span> <span class="hi">'+effectiveBatch+'</span><br>' +
+        '<span style="opacity:0.6">above: packed sequences — alternating colors are different documents concatenated back-to-back with no padding, filling every training position</span>';
+    }
+    slider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Section 4: gradient clipping / loss spikes ----
+  (function(){
+    var clipSlider = document.getElementById('spike-clip'), clipVal = document.getElementById('spike-clip-val');
+    var newBtn = document.getElementById('spike-new');
+    var canvas = document.getElementById('spike-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('spike-readout');
+    var W = canvas.width, H = canvas.height;
+    var rng = G.seededRandom(Date.now() % 100000);
+    var spikeSteps = [];
+    function newRun(){
+      spikeSteps = [];
+      for (var i=0;i<3;i++) spikeSteps.push(20+Math.floor(rng()*160));
+    }
+    newRun();
+    function render(){
+      var clip = parseFloat(clipSlider.value);
+      clipVal.textContent = clip.toFixed(1);
+      var pts = [];
+      var loss = 3.0;
+      var recovered = 0;
+      for (var s=0;s<200;s++){
+        var isSpikeStep = spikeSteps.indexOf(s) !== -1;
+        var rawGradNorm = isSpikeStep ? 8+Math.random()*6 : 0.3+Math.random()*0.4;
+        var clippedNorm = Math.min(rawGradNorm, clip);
+        var damageRatio = clip < rawGradNorm ? clippedNorm/rawGradNorm : 1;
+        var step_effect = isSpikeStep ? (rawGradNorm - clippedNorm)*0.15 : 0;
+        loss = Math.max(1.4, loss - 0.006 + step_effect);
+        pts.push({x:s, y:loss});
+      }
+      G.drawLines(ctx, W, H, [{points:pts, color:c.accent}], [0,200], [1.2,4.5], {xLabel:'training steps', yLabel:'loss'});
+      var maxLoss = Math.max.apply(null, pts.map(function(p){return p.y;}));
+      readout.innerHTML = '<span class="k">simulated spike events:</span> '+spikeSteps.length+'<br><span class="k">peak loss reached:</span> '+maxLoss.toFixed(2)+
+        '<br><span style="opacity:0.6">'+(clip<2?'tighter clipping suppresses spikes but can also slow legitimate large-but-useful updates':'looser clipping lets more of a bad batch\'s gradient through, producing bigger visible spikes')+'</span>';
+    }
+    clipSlider.addEventListener('input', render);
+    newBtn.addEventListener('click', function(){ newRun(); render(); });
+    render();
+  })();
+
+  // ---- Section 5 (numbered 6): loss curve + checkpoints, now including anneal drop ----
+  (function(){
+    var canvas = document.getElementById('s4-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var stepEl = document.getElementById('s4-step'), sval = document.getElementById('s4-sval');
+    var readout = document.getElementById('s4-readout');
+
+    function loss(stepFrac){
+      var base = 4.2*Math.exp(-stepFrac*5) + 1.9*Math.exp(-stepFrac*0.6) + 1.55;
+      var anneal = stepFrac > 0.92 ? -(stepFrac-0.92)*1.8 : 0;
+      var noise = 0.03*Math.sin(stepFrac*97);
+      return base + anneal + noise;
+    }
+    function stageNote(stepFrac){
+      if (stepFrac < 0.05) return 'Very early: outputs are close to random tokens — high loss, no coherent grammar yet.';
+      if (stepFrac < 0.25) return 'Early-mid: local grammar and common phrases start appearing; still frequently incoherent over long spans.';
+      if (stepFrac < 0.6) return 'Mid training: fluent, mostly grammatical text; factual reliability and reasoning are still developing.';
+      if (stepFrac < 0.92) return 'Late training: loss improvements are small per step but compound.';
+      return 'Mid-training anneal (Section 5): the high-quality Dolmino-style mixture and LR decay produce a visible extra drop right at the end.';
+    }
+    function draw(){
+      var stepFrac = stepEl.value/1000;
+      sval.textContent = Math.round(stepFrac*100) + '% through training (~step ' + Math.round(stepFrac*450000).toLocaleString() + ' of ~450,000, illustrative)';
+      var pts = []; for (var s=0;s<=1000;s+=4) pts.push({x:s/1000, y:loss(s/1000)});
+      var axes = G.drawLines(ctx, W, H, [{points:pts, color:c.accent}], [0,1], [1.4,4.6], {xLabel:'training progress', yLabel:'training loss'});
+      var mx = axes.px(stepFrac), my = axes.py(loss(stepFrac));
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(mx,my,5,0,2*Math.PI); ctx.fill();
+      readout.innerHTML = '<span class="k">approx. loss here:</span> <span class="hi">' + loss(stepFrac).toFixed(3) + '</span><br>' +
+        '<span class="k">what checkpoints around here typically look like:</span> ' + stageNote(stepFrac);
+    }
+    stepEl.addEventListener('input', draw);
+    draw();
+  })();
+
+  // ---- Section 5b: microanneal vs integration test cost ----
+  (function(){
+    var slider = document.getElementById('anneal-n'), val = document.getElementById('anneal-n-val');
+    var canvas = document.getElementById('p5-anneal'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('p5-anneal-readout');
+    var W = canvas.width, H = canvas.height;
+    function render(){
+      var n = parseInt(slider.value,10); val.textContent = n;
+      ctx.clearRect(0,0,W,H);
+      var micro = n*10, integ = n*100;
+      var maxV = Math.max(micro, integ);
+      var padL=190, padR=70, padT=30, padB=20;
+      var plotW = W-padL-padR, plotH = H-padT-padB;
+      var bars = [{label:'Microanneals (10B each)', v:micro, color:c.accent}, {label:'Integration tests (100B each)', v:integ, color:c.accent2}];
+      var barH = plotH/bars.length - 20;
+      bars.forEach(function(b,i){
+        var y = padT + i*(barH+20);
+        ctx.fillStyle=b.color; ctx.fillRect(padL, y, plotW*b.v/maxV, barH);
+        ctx.fillStyle=c.text; ctx.font='12px '+c.font; ctx.textAlign='right';
+        ctx.fillText(b.label, padL-8, y+barH*0.7);
+        ctx.textAlign='left';
+        ctx.fillText((b.v/1000).toFixed(1)+'T tokens', padL+plotW*b.v/maxV+6, y+barH*0.7);
+      });
+      readout.innerHTML = '<span class="k">microanneal budget:</span> '+(micro/1000).toFixed(1)+'T tokens &nbsp; <span class="k">integration budget:</span> '+(integ/1000).toFixed(1)+'T<br>'+
+        '<span style="opacity:0.65">Microanneals screen breadth cheaply; a few integration tests confirm what survives the full mix.</span>';
+    }
+    slider.addEventListener('input', render);
+    render();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

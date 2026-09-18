@@ -1,0 +1,551 @@
+---
+title: "Statistics, Interactively — Part 19: When conjugacy fails: MCMC"
+description: "Monte Carlo as sampling instead of integrating: tune a Metropolis–Hastings chain on a two-dimensional posterior and watch the acceptance rate, trace plot and R-hat respond."
+permalink: "/math/statistics/mcmc/"
+section: "math"
+series: "statistics"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true plotly=true %}
+<style>
+  .g-canvas-stack { display: flex; flex-direction: column; gap: 10px; }
+  .g-canvas-stack canvas { width: 100%; height: auto; display: block; background: var(--color-neutral-100); border-radius: var(--radius-sm); }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 4px; }
+  .g-note { font-size: 12px; line-height: 1.5; margin-top: 4px; }
+  .g-surface { width: 100%; height: 240px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.statistics %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Statistics</span>
+    <h1>When conjugacy fails: MCMC</h1>
+    <p>Conjugacy is the exception, not the rule. For a Beta prior and coin flips, or two Gaussians that fuse into one, the posterior can be written down in closed form &mdash; and the previous parts did exactly that. Most models are not so lucky. The moment a likelihood has several parameters, a mixture, a hierarchy or a link function, the product of prior and likelihood is a shape with no name, and the normalising constant hiding inside it is an integral nobody can do by hand. This part abandons the formula and keeps the goal: instead of an equation for the posterior, draw samples from it. You will run a live Metropolis&ndash;Hastings chain on a two-dimensional posterior, tune the proposal width, and read its health off a trace plot, an acceptance rate and R-hat.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">What do you do when the posterior has no formula?</p>
+    <p>Bayesian inference needs one object: the posterior $p(\theta \mid y)$, the distribution of the parameters after seeing the data. Everything you might report &mdash; a mean, a credible interval, a predictive probability &mdash; is an integral against that distribution. When the posterior is one of the handful of conjugate families, the integral is arithmetic and the story ends. When it is not, the shape exists but refuses to be written down, and the integral is what stands between you and every answer you wanted.</p>
+    <p>The escape is to stop trying to evaluate the integral and start trying to <em>draw from the distribution</em>. If you have samples $\theta_1, \dots, \theta_N$ that behave as though they came from the posterior, then any expectation you care about is just an average of numbers you already hold. You never differentiated or integrated anything. This part builds the machine that produces those samples, and then makes its failure modes visible.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a Markov chain can be engineered to have an arbitrary target as its stationary distribution, why the proposal width is the one knob that governs mixing, and why burn-in, autocorrelation and R-hat are the diagnostics that tell you whether the samples are worth averaging.</span></div>
+    <div class="g-toc">
+      <a href="#fails">2 · Why conjugacy fails</a>
+      <a href="#sampling">3 · Sampling instead of integrating</a>
+      <a href="#rule">4 · The Metropolis–Hastings rule</a>
+      <a href="#live">5 · Run the chain</a>
+      <a href="#diagnostics">6 · Burn-in, autocorrelation and R-hat</a>
+      <a href="#shows">7 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="fails">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Why conjugacy fails</h2></div>
+    <p class="g-eyebrow">The normalising constant is the wall</p>
+    <p>A conjugate prior is a prior chosen so that the posterior lands back in the same family as the prior. The choice is convenient but narrow. It works for the Beta&ndash;Binomial pair, for the Gaussian&ndash;Gaussian pair, for Gamma&ndash;Poisson, and for a short list of others. Each pairing has been tabulated precisely because it is rare, and the previous two parts spent their time inside that list.</p>
+    <p>Step outside it and the algebra collapses. Give a logistic regression a Gaussian prior on its coefficients and the posterior is the product of a smooth prior and a likelihood with $n$ logistic terms. It is a perfectly well-defined density, but it is not a Gaussian, not a Student-$t$, not anything with a name. Put a prior on the <em>parameters</em> of a distribution whose <em>mean</em> is a mixture of two components and the posterior becomes a multi-modal surface that no one-line formula describes. Add a hierarchy &mdash; parameters drawn from a population distribution whose own parameters are unknown &mdash; and the posterior acquires an integral inside it.</p>
+    <p>The obstruction is always the same piece of the definition,</p>
+    <div class="g-math g-katex">$$p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{\displaystyle\int p(y \mid \theta')\,p(\theta')\,d\theta'}$$</div>
+    <p>The numerator is easy: it is a product you can evaluate at any $\theta$ with a line of code. The denominator is an integral over the whole parameter space, and without a conjugate trick it has no closed form. It is the same number for every $\theta$, so it changes nothing about the <em>shape</em> of the posterior &mdash; only its scale. That observation is the crack in the wall, and Metropolis&ndash;Hastings drives straight through it.</p>
+  </section>
+
+  <section class="g-step" id="sampling">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Sampling instead of integrating</h2></div>
+    <p class="g-eyebrow">Monte Carlo turns an integral into an average</p>
+    <p>Suppose, for a moment, that samples from the posterior were handed to you. The posterior mean is then just the average of the samples, and any other posterior expectation follows the same pattern:</p>
+    <div class="g-math g-katex">$$\mathbb{E}[f(\theta) \mid y] = \int f(\theta)\,p(\theta \mid y)\,d\theta \;\approx\; \frac{1}{N}\sum_{i=1}^{N} f(\theta_i)$$</div>
+    <p>This is the Monte Carlo idea in one line. A credible interval becomes a pair of sample quantiles. A predictive probability becomes a fraction of samples that pass a test. Nothing requires the posterior to have a name, and the error of the approximation shrinks like $1/\sqrt{N}$ &mdash; crucially, that rate does not get worse as the number of parameters grows. A grid over ten dimensions with twenty points per axis is already $20^{10}$ cells, while a million samples remain a million samples in any dimension. The price is that the samples are random and correlated, and the $1/\sqrt{N}$ describes an idealised independent draw.</p>
+    <p>So the whole problem reduces to one question: how do you draw from a distribution you can only evaluate up to an unknown constant? Rejection sampling needs a bounding envelope that is hopeless in high dimensions, and importance sampling collapses when the proposal and the target disagree. The method that survives is to build a <em>Markov chain</em> &mdash; a sequence of values where each depends on the last &mdash; and arrange for the chain to spend time in each region in proportion to the target density. If a chain does that, its values are a sample from the target for every purpose that matters. Where <a href="{{ '/math/calculus-in-motion/optimizers/' | relative_url }}">optimizers</a> hunt for the single highest point of a function, a sampler wanders over the whole surface and reports how much of it is high.</p>
+  </section>
+
+  <section class="g-step" id="rule">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The Metropolis–Hastings rule</h2></div>
+    <p class="g-eyebrow">Propose, then accept or reject</p>
+    <p>Metropolis&ndash;Hastings is a recipe for that chain, and it is startlingly short. Standing at the current value $\theta$, propose a nearby value $\theta'$ from a proposal distribution $q(\theta' \mid \theta)$. Evaluate the target at both points. Accept the proposal with probability</p>
+    <div class="g-math g-katex">$$\alpha = \min\!\left(1,\; \frac{p(\theta' \mid y)\,q(\theta \mid \theta')}{p(\theta \mid y)\,q(\theta' \mid \theta)}\right)$$</div>
+    <p>and if the proposal is rejected, stay where you are and record the current value again. The most common choice is a symmetric random walk: $q(\theta' \mid \theta) = \mathcal{N}(\theta, s^2 I)$, so the two proposal densities cancel and the acceptance probability is just the ratio of target densities, $\min(1, p(\theta' \mid y)/p(\theta \mid y))$. A move uphill is always accepted; a move downhill is accepted sometimes, with a probability equal to how far downhill it is.</p>
+    <p>The denominator of Bayes' rule appears in both the numerator and denominator of that ratio, so it cancels. This is the point of the whole construction: the chain needs the posterior only up to a constant, which is precisely the part you can compute. The resulting transition rule satisfies a condition called detailed balance, and detailed balance is what forces the target distribution to be the chain's stationary distribution &mdash; the distribution it converges to and then samples from forever.</p>
+    <p>The one free parameter is the proposal width $s$. It behaves like the step size of an explorer who cannot see the map. Too small and almost every proposal is accepted, but each step is a crawl: the chain mixes slowly and consecutive samples are nearly identical. Too large and proposals jump far into low-density territory, where they are almost always rejected, so the chain sits still. The useful regime is between, where the step size is comparable to the width of the target. For a random walk in more than a couple of dimensions the classical target is an acceptance rate near a quarter, and the demo's readout will show you what each extreme looks like.</p>
+  </section>
+
+  <section class="g-step" id="live">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Run the chain</h2></div>
+    <p class="g-eyebrow">Proposal width, trace plot, acceptance rate, burn-in, R-hat</p>
+    <p>The target below is a correlated two-component mixture in the plane: two elliptical clumps, tilted in opposite directions, with a moderate dip between them. No normalising constant is used anywhere &mdash; the chain only ever evaluates the log of the unnormalised density. Four chains start from the corners of the plot, which is deliberately unhelpful, because watching them find the modes is part of the lesson. The shaded background is the target; the dots are the samples each chain has collected; the solid marker is the most recent position of the first chain.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-canvas-stack">
+        <canvas id="target-canvas" width="640" height="420"></canvas>
+        <canvas id="trace-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Top: the 2D target and the samples from four chains. Bottom: the trace of the first coordinate &mdash; the chain's value at each iteration, with the burn-in region shaded.</p>
+        <div class="g-surface" id="mcmc-surface" style="display:none;"></div>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Proposal width <span class="val">0.35</span></label><input type="range" id="prop-slider" min="0.05" max="2" step="0.01" value="0.35"></div>
+        <div class="g-field"><label>Burn-in <span class="val">100</span></label><input type="range" id="burn-slider" min="0" max="800" step="10" value="100"></div>
+        <div class="g-btnrow">
+          <button type="button" id="step-one" class="g-primary">Step</button>
+          <button type="button" id="step-fifty">Step 50</button>
+          <button type="button" id="run-btn">Run</button>
+          <button type="button" id="reset-btn">Reset</button>
+        </div>
+        <div class="g-readout" id="mcmc-readout"></div>
+        <div class="g-note" id="mcmc-note"></div>
+      </div>
+    </div>
+    <p>Press <b>Step</b> a few times and watch a single proposal at a time: the marker hops uphill without hesitation and sometimes declines a downhill move. Press <b>Run</b> and the four chains scatter out of their corners and converge onto the two clumps. The trace plot is the same story in one dimension: a chain that has not yet converged shows a slow drift from its starting value, and a chain that has converged shows a fuzzy band of jitter with no trend. The acceptance-rate readout names the proposal width for you, and the <b>Burn-in</b> slider sets how many early samples are greyed out and excluded from the estimates.</p>
+    <div class="g-warn">⚠ <span><b>The proposal width is not a nuisance parameter.</b> Drag it to the extremes and watch two different failures. At width $0.05$ the acceptance rate climbs above ninety percent and yet the samples barely move &mdash; high acceptance with terrible mixing. At width $1.8$ almost every proposal is rejected and the chains freeze in place. The healthy middle is not the setting with the most acceptances; it is the one that moves through the distribution fastest.</span></div>
+  </section>
+
+  <section class="g-step" id="diagnostics">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Burn-in, autocorrelation and R-hat</h2></div>
+    <p class="g-eyebrow">How to tell whether the samples are worth averaging</p>
+    <p><b>Burn-in.</b> A chain started at an arbitrary point is not yet sampling from the target; it is travelling towards it. Those early iterations carry a bias that has nothing to do with the posterior, and the standard remedy is to discard them. The grey region of the trace plot is exactly that discarded prefix. Burn-in is a crude instrument &mdash; you cannot prove a chain has arrived, only fail to see it still moving &mdash; but on a trace plot that has flattened into a stationary fuzz the transient is usually obvious.</p>
+    <p><b>Autocorrelation and effective sample size.</b> Successive values of a random-walk chain are correlated, so $N$ samples are worth less than $N$ independent ones. The autocorrelation $\rho_k$ measures how much a value resembles the value $k$ steps earlier, and the effective sample size converts the raw count into the equivalent number of independent draws,</p>
+    <div class="g-math g-katex">$$\mathrm{ESS} = \frac{N}{1 + 2\sum_{k\ge 1}\rho_k}$$</div>
+    <p>When the proposal width is too small the autocorrelation decays slowly, the denominator is large, and the ESS is a small fraction of $N$. This is why a high acceptance rate is not a virtue in itself: accepting every proposal is worthless if the accepted moves are microscopic. The cure is the same knob that the acceptance rate is reporting on.</p>
+    <p><b>R-hat.</b> The trace plot's weakness is that a single chain can look stationary while being stuck in one mode and never visiting another. The fix is to run several chains from over-dispersed starting points and compare them. R-hat pools two variance estimates: the average variance <em>within</em> each chain and the variance <em>between</em> the chains' means. If the chains have all converged to the same distribution, the two agree and</p>
+    <div class="g-math g-katex">$$\hat{R} = \sqrt{\frac{\hat{V}}{W}} \;\longrightarrow\; 1$$</div>
+    <p>If they are still exploring different regions, the between-chain spread inflates R-hat above one. The conventional rule of thumb is that $\hat{R} < 1.1$ is passable and values near $1.01$ are better. In the demo, R-hat is computed on the retained portion of all four chains; watch it fall towards one as the chains find both clumps, and watch it stall above one if you leave the starting points stranded. This diagnostic is the direct descendant of the Markov-chain filters used in <a href="{{ 'https://denimpatel.github.io/AI/robotics/navigation/odometry/' | relative_url }}">robot state estimation</a>, where a cloud of hypotheses is propagated and compared in exactly this spirit.</p>
+    <div class="g-warn">⚠ <span><b>Convergence is a diagnosis, not a guarantee.</b> A trace that looks stationary, an acceptance rate in the healthy band and an R-hat near one are all necessary conditions, and they can all be satisfied by a chain that never visits a mode on the far side of a low-density valley. Multi-chain R-hat is designed to catch that failure; when it cannot, the honest move is a better proposal or a different sampler.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Sampling when the formula runs out</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision &amp; Robotics</div>
+        <h3 style="margin:6px 0;">Sampling-based SLAM</h3>
+        <p style="margin-bottom:0;">The posterior over a robot's trajectory and map has no conjugate form &mdash; it is a nonlinear, high-dimensional distribution over thousands of variables. The <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM chapter</a> shows the two responses: find the mode by optimisation, or sample the distribution with particle methods and MCMC. Sampling keeps the uncertainty that a single best-fit trajectory throws away, at the cost of the diagnostics you have just been reading.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">ML / AI</div>
+        <h3 style="margin:6px 0;">Uncertainty in model evaluation</h3>
+        <p style="margin-bottom:0;">A held-out benchmark score is a point estimate; a Bayesian treatment of a model's error rate makes it a posterior over a parameter, and for non-conjugate likelihoods that posterior is sampled rather than derived. The <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">evaluation chapter</a> builds intervals on finite test sets, and the resampling ideas there and the MCMC ideas here share the same premise: when you cannot integrate, you simulate.</p>
+      </div>
+    </div>
+    <p>The pattern generalises far beyond these two. Every hierarchical model, every latent-variable model and every posterior over neural-network weights is a distribution you sample because you cannot integrate. What changes is the proposal mechanism: Hamiltonian Monte Carlo uses gradients to propose long, informed moves, and Gibbs sampling proposes along coordinate slices. What stays constant is the diagnostic vocabulary of this part &mdash; acceptance, trace, autocorrelation, effective sample size and R-hat &mdash; and the Monte Carlo reduction of integrals to averages that made the whole enterprise worthwhile.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The references below treat MCMC as a practical instrument with failure modes rather than a theorem to admire. If you take away one thing, take away the picture of a chain wandering over a surface it can only evaluate up to a constant, and of diagnostics as the instruments that tell you whether the wandering was honest.</p>
+    <p>Gelman and colleagues is the standard applied reference, with the convergence chapter that made R-hat a household name. MacKay derives Metropolis&ndash;Hastings from detailed balance in a handful of pages. Andrieu, de Freitas, Doucet and Jordan is the machine-learning survey that connects the algorithm to the models that need it, and Betancourt's conceptual introduction is the clearest modern account of why a random walk is the wrong default once gradients are available.</p>
+    <ul class="g-refs">
+      <li>Andrew Gelman, John Carlin, Hal Stern, David Dunson, Aki Vehtari and Donald Rubin, <em>Bayesian Data Analysis</em>, 3rd ed., chapter 11 &mdash; MCMC, convergence and effective sample size.</li>
+      <li>David MacKay, <em>Information Theory, Inference, and Learning Algorithms</em>, chapter 29 &mdash; Metropolis&ndash;Hastings from detailed balance.</li>
+      <li>Christophe Andrieu, Nando de Freitas, Arnaud Doucet and Michael Jordan, <a href="https://link.springer.com/article/10.1023/A:1020281327116">"An Introduction to MCMC for Machine Learning"</a>, <em>Machine Learning</em>, 2003.</li>
+      <li>Michael Betancourt, <a href="https://arxiv.org/abs/1701.02434">"A Conceptual Introduction to Hamiltonian Monte Carlo"</a>, 2017 &mdash; why informed proposals beat a random walk.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Target $p(\theta \mid y)$</td><td>The posterior the chain is built to sample; needed only up to a constant</td></tr>
+        <tr><td>Proposal $q(\theta' \mid \theta)$</td><td>The rule for suggesting the next value; a Gaussian random walk in this part</td></tr>
+        <tr><td>Acceptance $\alpha$</td><td>$\min(1,\ p(\theta')/p(\theta))$ for a symmetric proposal; a downhill move is accepted sometimes</td></tr>
+        <tr><td>Proposal width $s$</td><td>The step size; too small mixes slowly, too large rejects almost everything</td></tr>
+        <tr><td>Acceptance rate</td><td>Fraction of proposals accepted; a diagnostic, not a score to maximise</td></tr>
+        <tr><td>Burn-in</td><td>The discarded prefix before the chain reaches its stationary distribution</td></tr>
+        <tr><td>Trace plot</td><td>The chain's value against iteration; stationarity looks like a fuzzy band</td></tr>
+        <tr><td>Autocorrelation $\rho_k$</td><td>How much a sample resembles one $k$ steps earlier</td></tr>
+        <tr><td>ESS</td><td>Effective sample size, $N/(1+2\sum\rho_k)$; always below the raw count</td></tr>
+        <tr><td>R-hat $\hat{R}$</td><td>Between- to within-chain variance ratio; near $1$ means the chains agree</td></tr>
+        <tr><td>Stationary distribution</td><td>The long-run distribution of the chain; detailed balance makes it the target</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}MCMC gives you samples at the price of a chain that may not have converged. The next part buys speed instead &mdash; fitting a simple Gaussian to the posterior, or optimising a variational bound.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.statistics teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/stats-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var S = Stats;
+  var c = Guide.colors();
+
+  // ------------------------------------------------------------------
+  // A correlated two-component Gaussian mixture in the plane. The chain
+  // only ever evaluates it up to an additive constant.
+  // ------------------------------------------------------------------
+  var WEIGHTS = [0.6, 0.4];
+  var MEANS = [[-0.7, -0.6], [1.5, 1.3]];
+  var COVS = [
+    [[1.05, 0.75], [0.75, 1.05]],
+    [[0.85, -0.55], [-0.55, 0.95]]
+  ];
+
+  function logGauss2(p, mean, cov) {
+    var dx = p[0] - mean[0], dy = p[1] - mean[1];
+    var det = cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0];
+    var inv00 = cov[1][1] / det, inv01 = -cov[0][1] / det;
+    var inv10 = -cov[1][0] / det, inv11 = cov[0][0] / det;
+    var q = inv00 * dx * dx + (inv01 + inv10) * dx * dy + inv11 * dy * dy;
+    return -0.5 * q - 0.5 * Math.log(det) - Math.log(2 * Math.PI);
+  }
+  function logAdd(a, b) {
+    var m = Math.max(a, b);
+    return m + Math.log(Math.exp(a - m) + Math.exp(b - m));
+  }
+  function logpost(p) {
+    var t0 = Math.log(WEIGHTS[0]) + logGauss2(p, MEANS[0], COVS[0]);
+    var t1 = Math.log(WEIGHTS[1]) + logGauss2(p, MEANS[1], COVS[1]);
+    return logAdd(t0, t1);
+  }
+
+  var XR = [-4, 4], YR = [-4, 4];
+  var PM = [0, 0];
+  PM[0] = WEIGHTS[0] * MEANS[0][0] + WEIGHTS[1] * MEANS[1][0];
+  PM[1] = WEIGHTS[0] * MEANS[0][1] + WEIGHTS[1] * MEANS[1][1];
+
+  // Precompute the target on a grid once: both the canvas heatmap and the
+  // optional Plotly contour read from this.
+  var GRID = 50;
+  var gridVal = [], maxLp = -Infinity;
+  (function () {
+    for (var j = 0; j <= GRID; j++) {
+      var row = [];
+      var y = YR[0] + (YR[1] - YR[0]) * j / GRID;
+      for (var i = 0; i <= GRID; i++) {
+        var x = XR[0] + (XR[1] - XR[0]) * i / GRID;
+        var lp = logpost([x, y]);
+        if (lp > maxLp) maxLp = lp;
+        row.push(lp);
+      }
+      gridVal.push(row);
+    }
+  })();
+
+  // ------------------------------------------------------------------
+  // Chain state
+  // ------------------------------------------------------------------
+  var SEED = 20260914;
+  var NCHAINS = 4, MAXIT = 3000;
+  var STARTS = [[-2.6, 2.2], [2.6, 2.2], [-2.6, -2.2], [2.6, -2.2]];
+  var chainColors = ['', '', '', ''];
+
+  var chains = [], states = [], rngs = [];
+  var accepted = 0, proposed = 0;
+  var propSd = 0.35, burnIn = 100;
+
+  var targetPlot = S.plot(document.getElementById('target-canvas'), {
+    W: 640, H: 420, xRange: XR, yRange: YR,
+    xLabel: 'θ₁', yLabel: 'θ₂', onResize: redrawTarget
+  });
+  var tracePlot = S.plot(document.getElementById('trace-canvas'), {
+    W: 640, H: 220, xRange: [0, 100], yRange: [-4, 4],
+    xLabel: 'iteration', yLabel: 'θ₁', onResize: redrawTrace
+  });
+
+  function fmt(x, d) {
+    if (x == null || !isFinite(x)) return '—';
+    d = d == null ? 2 : d;
+    var s = x.toFixed(d);
+    s = s.replace(/\.?0+$/, '').replace(/\.$/, '');
+    return s === '-0' ? '0' : (s || '0');
+  }
+
+  function reset() {
+    chains = []; states = []; rngs = [];
+    accepted = 0; proposed = 0;
+    for (var i = 0; i < NCHAINS; i++) {
+      chains.push([]);
+      states.push(STARTS[i].slice());
+      rngs.push(S.rng(SEED + i * 104729));
+    }
+    redrawTarget();
+    redrawTrace();
+    redrawReadout();
+  }
+
+  function advance(steps) {
+    for (var ci = 0; ci < NCHAINS; ci++) {
+      var room = MAXIT - chains[ci].length;
+      if (room <= 0) continue;
+      var k = Math.min(steps, room);
+      var out = S.bayes.metropolis(logpost, states[ci], k, propSd, rngs[ci]);
+      for (var j = 0; j < out.chain.length; j++) chains[ci].push(out.chain[j]);
+      states[ci] = out.chain[out.chain.length - 1];
+      accepted += out.accepted;
+      proposed += k;
+    }
+    redrawTarget();
+    redrawTrace();
+    redrawReadout();
+  }
+
+  function retainedPerChain() {
+    var out = [];
+    for (var ci = 0; ci < NCHAINS; ci++) {
+      out.push(chains[ci].slice(Math.min(burnIn, chains[ci].length)));
+    }
+    return out;
+  }
+
+  function redrawTarget() {
+    if (!targetPlot) return;
+    targetPlot.clear();
+    // The target surface as a coarse density heatmap.
+    targetPlot.raw(function (ctx) {
+      for (var j = 0; j < GRID; j++) {
+        var y0 = YR[0] + (YR[1] - YR[0]) * j / GRID;
+        var y1 = YR[0] + (YR[1] - YR[0]) * (j + 1) / GRID;
+        var Y0 = targetPlot.py(y1), Y1 = targetPlot.py(y0);
+        for (var i = 0; i < GRID; i++) {
+          var x0 = XR[0] + (XR[1] - XR[0]) * i / GRID;
+          var x1 = XR[0] + (XR[1] - XR[0]) * (i + 1) / GRID;
+          var v = Math.exp(gridVal[j][i] - maxLp);
+          var a = Math.pow(v, 0.55) * 0.85;
+          if (a < 0.01) continue;
+          ctx.fillStyle = 'rgba(43,95,255,' + a.toFixed(3) + ')';
+          var X0 = targetPlot.px(x0), X1 = targetPlot.px(x1);
+          ctx.fillRect(X0, Y1, Math.max(1, X1 - X0 + 1), Math.max(1, Y0 - Y1 + 1));
+        }
+      }
+    });
+    targetPlot.axes({ xLabel: 'θ₁', yLabel: 'θ₂' });
+
+    var burnPts = [], keepPts = [];
+    for (var ci = 0; ci < NCHAINS; ci++) {
+      var bi = Math.min(burnIn, chains[ci].length);
+      for (var k = 0; k < chains[ci].length; k++) {
+        if (k < bi) burnPts.push(chains[ci][k]);
+        else keepPts.push(chains[ci][k]);
+      }
+    }
+    if (burnPts.length) targetPlot.points(burnPts, { color: 'rgba(214,0,108,0.22)', r: 1.5 });
+    if (keepPts.length) targetPlot.points(keepPts, { color: 'rgba(43,95,255,0.72)', r: 1.7 });
+    if (states[0] && chains[0].length) {
+      targetPlot.points([states[0]], { color: c.accent2, r: 4.5, stroke: '#fff', width: 1.5 });
+    }
+    targetPlot.points([PM], { color: c.text, r: 4, stroke: '#fff', width: 1.2 });
+    targetPlot.legend([
+      { label: 'target density', color: 'rgba(43,95,255,0.55)', fill: true, swatch: true },
+      { label: 'retained samples', color: c.accent },
+      { label: 'burn-in samples', color: c.accent2 },
+      { label: 'current state', color: c.accent2 },
+      { label: 'true posterior mean', color: c.text }
+    ], { dy: 8 });
+  }
+
+  function redrawTrace() {
+    if (!tracePlot) return;
+    tracePlot.clear();
+    var n = 0, lo = Infinity, hi = -Infinity;
+    for (var ci = 0; ci < NCHAINS; ci++) {
+      n = Math.max(n, chains[ci].length);
+      for (var k = 0; k < chains[ci].length; k++) {
+        var v = chains[ci][k][0];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    }
+    tracePlot.xRange[0] = 0;
+    tracePlot.xRange[1] = Math.max(60, n);
+    if (!isFinite(lo) || !isFinite(hi) || hi <= lo) { lo = -4; hi = 4; }
+    var pad = (hi - lo) * 0.12;
+    tracePlot.yRange[0] = lo - pad;
+    tracePlot.yRange[1] = hi + pad;
+    tracePlot.axes({ xLabel: 'iteration', yLabel: 'θ₁' });
+
+    var bi = Math.min(burnIn, n);
+    if (bi > 0) {
+      tracePlot.raw(function (ctx) {
+        var X = tracePlot.px(bi);
+        ctx.fillStyle = 'rgba(214,0,108,0.10)';
+        ctx.fillRect(tracePlot.padL, tracePlot.padT, Math.max(0, X - tracePlot.padL), tracePlot.plotH);
+      });
+    }
+
+    for (ci = 0; ci < NCHAINS; ci++) {
+      var pts = [];
+      for (k = 0; k < chains[ci].length; k++) pts.push([k, chains[ci][k][0]]);
+      if (!pts.length) continue;
+      tracePlot.curve(pts, {
+        color: ci === 0 ? c.accent : 'rgba(43,95,255,0.35)',
+        width: ci === 0 ? 1.6 : 1
+      });
+    }
+    if (bi > 0) tracePlot.vline(bi, { color: c.accent2, dashed: true, width: 1.4, label: 'burn-in', labelY: tracePlot.yRange[1] });
+    tracePlot.hline(PM[0], { color: c.text, dashed: true, width: 1.2, labelX: tracePlot.xRange[1], label: 'true θ₁' });
+    tracePlot.legend([
+      { label: 'chain 1', color: c.accent },
+      { label: 'chains 2–4', color: 'rgba(43,95,255,0.55)' },
+      { label: 'target mean', color: c.text, dashed: true }
+    ], { dy: 8 });
+  }
+
+  function redrawReadout() {
+    var rate = proposed ? accepted / proposed : NaN;
+    var ret = retainedPerChain();
+    var keepN = ret[0] ? ret[0].length : 0;
+    var xs = ret.map(function (ch) { return ch.map(function (p) { return p[0]; }); });
+    var rhat = keepN >= 12 ? S.bayes.rhat(xs) : NaN;
+    var allX = [], allY = [];
+    for (var ci = 0; ci < ret.length; ci++) {
+      for (var k = 0; k < ret[ci].length; k++) { allX.push(ret[ci][k][0]); allY.push(ret[ci][k][1]); }
+    }
+    var mx = S.summary.mean(allX), my = S.summary.mean(allY);
+    var lx = S.summary.quantile(allX, 0.05), hx = S.summary.quantile(allX, 0.95);
+
+    var rhatCls = !isFinite(rhat) ? '' : (rhat < 1.1 ? 'hi' : 'bad');
+    document.getElementById('mcmc-readout').innerHTML =
+      '<div><span class="k">iterations</span> ' + proposed + ' &nbsp; <span class="k">accepted</span> ' + accepted + '</div>' +
+      '<div><span class="k">acceptance rate</span> <span class="hi">' + fmt(rate * 100, 1) + '%</span></div>' +
+      '<div><span class="k">retained per chain</span> ' + keepN + '</div>' +
+      '<div><span class="k">R-hat (θ₁)</span> <span class="' + rhatCls + '">' + (isFinite(rhat) ? fmt(rhat, 3) : '—') + '</span></div>' +
+      '<div><span class="k">posterior mean</span> [' + fmt(mx) + ', ' + fmt(my) + ']</div>' +
+      '<div><span class="k">true mean</span> ' + '[' + fmt(PM[0]) + ', ' + fmt(PM[1]) + ']</div>' +
+      '<div><span class="k">θ₁ 5–95%</span> [' + fmt(lx) + ', ' + fmt(hx) + ']</div>' +
+      '<div class="g-mini">Averages over retained samples are the posterior summaries Monte Carlo buys you.</div>';
+
+    var note;
+    if (proposed < 40) {
+      note = 'Keep stepping: the acceptance rate needs a run of proposals before it means anything.';
+    } else if (rate > 0.6) {
+      note = 'High acceptance, but the proposal is too narrow: the chain takes tiny steps and mixes slowly.';
+    } else if (rate < 0.15) {
+      note = 'Low acceptance: the proposal is too wide, so most moves land in low-density regions and are thrown away.';
+    } else {
+      note = 'A healthy random-walk band: moves are accepted often enough that the chain actually travels.';
+    }
+    if (isFinite(rhat)) {
+      note += rhat < 1.1
+        ? ' R-hat is near one, so the four chains agree on where the mass is.'
+        : ' R-hat is above 1.1: the chains are still exploring different regions.';
+    }
+    document.getElementById('mcmc-note').textContent = note;
+  }
+
+  // ------------------------------------------------------------------
+  // Controls
+  // ------------------------------------------------------------------
+  Guide.bindSliders([document.getElementById('prop-slider')], function (el) {
+    propSd = parseFloat(el.value);
+    reset();
+  });
+  Guide.bindSliders([document.getElementById('burn-slider')], function (el) {
+    burnIn = parseInt(el.value, 10);
+    redrawTarget();
+    redrawTrace();
+    redrawReadout();
+  });
+
+  document.getElementById('step-one').addEventListener('click', function () { advance(1); });
+  document.getElementById('step-fifty').addEventListener('click', function () { advance(50); });
+  document.getElementById('reset-btn').addEventListener('click', function () { reset(); });
+
+  var runner = Guide.loop({
+    interval: 60,
+    button: document.getElementById('run-btn'),
+    playLabel: 'Run',
+    pauseLabel: 'Pause',
+    onStep: function () {
+      advance(3);
+      if (chains[0].length >= MAXIT) runner.stop();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Optional Plotly view of the same target: guarded, silent without Plotly.
+  // ------------------------------------------------------------------
+  (function () {
+    var el = document.getElementById('mcmc-surface');
+    if (!el || !window.Plotly) return;
+    var N = 70, xs = [], ys = [], z = [];
+    for (var i = 0; i <= N; i++) xs.push(XR[0] + (XR[1] - XR[0]) * i / N);
+    for (var j = 0; j <= N; j++) {
+      ys.push(YR[0] + (YR[1] - YR[0]) * j / N);
+      var row = [];
+      for (i = 0; i <= N; i++) row.push(logpost([xs[i], ys[j]]) - maxLp);
+      z.push(row);
+    }
+    window.Plotly.newPlot(el, [{
+      x: xs, y: ys, z: z, type: 'contour',
+      colorscale: 'Blues', showscale: false,
+      contours: { coloring: 'fill', showlines: true }
+    }], {
+      margin: { l: 40, r: 10, t: 10, b: 34 },
+      height: 240,
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      xaxis: { title: 'θ₁', zeroline: false },
+      yaxis: { title: 'θ₂', zeroline: false, scaleanchor: 'x' }
+    }, { displayModeBar: false, responsive: true });
+    el.style.display = 'block';
+  })();
+
+  reset();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'mcmc-purpose',
+      kind: 'choice',
+      prompt: 'What does a Metropolis–Hastings sampler ultimately give you for a posterior you cannot write down?',
+      options: [
+        { label: 'A set of samples whose long-run distribution is the posterior, so integrals become averages.', correct: true },
+        { label: 'A closed-form formula for the posterior after the chain finishes.', correct: false },
+        { label: 'The single most probable parameter value, found by hill climbing.', correct: false }
+      ],
+      explanation: 'MCMC never produces a formula. It produces values that behave as draws from the posterior, which is enough to turn any posterior expectation into an average over samples. Finding the single most probable value is optimisation, not sampling.'
+    },
+    {
+      id: 'mcmc-acceptance-rate',
+      kind: 'numeric',
+      prompt: 'A chain proposes 1000 moves and accepts 240 of them. What is its acceptance rate, as a percentage?',
+      answer: 24,
+      tolerance: 0.001,
+      explanation: 'The acceptance rate is accepted / proposed = 240 / 1000 = 0.24, or 24 percent. On its own it is only a diagnostic: a very high rate usually means the proposal is too narrow and the chain is barely moving.'
+    },
+    {
+      id: 'mcmc-proposal-width',
+      kind: 'choice',
+      prompt: 'You set the proposal width very small. What happens?',
+      options: [
+        { label: 'Most proposals are accepted, but each move is tiny, so the chain mixes slowly and the samples are highly correlated.', correct: true },
+        { label: 'Most proposals are rejected, so the chain freezes in place.', correct: false },
+        { label: 'The chain becomes independent, giving one effective sample per iteration.', correct: false }
+      ],
+      explanation: 'A narrow Gaussian proposal almost always lands in a high-density region, so almost everything is accepted — but the steps are microscopic. Acceptance is high while the effective sample size is poor. Wide proposals cause the opposite failure: rejection.'
+    },
+    {
+      id: 'mcmc-rhat',
+      kind: 'choice',
+      prompt: 'Several chains are run from spread-out starting points and R-hat comes out at 1.7. How should you read it?',
+      options: [
+        { label: 'The chains have not converged to a common distribution, so the samples are not yet trustworthy.', correct: true },
+        { label: 'The chains have converged; values above one simply indicate a well-mixed run.', correct: false },
+        { label: 'The acceptance rate must have been too low; R-hat measures rejection directly.', correct: false }
+      ],
+      explanation: 'R-hat compares the variance between chains to the variance within them. Values near one mean the chains agree; a value like 1.7 means the between-chain spread is far too large, so the chains are still exploring different regions. It is a convergence diagnostic, not an acceptance measure.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

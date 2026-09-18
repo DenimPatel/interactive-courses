@@ -1,0 +1,638 @@
+---
+title: "LLM Serving, Interactively — Part 6: Continuous batching and chunked prefill"
+description: "Static, dynamic and iteration-level batching compared on one workload, what batch size does to step time, the inter-token-latency spike a long prefill causes, and how a token budget trades smoothness for time-to-first-token."
+permalink: "/ai/llm-serving/batching/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .bt-gantt-title { font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; margin: 12px 0 2px; }
+  .bt-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  .bt-table th, .bt-table td { padding: 7px 10px; border-bottom: 1px solid var(--color-divider); text-align: left; }
+  .bt-table th { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .bt-table td.num { font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 6 of 20</span>
+    <h1>Continuous batching and chunked prefill</h1>
+    <p>Part&nbsp;5 made the KV cache allocatable. This part spends it. The question is what exactly the GPU computes in each iteration: a fixed group of requests that share a fate, or a fresh, ragged batch assembled at every step. The difference between those two answers is most of a serving engine's throughput — and the price is a scheduling problem in which a single long prompt can stall every decoder in the batch.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="static">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Static batching and the padding tax</h2></div>
+    <p class="g-eyebrow">One batch, one finish line</p>
+    <p>The oldest way to batch, and the one almost every other accelerator workload uses, is <b>static batching</b>: collect <var>N</var> requests, stack them, run the batch until every member has finished, then start the next batch. Matrix kernels need rectangular inputs, so the short sequences are padded out to the length of the longest one and the extra positions masked. Masking the arithmetic does not remove it: padded tokens cost the same FLOPs and the same attention reads as real ones. This is the <b>padding tax</b>, and it is largest exactly where chatbots live, in requests whose output lengths vary by an order of magnitude.</p>
+    <p>The second cost is worse than the padding. A batch cannot release a slot until its slowest member finishes, so a single 2,000-token response holds five finished 100-token responses hostage. The GPU's batch dimension — the thing that amortises a memory-bound decode step across requests — sits partly empty for the whole tail of every batch. Drag the variance slider below to see the tax itself; the Gantt in section 3 shows what it does to the timeline.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pad-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Six sequences padded to the longest in the batch. Hatched cells are masked padding that still cost compute.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Output-length variance <span class="val">0.6</span></label><input type="range" id="pad-var" min="0" max="1" step="0.05" value="0.6"></div>
+        <div class="g-readout" id="pad-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="dynamic">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Dynamic batching</h2></div>
+    <p class="g-eyebrow">Stop waiting for a full batch</p>
+    <p>Dynamic batching keeps the lockstep execution but changes when a batch is dispatched. Instead of waiting for exactly <var>N</var> requests, the scheduler starts a batch as soon as either <var>N</var> have queued or a maximum queue delay has elapsed, whichever comes first. At low load this dispatches small batches immediately, which is a large latency win; at high load it behaves like static batching, because <var>N</var> arrives long before the timer fires.</p>
+    <p>What it does <i>not</i> change is the finish line. The batch still runs to completion together, so padding and tail waste remain, and the GPU still idles between batches. Dynamic batching is the right tool for vision models with near-constant latency; for autoregressive decoding, where request durations differ by 100×, it is a half-measure. The demo below lets the same workload run under both regimes and under iteration-level batching.</p>
+  </section>
+
+  <section class="g-step" id="orca">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Iteration-level batching (Orca)</h2></div>
+    <p class="g-eyebrow">The batch is rebuilt every token</p>
+    <p>Orca's observation, in 2022, was that a transformer decode step is already an iteration boundary: the model produces one token per sequence, and then the scheduler is free to change who is in the batch. <b>Iteration-level batching</b> (equivalently <b>continuous</b> or <b>in-flight</b> batching) does exactly that. Finished sequences leave the batch the moment they emit their stop token; waiting sequences join the moment the KV pool and the sequence cap allow. The batch dimension stays nearly full for the entire run, and no request waits for a stranger's last token.</p>
+    <p>The training guide's <a href="{{ '/ai/llm-training/inference/#batching' | relative_url }}">continuous batching demo</a> shows the mechanism on a handful of requests. What it does not show is what the scheduler is optimising — that is this part's job — nor the two knobs that keep the iteration from becoming either idle or overstuffed, nor the prefill problem that arrives with it. The Gantt chart below runs one fixed request stream through all three policies.</p>
+
+    <div class="g-demo" style="flex-direction:column; align-items:stretch;">
+      <div class="g-controls" style="max-width:none;">
+        <div class="g-field"><label>Batch size / max_num_seqs <span class="val">6</span></label><input type="range" id="pol-batch" min="2" max="12" step="1" value="6"></div>
+      </div>
+      <div style="flex-basis:100%;">
+        <div class="bt-gantt-title">Static batching</div>
+        <div class="g-canvas-wrap" style="max-width:none;"><canvas id="gantt-static" width="640" height="170"></canvas></div>
+        <div class="bt-gantt-title">Dynamic batching (2.5 s dispatch window)</div>
+        <div class="g-canvas-wrap" style="max-width:none;"><canvas id="gantt-dynamic" width="640" height="170"></canvas></div>
+        <div class="bt-gantt-title">Continuous / iteration-level batching</div>
+        <div class="g-canvas-wrap" style="max-width:none;"><canvas id="gantt-cont" width="640" height="170"></canvas></div>
+      </div>
+      <!-- max-width:100% is load-bearing: as a flex item this wrapper's automatic minimum
+           size would otherwise be the table's min-content width and push the whole demo
+           (all three Gantt canvases included) past a narrow viewport. -->
+      <div style="overflow-x:auto; min-width:0; max-width:100%;"><table class="bt-table" id="pol-table"></table></div>
+    </div>
+
+    <div class="g-goal">💡 <span><b>Read the three axes.</b> Grey is queued, blue is prefill, the darker band is decode. Utilisation is the fraction of the run in which at least one sequence was computing; throughput is finished output tokens per second over the whole run; p99 e2e is the worst-request latency.</span></div>
+  </section>
+
+  <section class="g-step" id="step-time">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What batch size does to step time</h2></div>
+    <p class="g-eyebrow">Flat, then linear, then you pay</p>
+    <p>Part&nbsp;1's memory wall says a decode step reads the weights once per token no matter how large the batch. So adding the second sequence to a decode batch is almost free: the same 70 GB of weights streams from HBM while the tensor cores process two rows instead of one. This is why decode throughput scales nearly linearly with batch at small batch sizes. It stops when the batch's arithmetic intensity reaches the machine's ridge point — the batch size at which <span class="g-math" style="display:inline-block;padding:2px 6px;margin:0;">2 &times; params &times; batch</span> FLOPs take longer than streaming <span class="g-math" style="display:inline-block;padding:2px 6px;margin:0;">weights + KV</span> bytes. Past that knee the step is compute-bound and its time grows linearly in batch.</p>
+    <p>The knee is a property of the machine and the model, not a tuning decision: for an 8B model at BF16 on H100 it lands near batch 295 with no cache, and the KV cache drags it down toward the batch sizes people actually use. The step time itself — the quantity that <i>becomes</i> the inter-token latency — is what the chart plots. Slide batch, and slide the cache per sequence, and watch the knee move.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="st-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Decode step time versus batch size. Solid: total. Dashed: memory time and compute time. The knee is where they cross.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch size <span class="val">64</span></label><input type="range" id="st-batch" min="1" max="1024" step="1" value="64"></div>
+        <div class="g-field"><label>KV cached per sequence (tokens) <span class="val">0</span></label><input type="range" id="st-ctx" min="0" max="1024" step="64" value="0"></div>
+        <div class="g-readout" id="st-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="interrupt">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Prefill interrupts decode</h2></div>
+    <p class="g-eyebrow">The spike every decode user feels</p>
+    <p>Continuous batching introduces a new failure mode. Prefill is compute-bound and its cost is quadratic in prompt length; decode is memory-bound and its cost is one step. If a newly admitted 8,000-token prompt is prefilled in a single iteration, that iteration cannot also emit the usual token for everyone else — the batch is busy for the whole prompt. Every decoding sequence in the batch sees its <b>inter-token latency</b> jump from one step time to the full prefill time. On a 20&nbsp;ms decode cadence, an 8,000-token prefill is a 400&nbsp;ms gap: the user-visible stutter.</p>
+    <p>The same iteration also delays every other waiting request, so one large prompt creates a queue-wide latency spike. Engines therefore do not schedule prefill and decode in the same rigid way; the next section changes <i>how much</i> prefill goes into one iteration.</p>
+  </section>
+
+  <section class="g-step" id="chunked">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Chunked prefill and the token budget</h2></div>
+    <p class="g-eyebrow">Slice the prompt, pay in TTFT</p>
+    <p><b>Chunked prefill</b> caps the number of prefill tokens an iteration may process — vLLM's <code>max_num_batched_tokens</code>. A long prompt is split across several iterations, and the decoding sequences share each of those iterations, so no single step contains a full prompt. The ITL spike becomes a short series of small bumps instead of one cliff. The price is paid by the newcomer: its prefill now takes several iterations, so its <b>time-to-first-token gets worse</b>, not better. The smaller the chunk, the flatter everyone else's ITL and the longer the newcomer waits.</p>
+    <p>That is the whole trade, and it is explicit below. Toggle chunking on, watch the tallest bar drop and the newcomer's TTFT rise; then shrink the budget and watch both effects intensify. Choosing a budget is choosing a point on that curve — there is no setting that improves both.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="itl-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Per-step latency seen by an existing decoder. An 8,000-token prefill arrives at step 10; bars show how long that step takes.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prompt length (tokens) <span class="val">8000</span></label><input type="range" id="itl-len" min="1000" max="16000" step="500" value="8000"></div>
+        <div class="g-field"><label>Prefill token budget <span class="val">2048</span></label><input type="range" id="itl-budget" min="256" max="8192" step="256" value="2048"></div>
+        <div class="g-btnrow"><button id="itl-toggle" class="g-primary">Chunking: on</button></div>
+        <div class="g-readout" id="itl-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="piggyback">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Piggybacking</h2></div>
+    <p class="g-eyebrow">Make the decode batch compute-bound on purpose</p>
+    <p>Once prefill is chunked it can be <b>piggybacked</b>: a chunk of new prompt tokens rides along inside a decode iteration, and the iteration's tensor work is a mixed batch of prefill rows and decode rows. This is not a hack, it is the point. A pure decode step is memory-bound and leaves the tensor cores idle; a pure prefill step is compute-bound and leaves bandwidth idle. Overlaying them uses both, and under a fixed token budget the scheduler chooses how to split the budget between prompt tokens and decode tokens. Sarathi-Serve's formulation is the cleanest statement of it: prefill chunks and decodes are stitched into one batch per iteration, bounded by a token budget, which keeps the GPU saturated while bounding the worst-case ITL.</p>
+    <p>Piggybacking is why the token budget is a first-class knob rather than an implementation detail. It also explains a scheduler's preference order: admit as much prefill as fits without starving decode, because the decode tokens were going to be processed anyway and their weight-stream is already being paid for.</p>
+  </section>
+
+  <section class="g-step" id="tuning">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Tuning max_num_seqs and max_num_batched_tokens</h2></div>
+    <p class="g-eyebrow">Two knobs, one frontier</p>
+    <p><code>max_num_seqs</code> is the concurrency cap: how many sequences may be resident in a batch. Raise it and you raise throughput until the KV cache runs out or the step turns compute-bound; the V1 scheduler uses a default of 1,024 for small models and 256 for large ones, but the right value is where your p99 stops improving. <code>max_num_batched_tokens</code> is the per-iteration token budget that splits between prefill and decode. Raise it and prompts finish faster, at the cost of larger steps and worse ITL for everyone already decoding.</p>
+    <p>The two knobs do not act independently: a large token budget with a small sequence cap wastes the budget on a few long prompts, while a small budget with a high cap produces many tiny iterations and high launch overhead. This is exactly the throughput-latency frontier Part&nbsp;3 draws. The tuner below runs a real iteration-level simulation, sweeps the concurrency cap, and plots each resulting operating point as p99 time-to-first-token against throughput. Move the two sliders and the green point walks the frontier; the faded points are where you have already been.</p>
+
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="frontier-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Lower-left is better. The line is the Pareto frontier over the concurrency sweep; ghost points trace your tuning path.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>max_num_seqs <span class="val">32</span></label><input type="range" id="fr-seqs" min="4" max="64" step="2" value="32"></div>
+        <div class="g-field"><label>max_num_batched_tokens <span class="val">2048</span></label><input type="range" id="fr-budget" min="256" max="8192" step="256" value="2048"></div>
+        <div class="g-readout" id="fr-readout"></div>
+      </div>
+    </div>
+
+    <div class="g-goal">💡 <span><b>The tuner's punchline.</b> Both knobs move the same operating point. Before tuning either, decide which axis your SLO is written against — TTFT or ITL — because every step along this frontier makes one of them worse.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Policy / knob</th><th>What it does</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Static batching</td><td>Fixed group runs to completion together</td><td>Padding tax plus a tail where the batch dimension drains</td></tr>
+        <tr><td>Dynamic batching</td><td>Dispatch when full or when a queue timer fires</td><td>Still lockstep; helps latency at low load only</td></tr>
+        <tr><td>Iteration-level (continuous)</td><td>Rebuild the batch every decode step</td><td>Scheduler runs every token; prefill can stall the batch</td></tr>
+        <tr><td>Batch size</td><td>Amortises the weight read across sequences</td><td>Nothing until the memory/compute knee, linear step time after</td></tr>
+        <tr><td>Chunked prefill</td><td>Caps prefill tokens per iteration</td><td>Flattens ITL spikes; raises the newcomer's TTFT</td></tr>
+        <tr><td>Piggybacking</td><td>Runs prefill chunks inside decode iterations</td><td>Needs a token budget and a scheduler that can mix the two</td></tr>
+        <tr><td><code>max_num_seqs</code></td><td>Concurrency cap</td><td>Throughput up to the KV/step-time limit, then latency</td></tr>
+        <tr><td><code>max_num_batched_tokens</code></td><td>Per-iteration token budget</td><td>Prompt latency down, ITL up</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Yu, Jeong, Kim, Kim, Chun, <a href="https://www.usenix.org/conference/osdi22/presentation/yu">Orca: A Distributed Serving System for Transformer-Based Generative Models</a>, OSDI 2022.</li>
+      <li>Agrawal, Kedia, Panwar, Mohan, Kwatra, Gulavani, Tumanov, Ramjee, <a href="https://arxiv.org/abs/2403.02310">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a>, OSDI 2024 — chunked prefill and piggybacking.</li>
+      <li>Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang, Stoica, <a href="https://arxiv.org/abs/2309.06180">PagedAttention</a>, SOSP 2023 — the memory manager continuous batching depends on.</li>
+      <li>vLLM documentation, <a href="https://docs.vllm.ai/en/latest/configuration/optimization.html">optimization and tuning</a> (<code>max_num_seqs</code>, <code>max_num_batched_tokens</code>).</li>
+    </ul>
+    <p class="g-source" id="bt-source"></p>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The batch is now full and the budget is set. Next: who gets in, who waits, and who is dropped when the queue cannot drain.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var C = Guide.colors();
+  var STEP_MS = 20;
+  var PREFILL_MS_PER_TOK = 0.05;
+
+  var FALLBACK = {
+    paramsB: 8.03, bytesPerParam: 2, layers: 32, kvHeads: 8, headDim: 128,
+    bwTBs: 3.35, peakTFLOPs: 989,
+    source: "Batch/step-time model uses Llama 3.1 8B geometry (32 layers, 8 KV heads, head_dim 128, 2 bytes/element) on H100 SXM (3.35 TB/s HBM, 989 dense BF16 TFLOP/s). Chunked-prefill timings assume 0.05 ms per prefill token at the measured step overhead."
+  };
+  var NUM = FALLBACK;
+  var DATA_URL = {% endraw %}"{{ '/assets/data/llm-serving-numbers.json' | relative_url }}"{% raw %};
+  var srcEl = document.getElementById("bt-source");
+  srcEl.textContent = FALLBACK.source;
+
+  fetch(DATA_URL)
+    .then(function (r) { return r.json(); })
+    .then(function (json) {
+      var m = (json.model_configs && json.model_configs.items || []).filter(function (x) { return /Llama 3\.1 8B/.test(x.name); })[0];
+      var acc = (json.accelerators && json.accelerators.items || []).filter(function (x) { return /H100 SXM/.test(x.name); })[0];
+      if (m) {
+        NUM = {
+          paramsB: m.activeParamsB || m.totalParamsB, bytesPerParam: 2,
+          layers: m.layers, kvHeads: m.n_kv_heads, headDim: m.d_head,
+          bwTBs: acc ? acc.bwTBs : FALLBACK.bwTBs,
+          peakTFLOPs: acc ? acc.bf16TFLOPs : FALLBACK.peakTFLOPs,
+          source: FALLBACK.source
+        };
+      }
+      srcEl.textContent = NUM.source;
+      padDraw(); stDraw(); itlDraw(); frDraw(true);
+    })
+    .catch(function () { srcEl.textContent = FALLBACK.source; });
+
+  function pct(x) { return (100 * x).toFixed(1) + "%"; }
+  function unionMs(intervals) {
+    intervals = intervals.filter(function (s) { return s.end > s.start; }).sort(function (a, b) { return a.start - b.start; });
+    var total = 0, cs = null, ce = null;
+    intervals.forEach(function (s) {
+      if (cs === null) { cs = s.start; ce = s.end; }
+      else if (s.start <= ce) { ce = Math.max(ce, s.end); }
+      else { total += ce - cs; cs = s.start; ce = s.end; }
+    });
+    if (cs !== null) total += ce - cs;
+    return total;
+  }
+
+  // =====================================================================
+  // Demo 1 — padding tax
+  // =====================================================================
+  var padVar = document.getElementById("pad-var");
+  var padReadout = document.getElementById("pad-readout");
+  var padCanvas = document.getElementById("pad-canvas");
+  var padSetup = Guide.setupCanvas(padCanvas, 640, 220, function () { if (padSetup) padDraw(); });
+
+  function padDraw() {
+    var ctx = padSetup.ctx, W = 640, H = 220;
+    ctx.clearRect(0, 0, W, H);
+    var v = parseFloat(padVar.value);
+    var base = [180, 120, 90, 240, 70, 150];
+    var r = Guide.seededRandom(5);
+    var lens = base.map(function (b) { return Math.max(20, Math.round(b * (1 + v * (r() * 1.6 - 0.8)))); });
+    var maxLen = Math.max.apply(null, lens);
+    var pad = 14, top = 30, rowH = (H - top - 24) / lens.length;
+    var real = lens.reduce(function (a, b) { return a + b; }, 0);
+    var total = maxLen * lens.length;
+    var scale = (W - pad * 2) / maxLen;
+    ctx.font = "600 11px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("padded batch (longest = " + maxLen + " tokens)", pad, 18);
+    lens.forEach(function (len, i) {
+      var y = top + i * rowH;
+      var w = len * scale, pw = (maxLen - len) * scale;
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(pad, y, w, rowH - 6);
+      ctx.fillStyle = "#e2ddd4";
+      ctx.fillRect(pad + w, y, pw, rowH - 6);
+      ctx.strokeStyle = "rgba(214,0,108,0.45)";
+      ctx.lineWidth = 1;
+      for (var s = 0; s < pw; s += 7) {
+        ctx.beginPath();
+        ctx.moveTo(pad + w + s, y + rowH - 6);
+        ctx.lineTo(pad + w + s + (rowH - 6), y);
+        ctx.stroke();
+      }
+    });
+    padReadout.innerHTML =
+      '<div><span class="k">real tokens</span> ' + real + '</div>' +
+      '<div><span class="k">padded slots</span> ' + total + '</div>' +
+      '<div><span class="k">padding tax</span> <span class="bad">' + pct(1 - real / total) + '</span> of the batch compute</div>';
+  }
+  Guide.bindSliders([padVar], padDraw);
+  padDraw();
+
+  // =====================================================================
+  // Demo 3 — three policies
+  // =====================================================================
+  var polBatch = document.getElementById("pol-batch");
+  var polTable = document.getElementById("pol-table");
+  var gStatic = document.getElementById("gantt-static");
+  var gDynamic = document.getElementById("gantt-dynamic");
+  var gCont = document.getElementById("gantt-cont");
+  var polWork = ServingSim.workload({ seed: 11, rate: 1, promptMean: 350, promptCV: 0.6, decodeMean: 90, decodeCV: 0.7, horizon: 15000 });
+  var sStatic = Guide.setupCanvas(gStatic, 640, 170, function () { if (sStatic && sDynamic && sCont) polDraw(); });
+  var sDynamic = Guide.setupCanvas(gDynamic, 640, 170, function () { if (sStatic && sDynamic && sCont) polDraw(); });
+  var sCont = Guide.setupCanvas(gCont, 640, 170, function () { if (sStatic && sDynamic && sCont) polDraw(); });
+
+  function modelLockstep(B, windowMs) {
+    var reqs = polWork.requests.slice().sort(function (a, b) { return a.arrival - b.arrival; }).map(function (q) {
+      return { id: q.id, arrival: q.arrival, promptLen: q.promptLen, outputLen: q.outputLen, segments: [], completion: 0, ttft: 0, tpot: STEP_MS };
+    });
+    var i = 0, batches = [];
+    while (i < reqs.length) {
+      var group = [reqs[i]];
+      while (group.length < B && i + group.length < reqs.length) {
+        var next = reqs[i + group.length];
+        if (windowMs != null && next.arrival - reqs[i].arrival > windowMs) break;
+        group.push(next);
+      }
+      var start = group[group.length - 1].arrival;
+      if (batches.length && start < batches[batches.length - 1].end) start = batches[batches.length - 1].end;
+      var maxOut = Math.max.apply(null, group.map(function (g) { return g.outputLen; }));
+      var end = start + maxOut * STEP_MS;
+      group.forEach(function (g) {
+        var ownPrefillEnd = start + g.promptLen * PREFILL_MS_PER_TOK;
+        var ownDecodeEnd = ownPrefillEnd + g.outputLen * STEP_MS;
+        g.segments = [
+          { type: "queued", start: g.arrival, end: start },
+          { type: "prefill", start: start, end: ownPrefillEnd },
+          { type: "decode", start: ownPrefillEnd, end: ownDecodeEnd }
+        ];
+        g.completion = end;
+        g.ttft = ownPrefillEnd - g.arrival;
+        g.e2e = end - g.arrival;
+      });
+      batches.push({ start: start, end: end });
+      i += group.length;
+    }
+    return { reqs: reqs, batches: batches };
+  }
+
+  function policyStats(reqs, busyIntervals) {
+    var t0 = Infinity, t1 = 0, out = 0, ttfts = [], e2es = [];
+    reqs.forEach(function (g) {
+      t0 = Math.min(t0, g.arrival); t1 = Math.max(t1, g.completion);
+      out += g.outputLen; ttfts.push(g.ttft); e2es.push(g.e2e);
+    });
+    var makespan = Math.max(1, t1 - t0);
+    return {
+      t0: t0, t1: t1, util: unionMs(busyIntervals) / makespan,
+      thr: out / makespan * 1000,
+      p99: ServingSim.percentile(e2es, 99),
+      p99ttft: ServingSim.percentile(ttfts, 99)
+    };
+  }
+
+  function polDraw() {
+    var B = parseInt(polBatch.value, 10);
+    var st = modelLockstep(B, null);
+    var dy = modelLockstep(B, 2500);
+    var cont = ServingSim.run({
+      requests: polWork.requests, horizon: 15000, policy: "fcfs", capacity: B,
+      kvBlocks: 8192, blockSize: 16, stepMs: STEP_MS, chunkedPrefill: true,
+      prefillTokBudget: 1024, preempt: "recompute"
+    });
+    var contReqs = Object.keys(cont.perReq).map(function (k) { return cont.perReq[k]; });
+    var contBusy = [];
+    contReqs.forEach(function (g) {
+      (g.segments || []).forEach(function (s) { if (s.type === "prefill" || s.type === "decode") contBusy.push(s); });
+    });
+    var stats = {
+      "Static": policyStats(st.reqs, st.batches),
+      "Dynamic": policyStats(dy.reqs, dy.batches),
+      "Continuous": policyStats(contReqs, contBusy)
+    };
+    var t1 = Math.max(stats.Static.t1, stats.Dynamic.t1, stats.Continuous.t1);
+
+    function drawOne(setup, obj) {
+      ServingSim.drawGantt(setup.ctx, 640, 170, obj,
+        { t0: stats.Static.t0, t1: t1, colors: C, prefillColor: C.accent500 });
+    }
+    drawOne(sStatic, st.reqs);
+    drawOne(sDynamic, dy.reqs);
+    drawOne(sCont, contReqs);
+
+    polTable.innerHTML =
+      "<thead><tr><th>Policy</th><th>GPU busy</th><th>Throughput</th><th>p99 e2e</th><th>p99 TTFT</th></tr></thead><tbody>" +
+      Object.keys(stats).map(function (k) {
+        var s = stats[k];
+        var cls = k === "Continuous" ? "hi" : "";
+        return "<tr><td>" + k + "</td><td class='num " + cls + "'>" + pct(s.util) + "</td><td class='num " + cls + "'>" +
+          s.thr.toFixed(0) + " tok/s</td><td class='num'>" + Guide.fmtMs(s.p99) + "</td><td class='num'>" + Guide.fmtMs(s.p99ttft) + "</td></tr>";
+      }).join("") + "</tbody>";
+  }
+  Guide.bindSliders([polBatch], function () { polDraw(); });
+  polDraw();
+
+  // =====================================================================
+  // Demo 4 — batch vs step time
+  // =====================================================================
+  var stBatch = document.getElementById("st-batch");
+  var stCtx = document.getElementById("st-ctx");
+  var stReadout = document.getElementById("st-readout");
+  var stCanvas = document.getElementById("st-canvas");
+  var stSetup = Guide.setupCanvas(stCanvas, 640, 320, function () { if (stSetup) stDraw(); });
+
+  function stepAt(batch, ctxTok) {
+    var kv = ServingSim.kvBytes({ layers: NUM.layers, kvHeads: NUM.kvHeads, headDim: NUM.headDim, tokens: ctxTok, bytesPerElem: 2, batch: batch });
+    return ServingSim.stepTime({
+      paramsB: NUM.paramsB, bytesPerParam: 2, kvBytes: kv, bwTBs: NUM.bwTBs,
+      peakTFLOPs: NUM.peakTFLOPs, batch: batch, flops: 2 * NUM.paramsB * 1e9 * batch, overheadMs: 0
+    });
+  }
+
+  function stDraw() {
+    var ctx = stSetup.ctx;
+    var ctxTok = parseInt(stCtx.value, 10);
+    var cur = parseInt(stBatch.value, 10);
+    var samples = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384, 512, 640, 768, 896, 1024];
+    var total = [], memPts = [], compPts = [];
+    var knee = null;
+    for (var b = 1; b <= 1024; b += 2) {
+      if (knee === null && stepAt(b, ctxTok).bound === "compute") knee = b;
+    }
+    samples.forEach(function (b) {
+      var s = stepAt(b, ctxTok);
+      total.push({ x: b, y: s.totalMs });
+      memPts.push({ x: b, y: s.memMs });
+      compPts.push({ x: b, y: s.computeMs });
+    });
+    var maxY = Math.max.apply(null, total.map(function (p) { return p.y; })) * 1.1 + 0.5;
+    var geo = Guide.drawLines(ctx, 640, 320,
+      [
+        { points: memPts, color: C.accent400, width: 1.4, dashed: true },
+        { points: compPts, color: C.accent2, width: 1.4, dashed: true },
+        { points: total, color: C.accent, width: 2.6 }
+      ],
+      [1, 1024], [0, maxY],
+      { xLabel: "batch size (sequences)", yLabel: "decode step time (ms)", padL: 52, padB: 34 });
+    if (knee) {
+      var kx = geo.px(knee);
+      ctx.setLineDash([5, 4]); ctx.strokeStyle = C.text; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(kx, geo.padT); ctx.lineTo(kx, geo.padT + geo.plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = C.text; ctx.font = "10px " + C.font; ctx.textAlign = "center";
+      ctx.fillText("knee " + knee, kx, geo.padT + 10);
+    }
+    var s = stepAt(cur, ctxTok);
+    ctx.fillStyle = C.accent700;
+    ctx.beginPath(); ctx.arc(geo.px(cur), geo.py(Math.min(maxY, s.totalMs)), 4, 0, Math.PI * 2); ctx.fill();
+    ctx.font = "11px " + C.font; ctx.textAlign = "left";
+    ctx.fillStyle = C.accent; ctx.fillText("total", geo.padL + 8, geo.padT + 14);
+    ctx.fillStyle = C.accent400; ctx.fillText("memory", geo.padL + 8, geo.padT + 30);
+    ctx.fillStyle = C.accent2; ctx.fillText("compute", geo.padL + 8, geo.padT + 46);
+    stReadout.innerHTML =
+      '<div><span class="k">batch ' + cur + '</span> mem ' + s.memMs.toFixed(2) + ' ms · compute ' + s.computeMs.toFixed(2) + ' ms</div>' +
+      '<div><span class="k">step</span> <span class="hi">' + s.totalMs.toFixed(2) + ' ms</span> · ' + s.bound + '-bound</div>' +
+      '<div><span class="k">arithmetic intensity</span> ' + s.arithmeticIntensity.toFixed(2) + ' FLOP/byte</div>' +
+      '<div><span class="k">knee</span> ' + (knee ? "batch " + knee : "none below 1024 (memory-bound)") + '</div>';
+  }
+  Guide.bindSliders([stBatch, stCtx], stDraw);
+  stDraw();
+
+  // =====================================================================
+  // Demo 5/6 — ITL spike and chunking
+  // =====================================================================
+  var itlLen = document.getElementById("itl-len");
+  var itlBudget = document.getElementById("itl-budget");
+  var itlToggle = document.getElementById("itl-toggle");
+  var itlReadout = document.getElementById("itl-readout");
+  var itlCanvas = document.getElementById("itl-canvas");
+  var itlSetup = Guide.setupCanvas(itlCanvas, 640, 320, function () { if (itlSetup) itlDraw(); });
+  var chunked = true;
+  var ITL_STEPS = 24, ITL_ARRIVAL = 10;
+
+  function itlModel() {
+    var len = parseInt(itlLen.value, 10);
+    var budget = parseInt(itlBudget.value, 10);
+    var durations = [];
+    var chunks = [];
+    if (chunked) {
+      var remaining = len;
+      while (remaining > 0 && chunks.length < 400) {
+        var take = Math.min(remaining, budget);
+        chunks.push(take);
+        remaining -= take;
+      }
+    } else {
+      chunks.push(len);
+    }
+    for (var s = 0; s < ITL_STEPS; s++) {
+      var d = STEP_MS;
+      var ci = s - ITL_ARRIVAL;
+      if (ci >= 0 && ci < chunks.length) d = STEP_MS + chunks[ci] * PREFILL_MS_PER_TOK;
+      durations.push(d);
+    }
+    var ttft = 0;
+    chunks.forEach(function (c) { ttft += STEP_MS + c * PREFILL_MS_PER_TOK; });
+    return { durations: durations, max: Math.max.apply(null, durations), ttft: ttft, chunks: chunks.length, len: len, budget: budget };
+  }
+
+  function itlDraw() {
+    var ctx = itlSetup.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var m = itlModel();
+    var pad = 14, top = 26, bottom = H - 40;
+    var plotW = W - pad * 2;
+    var maxD = Math.max(m.max, STEP_MS) * 1.12;
+    var barW = plotW / ITL_STEPS;
+    ctx.font = "600 11px " + C.font; ctx.fillStyle = C.text; ctx.textAlign = "left";
+    ctx.fillText("step latency for a sequence already decoding", pad, 16);
+    ctx.strokeStyle = C.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad, bottom); ctx.lineTo(W - pad, bottom); ctx.stroke();
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = C.accent400;
+    ctx.beginPath();
+    var by = bottom - (STEP_MS / maxD) * (bottom - top);
+    ctx.moveTo(pad, by); ctx.lineTo(W - pad, by); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = C.accent400; ctx.font = "10px " + C.font;
+    ctx.fillText("baseline " + STEP_MS + " ms", W - pad - 92, by - 4);
+    m.durations.forEach(function (d, i) {
+      var h = (d / maxD) * (bottom - top);
+      var x = pad + i * barW;
+      var isSpike = d > STEP_MS + 1;
+      ctx.fillStyle = isSpike ? C.accent2 : C.accent;
+      ctx.fillRect(x + 1, bottom - h, barW - 2, h);
+    });
+    ctx.fillStyle = C.text; ctx.font = "10px " + C.font; ctx.textAlign = "center";
+    ctx.fillText("newcomer prompt arrives → step " + ITL_ARRIVAL, pad + (0.5 + ITL_ARRIVAL) * barW, bottom + 14);
+    ctx.textAlign = "left"; ctx.fillStyle = C.text; ctx.font = "10px " + C.font;
+    ctx.fillText("decode step", pad, bottom + 30);
+    itlReadout.innerHTML =
+      '<div><span class="k">worst step (ITL)</span> <span class="' + (m.max > STEP_MS * 2 ? "bad" : "hi") + '">' + Guide.fmtMs(m.max) + '</span></div>' +
+      '<div><span class="k">newcomer TTFT</span> ' + Guide.fmtMs(m.ttft) + '</div>' +
+      '<div><span class="k">prefill chunks</span> ' + m.chunks + (chunked ? " × ≤ " + m.budget + " tokens" : " (unchunked)") + '</div>' +
+      '<div><span class="k">trade</span> ' + (chunked ? "flatter ITL, slower first token" : "one big spike, fastest first token") + '</div>';
+  }
+  itlToggle.addEventListener("click", function () {
+    chunked = !chunked;
+    itlToggle.textContent = "Chunking: " + (chunked ? "on" : "off");
+    itlToggle.className = chunked ? "g-primary" : "";
+    itlDraw();
+  });
+  Guide.bindSliders([itlLen, itlBudget], itlDraw);
+  itlDraw();
+
+  // =====================================================================
+  // Demo 8 — token-budget tuner on the frontier
+  // =====================================================================
+  var frSeqs = document.getElementById("fr-seqs");
+  var frBudget = document.getElementById("fr-budget");
+  var frReadout = document.getElementById("fr-readout");
+  var frCanvas = document.getElementById("frontier-canvas");
+  var frWork = ServingSim.workload({ seed: 21, rate: 6, promptMean: 250, promptCV: 0.6, decodeMean: 80, decodeCV: 0.7, horizon: 10000 });
+  var frCaps = [4, 6, 8, 12, 16, 24, 32, 48, 64];
+  var frCache = {}, frGhosts = [];
+  var frSetup = Guide.setupCanvas(frCanvas, 640, 340, function () { if (frSetup) frDraw(); });
+
+  function runFr(cap, budget) {
+    return ServingSim.run({
+      requests: frWork.requests, horizon: 10000, policy: "fcfs", capacity: cap,
+      kvBlocks: 8192, blockSize: 16, stepMs: STEP_MS, chunkedPrefill: true,
+      prefillTokBudget: budget, preempt: "recompute"
+    });
+  }
+
+  function lx(ms) { return Math.log10(1 + ms); }
+  function frSweep(budget) {
+    if (frCache[budget]) return frCache[budget];
+    var pts = frCaps.map(function (cap) {
+      var r = runFr(cap, budget);
+      return { x: lx(r.stats.ttft.p99), y: r.stats.throughput, cap: cap };
+    });
+    frCache[budget] = pts;
+    return pts;
+  }
+
+  function pareto(pts) {
+    return pts.filter(function (p) {
+      return !pts.some(function (q) { return q !== p && q.x <= p.x && q.y >= p.y && (q.x < p.x || q.y > p.y); });
+    }).sort(function (a, b) { return a.x - b.x; });
+  }
+
+  function frDraw(refresh) {
+    if (refresh) frCache = {};
+    var cap = parseInt(frSeqs.value, 10);
+    var budget = parseInt(frBudget.value, 10);
+    var pts = frSweep(budget);
+    var run = runFr(cap, budget);
+    var ptMs = run.stats.ttft.p99;
+    var pt = { x: lx(ptMs), y: run.stats.throughput };
+    var yMax = Math.max.apply(null, pts.map(function (p) { return p.y; })) * 1.15 + 1;
+    var xMax = Math.max.apply(null, pts.map(function (p) { return p.x; })) * 1.15 + 1;
+    var front = pareto(pts);
+    var ctx = frSetup.ctx;
+    var geo = Guide.drawLines(ctx, 640, 340,
+      [{ points: front, color: C.accent400, width: 2 }],
+      [0, xMax], [0, yMax],
+      { xLabel: "p99 TTFT (ms) — log scale", yLabel: "throughput (tok/s)", padL: 52, padB: 34 });
+    pts.forEach(function (p) {
+      ctx.fillStyle = C.accent; ctx.globalAlpha = 0.45;
+      ctx.beginPath(); ctx.arc(geo.px(p.x), geo.py(p.y), 2.6, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    });
+    frGhosts.forEach(function (g) {
+      ctx.fillStyle = C.accent2; ctx.globalAlpha = 0.4;
+      ctx.beginPath(); ctx.arc(geo.px(Math.min(xMax, g.x)), geo.py(Math.min(yMax, g.y)), 3.6, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    });
+    ctx.fillStyle = C.accent700; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(geo.px(Math.min(xMax, pt.x)), geo.py(Math.min(yMax, pt.y)), 5.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    frReadout.innerHTML =
+      '<div><span class="k">p99 TTFT</span> <span class="hi">' + Guide.fmtMs(ptMs) + '</span></div>' +
+      '<div><span class="k">throughput</span> ' + pt.y.toFixed(0) + ' tok/s</div>' +
+      '<div><span class="k">completed</span> ' + run.stats.completed + ' / ' + run.stats.count + '</div>' +
+      '<div><span class="k">ghosts</span> ' + frGhosts.length + ' previous point(s)</div>';
+  }
+
+  function frCommit() {
+    var cap = parseInt(frSeqs.value, 10);
+    var budget = parseInt(frBudget.value, 10);
+    var run = runFr(cap, budget);
+    frGhosts.push({ x: lx(run.stats.ttft.p99), y: run.stats.throughput });
+    if (frGhosts.length > 8) frGhosts.shift();
+    frDraw(false);
+  }
+  var frInit = true;
+  Guide.bindSliders([frSeqs, frBudget], function (el) {
+    if (frInit) return;
+    if (el === frBudget) frDraw(true); else frCommit();
+  });
+  frInit = false;
+  frDraw(true);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

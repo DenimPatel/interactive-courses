@@ -1,0 +1,381 @@
+---
+title: "Samplers and schedulers"
+description: "Euler, Heun and multistep solvers against the ancestral sampler, timestep spacing as a design choice, and step budget against error on a known trajectory."
+permalink: "/ai/generative-media/samplers/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Samplers and schedulers</h1>
+    <p>A diffusion model is trained to denoise one step at a time, but the sampler that walks from noise to image is not fixed by the training. The reverse loop can be stochastic or deterministic, the step size can be constant or warped, and the number of network evaluations is a budget you choose. This part keeps the model fixed and treats the sampler as the object of study: two solver families, the error each one leaves on a known trajectory, and the schedule that decides where the steps land.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="families">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The two families</h2></div>
+    <p class="g-eyebrow">Ancestral noise or a deterministic integration</p>
+    <p>Every sampler here runs the same reverse loop. At each step it asks the network for an estimate of the noise $\varepsilon$ left in the current sample and then takes a step toward less noise. The families differ in what the step looks like. The <em>ancestral</em> sampler &mdash; DDPM &mdash; treats the reverse process as a chain of noisy transitions: at every step it computes a mean and then adds a fresh draw of Gaussian noise whose variance is fixed by the schedule. Two runs from the same start give two different images, and the stochasticity is not a defect; it is the Markov chain doing exactly what it was trained to do.</p>
+    <p>The <em>deterministic</em> family throws the injected noise away. DDIM replaces the noisy transition with a straight interpolation toward the predicted clean sample, so the whole trajectory becomes a function of the starting noise: one start, one endpoint. The same rule can be read as an ordinary differential equation, the probability-flow ODE, whose velocity field is built from the denoiser. Once generation is an ODE, the entire numerical-analysis toolkit applies. Euler is the crudest integrator, Heun corrects Euler with a second field evaluation, and the multistep methods reuse predictions from earlier steps to buy accuracy at a fixed number of network calls.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say why a deterministic sampler is a function and an ancestral one is a distribution, why a higher-order solver leaves less error at the same step count, and why the spacing of the timesteps is as much a design choice as the solver itself.</span></div>
+    <div class="g-toc">
+      <a href="#order">2 · Solver order and error</a>
+      <a href="#spacing">3 · Timestep spacing</a>
+      <a href="#budget">4 · The step budget</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="order">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Solver order and error</h2></div>
+    <p class="g-eyebrow">What a second evaluation buys</p>
+    <p>The plot below integrates the probability-flow ODE on a linear schedule from a known start toward a known clean point $x_0 = 1$, and measures how far the endpoint lands from that point. The predictor is deliberately imperfect: it is an oracle model with its noise estimate inflated by $15\%$ whenever the signal has mostly been destroyed, which is the garden-variety failure of a real network at high noise. That single flaw is enough to make the solver's job non-trivial, and it is what the curves measure.</p>
+    <p>Euler is first order: halve the step size and the error roughly halves. Heun is second order: it takes an Euler step, evaluates the field again at the provisional endpoint, and averages the two, which costs twice as many network calls per step but makes the error fall much faster as the steps multiply. The dashed line is the floor the error would reach with a perfect predictor, computed by <code>Diffusion.solverError</code>; no solver can go below it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-plot-stack">
+        <canvas id="samplers-error-canvas" width="620" height="340"></canvas>
+        <p class="g-canvas-hint">Endpoint error against the number of steps, log scale. Solid curves use the imperfect predictor; the dashed curve is the perfect-model floor.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Solver <span class="val">Euler</span></label><input type="range" id="sampler-method" min="0" max="3" step="1" value="0"></div>
+        <div class="g-field"><label>Sampling steps N <span class="val">8</span></label><input type="range" id="sampler-steps" min="1" max="32" step="1" value="8"></div>
+        <div class="g-readout" id="samplers-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Heun is not free.</b> Two field evaluations per step double the number of forward passes through the network, and the network is almost the whole cost of sampling. A second-order solver that halves the error at 16 steps is really spending 32 evaluations to do it, which is often the same as 32 Euler steps. The right comparison is error per network call, not error per step.</span></div>
+  </section>
+
+  <section class="g-step" id="spacing">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Timestep spacing</h2></div>
+    <p class="g-eyebrow">Where the steps land on the sigma curve</p>
+    <p>The schedule fixes how much noise each timestep carries. It is convenient to measure that as a noise-to-signal ratio, $\sigma_t = \sqrt{(1-\bar\alpha_t)/\bar\alpha_t}$, which falls from a large value at the start of sampling to nearly zero at the end. Uniform spacing &mdash; the familiar <code>linspace</code> over timesteps &mdash; takes equal steps along the index, but the index is not where the difficulty lives. Almost all of the structural decision-making happens when $\sigma$ is small and the image is nearly formed, and uniform spacing spends most of its budget at high $\sigma$ where there is little to decide.</p>
+    <p>Karras and coauthors warp the grid in $\sigma$-space instead, pulling steps densely toward small $\sigma$ and sparsely toward the noise end. The plot makes the difference visible: the marker sets are the same number of steps, but the Karras set leaves the smooth $\sigma$ curve and clusters at the low-noise end. With a fixed step budget, that reallocation is usually worth more than a higher-order solver, which is why every production sampler exposes a spacing knob beside its solver knob.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="samplers-spacing-canvas" width="620" height="320"></canvas>
+        <p class="g-canvas-hint">The noise-to-signal curve (solid) with the steps chosen by uniform spacing and by Karras spacing. Both use the step count from the solver demo above.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Karras exponent &rho; <span class="val">7</span></label><input type="range" id="sampler-rho" min="3" max="9" step="1" value="7"></div>
+        <div class="g-readout" id="samplers-spacing-readout"></div>
+        <p class="g-mini">Larger &rho; concentrates steps even harder at low &sigma;. Uniform spacing is the special case where every step covers the same index interval.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span>The curve is not an accident of the schedule: it is determined by $\bar\alpha_t$, the same quantity the forward process accumulated. Changing the schedule changes the shape, and changing the spacing changes which part of the shape the solver is allowed to resolve.</span></div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The step budget</h2></div>
+    <p class="g-eyebrow">The twenty-to-fifty sweet spot</p>
+    <p>The training process used a thousand forward steps, but sampling never has to. The reverse loop is far more forgiving than the forward chain, and the honest way to state the trade is in network evaluations: wall-clock time is roughly the number of forward passes times the cost of one pass. The bars below hold the solver fixed and spend four different budgets, from four steps to fifty, on the same trajectory.</p>
+    <p>In practice the curve flattens somewhere in the twenties. Below that the image is visibly under-resolved and the sampler has not had enough looks at the low-noise end; above fifty the extra evaluations buy a difference no one can see. That flat region is why the default sampler in a shipping pipeline is typically twenty to fifty steps with a second-order or multistep solver and a warped grid, and why the few-step methods in the next part are interesting at all: they try to move the knee of this curve down to one or four.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="samplers-budget-canvas" width="620" height="240"></canvas>
+        <p class="g-canvas-hint">Endpoint error at 4, 8, 20 and 50 steps for the solver selected above. The highlighted bar is the current budget.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="samplers-budget-readout"></div>
+        <p class="g-mini">Multistep solvers such as DPM-Solver++ reach the flat region in roughly ten to twenty calls by reusing earlier predictions as extra terms in the update, rather than by evaluating the field again.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">The knobs every pipeline exposes</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">Stable Diffusion samplers</h3>
+        <p style="margin-bottom:0;">The sampler menu in every Stable Diffusion interface is this part's taxonomy: ancestral samplers that inject noise, DDIM and its relatives that do not, and DPM-Solver++ variants that add history terms. The <a href="{{ '/ai/generative-media/sampling/' | relative_url }}">reverse-loop chapter</a> builds the same loop on a real trained denoiser.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Flow &amp; real time</div>
+        <h3 style="margin:6px 0;">Few-step and interactive generation</h3>
+        <p style="margin-bottom:0;">A straight-path <a href="{{ '/ai/generative-media/flow-matching/' | relative_url }}">flow-matching field</a> can be integrated in a handful of Euler steps, which is what makes interactive editing and robot policies at control rate feasible. The <a href="{{ '/math/calculus-in-motion/odes/' | relative_url }}">ODE guide</a> develops Euler and Runge&ndash;Kutta error orders, which is the analysis behind every curve on this page.</p>
+      </div>
+    </div>
+    <p>The same arithmetic organises video, audio and 3-D generation, where each network call is even more expensive and the step budget is measured in seconds of latency rather than milliseconds. Whenever a paper reports a sampling time, read it as solver, spacing and step count together &mdash; the three are chosen jointly and usually tuned against each other.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Sampling is where diffusion stops being a probabilistic model and starts being numerical analysis. These are the papers that made that shift explicit: the one that removed the injected noise, the one that added higher-order integration, and the one that treated the schedule as a warped grid in noise-to-signal space.</p>
+    <p>Song and coauthors show that the reverse process has a deterministic counterpart; Lu and coauthors bring the multistep ODE solvers of numerical analysis into the loop; Karras and coauthors rework the whole sampler around the sigma parameterisation; and Ho and coauthors are the ancestral baseline everything else is measured against.</p>
+    <ul class="g-refs">
+      <li>Jiaming Song, Chenlin Meng and Stefano Ermon, <a href="https://arxiv.org/abs/2010.02502">"Denoising Diffusion Implicit Models"</a>, 2021 &mdash; the deterministic sampler and the step-count trade.</li>
+      <li>Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li and Jun Zhu, <a href="https://arxiv.org/abs/2206.00927">"DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling in Around 10 Steps"</a>, 2022 &mdash; high-order and multistep solvers for the reverse ODE.</li>
+      <li>Tero Karras, Miika Aittala, Timo Aila and Samuli Laine, <a href="https://arxiv.org/abs/2206.00364">"Elucidating the Design Space of Diffusion-Based Generative Models"</a>, 2022 &mdash; the sigma parameterisation and the non-uniform grid.</li>
+      <li>Jonathan Ho, Ajay Jain and Pieter Abbeel, <a href="https://arxiv.org/abs/2006.11239">"Denoising Diffusion Probabilistic Models"</a>, 2020 &mdash; the ancestral sampler in its original form.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Ancestral sampler</td><td>Injects fresh Gaussian noise at every step; DDPM; stochastic output</td></tr>
+        <tr><td>Deterministic sampler</td><td>No injected noise; the endpoint is a function of the starting noise</td></tr>
+        <tr><td>Probability-flow ODE</td><td>The differential equation whose solution is the deterministic reverse path</td></tr>
+        <tr><td>Euler step</td><td>First order: follow the field at the current point; $x \leftarrow x + v\,\Delta t$</td></tr>
+        <tr><td>Heun step</td><td>Second order: average the field at the start and at a provisional endpoint; two evaluations</td></tr>
+        <tr><td>NFE</td><td>Number of function evaluations; the true cost of a sampler</td></tr>
+        <tr><td>$\sigma_t$</td><td>Noise-to-signal ratio $\sqrt{(1-\bar\alpha_t)/\bar\alpha_t}$; what the schedule really controls</td></tr>
+        <tr><td>Karras spacing</td><td>Non-uniform grid, dense at low $\sigma$; <code>Diffusion.karrasSigmas</code></td></tr>
+        <tr><td>Sweet spot</td><td>Roughly 20&ndash;50 evaluations for images before the error curve flattens</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The sampler is how you spend a budget you already have. The next part asks a different question: how to need almost no budget at all, by training a smaller student to jump the whole trajectory in one or four steps &mdash; and what that costs.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  var METHODS = ['euler', 'heun', 'ddim', 'ddpm'];
+  var METHOD_NAMES = ['Euler', 'Heun', 'DDIM', 'DDPM'];
+  var METHOD_COLORS = [c.accent, c.accent2, c.accent400, c.accent700];
+
+  var sch = D.schedule('linear', 1000);
+  var X0 = 1.0, EPS = 0.7;
+  var SIGMA_MIN = 0.01, SIGMA_MAX = 80;
+
+  var methodIdx = 0;
+  var steps = 8;
+  var karrasRho = 7;
+
+  var start = D.forwardX(sch, X0, sch.T, EPS);
+
+  function pred(x, t) {
+    var ab = D.abAt(sch, t);
+    return D.epsFromX0(x, X0, ab) * (1 + 0.15 * (1 - ab));
+  }
+
+  function sampleErr(method, n) {
+    if (method === 'euler' || method === 'heun') {
+      var x = D.odeSolve(sch, { method: method, steps: n, start: start, predict: pred });
+      return Math.abs(x - X0);
+    }
+    var res = D.sampler(sch, { method: method, steps: n, start: start, predict: pred, rng: GM.rng(9000 + n) });
+    return Math.abs(res.x - X0);
+  }
+  function log10(v) { return Math.log(Math.max(1e-9, v)) / Math.LN10; }
+  function sigmaL10(s) { return Math.log(Math.max(1e-3, s)) / Math.LN10; }
+  function fmtErr(v) {
+    if (!isFinite(v)) return '—';
+    if (v === 0) return '0';
+    if (v < 1e-3 || v >= 1e3) return v.toExponential(2);
+    return v.toFixed(4);
+  }
+
+  function tForSigma(sig) {
+    var best = sch.T, bestD = Infinity;
+    for (var t = 1; t <= sch.T; t++) {
+      var d = Math.abs(D.sigmaAt(sch, t) - sig);
+      if (d < bestD) { bestD = d; best = t; }
+    }
+    return best;
+  }
+
+  var errPlot = GM.plot(document.getElementById('samplers-error-canvas'), {
+    W: 620, H: 340, xRange: [1, 32], yRange: [-4, 1],
+    xLabel: 'sampling steps N', yLabel: 'log10 endpoint error',
+    onResize: function () { redrawErr(); }
+  });
+  var spacePlot = GM.plot(document.getElementById('samplers-spacing-canvas'), {
+    W: 620, H: 320, xRange: [0, 1], yRange: [-2.8, 2.4],
+    xLabel: 'fraction of the trajectory', yLabel: 'log10 sigma',
+    onResize: function () { redrawSpace(); }
+  });
+  var barSetup = Guide.setupCanvas(document.getElementById('samplers-budget-canvas'), 620, 240, function () { drawBudget(); });
+
+  function redrawErr() {
+    if (!errPlot) return;
+    errPlot.clear();
+    errPlot.axes({ xLabel: 'sampling steps N', yLabel: 'log10 endpoint error' });
+    for (var m = 0; m < METHODS.length; m++) {
+      (function (mm, col) {
+        errPlot.curve(function (x) {
+          return log10(sampleErr(mm, Math.max(1, Math.round(x))));
+        }, { color: col, width: 2, samples: 40 });
+      })(METHODS[m], METHOD_COLORS[m]);
+    }
+    errPlot.curve(function (x) {
+      return log10(D.solverError(sch, X0, { method: 'euler', steps: Math.max(1, Math.round(x)), eps: EPS }));
+    }, { color: c.text, width: 1.2, dashed: true, samples: 40 });
+    errPlot.vline(steps, { color: c.text, dashed: true, width: 1.2, label: 'N = ' + steps, labelY: 0.7 });
+    var leg = METHODS.map(function (mm, i) { return { label: METHOD_NAMES[i], color: METHOD_COLORS[i] }; });
+    leg.push({ label: 'perfect-model floor', color: c.text, dashed: true });
+    errPlot.legend(leg, { dy: 6 });
+  }
+
+  function redrawSpace() {
+    if (!spacePlot) return;
+    spacePlot.clear();
+    spacePlot.axes({ xLabel: 'fraction of the trajectory', yLabel: 'log10 sigma' });
+    spacePlot.curve(function (f) {
+      var t = Math.round(sch.T * (1 - f));
+      return sigmaL10(D.sigmaAt(sch, Math.max(1, Math.min(sch.T, t))));
+    }, { color: c.text, width: 1.8 });
+    var ts = D.timesteps(sch.T, steps);
+    var uni = ts.map(function (t) {
+      return [1 - t / sch.T, sigmaL10(D.sigmaAt(sch, Math.max(1, t)))];
+    });
+    spacePlot.points(uni, { color: c.accent, r: 3.4 });
+    var kar = D.karrasSigmas(Math.max(2, steps), SIGMA_MIN, SIGMA_MAX, karrasRho);
+    var kpts = kar.map(function (s) {
+      return [1 - tForSigma(s) / sch.T, sigmaL10(s)];
+    });
+    spacePlot.points(kpts, { color: c.accent2, r: 3.4 });
+    spacePlot.legend([
+      { label: 'sigma(t) of the schedule', color: c.text },
+      { label: 'uniform steps', color: c.accent },
+      { label: 'Karras steps', color: c.accent2 }
+    ], { dy: 6 });
+  }
+
+  function drawBudget() {
+    if (!barSetup) return;
+    var m = METHODS[methodIdx];
+    var budgets = [4, 8, 20, 50];
+    var data = budgets.map(function (b) {
+      var e = sampleErr(m, b);
+      return {
+        label: b + ' steps',
+        value: e,
+        valueLabel: fmtErr(e),
+        color: b === steps ? c.accent2 : c.accent
+      };
+    });
+    Guide.drawBars(barSetup.ctx, 620, 240, data, { padL: 96, fontSize: 12 });
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('samplers-readout');
+    if (!el) return;
+    var m = METHODS[methodIdx];
+    el.innerHTML =
+      '<div><span class="k">solver</span> <span class="hi">' + METHOD_NAMES[methodIdx] + '</span></div>' +
+      '<div><span class="k">steps</span> ' + steps + '</div>' +
+      '<div><span class="k">endpoint error</span> ' + fmtErr(sampleErr(m, steps)) + '</div>' +
+      '<div><span class="k">same solver at 50 steps</span> ' + fmtErr(sampleErr(m, 50)) + '</div>' +
+      '<div class="g-mini">Predictor: oracle noise estimate inflated by 15% as the signal is destroyed.</div>';
+    var de = document.getElementById('samplers-budget-readout');
+    if (de) {
+      de.innerHTML =
+        '<div><span class="k">error at 4 steps</span> ' + fmtErr(sampleErr(m, 4)) + '</div>' +
+        '<div><span class="k">error at 20 steps</span> ' + fmtErr(sampleErr(m, 20)) + '</div>' +
+        '<div><span class="k">error at 50 steps</span> <span class="hi">' + fmtErr(sampleErr(m, 50)) + '</span></div>' +
+        '<div class="g-mini">Ratio 4-step to 50-step error: ' +
+        (sampleErr(m, 50) > 0 ? (sampleErr(m, 4) / sampleErr(m, 50)).toFixed(1) : '—') + '×.</div>';
+    }
+    var se = document.getElementById('samplers-spacing-readout');
+    if (se) {
+      var kar = D.karrasSigmas(Math.max(2, steps), SIGMA_MIN, SIGMA_MAX, karrasRho);
+      se.innerHTML =
+        '<div><span class="k">steps</span> ' + steps + '</div>' +
+        '<div><span class="k">uniform sigma at step 1</span> ' + D.sigmaAt(sch, sch.T).toFixed(1) + '</div>' +
+        '<div><span class="k">Karras sigma range</span> ' + kar[0].toFixed(2) + ' → ' + kar[kar.length - 1].toFixed(3) + '</div>' +
+        '<div class="g-mini">Both spacings choose ' + steps + ' steps; they differ in where those steps sit on the curve.</div>';
+    }
+  }
+
+  function redraw() { redrawErr(); redrawSpace(); drawBudget(); redrawReadout(); }
+
+  Guide.bindSliders(document.querySelectorAll('#sampler-method'), function (el) {
+    methodIdx = parseInt(el.value, 10);
+    var p = el.parentElement;
+    if (p) { var lab = p.querySelector('.val'); if (lab) lab.textContent = METHOD_NAMES[methodIdx]; }
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#sampler-steps'), function (el) {
+    steps = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#sampler-rho'), function (el) {
+    karrasRho = parseInt(el.value, 10);
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'samplers-ancestral',
+      kind: 'choice',
+      prompt: 'What distinguishes an ancestral sampler such as DDPM from a deterministic one such as DDIM?',
+      options: [
+        { label: 'The ancestral update injects fresh Gaussian noise at every step; the deterministic update does not.', correct: true },
+        { label: 'The ancestral sampler uses a different trained network than the deterministic one.', correct: false },
+        { label: 'The deterministic sampler skips the network entirely and uses the schedule only.', correct: false }
+      ],
+      explanation: 'Both use the same denoiser. DDPM adds noise with a schedule-fixed variance at each transition, making the output stochastic; DDIM replaces that with a straight interpolation and turns generation into a deterministic ODE.'
+    },
+    {
+      id: 'samplers-nfe',
+      kind: 'numeric',
+      prompt: 'Euler makes one network evaluation per step and Heun makes two. How many evaluations does a 25-step Heun sampler use?',
+      answer: 50,
+      tolerance: 0.5,
+      explanation: 'Heun evaluates the field at the start of the step and again at a provisional endpoint, so 25 steps cost 50 forward passes. That is why error per evaluation, not error per step, is the fair comparison.'
+    },
+    {
+      id: 'samplers-karras',
+      kind: 'choice',
+      prompt: 'Why does Karras-style spacing place steps densely near small sigma?',
+      options: [
+        { label: 'Most of the structural decision happens once the image is nearly formed, so the low-noise end deserves more steps.', correct: true },
+        { label: 'Small sigma values are numerically unstable and require more sampling steps.', correct: false },
+        { label: 'It removes the need for a trained network at low noise.', correct: false }
+      ],
+      explanation: 'At high sigma there is little signal to refine, so uniform spacing wastes budget there. Warping the grid toward small sigma reallocates the same step count to the part of the trajectory that determines the final image.'
+    },
+    {
+      id: 'samplers-order',
+      kind: 'numeric',
+      prompt: 'Euler is first order, so its error scales roughly with the step size. If 8 steps leave an endpoint error of 0.40, what error should 16 steps leave?',
+      answer: 0.2,
+      tolerance: 0.01,
+      explanation: 'Halving the step size roughly halves a first-order method\'s error, so 0.40 becomes about 0.20. A second-order method such as Heun would shrink it by about four rather than two, at twice the cost per step.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

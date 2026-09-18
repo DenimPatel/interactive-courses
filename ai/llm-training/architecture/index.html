@@ -1,0 +1,742 @@
+---
+title: "LLM Training, Interactively — Part 3: The Transformer, Block by Block"
+description: "A hands-on walkthrough of the transformer block that powers OLMo and every modern LLM — real small-matrix attention, multi-head splitting, RoPE, residual streams, RMSNorm, SwiGLU, parameter counting, and mixture-of-experts routing."
+permalink: "/ai/llm-training/architecture/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-architecture.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .mat-grid { display: grid; gap: 3px; font-family: var(--font-mono); font-size: 11.5px; }
+  .mat-cell {
+    background: var(--color-bg); border-radius: 2px; padding: 4px 2px; text-align: center;
+    min-width: 34px;
+  }
+  .mat-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .mat-label { font-size: 11px; opacity: 0.65; font-family: var(--font-heading); }
+  .mat-row { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; justify-content: center; }
+  .mat-op { font-size: 20px; opacity: 0.5; align-self: center; }
+  .heat-cell { transition: background-color 0.1s; cursor: pointer; }
+  .arch-blocks { display: flex; flex-direction: column-reverse; gap: 3px; }
+  .arch-block { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius-sm); background: var(--color-bg); font-size: 11.5px; font-family: var(--font-mono); }
+  .arch-block.active { background: var(--color-accent-100); border: 1px solid var(--color-accent-300); }
+  .param-bar-seg { height: 22px; display: inline-block; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 3 of 15</span>
+    <h1>The Transformer, Block by Block</h1>
+    <p>Part 1 said a language model predicts a distribution over the next token. Part 2 turned text into token vectors. This part is about the function in between: the <strong>transformer block</strong>, stacked dozens of times, that turns a sequence of vectors into a better sequence of vectors — one that a final linear layer can read off as next-token logits. Every matrix on this page is small enough to compute by hand and large enough to show the real mechanism: nothing here is illustrative or hand-waved.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+  <nav class="llmt-toc">
+    <a href="#attention">Attention</a><a href="#multihead">Multi-head</a><a href="#rope">Positional info &amp; RoPE</a>
+    <a href="#residual">Residual stream</a><a href="#norm">Normalization</a><a href="#mlp">MLP / SwiGLU</a>
+    <a href="#params">Parameter counting</a><a href="#moe">Mixture of experts</a>
+  </nav>
+
+{% raw %}
+  <section class="llmt-step" id="setup">
+    <div class="llmt-step-head"><span class="llmt-step-num">0</span><h2>Why attention is permutation-invariant (for now)</h2></div>
+    <p class="llmt-eyebrow">Setup</p>
+    <p>A transformer block does two things to a sequence of token vectors, repeatedly: it lets tokens exchange information (<strong>self-attention</strong>), then it processes each position independently (a per-token <strong>MLP</strong>). Both are wrapped in a residual connection and a normalization step. Stack this block $L$ times and you have a full model — OLMo 2 7B stacks it 32 times.</p>
+    <div class="llmt-goal">💡 <span><b>The shape of this part:</b> we'll build the block piece by piece — attention, multiple heads, positional encoding (attention alone can't tell position <var>i</var> from position <var>j</var>!), the residual stream those pieces write into, normalization, the MLP, and finally how to count and route parameters at scale.</span></div>
+  </section>
+
+  <section class="llmt-step" id="attention">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Self-attention: queries, keys, values</h2></div>
+    <p class="llmt-eyebrow">Core mechanism</p>
+    <p>Each token embedding <var>x</var> is projected three ways by learned weight matrices: a <strong>query</strong> $Q=XW_Q$ ("what am I looking for"), a <strong>key</strong> $K=XW_K$ ("what do I contain"), and a <strong>value</strong> $V=XW_V$ ("what do I offer if attended to"). Every token's query is dot-producted against every token's key, scaled, masked (a token may only attend to itself and earlier tokens — that's what makes generation autoregressive), turned into a probability distribution with softmax, and used to take a weighted average of the values.</p>
+    <div class="llmt-math llmt-katex">$$\text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + M\right)V$$</div>
+    <p>Edit the 4 toy token embeddings below (4 tokens × 4 dimensions) and watch every intermediate matrix update — projections, raw scores, the causal mask, the softmax, and the final output.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-controls" style="flex-basis:100%; display:flex; gap:20px; flex-wrap:wrap;">
+        <div class="llmt-field" style="flex:1 1 200px;"><label>√d<sub>k</sub> scaling <span class="val" id="a-scale-val">on</span></label>
+          <div class="llmt-btnrow"><button id="a-scale-toggle" class="llmt-primary">Toggle scaling</button></div>
+        </div>
+        <div class="llmt-field" style="flex:1 1 200px;"><label>Causal mask <span class="val" id="a-mask-val">on</span></label>
+          <div class="llmt-btnrow"><button id="a-mask-toggle" class="llmt-primary">Toggle mask</button></div>
+        </div>
+        <div class="llmt-field" style="flex:1 1 200px;"><label>Seed</label>
+          <div class="llmt-btnrow"><button id="a-reseed">Re-randomize W<sub>Q</sub>, W<sub>K</sub>, W<sub>V</sub></button></div>
+        </div>
+      </div>
+      <div id="a-embed-inputs" class="mat-row"></div>
+      <div class="mat-row" id="a-qkv-row"></div>
+      <div class="mat-row"><div class="mat-wrap"><div class="mat-label">scores = QKᵀ/√d<sub>k</sub> (masked)</div><canvas id="a-heat" width="260" height="260" style="width:220px;height:220px;"></canvas></div>
+        <span class="mat-op">→ softmax →</span>
+        <div class="mat-wrap"><div class="mat-label">attention weights</div><canvas id="a-heat2" width="260" height="260" style="width:220px;height:220px;"></canvas></div>
+        <span class="mat-op">× V =</span>
+        <div class="mat-wrap" id="a-output"></div>
+      </div>
+      <div class="llmt-readout" id="a-hover-readout">Hover a cell in the score heatmap to see its dot product.</div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Notice:</b> nothing above the mask/softmax step knows token order — swap two rows of the input and you get exactly the same set of dot products, just relabeled. Attention by itself is <strong>permutation-invariant</strong>. We fix that in the RoPE section below.</span></div>
+  </section>
+
+  <section class="llmt-step" id="multihead">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>Multiple heads, running in parallel</h2></div>
+    <p class="llmt-eyebrow">Core mechanism</p>
+    <p>One attention pattern can only capture one notion of "relevant." Transformers instead split <var>Q, K, V</var> into <var>h</var> smaller <strong>heads</strong>, each with its own learned projections, run attention independently per head, then concatenate the results back to the full width. OLMo 2 7B uses 32 heads of dimension 128 each (32 × 128 = 4096 = d<sub>model</sub>). Some models (including many recent OLMo variants) use <strong>grouped-query attention (GQA)</strong>, where several query heads share one key/value head — this shrinks the KV cache we'll meet in Part 11 with little quality loss.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="mh-canvas" width="560" height="220"></canvas>
+        <p class="llmt-canvas-hint">Each row is one head's attention pattern over the same 4 tokens — different random projections, different pattern.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Number of heads <span class="val" id="mh-n-val">4</span></label>
+          <input type="range" id="mh-n" min="1" max="8" step="1" value="4"></div>
+        <div class="llmt-field"><label>GQA groups (KV heads shared by) <span class="val" id="mh-gqa-val">1</span></label>
+          <input type="range" id="mh-gqa" min="1" max="4" step="1" value="1"></div>
+        <div class="llmt-readout" id="mh-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="rope">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Positional information: RoPE</h2></div>
+    <p class="llmt-eyebrow">Core mechanism</p>
+    <p>Since raw attention can't see position, every transformer injects positional information somewhere. OLMo, like Llama and most current open models, uses <strong>Rotary Position Embeddings (RoPE)</strong>: instead of adding a position vector, RoPE <em>rotates</em> each query/key vector by an angle proportional to its position, in 2D sub-planes of the embedding. Two vectors rotated by the same angle keep the same dot product — so what matters for the QK dot product is the <em>relative</em> rotation, i.e. the distance between the two positions, not their absolute positions.</p>
+    <div class="llmt-math llmt-katex">$$q_m^\top k_n \text{ depends only on } (m-n) \text{ after rotating } q_m, k_n \text{ by angles } m\theta, n\theta$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="rope-canvas" width="380" height="380"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Position of key token n <span class="val" id="rope-n-val">3</span></label>
+          <input type="range" id="rope-n" min="0" max="20" step="1" value="3"></div>
+        <div class="llmt-field"><label>Rotation frequency θ <span class="val" id="rope-theta-val">0.30</span></label>
+          <input type="range" id="rope-theta" min="0.05" max="1.2" step="0.01" value="0.30"></div>
+        <div class="llmt-readout" id="rope-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-canvas-hint">Query token is fixed at position 0. As you drag the key token's position <var>n</var> away, both vectors keep rotating together (same relative angle for a given distance) — watch the dot-product-vs-distance curve on the right decay smoothly instead of jumping around, which is exactly the "nearby tokens matter more, and it's about distance, not absolute position" property RoPE is designed to give a model for free.</p>
+  </section>
+
+  <section class="llmt-step" id="residual">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>The residual stream</h2></div>
+    <p class="llmt-eyebrow">Architecture</p>
+    <p>Attention and the MLP don't <em>replace</em> a token's representation — they compute an update that gets <strong>added</strong> to it: $x \leftarrow x + \text{Attention}(x)$, then $x \leftarrow x + \text{MLP}(x)$. This running sum across all 32 (or however many) layers is the <strong>residual stream</strong>. It's the reason gradients can flow all the way back to layer 1 in a 32-layer network without vanishing, and it means every layer's job is only to compute a small <em>correction</em>, not to recompute the whole representation from scratch.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap" style="flex-basis:100%;">
+        <div class="llmt-field"><label>Layer <span class="val" id="res-layer-val">1</span> of 8</label>
+          <input type="range" id="res-layer" min="1" max="8" step="1" value="1"></div>
+        <div class="llmt-btnrow">
+          <button id="res-toggle" class="llmt-primary">Residual connection: ON (click to disable)</button>
+        </div>
+        <div class="arch-blocks" id="res-blocks"></div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Disable the residual connection</b> and each layer's random, untrained-looking update simply overwrites the last — the representation's norm drifts and the original token identity is lost by layer 3–4. This is a real, not merely didactic, failure mode: very deep networks without residual connections are notoriously hard to train.</span></div>
+  </section>
+
+  <section class="llmt-step" id="norm">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>LayerNorm, RMSNorm, and where to put it</h2></div>
+    <p class="llmt-eyebrow">Architecture</p>
+    <p>Before feeding a vector into attention or the MLP, it's normalized. The original transformer used <strong>LayerNorm</strong> (subtract the mean, divide by the standard deviation, then apply a learned scale and shift). Most current LLMs, including OLMo, use <strong>RMSNorm</strong> — skip the mean-centering, just divide by the root-mean-square and rescale — which is cheaper and works about as well:</p>
+    <div class="llmt-math llmt-katex">$$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \epsilon}} \cdot \gamma$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="norm-canvas" width="440" height="200"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow">
+          <button id="norm-ln" class="llmt-primary">LayerNorm</button>
+          <button id="norm-rms">RMSNorm</button>
+        </div>
+        <div class="llmt-field"><label>Perturb one activation (outlier) <span class="val" id="norm-outlier-val">0</span></label>
+          <input type="range" id="norm-outlier" min="0" max="8" step="0.2" value="0"></div>
+        <div class="llmt-readout" id="norm-readout"></div>
+      </div>
+    </div>
+    <p><strong>Where</strong> normalization sits also matters. The original ("post-norm") design normalizes <em>after</em> adding the sublayer output to the residual stream; most modern models use <strong>pre-norm</strong> (normalize the input to attention/MLP, then add the raw output to the residual stream), which trains far more stably at depth. OLMo 2 made a further, specific tweak: it normalizes the sublayer's <em>output</em> before adding it to the residual stream (sometimes called "post-norm on the branch"), plus adds RMSNorm directly to queries and keys (<strong>QK-norm</strong>) — both changes the OLMo 2 paper credits with fixing training-loss spikes that plagued OLMo 1 at scale.</p>
+    <div class="llmt-goal">💡 <span><b>OLMo hook:</b> if you've read Part 5's loss-spike section, this is the architectural half of the fix; the optimizer/learning-rate half lives there.</span></div>
+  </section>
+
+  <section class="llmt-step" id="mlp">
+    <div class="llmt-step-head"><span class="llmt-step-num">6</span><h2>The MLP: most of the parameters, half the story</h2></div>
+    <p class="llmt-eyebrow">Architecture</p>
+    <p>After attention mixes information <em>across</em> tokens, the MLP (feed-forward block) processes each token position independently — expand to a wider hidden dimension, apply a nonlinearity, project back down. Modern models use <strong>SwiGLU</strong>: two parallel "up" projections, one gated through a SiLU nonlinearity and multiplied elementwise into the other, then a "down" projection back to <var>d</var><sub>model</sub>:</p>
+    <div class="llmt-math llmt-katex">$$\text{SwiGLU}(x) = \big(\text{SiLU}(xW_{\text{gate}}) \odot xW_{\text{up}}\big)\,W_{\text{down}}$$</div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="mlp-canvas" width="520" height="180"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>FFN expansion ratio <span class="val" id="mlp-ratio-val">2.7×</span></label>
+          <input type="range" id="mlp-ratio" min="1" max="6" step="0.1" value="2.7"></div>
+        <div class="llmt-readout" id="mlp-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-canvas-hint">OLMo 2 7B uses an FFN hidden size of 11008 against d<sub>model</sub>=4096 — a ratio of about 2.7× per projection, but <em>three</em> projections (gate, up, down) instead of the plain MLP's two, which is why the MLP block, not attention, holds roughly two-thirds of a dense transformer's parameters.</p>
+  </section>
+
+  <section class="llmt-step" id="params">
+    <div class="llmt-step-head"><span class="llmt-step-num">7</span><h2>Parameter-count calculator</h2></div>
+    <p class="llmt-eyebrow">Putting it together</p>
+    <p>Per transformer layer: attention contributes roughly $4d^2$ (Q, K, V, and output projections, each d×d), the MLP contributes roughly $3 d \cdot d_{ffn}$ (gate, up, down), plus two small RMSNorm vectors. Add the embedding table ($V \times d$, doubled if input/output embeddings aren't tied) once, multiply the per-layer cost by <var>L</var>, and you get the whole model. Try the preset for OLMo 2 7B — the calculator should land within a percent or two of the real, published 7B parameter count.</p>
+    <div class="llmt-demo">
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-btnrow">
+          <button id="pc-preset-7b" class="llmt-primary">Preset: OLMo 2 7B</button>
+          <button id="pc-preset-1b">Preset: ~1B-scale</button>
+          <button id="pc-preset-13b">Preset: ~13B-scale</button>
+        </div>
+        <div class="llmt-grid3">
+          <div class="llmt-field"><label>d_model <span class="val" id="pc-d-val">4096</span></label><input type="range" id="pc-d" min="256" max="8192" step="64" value="4096"></div>
+          <div class="llmt-field"><label>layers L <span class="val" id="pc-L-val">32</span></label><input type="range" id="pc-L" min="1" max="80" step="1" value="32"></div>
+          <div class="llmt-field"><label>ffn hidden <span class="val" id="pc-ffn-val">11008</span></label><input type="range" id="pc-ffn" min="256" max="30000" step="64" value="11008"></div>
+          <div class="llmt-field"><label>vocab size <span class="val" id="pc-vocab-val">100278</span></label><input type="range" id="pc-vocab" min="1000" max="200000" step="1000" value="100278"></div>
+          <div class="llmt-field"><label>heads (informational) <span class="val" id="pc-heads-val">32</span></label><input type="range" id="pc-heads" min="1" max="128" step="1" value="32"></div>
+          <div class="llmt-field"><label>tie embeddings? <span class="val" id="pc-tie-val">no</span></label>
+            <div class="llmt-btnrow"><button id="pc-tie-toggle">Toggle</button></div></div>
+        </div>
+        <canvas id="pc-canvas" width="700" height="60" style="width:100%; height:34px; border-radius:2px;"></canvas>
+        <div class="llmt-readout" id="pc-readout" style="margin-top:8px;"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="moe">
+    <div class="llmt-step-head"><span class="llmt-step-num">8</span><h2>Mixture of experts: more parameters, same compute</h2></div>
+    <p class="llmt-eyebrow">Scaling the architecture</p>
+    <p>A dense model runs every parameter on every token. A <strong>mixture-of-experts (MoE)</strong> model replaces the single MLP in each block with many parallel "expert" MLPs and a small learned router that picks a handful of them per token. Total parameters grow (more experts to store), but compute per token doesn't (only the chosen experts run) — this is how you get a bigger, more capable model at roughly the same serving cost. Ai2's open MoE, <strong>OLMoE</strong>, uses 64 experts per layer across 16 MoE layers, routing each token to just 8 of them: 6.9B total parameters, only 1.3B active per token.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="moe-canvas" width="520" height="260"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Experts per layer <span class="val" id="moe-n-val">8</span></label>
+          <input type="range" id="moe-n" min="4" max="16" step="1" value="8"></div>
+        <div class="llmt-field"><label>Active experts (top-k) <span class="val" id="moe-k-val">2</span></label>
+          <input type="range" id="moe-k" min="1" max="4" step="1" value="2"></div>
+        <div class="llmt-btnrow"><button id="moe-route" class="llmt-primary">Route a new batch of tokens</button></div>
+        <div class="llmt-readout" id="moe-readout"></div>
+      </div>
+    </div>
+    <p class="llmt-canvas-hint">The load-balance meter shows how evenly tokens spread across experts — real MoE training adds an auxiliary loss specifically to discourage the router from collapsing onto a favorite few experts.</p>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th><th>OLMo 2 7B value</th></tr></thead>
+      <tbody>
+        <tr><td>Self-attention</td><td>Softmax(QKᵀ/√d<sub>k</sub> + mask)V — tokens exchange information</td><td>32 heads × 128 dim</td></tr>
+        <tr><td>RoPE</td><td>Rotates Q/K by position so their dot product depends on relative distance</td><td>θ base 10,000</td></tr>
+        <tr><td>Residual stream</td><td>Running sum each sublayer adds a correction to</td><td>32 layers deep</td></tr>
+        <tr><td>RMSNorm</td><td>Cheaper LayerNorm variant; OLMo 2 also reorders it and adds QK-norm</td><td>ε = 1e-5</td></tr>
+        <tr><td>SwiGLU MLP</td><td>Gated expansion → nonlinearity → projection back down</td><td>d_ffn = 11,008</td></tr>
+        <tr><td>MoE</td><td>Many experts, few active per token — more params, same compute</td><td>OLMoE: 64 experts, top-8, 6.9B/1.3B</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Vaswani et al., <a href="https://arxiv.org/abs/1706.03762">"Attention Is All You Need"</a> (2017).</li>
+      <li>Su et al., <a href="https://arxiv.org/abs/2104.09864">"RoFormer: Enhanced Transformer with Rotary Position Embedding"</a> (2021) — RoPE.</li>
+      <li>Shazeer, <a href="https://arxiv.org/abs/2002.05202">"GLU Variants Improve Transformer"</a> (2020) — SwiGLU.</li>
+      <li>OLMo 2 Team (Ai2), <a href="https://arxiv.org/abs/2501.00656">"2 OLMo 2 Furious"</a> (2024) — norm reordering, QK-norm, z-loss.</li>
+      <li>Muennighoff et al. (Ai2), <a href="https://arxiv.org/abs/2409.02060">"OLMoE: Open Mixture-of-Experts Language Models"</a> (2024).</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>The architecture is fixed once training starts. What varies — and what makes or breaks the run — is the data it's trained on.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/data/' | relative_url }}">Continue: building the pretraining dataset →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+
+  function fmtNum(x){
+    if (x >= 1e9) return (x/1e9).toFixed(2) + 'B';
+    if (x >= 1e6) return (x/1e6).toFixed(2) + 'M';
+    if (x >= 1e3) return (x/1e3).toFixed(1) + 'K';
+    return String(Math.round(x));
+  }
+  function mkMat(container, M, label, opts){
+    opts = opts || {};
+    var wrap = document.createElement('div'); wrap.className = 'mat-wrap';
+    var lab = document.createElement('div'); lab.className = 'mat-label'; lab.textContent = label;
+    var grid = document.createElement('div'); grid.className = 'mat-grid';
+    grid.style.gridTemplateColumns = 'repeat(' + M[0].length + ', 1fr)';
+    M.forEach(function(row, ri){
+      row.forEach(function(v, ci){
+        var cell = document.createElement(opts.editable ? 'input' : 'div');
+        cell.className = 'mat-cell';
+        if (opts.editable){
+          cell.type = 'text'; cell.value = v.toFixed(2);
+          cell.style.border = '1px solid ' + c.divider;
+          cell.addEventListener('change', function(){
+            var n = parseFloat(cell.value); if (isNaN(n)) n = 0;
+            M[ri][ci] = n; if (opts.onEdit) opts.onEdit();
+          });
+        } else {
+          cell.textContent = v.toFixed(2);
+        }
+        grid.appendChild(cell);
+      });
+    });
+    wrap.appendChild(lab); wrap.appendChild(grid);
+    container.appendChild(wrap);
+    return wrap;
+  }
+
+  // ---- Section 1: attention (QKV inspector + heatmap + hover) ----
+  (function(){
+    var d = 4, n = 4;
+    var rng = G.seededRandom(7);
+    var X = [[0.8,0.1,-0.3,0.4],[0.2,0.7,0.1,-0.2],[-0.4,0.3,0.6,0.1],[0.1,-0.2,0.4,0.5]];
+    var Wq, Wk, Wv;
+    function reseed(){ Wq = G.randMatrix(d,d,rng,0.6); Wk = G.randMatrix(d,d,rng,0.6); Wv = G.randMatrix(d,d,rng,0.6); }
+    reseed();
+    var useScale = true, useMask = true;
+
+    var embedContainer = document.getElementById('a-embed-inputs');
+    var qkvRow = document.getElementById('a-qkv-row');
+    var outContainer = document.getElementById('a-output');
+    var heat = document.getElementById('a-heat'), heatCtx = heat.getContext('2d');
+    var heat2 = document.getElementById('a-heat2'), heat2Ctx = heat2.getContext('2d');
+    var hoverReadout = document.getElementById('a-hover-readout');
+    var scaleVal = document.getElementById('a-scale-val'), maskVal = document.getElementById('a-mask-val');
+
+    var lastScores = null, lastWeights = null;
+
+    function drawHeat(ctx, canvas, M, highlightNeg){
+      var W = canvas.width, H = canvas.height;
+      ctx.clearRect(0,0,W,H);
+      var cell = W / M.length;
+      var flat = [].concat.apply([], M);
+      var mn = Math.min.apply(null, flat), mx = Math.max.apply(null, flat);
+      M.forEach(function(row, i){
+        row.forEach(function(v, j){
+          var t = (v - mn) / (mx - mn + 1e-9);
+          var isMasked = highlightNeg && v <= -1e8;
+          ctx.fillStyle = isMasked ? '#dddddd' : 'color-mix(in srgb, ' + c.accent + ' ' + Math.round(t*90) + '%, white)';
+          ctx.fillRect(j*cell, i*cell, cell-2, cell-2);
+        });
+      });
+    }
+
+    function compute(){
+      var Q = G.matmul(X, Wq), K = G.matmul(X, Wk), V = G.matmul(X, Wv);
+      var scores = G.matmul(Q, G.transpose(K));
+      var scale = useScale ? Math.sqrt(d) : 1;
+      scores = scores.map(function(row){ return row.map(function(v){ return v/scale; }); });
+      if (useMask){
+        for (var i=0;i<n;i++) for (var j=0;j<n;j++) if (j>i) scores[i][j] = -1e9;
+      }
+      var weights = scores.map(function(row){
+        var maxed = row.map(function(v){ return v <= -1e8 ? -1e9 : v; });
+        return G.softmax(maxed, 1);
+      });
+      var out = G.matmul(weights, V);
+      lastScores = scores; lastWeights = weights;
+      return {Q:Q,K:K,V:V,scores:scores,weights:weights,out:out};
+    }
+
+    function render(){
+      var r = compute();
+      embedContainer.innerHTML = '';
+      mkMat(embedContainer, X, 'X (tokens × d, editable)', {editable:true, onEdit: render});
+      qkvRow.innerHTML = '';
+      mkMat(qkvRow, r.Q, 'Q = XW_Q');
+      var op1 = document.createElement('span'); op1.className='mat-op'; op1.textContent='·'; qkvRow.appendChild(op1);
+      mkMat(qkvRow, r.K, 'K = XW_K');
+      var op2 = document.createElement('span'); op2.className='mat-op'; op2.textContent='·'; qkvRow.appendChild(op2);
+      mkMat(qkvRow, r.V, 'V = XW_V');
+      drawHeat(heatCtx, heat, r.scores, true);
+      drawHeat(heat2Ctx, heat2, r.weights, false);
+      outContainer.innerHTML = '';
+      mkMat(outContainer, r.out, 'output = weights · V');
+    }
+
+    function cellHover(canvas, M, isScore){
+      canvas.addEventListener('mousemove', function(e){
+        var rect = canvas.getBoundingClientRect();
+        var cell = rect.width / M.length;
+        var i = Math.floor((e.clientY-rect.top)/cell), j = Math.floor((e.clientX-rect.left)/cell);
+        if (i<0||i>=M.length||j<0||j>=M.length) return;
+        var v = M[i][j];
+        hoverReadout.innerHTML = isScore
+          ? '<span class="k">score[row '+i+', col '+j+']</span> = q<sub>'+i+'</sub>·k<sub>'+j+'</sub>'+(useScale?'/√d<sub>k</sub>':'')+' = <span class="hi">'+(v<=-1e8?'-∞ (masked)':v.toFixed(3))+'</span>'
+          : '<span class="k">attention weight[row '+i+', col '+j+']</span> = <span class="hi">'+(v*100).toFixed(1)+'%</span> — how much token '+i+' attends to token '+j;
+      });
+    }
+    cellHover(heat, {get length(){return lastScores?lastScores.length:n;}}, true);
+    heat.addEventListener('mousemove', function(e){
+      var rect = heat.getBoundingClientRect(); var cell = rect.width/n;
+      var i = Math.floor((e.clientY-rect.top)/cell), j = Math.floor((e.clientX-rect.left)/cell);
+      if (i<0||i>=n||j<0||j>=n||!lastScores) return;
+      var v = lastScores[i][j];
+      hoverReadout.innerHTML = '<span class="k">score[row '+i+', col '+j+']</span> = q<sub>'+i+'</sub>·k<sub>'+j+'</sub>'+(useScale?'/√d<sub>k</sub>':'')+' = <span class="hi">'+(v<=-1e8?'-∞ (masked)':v.toFixed(3))+'</span>';
+    });
+    heat2.addEventListener('mousemove', function(e){
+      var rect = heat2.getBoundingClientRect(); var cell = rect.width/n;
+      var i = Math.floor((e.clientY-rect.top)/cell), j = Math.floor((e.clientX-rect.left)/cell);
+      if (i<0||i>=n||j<0||j>=n||!lastWeights) return;
+      var v = lastWeights[i][j];
+      hoverReadout.innerHTML = '<span class="k">attn weight[row '+i+', col '+j+']</span> = how much token '+i+' attends to token '+j+' = <span class="hi">'+(v*100).toFixed(1)+'%</span>';
+    });
+
+    document.getElementById('a-scale-toggle').addEventListener('click', function(){ useScale = !useScale; scaleVal.textContent = useScale?'on':'off'; render(); });
+    document.getElementById('a-mask-toggle').addEventListener('click', function(){ useMask = !useMask; maskVal.textContent = useMask?'on':'off'; render(); });
+    document.getElementById('a-reseed').addEventListener('click', function(){ reseed(); render(); });
+    render();
+  })();
+
+  // ---- Section 2: multi-head ----
+  (function(){
+    var canvas = document.getElementById('mh-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var nSlider = document.getElementById('mh-n'), gqaSlider = document.getElementById('mh-gqa');
+    var nVal = document.getElementById('mh-n-val'), gqaVal = document.getElementById('mh-gqa-val');
+    var readout = document.getElementById('mh-readout');
+    var n = 4;
+    var X = [[0.8,0.1,-0.3,0.4],[0.2,0.7,0.1,-0.2],[-0.4,0.3,0.6,0.1],[0.1,-0.2,0.4,0.5]];
+
+    function render(){
+      var heads = parseInt(nSlider.value,10);
+      var gqaGroup = Math.min(parseInt(gqaSlider.value,10), heads);
+      nVal.textContent = heads; gqaVal.textContent = gqaGroup;
+      ctx.clearRect(0,0,W,H);
+      var rowH = H/heads;
+      var kvRng = {};
+      for (var h=0; h<heads; h++){
+        var kvGroupIdx = Math.floor(h/gqaGroup);
+        var rng = G.seededRandom(100 + kvGroupIdx*17);
+        var rngQ = G.seededRandom(200 + h*31);
+        var Wk = G.randMatrix(4,4,rng,0.7), Wv = G.randMatrix(4,4,rng,0.7);
+        var Wq = G.randMatrix(4,4,rngQ,0.7);
+        var Q = G.matmul(X,Wq), K = G.matmul(X,Wk);
+        var scores = G.matmul(Q, G.transpose(K)).map(function(row){ return row.map(function(v){return v/2;}); });
+        for (var i=0;i<n;i++) for (var j=0;j<n;j++) if (j>i) scores[i][j] = -1e9;
+        var weights = scores.map(function(row){ return G.softmax(row.map(function(v){return v<=-1e8?-1e9:v;}),1); });
+        var cell = (W/n);
+        weights.forEach(function(row, ri){
+          row.forEach(function(v, ci){
+            var t = v;
+            ctx.fillStyle = 'color-mix(in srgb, ' + (h%2===0?c.accent:c.accent2) + ' ' + Math.round(t*85) + '%, white)';
+            ctx.fillRect(ci*cell, h*rowH + ri*(rowH/n), cell-1, rowH/n - 1);
+          });
+        });
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+        ctx.fillText('head '+h+(gqaGroup>1?' (KV group '+kvGroupIdx+')':''), 4, h*rowH+11);
+      }
+      readout.innerHTML = '<span class="k">total heads:</span> '+heads+'<br><span class="k">distinct KV projections:</span> '+Math.ceil(heads/gqaGroup)+' (grouped-query attention shares K/V within a group of '+gqaGroup+' query heads)';
+    }
+    nSlider.addEventListener('input', render); gqaSlider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Section 3: RoPE ----
+  (function(){
+    var canvas = document.getElementById('rope-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var nSlider = document.getElementById('rope-n'), thetaSlider = document.getElementById('rope-theta');
+    var nVal = document.getElementById('rope-n-val'), thetaVal = document.getElementById('rope-theta-val');
+    var readout = document.getElementById('rope-readout');
+
+    function rotate(v, angle){
+      var cosA = Math.cos(angle), sinA = Math.sin(angle);
+      return [v[0]*cosA - v[1]*sinA, v[0]*sinA + v[1]*cosA];
+    }
+
+    function render(){
+      var n = parseInt(nSlider.value,10), theta = parseFloat(thetaSlider.value);
+      nVal.textContent = n; thetaVal.textContent = theta.toFixed(2);
+      var q0 = [1, 0], k0 = [0.85, 0.3];
+      var qRot = rotate(q0, 0);
+      var kRot = rotate(k0, n*theta);
+
+      ctx.clearRect(0,0,W,H);
+      var cx = W*0.32, cy = H*0.42, R = Math.min(W,H)*0.28;
+      ctx.strokeStyle = c.divider; ctx.beginPath(); ctx.arc(cx,cy,R,0,2*Math.PI); ctx.stroke();
+      function drawVec(v, color, label){
+        ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+v[0]*R, cy-v[1]*R); ctx.stroke();
+        ctx.font = '12px ' + c.font;
+        ctx.fillText(label, cx+v[0]*R*1.15, cy-v[1]*R*1.15);
+      }
+      drawVec(qRot, c.accent, 'q (pos 0)');
+      drawVec(kRot, c.accent2, 'k (pos '+n+')');
+
+      // dot product vs distance curve
+      var padL = W*0.62, padR = 16, padT = 20, padB = 30;
+      var plotW = W - padL - padR, plotH = H*0.7;
+      ctx.strokeStyle = c.divider; ctx.beginPath();
+      ctx.moveTo(padL,padT); ctx.lineTo(padL,padT+plotH); ctx.lineTo(padL+plotW,padT+plotH); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font='10px '+c.font; ctx.fillText('distance (m-n)', padL+plotW/2-30, padT+plotH+18);
+      ctx.save(); ctx.translate(padL-24, padT+plotH/2); ctx.rotate(-Math.PI/2); ctx.fillText('q·k', 0,0); ctx.restore();
+      ctx.strokeStyle = c.accent; ctx.lineWidth = 2; ctx.beginPath();
+      for (var dist=0; dist<=20; dist++){
+        var kk = rotate(k0, dist*theta);
+        var dp = qRot[0]*kk[0] + qRot[1]*kk[1];
+        var x = padL + plotW*(dist/20), y = padT + plotH*(1 - (dp+1)/2);
+        if (dist===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+      var curDist = n;
+      var curK = rotate(k0, curDist*theta);
+      var curDp = qRot[0]*curK[0]+qRot[1]*curK[1];
+      var cx2 = padL+plotW*(curDist/20), cy2 = padT+plotH*(1-(curDp+1)/2);
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(cx2,cy2,4,0,2*Math.PI); ctx.fill();
+
+      readout.innerHTML = '<span class="k">relative distance:</span> '+n+'<br><span class="k">q·k at this distance:</span> <span class="hi">'+curDp.toFixed(3)+'</span><br><span class="k">key point:</span> this value depends only on (m−n) — shift both positions by the same amount and it is unchanged.';
+    }
+    nSlider.addEventListener('input', render); thetaSlider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Section 4: residual stream ----
+  (function(){
+    var layerSlider = document.getElementById('res-layer'), layerVal = document.getElementById('res-layer-val');
+    var toggleBtn = document.getElementById('res-toggle');
+    var blocksEl = document.getElementById('res-blocks');
+    var residualOn = true;
+    var rng = G.seededRandom(3);
+    var updates = []; for (var i=0;i<8;i++) updates.push([(rng()-0.5)*0.6,(rng()-0.5)*0.6,(rng()-0.5)*0.6,(rng()-0.5)*0.6]);
+    var x0 = [1,0,0,0];
+
+    function render(){
+      var upto = parseInt(layerSlider.value,10);
+      layerVal.textContent = upto;
+      var x = x0.slice();
+      blocksEl.innerHTML = '';
+      for (var l=1; l<=8; l++){
+        if (residualOn){ x = G.vadd(x, updates[l-1]); }
+        else { x = updates[l-1].slice(); }
+        var div = document.createElement('div');
+        div.className = 'arch-block' + (l===upto ? ' active' : '');
+        div.textContent = 'layer '+l+':  x = [' + x.map(function(v){return v.toFixed(2);}).join(', ') + ']   ‖x‖=' + G.norm(x).toFixed(2);
+        blocksEl.appendChild(div);
+      }
+    }
+    layerSlider.addEventListener('input', render);
+    toggleBtn.addEventListener('click', function(){
+      residualOn = !residualOn;
+      toggleBtn.textContent = 'Residual connection: ' + (residualOn?'ON (click to disable)':'OFF (click to enable)');
+      render();
+    });
+    render();
+  })();
+
+  // ---- Section 5: norms ----
+  (function(){
+    var canvas = document.getElementById('norm-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var outlierSlider = document.getElementById('norm-outlier'), outlierVal = document.getElementById('norm-outlier-val');
+    var lnBtn = document.getElementById('norm-ln'), rmsBtn = document.getElementById('norm-rms');
+    var readout = document.getElementById('norm-readout');
+    var mode = 'ln';
+    var base = [0.4, -0.6, 0.3, 0.5, -0.2, 0.7, -0.4, 0.2];
+
+    function layerNorm(x){
+      var mean = x.reduce(function(a,b){return a+b;},0)/x.length;
+      var variance = x.reduce(function(a,b){return a+(b-mean)*(b-mean);},0)/x.length;
+      return x.map(function(v){ return (v-mean)/Math.sqrt(variance+1e-5); });
+    }
+    function rmsNorm(x){
+      var ms = x.reduce(function(a,b){return a+b*b;},0)/x.length;
+      return x.map(function(v){ return v/Math.sqrt(ms+1e-5); });
+    }
+
+    function render(){
+      var outlier = parseFloat(outlierSlider.value);
+      outlierVal.textContent = outlier.toFixed(1);
+      var x = base.slice(); x[0] = base[0] + outlier;
+      var y = mode==='ln' ? layerNorm(x) : rmsNorm(x);
+      ctx.clearRect(0,0,W,H);
+      var barW = W/x.length;
+      var maxAbs = Math.max(2, Math.max.apply(null, x.map(Math.abs)), Math.max.apply(null, y.map(Math.abs)));
+      var midY = H/2;
+      x.forEach(function(v, i){
+        var h1 = (v/maxAbs)*(H*0.4);
+        ctx.fillStyle = c.accent400;
+        ctx.fillRect(i*barW+4, midY-Math.max(0,h1), barW*0.35, Math.abs(h1));
+      });
+      y.forEach(function(v, i){
+        var h2 = (v/maxAbs)*(H*0.4);
+        ctx.fillStyle = c.accent;
+        ctx.fillRect(i*barW+4+barW*0.4, midY-Math.max(0,h2), barW*0.35, Math.abs(h2));
+      });
+      ctx.strokeStyle = c.divider; ctx.beginPath(); ctx.moveTo(0,midY); ctx.lineTo(W,midY); ctx.stroke();
+      readout.innerHTML = '<span class="k">mode:</span> ' + (mode==='ln'?'LayerNorm':'RMSNorm') + '<br><span class="k">input norm:</span> ' + G.norm(x).toFixed(2) + '  <span class="k">output norm:</span> ' + G.norm(y).toFixed(2) + '<br><span style="opacity:0.6">light bars = raw activations, dark bars = normalized</span>';
+    }
+    outlierSlider.addEventListener('input', render);
+    lnBtn.addEventListener('click', function(){ mode='ln'; lnBtn.className='llmt-primary'; rmsBtn.className=''; render(); });
+    rmsBtn.addEventListener('click', function(){ mode='rms'; rmsBtn.className='llmt-primary'; lnBtn.className=''; render(); });
+    render();
+  })();
+
+  // ---- Section 6: MLP / SwiGLU ----
+  (function(){
+    var canvas = document.getElementById('mlp-canvas'), ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    var ratioSlider = document.getElementById('mlp-ratio'), ratioVal = document.getElementById('mlp-ratio-val');
+    var readout = document.getElementById('mlp-readout');
+    var dModel = 4096;
+
+    function render(){
+      var ratio = parseFloat(ratioSlider.value);
+      ratioVal.textContent = ratio.toFixed(1)+'×';
+      var dFfn = Math.round(dModel*ratio);
+      var attnParams = 4*dModel*dModel;
+      var mlpParams = 3*dModel*dFfn;
+      ctx.clearRect(0,0,W,H);
+      var total = attnParams+mlpParams;
+      var attnW = W*(attnParams/total), mlpW = W-attnW;
+      ctx.fillStyle = c.accent400; ctx.fillRect(0, H*0.3, attnW, H*0.4);
+      ctx.fillStyle = c.accent; ctx.fillRect(attnW, H*0.3, mlpW, H*0.4);
+      ctx.fillStyle = c.text; ctx.font='12px '+c.font; ctx.textAlign='center';
+      ctx.fillText('attention ' + (100*attnParams/total).toFixed(0)+'%', attnW/2, H*0.3-8);
+      ctx.fillText('MLP ' + (100*mlpParams/total).toFixed(0)+'%', attnW+mlpW/2, H*0.3-8);
+      ctx.textAlign='left';
+      readout.innerHTML = '<span class="k">d_ffn:</span> '+dFfn+'  <span class="k">per-layer attention params:</span> '+fmtNum(attnParams)+'  <span class="k">per-layer MLP params:</span> '+fmtNum(mlpParams);
+    }
+    ratioSlider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Section 7: parameter calculator ----
+  (function(){
+    var dS=document.getElementById('pc-d'), LS=document.getElementById('pc-L'), ffnS=document.getElementById('pc-ffn'),
+        vocabS=document.getElementById('pc-vocab'), headsS=document.getElementById('pc-heads');
+    var dV=document.getElementById('pc-d-val'), LV=document.getElementById('pc-L-val'), ffnV=document.getElementById('pc-ffn-val'),
+        vocabV=document.getElementById('pc-vocab-val'), headsV=document.getElementById('pc-heads-val'), tieV=document.getElementById('pc-tie-val');
+    var canvas = document.getElementById('pc-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('pc-readout');
+    var tied = false;
+
+    function render(){
+      var d=+dS.value, L=+LS.value, ffn=+ffnS.value, vocab=+vocabS.value, heads=+headsS.value;
+      dV.textContent=d; LV.textContent=L; ffnV.textContent=ffn; vocabV.textContent=vocab; headsV.textContent=heads;
+      tieV.textContent = tied ? 'yes' : 'no';
+      var attnPerLayer = 4*d*d;
+      var mlpPerLayer = 3*d*ffn;
+      var normPerLayer = 2*d;
+      var perLayer = attnPerLayer+mlpPerLayer+normPerLayer;
+      var embed = vocab*d*(tied?1:2);
+      var total = perLayer*L + embed;
+      var W = canvas.width, H = canvas.height;
+      ctx.clearRect(0,0,W,H);
+      var embedW = W*(embed/total), layersW = W-embedW;
+      ctx.fillStyle = c.accent2; ctx.fillRect(0,0,embedW,H);
+      ctx.fillStyle = c.accent; ctx.fillRect(embedW,0,layersW,H);
+      readout.innerHTML = '<span class="k">per-layer:</span> attn ' + fmtNum(attnPerLayer) + ' + mlp ' + fmtNum(mlpPerLayer) + ' + norm ' + fmtNum(normPerLayer) +
+        '<br><span class="k">× ' + L + ' layers:</span> ' + fmtNum(perLayer*L) + '  +  <span class="k">embeddings:</span> ' + fmtNum(embed) +
+        '<br><span class="k">total parameters:</span> <span class="hi">' + fmtNum(total) + '</span>' +
+        (Math.abs(total-6.9e9) < 6.9e8 ? '  <span style="opacity:0.6">— within ~10% of OLMo 2 7B\'s published size</span>' : '');
+    }
+    [dS,LS,ffnS,vocabS,headsS].forEach(function(el){ el.addEventListener('input', render); });
+    document.getElementById('pc-tie-toggle').addEventListener('click', function(){ tied=!tied; render(); });
+    document.getElementById('pc-preset-7b').addEventListener('click', function(){
+      dS.value=4096; LS.value=32; ffnS.value=11008; vocabS.value=100278; headsS.value=32; tied=false; render();
+    });
+    document.getElementById('pc-preset-1b').addEventListener('click', function(){
+      dS.value=2048; LS.value=16; ffnS.value=8192; vocabS.value=100278; headsS.value=16; tied=true; render();
+    });
+    document.getElementById('pc-preset-13b').addEventListener('click', function(){
+      dS.value=5120; LS.value=40; ffnS.value=13824; vocabS.value=100278; headsS.value=40; tied=false; render();
+    });
+    render();
+  })();
+
+  // ---- Section 8: MoE router ----
+  (function(){
+    var nS = document.getElementById('moe-n'), kS = document.getElementById('moe-k');
+    var nV = document.getElementById('moe-n-val'), kV = document.getElementById('moe-k-val');
+    var routeBtn = document.getElementById('moe-route');
+    var canvas = document.getElementById('moe-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('moe-readout');
+    var W = canvas.width, H = canvas.height;
+    var loadCounts = [];
+
+    function route(){
+      var nExperts = +nS.value, k = Math.min(+kS.value, nExperts);
+      nV.textContent = nExperts; kV.textContent = k;
+      loadCounts = new Array(nExperts).fill(0);
+      var nTokens = 24;
+      var assignments = [];
+      for (var t=0; t<nTokens; t++){
+        var scores = [];
+        for (var e=0;e<nExperts;e++) scores.push(Math.random());
+        var idx = scores.map(function(s,i){return [s,i];}).sort(function(a,b){return b[0]-a[0];}).slice(0,k).map(function(p){return p[1];});
+        idx.forEach(function(e){ loadCounts[e]++; });
+        assignments.push(idx);
+      }
+      draw(nExperts, k, assignments, nTokens);
+    }
+
+    function draw(nExperts, k, assignments, nTokens){
+      ctx.clearRect(0,0,W,H);
+      var expertW = W/nExperts;
+      var maxLoad = Math.max.apply(null, loadCounts.concat([1]));
+      for (var e=0;e<nExperts;e++){
+        var h = (H*0.55) * (loadCounts[e]/maxLoad);
+        ctx.fillStyle = c.accent;
+        ctx.fillRect(e*expertW+3, H*0.7-h, expertW-6, h);
+        ctx.fillStyle = c.text; ctx.font='10px '+c.font; ctx.textAlign='center';
+        ctx.fillText('E'+e, e*expertW+expertW/2, H*0.7+12);
+        ctx.fillText(loadCounts[e], e*expertW+expertW/2, H*0.7-h-4);
+      }
+      ctx.textAlign='left';
+      var mean = loadCounts.reduce(function(a,b){return a+b;},0)/nExperts;
+      var variance = loadCounts.reduce(function(a,b){return a+(b-mean)*(b-mean);},0)/nExperts;
+      var cv = Math.sqrt(variance)/(mean||1);
+      readout.innerHTML = '<span class="k">tokens routed:</span> 24 × top-'+k+' = '+ (24*k) + ' expert-assignments across ' + nExperts + ' experts<br>' +
+        '<span class="k">load-balance (coefficient of variation, lower=better):</span> <span class="hi">' + cv.toFixed(2) + '</span><br>' +
+        '<span class="k">OLMoE for comparison:</span> 64 experts, top-8, 6.9B total / 1.3B active params per token';
+    }
+    nS.addEventListener('input', route); kS.addEventListener('input', route);
+    routeBtn.addEventListener('click', route);
+    route();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

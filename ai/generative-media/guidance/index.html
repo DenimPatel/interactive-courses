@@ -1,0 +1,432 @@
+---
+title: "Conditioning and classifier-free guidance"
+description: "Text encoders and cross- against joint attention, CFG as extrapolation, and a guidance-scale slider that shows diversity collapse and oversaturation."
+permalink: "/ai/generative-media/guidance/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Conditioning and classifier-free guidance</h1>
+    <p>A denoiser that ignores its prompt will produce something, just not what you asked for. Conditioning attaches a text encoder to the network so the noise prediction depends on the words, and classifier-free guidance then amplifies that dependence by extrapolating away from the unconditional prediction. The amplification is a single scalar, and it controls the trade between diversity and fidelity more sharply than any other knob in the pipeline. This part shows where the conditioning enters, what the scalar does, and why pushing it too far oversaturates.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="condition">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Conditioning a model</h2></div>
+    <p class="g-eyebrow">Getting words into a noise predictor</p>
+    <p>The prompt is turned into vectors by a text encoder: CLIP for its familiar embedding, T5 for longer and more compositional prompts, or a vision-language model when the model needs to reason about the caption. The encoder output is a sequence of token features, one per token, and the question is how those features reach the denoiser's spatial features.</p>
+    <p>There are two answers, and the difference matters. In <em>cross-attention</em>, the image features supply the queries and the text features supply keys and values, so each patch of the latent attends to the tokens it finds relevant. In <em>joint attention</em>, image and text tokens are concatenated into one sequence and attend to each other with shared weights; MMDiT's separate streams are a refinement of this, keeping per-modality projections but sharing the attention. Cross-attention is cheaper and was the original design; joint attention conditions more strongly and scales better with long prompts.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gf-attn-canvas" width="520" height="300"></canvas>
+        <p class="g-canvas-hint">A row-normalised cross-attention map: six image patches against the six tokens of one prompt. Each row sums to one, so a bright cell is a patch attending to that token. The map is seeded, not trained &mdash; the shape is what matters, not the values.</p>
+      </div>
+      <div class="g-controls">
+        <p>Real maps are far sparser and far more interpretable than this after training: the patch containing a cat's ear lights up on the token "cat" and almost nowhere else. That sparsity is the mechanism by which a prompt steers generation, and it is also why attention maps are the usual tool for localisation and editing.</p>
+        <p class="g-mini">No conditioning means no guidance: with an empty prompt the model can only sample the unconditional distribution, which is exactly the reference CFG needs.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> say what cross- and joint attention each do, write the CFG formula from memory, predict what a large guidance scale does to diversity and to saturation, and know what rescaling and guidance intervals are for.</span></div>
+    <div class="g-toc">
+      <a href="#cfg">2 · The CFG trick</a>
+      <a href="#scale">3 · The guidance scale</a>
+      <a href="#tricks">4 · Rescale and intervals</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="cfg">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The CFG trick</h2></div>
+    <p class="g-eyebrow">Train one model to do two jobs</p>
+    <p>Classifier guidance once required a separate noisy classifier whose gradient nudged samples toward a class. Classifier-free guidance gets the same effect without the classifier by training a single model to predict both a conditional and an unconditional noise, dropping the conditioning randomly during training so the model learns the unconditional task as well. At sampling time you run the model twice on the same input &mdash; once with the prompt and once without &mdash; and combine the two predictions linearly:</p>
+    <p>$$ \varepsilon \;=\; w\,\varepsilon_\text{cond} \;+\; (1-w)\,\varepsilon_\text{uncond}. $$</p>
+    <p>When $w = 1$ this is pure conditional prediction. When $w = 0$ it is the unconditional model, a plain sample from the data distribution. Values between and beyond those two points are the interesting part: the combination is a linear <em>extrapolation</em>, not an interpolation, because the coefficient on the unconditional term goes negative once $w > 1$. Subtracting a multiple of the unconditional direction pushes the sample away from the generic and toward whatever makes the prompt distinctive.</p>
+    <p>In code this is <code>Diffusion.cfg(w, uncond, cond)</code>, applied componentwise to the noise prediction at every step. It costs one extra forward pass per step, which is the entire price of guidance.</p>
+    <div class="g-warn">⚠ <span><b>Guidance is a distortion, not an improvement.</b> The quantity being sampled is no longer the conditional distribution; it is a sharpened version of it that trades mode coverage for prompt adherence. At high $w$ the samples look more like the prompt and less like the data, which is a feature until it becomes the familiar over-saturated artifact.</span></div>
+  </section>
+
+  <section class="g-step" id="scale">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The guidance scale</h2></div>
+    <p class="g-eyebrow">Diversity collapses, then oversaturation sets in</p>
+    <p>The demo below is a two-dimensional stand-in for the whole mechanism. The data distribution is a mixture of three modes; the conditional target is a single one of them; the unconditional target is the mixture. (The unconditional predictor here is the mixture's posterior mean blended slightly toward the global mean &mdash; the small approximation error a real unconditional model carries, and the reason guidance has anything to extrapolate at all. With two perfect predictors the guided field would vanish at the mode and no scale could push past it.) Every sample starts somewhere in the mixture and is then moved by the guided prediction, so you can see in one picture what the scalar does. At $w = 0$ the samples stay spread across the mixture; near $w = 1$ they collapse onto the conditional mode; past that the extrapolated fixed point moves through and beyond the mode, and the cloud visibly overshoots it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap g-plot-stack">
+        <canvas id="gf-samples-canvas" width="440" height="360"></canvas>
+        <canvas id="gf-curve-canvas" width="560" height="240"></canvas>
+        <p class="g-canvas-hint">Top: sample cloud after guided sampling, with the three mixture modes (blue), the conditional mode (pink) and the target width (dashed). Bottom: mean distance to the conditional mode against $w$ &mdash; the U shape is diversity collapse on the left and oversaturation on the right.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field">
+          <label>guidance scale w <span class="val">4</span></label>
+          <input type="range" id="gf-w" min="0" max="15" step="0.5" value="4">
+        </div>
+        <div class="g-btnrow">
+          <button type="button" id="gf-neg">Negative prompt: off</button>
+        </div>
+        <div class="g-readout" id="gf-readout"></div>
+        <p class="g-mini">The negative-prompt toggle offsets the unconditional prediction, so the guided result is pushed away from it. With $w=1$ it has no effect at all, because the unconditional term is multiplied by zero.</p>
+      </div>
+    </div>
+    <p>The readout is <code>Diffusion.guidanceEffect</code>, which returns the guided value alongside how far past the conditional prediction the result has been extrapolated. Watch that excess grow linearly in $w$ while the sample cloud first tightens and then scatters: that is the same oversaturation an image model shows as washed-out, over-contrasted frames at scale 15.</p>
+    <div class="g-warn">⚠ <span><b>Guidance and diversity trade off, always.</b> Every unit of $w$ above one makes the samples more prompt-faithful and less varied. The standard practice is to tune it per model and per prompt length, and to accept that a high scale means fewer distinct outputs for the same seed budget.</span></div>
+  </section>
+
+  <section class="g-step" id="tricks">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Rescale and intervals</h2></div>
+    <p class="g-eyebrow">Two fixes for the artifacts guidance introduces</p>
+    <p>High guidance makes the predicted noise too large, which is the mechanism behind over-saturation. <em>Guidance rescaling</em> measures the standard deviation of the guided prediction and scales it back toward the conditional prediction's, so the direction is preserved while the magnitude is restrained. It is the line <code>Diffusion.cfgRescale(x, ratio)</code>, and it is why some pipelines expose a rescale parameter next to the guidance scale.</p>
+    <p>The second fix is to apply guidance only where it helps. Several models find that full guidance late in the trajectory harms fine detail, while early and mid-trajectory guidance is what fixes the composition. A <em>guidance interval</em> leaves the scale at a baseline outside a chosen band of timesteps and switches to the guided value inside it &mdash; the step function <code>Diffusion.cfgInterval(wBase, w, t, tLo, tHi)</code> plots the weight actually used.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gf-interval-canvas" width="560" height="240"></canvas>
+        <p class="g-canvas-hint">Effective guidance weight along the trajectory for a baseline of 1 and the current scale, with the interval bounds dashed. Inside the interval the full scale applies; outside it, the baseline.</p>
+      </div>
+      <div class="g-controls">
+        <p>An interval of the middle 60% of the trajectory is the common setting, and it typically allows a higher guidance scale than a constant schedule would tolerate, because the distortion is confined to the steps where the composition is still being decided.</p>
+        <p class="g-mini">Rescale and intervals address different symptoms: rescale controls the magnitude of the extrapolation, an interval controls when it is applied.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">One scalar, every pipeline</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Image</div>
+        <h3 style="margin:6px 0;">Negative prompts and editing</h3>
+        <p style="margin-bottom:0;">A negative prompt is nothing more than a second unconditional run conditioned on what you do not want. Editing pipelines invert the same formula to steer <em>toward</em> a source image instead of a prompt, which is how diffusion-based image-to-image and inversion methods stay faithful to their input.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Video &amp; audio</div>
+        <h3 style="margin:6px 0;">Guidance in time</h3>
+        <p style="margin-bottom:0;">Video models usually guide less than image models, because temporal consistency degrades quickly when the prediction is extrapolated. Audio models face the same trade with a stronger prior on silence, and commonly pair a modest scale with a negative prompt for noise.</p>
+      </div>
+    </div>
+    <p>The knob is universal because the trick is universal: run the model with and without conditioning, then extrapolate. Any conditional generative model with an unconditional fallback can be guided this way, and almost every one that ships is.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>Ho and Salimans introduced classifier-free guidance as a way to remove the auxiliary classifier; Dhariwal and Nichol then showed it beating classifier guidance outright. The rescale trick and the interval schedule come from later production experience, and the MMDiT paper is the clearest account of joint versus cross attention at scale.</p>
+    <p>Read Ho and Salimans first for the formula, Dhariwal and Nichol for the empirical case, Lin and coauthors for rescaling, and Esser and coauthors for the attention variant.</p>
+    <ul class="g-refs">
+      <li>Jonathan Ho and Tim Salimans, <a href="https://arxiv.org/abs/2207.12598">"Classifier-Free Diffusion Guidance"</a>, 2022 &mdash; the formula, and training one model for both conditional and unconditional prediction.</li>
+      <li>Prafulla Dhariwal and Alex Nichol, <a href="https://arxiv.org/abs/2105.05233">"Diffusion Models Beat GANs on Image Synthesis"</a>, 2021 &mdash; classifier guidance and the case against it.</li>
+      <li>Shanchuan Lin, Bingchen Liu, Jiashi Li and Xiao Yang, <a href="https://arxiv.org/abs/2305.08891">"Common Diffusion Noise Schedules and Sample Steps are Flawed"</a>, 2023 &mdash; variance-preservation fixes, including guidance rescaling.</li>
+      <li>Patrick Esser and coauthors, <a href="https://arxiv.org/abs/2403.03206">"Scaling Rectified Flow Transformers for High-Resolution Image Synthesis"</a>, 2024 &mdash; joint attention and the MMDiT conditioning design.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Text encoder</td><td>CLIP, T5 or a VLM; turns the prompt into token features</td></tr>
+        <tr><td>Cross-attention</td><td>Image queries, text keys and values; how a patch reads the prompt</td></tr>
+        <tr><td>Joint attention</td><td>Image and text tokens in one sequence with shared attention weights</td></tr>
+        <tr><td>Unconditional model</td><td>The same network run with conditioning dropped; the CFG reference</td></tr>
+        <tr><td>$\varepsilon = w\varepsilon_\text{cond} + (1-w)\varepsilon_\text{uncond}$</td><td>Classifier-free guidance as linear extrapolation</td></tr>
+        <tr><td>$w = 1$</td><td>Pure conditional prediction; diversity preserved</td></tr>
+        <tr><td>$w \gg 1$</td><td>Extrapolation; prompt fidelity up, diversity down, oversaturation risk</td></tr>
+        <tr><td>Rescale</td><td>Restores the guided prediction's standard deviation to control saturation</td></tr>
+        <tr><td>Guidance interval</td><td>Applies the full scale only inside a band of timesteps</td></tr>
+        <tr><td>Negative prompt</td><td>An offset applied to the unconditional prediction</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The stack is now complete: a latent compressor, a backbone, a path to integrate, and a scalar that decides how hard the prompt pulls. Return to the series hub to see how the parts sit together, or jump to the multimodal volume where the same conditioning machinery meets other modalities.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, D = Diffusion, c = Guide.colors();
+
+  // ---- step 1: a cross-attention map -------------------------------------
+  var TOKENS = ['a', 'cat', 'on', 'a', 'mat', '.'];
+  var PATCHES = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'];
+
+  function buildAttn() {
+    var r = GM.rng(2026), q = [], k = [], i, j;
+    for (i = 0; i < 6; i++) q.push([GM.gauss(r), GM.gauss(r), GM.gauss(r)]);
+    for (j = 0; j < 6; j++) k.push([GM.gauss(r), GM.gauss(r), GM.gauss(r)]);
+    var sim = GM.attn.simMatrix(q, k);
+    return sim.map(function (row) {
+      return GM.attn.softmax(row.map(function (v) { return v * 6; }));
+    });
+  }
+  var attnMatrix = buildAttn();
+  var attnSetup = Guide.setupCanvas(document.getElementById('gf-attn-canvas'), 520, 300, function () { drawAttn(); });
+  function drawAttn() {
+    if (!attnSetup) return;
+    Guide.drawHeatmap(attnSetup.ctx, 520, 300, attnMatrix, {
+      rowLabels: PATCHES, colLabels: TOKENS, padL: 46, padB: 30, fontSize: 10
+    });
+  }
+
+  // ---- steps 3 & 4: the 2-D guidance demo --------------------------------
+  var MODES = [[-1.6, -0.6], [1.5, 0.9], [0.1, -1.7]];
+  var COND = MODES[0];
+  var SD = 0.55;
+  var N = 240, K = 44, STEP = 0.24;
+  var NEG = [1.3, -0.9];
+  var w = 4, negOn = false;
+
+  var ALPHA = 0.22;                       // how far the unconditional model is pulled to the global mean
+  var M_MIX = [0, -0.4667];               // mean of the three modes
+
+  var starts = (function () {
+    var r = GM.rng(4242), a = [];
+    for (var i = 0; i < N; i++) {
+      var cc = MODES[i % MODES.length];
+      var g = GM.gauss2(r);
+      a.push([cc[0] + SD * g[0], cc[1] + SD * g[1]]);
+    }
+    return a;
+  })();
+
+  // The unconditional predictor: the mixture's posterior mean, blended slightly
+  // toward the global mean. Real unconditional models are approximate in exactly
+  // this way, and it is the imperfection that guidance extrapolates through.
+  function uncondPredict(x) {
+    var mu = D.mixturePosteriorMean(x, 1, MODES, SD);
+    return [mu[0] + ALPHA * (M_MIX[0] - mu[0]), mu[1] + ALPHA * (M_MIX[1] - mu[1])];
+  }
+
+  function runGuided(wv, neg, n, k, seed) {
+    var r = GM.rng(seed == null ? 77 : seed);
+    var pts = [], i;
+    for (i = 0; i < n; i++) pts.push([starts[i][0], starts[i][1]]);
+    var sgU = [0, 0], sgC = [0, 0];
+    for (var s = 0; s < k; s++) {
+      sgU[0] = 0; sgU[1] = 0; sgC[0] = 0; sgC[1] = 0;
+      for (i = 0; i < n; i++) {
+        var x = pts[i];
+        var muU = uncondPredict(x);
+        var gC0 = COND[0] - x[0], gC1 = COND[1] - x[1];
+        var gU0 = muU[0] - x[0], gU1 = muU[1] - x[1];
+        if (neg) { gU0 += NEG[0]; gU1 += NEG[1]; }
+        sgC[0] += gC0; sgC[1] += gC1; sgU[0] += gU0; sgU[1] += gU1;
+        x[0] += STEP * D.cfg(wv, gU0, gC0) + 0.05 * GM.gauss(r);
+        x[1] += STEP * D.cfg(wv, gU1, gC1) + 0.05 * GM.gauss(r);
+      }
+    }
+    return { pts: pts, gU: [sgU[0] / n, sgU[1] / n], gC: [sgC[0] / n, sgC[1] / n] };
+  }
+
+  var current = { pts: [], gU: [0, 0], gC: [0, 0] };
+
+  var samplesPlot = GM.plot(document.getElementById('gf-samples-canvas'), {
+    W: 440, H: 360, xRange: [-7, 7], yRange: [-7, 7],
+    xLabel: 'x₁', yLabel: 'x₂', onResize: redrawSamples
+  });
+  var curvePlot = GM.plot(document.getElementById('gf-curve-canvas'), {
+    W: 560, H: 240, xRange: [0, 15], yRange: [0, 6],
+    xLabel: 'guidance scale w', yLabel: 'mean distance to condition', onResize: redrawCurve
+  });
+  var intervalPlot = GM.plot(document.getElementById('gf-interval-canvas'), {
+    W: 560, H: 240, xRange: [0, 1], yRange: [0, 16],
+    xLabel: 'fraction of trajectory t', yLabel: 'effective guidance w(t)', onResize: redrawInterval
+  });
+
+  var curveCache = {};
+  function diversityCurve(neg) {
+    var key = neg ? '1' : '0';
+    if (curveCache[key]) return curveCache[key];
+    var out = [];
+    for (var ww = 0; ww <= 15.001; ww += 0.5) {
+      var res = runGuided(ww, neg, 140, 26, 1234);
+      var s = 0;
+      for (var i = 0; i < res.pts.length; i++) {
+        var dx = res.pts[i][0] - COND[0], dy = res.pts[i][1] - COND[1];
+        s += Math.hypot(dx, dy);
+      }
+      out.push([ww, s / res.pts.length]);
+    }
+    curveCache[key] = out;
+    return out;
+  }
+
+  function redrawSamples() {
+    if (!samplesPlot) return;
+    samplesPlot.clear();
+    samplesPlot.axes({ xLabel: 'x₁', yLabel: 'x₂' });
+    samplesPlot.raw(function (ctx) {
+      ctx.globalAlpha = 0.5;
+      ctx.fillStyle = c.accent;
+      for (var i = 0; i < current.pts.length; i++) {
+        var p = current.pts[i];
+        if (Math.abs(p[0]) > 7 || Math.abs(p[1]) > 7) continue;
+        ctx.beginPath();
+        ctx.arc(samplesPlot.px(p[0]), samplesPlot.py(p[1]), 2.2, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    });
+    samplesPlot.points(MODES, { color: c.accent400, r: 5, stroke: c.text, width: 1 });
+    samplesPlot.points([COND], { color: c.accent2, r: 7, stroke: c.text, width: 1.5 });
+    samplesPlot.legend([
+      { label: 'samples at w = ' + w, color: c.accent },
+      { label: 'mixture modes', color: c.accent400 },
+      { label: 'conditional mode', color: c.accent2 }
+    ], { dy: 6 });
+  }
+
+  function redrawCurve() {
+    if (!curvePlot) return;
+    curvePlot.clear();
+    curvePlot.axes({ xLabel: 'guidance scale w', yLabel: 'mean distance to condition' });
+    curvePlot.curve(diversityCurve(negOn), { color: c.accent, width: 2.4 });
+    curvePlot.hline(2 * SD, { color: c.text, dashed: true, width: 1.2, label: '2σ', labelX: 0.3 });
+    curvePlot.vline(w, { color: c.accent2, dashed: true, width: 1.4, label: 'w = ' + w });
+    curvePlot.legend([
+      { label: 'mean distance to the conditional mode', color: c.accent },
+      { label: 'true conditional width (2σ)', color: c.text, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function redrawInterval() {
+    if (!intervalPlot) return;
+    var TLO = 0.1, THI = 0.7;
+    intervalPlot.clear();
+    intervalPlot.axes({ xLabel: 'fraction of trajectory t', yLabel: 'effective guidance w(t)' });
+    intervalPlot.curve(function (x) { return D.cfgInterval(1, w, x, TLO, THI); },
+      { color: c.accent, width: 2.6 });
+    intervalPlot.vline(TLO, { color: c.text, dashed: true, width: 1 });
+    intervalPlot.vline(THI, { color: c.text, dashed: true, width: 1 });
+    intervalPlot.legend([
+      { label: 'w(t) with a guidance interval', color: c.accent },
+      { label: 'interval bounds (10%, 70%)', color: c.text, dashed: true }
+    ], { dy: 6 });
+  }
+
+  function redrawReadout() {
+    var el = document.getElementById('gf-readout');
+    if (!el) return;
+    var i, s = 0, close = 0;
+    for (i = 0; i < current.pts.length; i++) {
+      var d = Math.hypot(current.pts[i][0] - COND[0], current.pts[i][1] - COND[1]);
+      s += d;
+      if (d <= 2 * SD) close++;
+    }
+    var meanDist = s / current.pts.length;
+    var ge = D.guidanceEffect(w, current.gU[0], current.gC[0]);
+    el.innerHTML =
+      '<div><span class="k">w</span> <span class="hi">' + w + '</span></div>' +
+      '<div><span class="k">negative prompt</span> ' + (negOn ? 'on' : 'off') + '</div>' +
+      '<div><span class="k">within 2σ of condition</span> <span class="hi">' + Guide.fmtPct(close / current.pts.length, 0) + '</span></div>' +
+      '<div><span class="k">mean distance</span> ' + meanDist.toFixed(3) + '</div>' +
+      '<div><span class="k">guided ε (x-component)</span> ' + ge.value.toFixed(3) + '</div>' +
+      '<div><span class="k">extrapolation excess</span> ' + ge.excess.toFixed(3) + '</div>' +
+      '<div class="g-mini">Excess grows linearly in w; the sample cloud tightens to the mode and then overshoots through it.</div>';
+  }
+
+  function refreshSamples() { current = runGuided(w, negOn, N, K, 77); }
+  function refresh() {
+    refreshSamples();
+    drawAttn();
+    redrawSamples();
+    redrawCurve();
+    redrawInterval();
+    redrawReadout();
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#gf-w'), function (el) {
+    w = parseFloat(el.value);
+    refresh();
+  });
+
+  var negBtn = document.getElementById('gf-neg');
+  if (negBtn) {
+    negBtn.addEventListener('click', function () {
+      negOn = !negOn;
+      negBtn.textContent = 'Negative prompt: ' + (negOn ? 'on' : 'off');
+      negBtn.className = negOn ? 'active' : '';
+      refresh();
+    });
+  }
+
+  refresh();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'guidance-cfg-value',
+      kind: 'numeric',
+      prompt: 'With $\\varepsilon_\\text{cond} = -1.0$, $\\varepsilon_\\text{uncond} = 0.2$ and $w = 3$, what is the guided prediction $\\varepsilon = w\\varepsilon_\\text{cond} + (1-w)\\varepsilon_\\text{uncond}$?',
+      answer: -3.4,
+      tolerance: 0.001,
+      explanation: '$w\\varepsilon_\\text{cond} = 3 \\times (-1.0) = -3.0$ and $(1-w)\\varepsilon_\\text{uncond} = (-2) \\times 0.2 = -0.4$. Adding gives $-3.4$. The coefficient on the unconditional term is negative, which is why the combination extrapolates rather than interpolates.'
+    },
+    {
+      id: 'guidance-why',
+      kind: 'choice',
+      prompt: 'Why can a single model produce both the conditional and the unconditional prediction CFG needs?',
+      options: [
+        { label: 'The conditioning is dropped at random during training, so the model learns the unconditional task too.', correct: true },
+        { label: 'A separate classifier supplies the unconditional prediction at sampling time.', correct: false },
+        { label: 'The unconditional prediction is just zero noise, so no model is needed.', correct: false }
+      ],
+      explanation: 'Classifier-free guidance trains one network and randomly removes the conditioning, so the same weights serve both jobs. That is exactly what removes the auxiliary classifier the original guidance method required.'
+    },
+    {
+      id: 'guidance-scale-effect',
+      kind: 'choice',
+      prompt: 'What happens as the guidance scale is pushed well above one?',
+      options: [
+        { label: 'Prompt fidelity rises, diversity falls, and the prediction is extrapolated past the conditional target toward oversaturation.', correct: true },
+        { label: 'The sampler becomes stochastic and diversity rises with the scale.', correct: false },
+        { label: 'The model converges to the exact conditional distribution.', correct: false }
+      ],
+      explanation: 'Guidance extrapolates the conditional prediction away from the unconditional one. That sharpens the distribution &mdash; fewer distinct outputs, more prompt adherence &mdash; and eventually overshoots, which shows up as over-saturated images and a sample cloud that has flown past the mode.'
+    },
+    {
+      id: 'guidance-cross-vs-joint',
+      kind: 'choice',
+      prompt: 'How does joint attention differ from cross-attention for conditioning?',
+      options: [
+        { label: 'Image and text tokens sit in one sequence and attend to each other with shared weights, rather than image queries reading text keys.', correct: true },
+        { label: 'Joint attention removes the text encoder and conditions on class labels only.', correct: false },
+        { label: 'Joint attention applies the guidance scale inside the attention layer.', correct: false }
+      ],
+      explanation: 'Cross-attention keeps the image features as queries and the text as keys and values. Joint attention concatenates both sequences and lets them attend with shared weights; MMDiT refines this by keeping separate projections per modality. Neither changes where the guidance scalar is applied, which is to the noise prediction.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

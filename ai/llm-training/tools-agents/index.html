@@ -1,0 +1,484 @@
+---
+title: "LLM Training, Interactively — Part 14: Tool use, function calling & agents"
+description: "How models learn to call functions — OpenAPI tool specs, pythonic code-block calls, the environment role, real MCP trajectories vs simulated ones, and how function calling (BFCLv3) and task completion (LitQA2, SimpleQA) are actually evaluated."
+permalink: "/ai/llm-training/tools-agents/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-tools-agents.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .fc-pane { background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-x: auto; }
+  .fc-pane .tag { color: var(--color-accent-700); }
+  .fc-pane .fn { color: var(--color-accent-2-700); font-weight: 600; }
+  .fc-pane .str { color: #3aa66a; }
+  .trace-step { border-left: 3px solid var(--color-accent); padding: 8px 12px; margin: 0 0 8px; background: var(--color-bg); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+  .trace-step .who { font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; opacity: 0.6; }
+  .trace-step.user { border-left-color: var(--color-accent-2); }
+  .trace-step.env { border-left-color: #3aa66a; }
+  .fc-fnbtn { display:block; text-align:left; width:100%; margin:4px 0; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 14 of 15</span>
+    <h1>Tool Use, Function Calling &amp; Agents</h1>
+    <p>A language model's knowledge is frozen at training time and cannot, by itself, look anything up, run code, or change the world. Tool use fixes that: the model emits a structured function call, a runtime executes it, and the result is fed back into the conversation. Done well, this turns a model into an agent that can search, calculate, and act. OLMo 3's Instruct models are explicitly trained for it, with a single unified format and newly released datasets. This part covers the format, the data, and how it is measured.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="why">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Why tools</h2></div>
+    <p class="llmt-eyebrow">Parametric knowledge vs retrieval</p>
+    <p>Ask a model a factual question and it answers from its weights — “parametric” knowledge. That knowledge is broad but stale, unverifiable, and unreliable for rare facts. A tool converts an open-book problem into a closed-book one: the model still has to know <em>to</em> search, formulate a query, and read the result, but the fact itself comes from a database. The effect is dramatic on factuality benchmarks. On SimpleQA (short, hard factual questions), OLMo 3 Instruct 7B jumps from 3.3% correct with no tools to 79.2% with a Google-search tool — a 76-point swing. Every Qwen baseline shows the same pattern.</p>
+    <p>On LitQA2 (literature QA) the story is more nuanced and worth internalizing. OLMo 3 Instruct 7B improves from 24.4% to 38.2% using the Asta Scientific Corpus tools, but Qwen 3 VL 8B and Qwen 2.5 7B actually <em>lose</em> 4–6 points when given the same tools, because they lean on parametric knowledge and get pulled off course by retrieval. Tools are a capability, not a free upgrade.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p14-tools-delta" width="620" height="340"></canvas>
+        <p class="llmt-canvas-hint">No-tools vs with-tools accuracy by model. Toggle the benchmark.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-btnrow" id="tools-metric">
+          <button data-metric="simpleqa" class="llmt-primary">SimpleQA (search)</button>
+          <button data-metric="litqa2">LitQA2 (Asta)</button>
+        </div>
+        <div class="llmt-readout" id="p14-tools-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Tools can hurt.</b> Giving a model a tool it hasn't been trained to use well can lower accuracy. The format, the training trajectories, and the model's willingness to trust retrieval all have to line up.</span></div>
+  </section>
+
+  <section class="llmt-step" id="format">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>The function-calling format</h2></div>
+    <p class="llmt-eyebrow">One format to rule them all</p>
+    <p>Tool use is a <em>syntax</em> problem before it is a reasoning problem. The model needs to know what functions exist, emit a call that the runtime can parse, and recognize the reply. OLMo 3 unifies all of this:</p>
+    <ul>
+      <li>Tools are declared with the <b>OpenAPI specification</b> and injected into the system prompt.</li>
+      <li>Function calls are written as <b>pythonic code blocks</b>, wrapped in XML tags inside the assistant message.</li>
+      <li>Environment outputs come back in a dedicated <b>environment role</b>.</li>
+      <li>The tokenizer's vocabulary is extended with <b>special tokens</b> for those tags. Interestingly, the Think model went the other way and <em>avoided</em> special tokens during midtraining; for Instruct tool use, dedicated tokens measurably helped.</li>
+    </ul>
+    <p>The team's strongest finding here: <strong>unifying the format across every tool-use dataset was crucial</strong> for stable behavior. Mixing incompatible conventions is a common cause of unreliable tool use.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <p style="margin:0 0 10px;font-size:13.5px;">Build a call. Pick a function and fill its arguments to see the full round trip: system tool spec → assistant call → environment result.</p>
+      <div class="llmt-btnrow" id="fc-fnselect"></div>
+      <div id="fc-args" style="margin-bottom:12px;"></div>
+      <div class="llmt-btnrow">
+        <button data-enc="xml" class="llmt-primary" id="fc-enc-xml">XML tags</button>
+        <button data-enc="special" id="fc-enc-special">Special tokens</button>
+      </div>
+      <div class="llmt-grid3" style="align-items:start;">
+        <div><div class="llmt-source" style="margin:0 0 4px;">1 · tool spec (system)</div><div class="fc-pane" id="fc-spec"></div></div>
+        <div><div class="llmt-source" style="margin:0 0 4px;">2 · assistant call</div><div class="fc-pane" id="fc-call"></div></div>
+        <div><div class="llmt-source" style="margin:0 0 4px;">3 · environment result</div><div class="fc-pane" id="fc-result"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="environments">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Real vs simulated environments</h2></div>
+    <p class="llmt-eyebrow">Executable MCP servers vs LLM-simulated tools</p>
+    <p>Tool-use training data comes in two flavors, and they teach different things. <strong>Real trajectories</strong> execute against actual MCP (Model Context Protocol) servers — OLMo 3 uses the Asta Scientific Corpus server and the Serper search API. These are small but naturally complex, with many environment interactions per request, and they teach the model to cope with real, messy, sometimes-erroring outputs. <strong>Simulated trajectories</strong> (the <em>SimFC</em> dataset) are generated end-to-end by an LLM against a large pool of tool definitions, so they scale to hundreds of thousands of examples and tens of thousands of unique functions.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div style="overflow-x:auto;">
+      <table class="llmt-cheat">
+        <thead><tr><th>Dataset</th><th>Environment</th><th>Trajectories</th><th>Unique functions</th><th>Multi-turn</th><th>Multi-step</th></tr></thead>
+        <tbody id="fc-stats-body"></tbody>
+      </table>
+      </div>
+      <p class="llmt-canvas-hint" style="margin-top:8px;">Multi-turn = several user turns per trajectory. Multi-step = several assistant–environment interactions per user request. Real data is smaller but richer in multi-step structure; simulated data wins on scale and function diversity.</p>
+    </div>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow" id="trace-toggle">
+        <button data-mode="multistep" class="llmt-primary">Multi-step (science QA)</button>
+        <button data-mode="multiturn">Multi-turn (chat + search)</button>
+      </div>
+      <div id="trace-view"></div>
+      <div class="llmt-btnrow">
+        <button id="trace-prev">← Previous</button>
+        <button id="trace-next">Next →</button>
+        <span class="llmt-source" id="trace-counter" style="align-self:center;"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="eval">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Evaluating tool use</h2></div>
+    <p class="llmt-eyebrow">Intrinsic vs extrinsic</p>
+    <p>There are two separate questions. <b>Intrinsic function calling</b> asks: did the model choose the right function and fill the arguments correctly? That is what <strong>BFCLv3</strong> (Berkeley Function Calling Leaderboard) measures, including multi-turn and multi-step scenarios. <b>Extrinsic task completion</b> asks: did the model actually <em>solve the task</em> with tools? OLMo 3 measures that on LitQA2 via the Asta MCP server and SimpleQA via Serper, allowing the agent at most <strong>10 turns</strong>, sampling at temperature 0, and averaging three runs.</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <p style="margin:0 0 10px;font-size:13.5px;">Mini BFCL scorer. Read the request, pick the function, fill the key argument, and check.</p>
+      <div id="bfcl-task" class="llmt-readout" style="margin-bottom:10px;"></div>
+      <div class="llmt-grid2" style="gap:12px;">
+        <div><div class="llmt-source" style="margin:0 0 4px;">available functions</div><div id="bfcl-fns"></div></div>
+        <div>
+          <div class="llmt-field"><label>Argument value</label><input type="text" id="bfcl-arg" placeholder="e.g. Tokyo"></div>
+          <div class="llmt-btnrow"><button class="llmt-primary" id="bfcl-check">Check call</button><button id="bfcl-next">New task</button></div>
+          <div class="llmt-readout" id="bfcl-readout"></div>
+        </div>
+      </div>
+    </div>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="p14-turns" width="520" height="270"></canvas>
+        <p class="llmt-canvas-hint">Illustrative: task accuracy if each tool call succeeds independently with probability p, versus the turn budget.</p>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Per-call success probability p <span class="val" id="turns-p-val">0.6</span></label>
+          <input type="range" id="turns-p" min="0.1" max="0.95" step="0.01" value="0.6"></div>
+        <div class="llmt-readout" id="p14-turns-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="tradeoffs">
+    <div class="llmt-step-head"><span class="llmt-step-num">5</span><h2>When tools help or hurt</h2></div>
+    <p class="llmt-eyebrow">A balanced view</p>
+    <ul>
+      <li><b>Retrieval-friendly tasks benefit hugely.</b> Short factual questions and literature lookup are where tools shine, because the bottleneck is knowledge, not reasoning.</li>
+      <li><b>Reasoning-heavy tasks can regress.</b> A model that already knows the answer may be derailed by an imperfect retrieval; two of three Qwen baselines lose points on LitQA2 with tools.</li>
+      <li><b>Format is the hidden variable.</b> The same functions, declared or encoded differently, produce very different reliability. Unify the format before tuning anything else.</li>
+      <li><b>MCP is the interface standard.</b> The Model Context Protocol gives tools a common transport, which is what makes a single agent harness able to drive many different servers.</li>
+    </ul>
+    <div class="llmt-goal">📌 <span><b>Cross-links:</b> function-calling SFT is a specialization of Part 7's instruction tuning; the multi-turn preference data that keeps agents coherent across turns is Part 15's territory; and the context window that holds a long trajectory is Part 13's extension stage.</span></div>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td>Function calling</td><td>Model emits a structured call; runtime executes it; result returns to the context.</td></tr>
+        <tr><td>OpenAPI tool spec</td><td>Standard schema for declaring tool names, descriptions, and arguments in the system prompt.</td></tr>
+        <tr><td>Environment role</td><td>A dedicated message role that carries tool outputs back to the model, distinct from user/assistant.</td></tr>
+        <tr><td>Tool special tokens</td><td>Tokenizer tokens delimiting calls; unify the format or tool use becomes unstable.</td></tr>
+        <tr><td>MCP</td><td>Model Context Protocol — the transport standard for connecting agents to tools/servers.</td></tr>
+        <tr><td>Real trajectories</td><td>Executed against live MCP servers (Asta, Serper); smaller but richly multi-step.</td></tr>
+        <tr><td>SimFC</td><td>LLM-simulated trajectories: 200K examples, 42.6K unique functions, scalable.</td></tr>
+        <tr><td>BFCLv3</td><td>Intrinsic function-calling benchmark (function choice + argument correctness).</td></tr>
+        <tr><td>Extrinsic completion</td><td>End-task accuracy with tools: LitQA2 via Asta, SimpleQA via Serper, ≤10 turns.</td></tr>
+        <tr><td>Multi-turn vs multi-step</td><td>Multiple user turns vs multiple tool calls within one user request.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>OLMo 3 Team (Ai2), <a href="https://arxiv.org/abs/2512.13961">"OLMo 3"</a> (2025) — function-calling data and tool-use evaluation (§5.2.1, Tables 9–10).</li>
+      <li>Patil et al., <a href="https://arxiv.org/abs/2402.15690">"BFCL: Berkeley Function Calling Leaderboard"</a> (2024); BFCLv3.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2409.00920">"xLAM: A Family of Large Action Models"</a> (2024).</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2410.06640">"ToolACE: Winning the Points of LLM Function Calling"</a> (2024).</li>
+      <li>Xu et al., <a href="https://arxiv.org/abs/2503.04783">"DR Tulu"</a> (2025) — search/browse agent data.</li>
+      <li>Skarlinski et al., <a href="https://arxiv.org/abs/2403.18802">"Language agents achieve superhuman synthesis of scientific knowledge"</a> (2024) — LitQA2.</li>
+      <li>Wei et al., <a href="https://arxiv.org/abs/2411.04368">"Measuring short-form factuality in large language models"</a> (2024) — SimpleQA.</li>
+      <li>Asta Scientific Corpus MCP server: <a href="https://allenai.org/asta/resources/mcp">allenai.org/asta/resources/mcp</a>.</li>
+      <li>Model Context Protocol: <a href="https://modelcontextprotocol.io/">modelcontextprotocol.io</a>.</li>
+      <li>OpenAI Agent SDK: <a href="https://openai.github.io/openai-agents-python/">openai.github.io/openai-agents-python</a>.</li>
+      {% endraw %}<li>Serving consequence: <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">LLM Serving, Part 18</a> covers what agent traces do to KV residency and pool sizing.{% raw %}
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>We've now seen the three post-training surfaces — reasoning, tools, and instruction — as if they were separate. The final part steps back and looks at the single recipe that produces all of them at scale.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/posttraining-scale/' | relative_url }}">Continue: post-training at scale →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+  var DATA_URL = "{% endraw %}{{ '/assets/data/llm-published-numbers.json' | relative_url }}{% raw %}";
+
+  fetch(DATA_URL).then(function(r){ return r.json(); }).then(function(data){
+    var tools = data.olmo3_tools;
+    if (!tools || !tools.tools_vs_no_tools){ console.warn('olmo3_tools data unavailable'); return; }
+
+    // ---------- 1. Tools delta ----------
+    (function(){
+      var canvas = document.getElementById('p14-tools-delta');
+      var readout = document.getElementById('p14-tools-readout');
+      var metric = 'simpleqa';
+      var W = 620, H = 340;
+      function render(){
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,W,H);
+        var rows = tools.tools_vs_no_tools;
+        var padL = 180, padR = 50, padT = 34, padB = 30;
+        var plotW = W - padL - padR;
+        var groupH = (H - padT - padB) / rows.length;
+        var barH = Math.max(8, groupH/2 - 6);
+        ctx.font = '12px ' + c.font;
+        rows.forEach(function(r, i){
+          var base = padT + i*groupH;
+          var no = (metric === 'simpleqa') ? r.simpleqa_no_tools : r.litqa2_no_tools;
+          var wth = (metric === 'simpleqa') ? r.simpleqa_sbt : r.litqa2_asc;
+          // label
+          ctx.fillStyle = c.text; ctx.textAlign = 'right';
+          ctx.fillText(r.model, padL - 8, base + groupH*0.6);
+          // no-tools bar
+          ctx.fillStyle = c.divider;
+          ctx.fillRect(padL, base + 2, plotW*(no/100), barH);
+          ctx.fillStyle = c.text; ctx.textAlign = 'left';
+          ctx.fillText(no + '%', padL + plotW*(no/100) + 5, base + 2 + barH*0.8);
+          // with-tools bar
+          var delta = wth - no;
+          ctx.fillStyle = delta >= 0 ? c.accent : c.accent2;
+          ctx.fillRect(padL, base + barH + 6, plotW*(wth/100), barH);
+          ctx.fillStyle = delta >= 0 ? c.accent : c.accent2;
+          ctx.fillText(wth + '%  (' + (delta>=0?'+':'') + delta.toFixed(1) + ')', padL + plotW*(wth/100) + 5, base + barH + 6 + barH*0.8);
+        });
+        ctx.fillStyle = c.text; ctx.font = '10.5px ' + c.font; ctx.globalAlpha = 0.6;
+        ctx.fillText('▬ no tools', padL, 16);
+        ctx.fillStyle = c.accent; ctx.fillText('▬ with tools', padL + 90, 16);
+        ctx.globalAlpha = 1;
+        readout.innerHTML = (metric === 'simpleqa')
+          ? '<span class="k">SimpleQA:</span> search lifts every model by 70+ points.'
+          : '<span class="k">LitQA2:</span> OLMo 3 gains 13.8 pts; two Qwen baselines <span class="bad">lose</span> points with tools.';
+      }
+      var btns = document.querySelectorAll('#tools-metric button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          metric = b.getAttribute('data-metric');
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          render();
+        });
+      });
+      G.setupCanvas(canvas, W, H, render);
+    })();
+
+    // ---------- 2. Function-call builder ----------
+    (function(){
+      var FNS = {
+        get_weather: { desc:'Get the current weather for a city.', args:[{name:'city',type:'string',req:true},{name:'unit',type:'string',req:false,def:'c'}], result:function(a){ return JSON.stringify({ city:a.city||'?', temp_c:18, conditions:'partly cloudy', unit:a.unit||'c' }, null, 2); } },
+        search_papers: { desc:'Search scientific literature for relevant papers.', args:[{name:'query',type:'string',req:true},{name:'year_min',type:'integer',req:false,def:'2020'}], result:function(a){ return JSON.stringify({ results:[{ id:'S2:204e3073870fae3d05bcbc2f6a8e263d9b72e776', title:'Attention Is All You Need', year:2017 }], query:a.query||'' }, null, 2); } },
+        fetch_url: { desc:'Fetch the text content of a web page by URL.', args:[{name:'url',type:'string',req:true}], result:function(a){ return JSON.stringify({ url:a.url||'', status:200, snippet:'…page text…' }, null, 2); } }
+      };
+      var current = 'get_weather', enc = 'xml';
+      var argsEl = document.getElementById('fc-args');
+      var fnRow = document.getElementById('fc-fnselect');
+      var specEl = document.getElementById('fc-spec'), callEl = document.getElementById('fc-call'), resEl = document.getElementById('fc-result');
+      Object.keys(FNS).forEach(function(name){
+        var b = document.createElement('button');
+        b.textContent = name; b.className = 'fc-fnbtn' + (name===current?' llmt-primary':''); b.setAttribute('data-fn', name);
+        b.addEventListener('click', function(){
+          current = name;
+          fnRow.querySelectorAll('button').forEach(function(x){ x.classList.remove('llmt-primary'); });
+          b.classList.add('llmt-primary');
+          buildArgs(); render();
+        });
+        fnRow.appendChild(b);
+      });
+      function buildArgs(){
+        argsEl.innerHTML = '';
+        FNS[current].args.forEach(function(a){
+          var id = 'fc-arg-' + a.name;
+          var d = document.createElement('div'); d.className = 'llmt-field';
+          d.innerHTML = '<label>' + a.name + ' <span class="val">' + a.type + (a.req?' · required':'') + '</span></label>' +
+            '<input type="text" id="' + id + '" value="' + (a.def||'') + '">';
+          argsEl.appendChild(d);
+          d.querySelector('input').addEventListener('input', render);
+        });
+      }
+      function readArgs(){
+        var out = {};
+        FNS[current].args.forEach(function(a){
+          var v = document.getElementById('fc-arg-' + a.name).value;
+          out[a.name] = (a.type === 'integer') ? (parseInt(v,10)||0) : v;
+        });
+        return out;
+      }
+      function spec(){
+        var props = {};
+        FNS[current].args.forEach(function(a){ props[a.name] = { type:a.type }; if (a.def) props[a.name].default = a.def; });
+        return JSON.stringify({ name: current, description: FNS[current].desc, parameters: { type:'object', properties: props, required: FNS[current].args.filter(function(a){return a.req;}).map(function(a){return a.name;}) } }, null, 2);
+      }
+      function callText(a){
+        var parts = FNS[current].args.map(function(x){ return x.name + '="' + String(a[x.name]) + '"'; });
+        var inner = current + '(' + parts.join(', ') + ')';
+        return (enc === 'special')
+          ? '<|tool_call_start|>' + inner + '<|tool_call_end|>'
+          : '<function_calls>\n' + inner + '\n</function_calls>';
+      }
+      function render(){
+        specEl.textContent = spec();
+        callEl.textContent = callText(readArgs());
+        resEl.textContent = FNS[current].result(readArgs());
+      }
+      document.getElementById('fc-enc-xml').addEventListener('click', function(){
+        enc = 'xml';
+        document.getElementById('fc-enc-xml').classList.add('llmt-primary');
+        document.getElementById('fc-enc-special').classList.remove('llmt-primary');
+        render();
+      });
+      document.getElementById('fc-enc-special').addEventListener('click', function(){
+        enc = 'special';
+        document.getElementById('fc-enc-special').classList.add('llmt-primary');
+        document.getElementById('fc-enc-xml').classList.remove('llmt-primary');
+        render();
+      });
+      buildArgs(); render();
+    })();
+
+    // ---------- 3a. Dataset stats table ----------
+    (function(){
+      var body = document.getElementById('fc-stats-body');
+      tools.datasets.forEach(function(d){
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + d.name + '</td><td>' + d.environment + '</td><td>' + d.trajectories.toLocaleString() + '</td><td>' + d.unique_functions.toLocaleString() + '</td><td>' + (d.multi_turn_pct==null?'—':d.multi_turn_pct+'%') + '</td><td>' + (d.multi_step_pct==null?'—':d.multi_step_pct+'%') + '</td>';
+        body.appendChild(tr);
+      });
+    })();
+
+    // ---------- 3b. Trace viewer ----------
+    (function(){
+      var traces = {
+        multistep: [
+          { who:'user', text:'What did the 2024 paper by Lee et al. find about CRISPR off-target effects?' },
+          { who:'assistant', text:'I\'ll search the literature first.\nsearch_papers(query="Lee 2024 CRISPR off-target", year_min=2023)' },
+          { who:'environment', text:'[{"id":"S2:abc123","title":"Genome-wide off-target profiling of CRISPR","year":2024}]' },
+          { who:'assistant', text:'Found it. Let me read the paper content.\nget_paper_content(paper_id="S2:abc123")' },
+          { who:'environment', text:'{"abstract":"We measured off-target editing at 12,000 loci and found…"}' },
+          { who:'assistant', text:'The paper reports off-target editing concentrated at a small subset of loci with sequence similarity to the guide, and proposes…' }
+        ],
+        multiturn: [
+          { who:'user', text:'Can you check the weather in Kyoto for me?' },
+          { who:'assistant', text:'get_weather(city="Kyoto", unit="c")' },
+          { who:'environment', text:'{"city":"Kyoto","temp_c":21,"conditions":"clear"}' },
+          { who:'assistant', text:'It is 21°C and clear in Kyoto.' },
+          { who:'user', text:'Nice. Find me a paper about urban heat islands there.' },
+          { who:'assistant', text:'search_papers(query="Kyoto urban heat island", year_min=2020)' },
+          { who:'environment', text:'[{"id":"S2:xyz789","title":"Urban heat island intensity in Kyoto","year":2022}]' },
+          { who:'assistant', text:'Here\'s a 2022 study on Kyoto\'s urban heat island intensity.' }
+        ]
+      };
+      var mode = 'multistep', idx = 0;
+      var view = document.getElementById('trace-view');
+      var counter = document.getElementById('trace-counter');
+      function render(){
+        view.innerHTML = '';
+        traces[mode].slice(0, idx+1).forEach(function(s){
+          var d = document.createElement('div');
+          d.className = 'trace-step ' + (s.who === 'user' ? 'user' : (s.who === 'environment' ? 'env' : ''));
+          var label = s.who === 'env' ? 'environment' : s.who;
+          d.innerHTML = '<div class="who">' + label + '</div>' + s.text.replace(/\n/g,'<br>').replace(/</g,'&lt;').replace(/&lt;br>/g,'<br>');
+          view.appendChild(d);
+        });
+        counter.textContent = 'step ' + (idx+1) + ' / ' + traces[mode].length;
+        document.getElementById('trace-prev').disabled = (idx === 0);
+        document.getElementById('trace-next').disabled = (idx === traces[mode].length-1);
+      }
+      document.getElementById('trace-next').addEventListener('click', function(){ if (idx < traces[mode].length-1){ idx++; render(); } });
+      document.getElementById('trace-prev').addEventListener('click', function(){ if (idx > 0){ idx--; render(); } });
+      var btns = document.querySelectorAll('#trace-toggle button');
+      btns.forEach(function(b){
+        b.addEventListener('click', function(){
+          mode = b.getAttribute('data-mode'); idx = 0;
+          btns.forEach(function(x){ x.classList.remove('llmt-primary'); }); b.classList.add('llmt-primary');
+          render();
+        });
+      });
+      render();
+    })();
+
+    // ---------- 4a. Mini BFCL scorer ----------
+    (function(){
+      var tasks = [
+        { req:'What is the weather in Tokyo right now?', fn:'get_weather', argName:'city', argMatch:function(v){ return v.toLowerCase().indexOf('tokyo') !== -1; }, fns:['get_weather','convert_currency','search_papers'] },
+        { req:'Find recent papers on protein folding.', fn:'search_papers', argName:'query', argMatch:function(v){ return /protein|fold/i.test(v); }, fns:['search_papers','get_weather','fetch_url'] },
+        { req:'Convert 250 euros to US dollars.', fn:'convert_currency', argName:'amount', argMatch:function(v){ return /250/.test(v); }, fns:['convert_currency','get_weather','search_papers'] }
+      ];
+      var ti = 0, picked = null;
+      var taskEl = document.getElementById('bfcl-task'), fnsEl = document.getElementById('bfcl-fns');
+      var argEl = document.getElementById('bfcl-arg'), out = document.getElementById('bfcl-readout');
+      function render(){
+        var t = tasks[ti]; picked = null; argEl.value = '';
+        taskEl.innerHTML = '<span class="k">request:</span> ' + t.req;
+        fnsEl.innerHTML = '';
+        t.fns.forEach(function(fn){
+          var b = document.createElement('button'); b.className = 'fc-fnbtn'; b.textContent = fn;
+          b.addEventListener('click', function(){
+            picked = fn;
+            fnsEl.querySelectorAll('button').forEach(function(x){ x.classList.remove('llmt-primary'); });
+            b.classList.add('llmt-primary');
+          });
+          fnsEl.appendChild(b);
+        });
+        out.textContent = 'Pick a function and enter the key argument.';
+      }
+      document.getElementById('bfcl-check').addEventListener('click', function(){
+        var t = tasks[ti];
+        var okFn = picked === t.fn;
+        var okArg = t.argMatch(argEl.value || '');
+        var cls = (okFn && okArg) ? 'hi' : 'bad';
+        out.innerHTML = '<span class="' + cls + '">' + ((okFn && okArg) ? 'PASS' : 'FAIL') + '</span><br>' +
+          '<span class="k">function:</span> ' + (picked || '(none)') + (okFn ? ' ✓' : ' ✗ expected ' + t.fn) + '<br>' +
+          '<span class="k">argument (' + t.argName + '):</span> ' + (argEl.value || '(empty)') + (okArg ? ' ✓' : ' ✗');
+      });
+      document.getElementById('bfcl-next').addEventListener('click', function(){ ti = (ti+1) % tasks.length; render(); });
+      render();
+    })();
+
+    // ---------- 4b. Accuracy vs turns ----------
+    (function(){
+      var canvas = document.getElementById('p14-turns');
+      var slider = document.getElementById('turns-p'), pVal = document.getElementById('turns-p-val');
+      var readout = document.getElementById('p14-turns-readout');
+      var W = 520, H = 270;
+      function render(){
+        var p = parseFloat(slider.value); pVal.textContent = p.toFixed(2);
+        var pts = [];
+        for (var t=1;t<=10;t++) pts.push({ x:t, y: 100*(1-Math.pow(1-p, t)) });
+        var ax = G.drawLines(canvas.getContext('2d'), W, H, [{ points:pts, color:c.accent }], [1,10], [0,100], { xLabel:'max turns allowed', yLabel:'task accuracy (%)' });
+        if (readout) readout.innerHTML = '<span class="k">accuracy @ 3 turns:</span> ' + (100*(1-Math.pow(1-p,3))).toFixed(0) + '%<br>' +
+          '<span class="k">accuracy @ 10 turns:</span> ' + (100*(1-Math.pow(1-p,10))).toFixed(0) + '%<br>' +
+          '<span style="opacity:0.65">the last 5 turns usually add little — hence the 10-turn budget.</span>';
+      }
+      slider.addEventListener('input', render);
+      G.setupCanvas(canvas, W, H, render);
+    })();
+  }).catch(function(err){
+    console.error('Failed to load tool-use data', err);
+  });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

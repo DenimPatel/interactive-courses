@@ -1,0 +1,324 @@
+---
+title: "LLM Training, Interactively — Part 6: Scaling Laws & Training Systems"
+description: "Chinchilla compute-optimal scaling with the paper's real fitted loss curve, a C≈6ND calculator, GPU memory accounting, and a parallelism explainer for training across thousands of GPUs."
+permalink: "/ai/llm-training/scaling/"
+section: "ai"
+series: "llm_training"
+redirect_from:
+  - /llm-training-scaling.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+{% include llm-head.html %}
+<style>
+  .mem-stack { display: flex; flex-direction: column; border-radius: var(--radius-sm); overflow: hidden; height: 34px; }
+  .mem-seg { display: flex; align-items: center; padding-left: 8px; font-size: 11px; color: #fff; font-family: var(--font-mono); white-space: nowrap; overflow: hidden; }
+  .gpu-grid { display: grid; gap: 4px; }
+  .gpu-cell { aspect-ratio: 1; border-radius: 2px; font-size: 9px; display:flex; align-items:center; justify-content:center; font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_training %}
+
+<main>
+<div class="wrap llmt">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 6 of 15</span>
+    <h1>Scaling Laws &amp; Training Systems</h1>
+    <p>Two questions every training run has to answer before it starts: given a fixed compute budget, what's the best split between model size and data (<strong>scaling laws</strong>)? And given that split, how do you actually run it across a cluster without running out of memory or bandwidth (<strong>training systems</strong>)? Both have real, quantitative answers.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="llmt-step" id="chinchilla">
+    <div class="llmt-step-head"><span class="llmt-step-num">1</span><h2>Chinchilla: the compute-optimal split</h2></div>
+    <p class="llmt-eyebrow">Scaling laws</p>
+    <p>Hoffmann et al. (DeepMind, 2022) trained hundreds of models at different sizes and token counts, then fit power-law curves to find how the loss-minimizing parameter count <var>N</var> and token count <var>D</var> each grow with compute <var>C</var>. All three of the paper's independent fitting methods agreed on the headline result to within a small factor: at compute-optimal allocation, <var>N</var> and <var>D</var> scale with roughly equal exponents in <var>C</var>, which empirically worked out to <strong>about 20 training tokens per parameter</strong> across the compute range they studied (their own three approaches predicted 67–68B/1.5T, 67B/1.5T, and 40B/1.9T at Gopher's compute budget — the <em>exact</em> fitted coefficients of the parametric loss curve are less robust than this ratio, which is why later reproduction attempts flagged ambiguity in the paper's reported constants but not in the ~20:1 conclusion).</p>
+    <div class="llmt-math llmt-katex">$$C \approx 6ND, \qquad D_{\text{opt}} \approx 20\,N_{\text{opt}} \ \Rightarrow\ N_{\text{opt}} = \sqrt{\frac{C}{120}},\ \ D_{\text{opt}} = 20\,N_{\text{opt}}$$</div>
+    <p>Those two equations are exactly solvable — for a fixed compute budget <var>C</var>, there's a whole hyperbola of (N, D) pairs that cost exactly <var>C</var> FLOPs ($D = C/6N$); the compute-optimal point is where that hyperbola crosses the 20-tokens-per-parameter line. Drag the budget below and watch both curves and their intersection move.</p>
+    <div class="llmt-demo">
+      <div class="llmt-canvas-wrap">
+        <canvas id="chin-canvas" width="560" height="320"></canvas>
+      </div>
+      <div class="llmt-controls">
+        <div class="llmt-field"><label>Compute budget C (FLOPs, log₁₀) <span class="val" id="chin-c-val">1.0e21</span></label>
+          <input type="range" id="chin-c" min="18" max="26" step="0.05" value="21"></div>
+        <div class="llmt-readout" id="chin-readout"></div>
+      </div>
+    </div>
+    <div class="llmt-warn">⚠️ <span><b>Why real models overtrain anyway:</b> the compute-optimal point minimizes <em>training</em> compute for a target loss — it says nothing about inference cost. A smaller model trained on far more than its "optimal" token count (an <strong>overtrained</strong> model) reaches nearly the same loss but is cheaper to serve for the rest of its life, often billions of inference calls. OLMo 2 7B, like Llama 3 8B, is trained on several trillion tokens — tens of tokens per parameter past the Chinchilla-optimal ~20:1 ratio for its size.</span></div>
+  </section>
+
+  <section class="llmt-step" id="compute-calc">
+    <div class="llmt-step-head"><span class="llmt-step-num">2</span><h2>From parameters and tokens to GPU-hours and dollars</h2></div>
+    <p class="llmt-eyebrow">Turning FLOPs into a training run</p>
+    <p>$C \approx 6ND$ is a rule of thumb — 2 FLOPs per parameter per token for the forward pass, ×3 to include the backward pass, giving 6 total. Divide by a GPU's real achieved throughput (never its advertised peak — see MFU below) to get GPU-hours, then by cluster size for wall-clock time.</p>
+    <div class="llmt-demo">
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-grid3">
+          <div class="llmt-field"><label>Parameters N <span class="val" id="cc-n-val">7B</span></label><input type="range" id="cc-n" min="8" max="12" step="0.02" value="9.845"></div>
+          <div class="llmt-field"><label>Training tokens D <span class="val" id="cc-d-val">4.0T</span></label><input type="range" id="cc-d" min="10" max="13.5" step="0.02" value="12.6"></div>
+          <div class="llmt-field"><label>GPUs <span class="val" id="cc-gpus-val">1024</span></label><input type="range" id="cc-gpus" min="0" max="4" step="0.05" value="3.01"></div>
+          <div class="llmt-field"><label>Achieved TFLOP/s per GPU (bf16, real-world MFU) <span class="val" id="cc-tflops-val">400</span></label><input type="range" id="cc-tflops" min="50" max="900" step="10" value="400"></div>
+          <div class="llmt-field"><label>$ / GPU-hour <span class="val" id="cc-price-val">2.5</span></label><input type="range" id="cc-price" min="0.5" max="8" step="0.1" value="2.5"></div>
+        </div>
+        <div class="llmt-readout" id="cc-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="memory">
+    <div class="llmt-step-head"><span class="llmt-step-num">3</span><h2>Why a 70B model doesn't fit on one GPU</h2></div>
+    <p class="llmt-eyebrow">Memory accounting</p>
+    <p>Training needs more than just the weights: AdamW keeps two extra optimizer states (momentum and variance) per parameter, gradients need one more copy, and mixed-precision training typically keeps an fp32 master copy alongside a lower-precision (bf16/fp8) working copy. A rough per-parameter budget in mixed precision: 2 bytes (bf16 weights) + 2 bytes (bf16 grads) + 4+4 bytes (fp32 Adam moments) + 4 bytes (fp32 master weights) ≈ <strong>16 bytes/parameter</strong> before activations — which is why a 70B model needs well over 1TB of GPU memory just for state, before it processes a single token.</p>
+    <div class="llmt-demo">
+      <div class="llmt-controls" style="flex-basis:100%;">
+        <div class="llmt-grid3">
+          <div class="llmt-field"><label>Parameters (B) <span class="val" id="mem-n-val">7</span></label><input type="range" id="mem-n" min="0.5" max="140" step="0.5" value="7"></div>
+          <div class="llmt-field"><label>Batch × seq activations (relative) <span class="val" id="mem-act-val">low</span></label><input type="range" id="mem-act" min="0" max="2" step="1" value="0"></div>
+          <div class="llmt-field"><label>GPU memory (GB) <span class="val" id="mem-gpu-val">80</span></label><input type="range" id="mem-gpu" min="16" max="192" step="8" value="80"></div>
+        </div>
+        <div class="mem-stack" id="mem-stack"></div>
+        <div class="llmt-readout" id="mem-readout" style="margin-top:10px;"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="parallelism">
+    <div class="llmt-step-head"><span class="llmt-step-num">4</span><h2>Splitting a model across a cluster</h2></div>
+    <p class="llmt-eyebrow">Distributed training</p>
+    <p>When one model's state doesn't fit on one GPU (or you simply want more throughput), you shard the work. The four standard strategies compose:</p>
+    <div class="llmt-demo" style="flex-direction:column;">
+      <div class="llmt-btnrow" id="par-btns">
+        <button data-p="dp" class="llmt-primary">Data parallel</button>
+        <button data-p="tp">Tensor parallel</button>
+        <button data-p="pp">Pipeline parallel</button>
+        <button data-p="fsdp">FSDP / ZeRO</button>
+      </div>
+      <div class="gpu-grid" id="par-grid" style="grid-template-columns: repeat(8, 1fr); max-width:480px;"></div>
+      <div class="llmt-readout" id="par-readout" style="margin-top:10px;"></div>
+    </div>
+    <p class="llmt-canvas-hint">Real training runs combine all four (often called "3D" or "4D parallelism") — e.g. FSDP within a node, pipeline parallel across node groups, data parallel across replicas of the whole pipeline. Communication cost, not memory, is usually the thing that limits how far you can push any single strategy — which is why interconnect bandwidth is as strategically important as GPU count.</p>
+  </section>
+
+  <section class="llmt-step" id="cheatsheet">
+    <div class="llmt-step-head"><span class="llmt-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="llmt-eyebrow">Recap</p>
+    <div style="overflow-x:auto;">
+    <table class="llmt-cheat">
+      <thead><tr><th>Concept</th><th>What it is</th><th>Rule of thumb</th></tr></thead>
+      <tbody>
+        <tr><td>C ≈ 6ND</td><td>Training FLOPs ≈ 6 × parameters × tokens</td><td>2 (fwd) + 4 (bwd) FLOPs per param per token</td></tr>
+        <tr><td>Compute-optimal ratio</td><td>Chinchilla's fitted loss-minimizing D/N</td><td>~20 tokens per parameter</td></tr>
+        <tr><td>Overtraining</td><td>Training well past compute-optimal to shrink inference cost</td><td>OLMo 2, Llama 3: 100s of tokens/param</td></tr>
+        <tr><td>Mixed-precision memory</td><td>Weights + grads + optimizer state + master copy</td><td>~16 bytes/parameter (AdamW, bf16)</td></tr>
+        <tr><td>MFU</td><td>Model FLOPs Utilization — achieved ÷ peak FLOP/s</td><td>Real runs: 30–55%, rarely more</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="llmt-step" id="refs">
+    <div class="llmt-step-head"><span class="llmt-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="llmt-eyebrow">References</p>
+    <ul class="llmt-refs">
+      <li>Hoffmann et al. (DeepMind), <a href="https://arxiv.org/abs/2203.15556">"Training Compute-Optimal Large Language Models"</a> (2022) — Chinchilla.</li>
+      <li>Kaplan et al. (OpenAI), <a href="https://arxiv.org/abs/2001.08361">"Scaling Laws for Neural Language Models"</a> (2020) — the earlier scaling-law study Chinchilla revised.</li>
+      <li>Rajbhandari et al., <a href="https://arxiv.org/abs/1910.02054">"ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"</a> (2019).</li>
+      <li>OLMo 2 Team (Ai2), <a href="https://arxiv.org/abs/2501.00656">"2 OLMo 2 Furious"</a> — published hardware logs and token counts.</li>
+    </ul>
+  </section>
+{% endraw %}
+
+  <div class="llmt-next reveal">
+    <span>With a budget, a data split, and a cluster plan settled, it's time to actually run the training loop.</span>
+    <a class="btn btn-secondary" href="{{ '/ai/llm-training/pretraining/' | relative_url }}">Continue: pretraining, the training loop →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.llm_training %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script src="{{ '/assets/js/llm-guide.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function(){
+  "use strict";
+  var G = window.LLMG, c = G.colors();
+
+  function fmtNum(x){
+    if (x >= 1e12) return (x/1e12).toFixed(2)+'T';
+    if (x >= 1e9) return (x/1e9).toFixed(2)+'B';
+    if (x >= 1e6) return (x/1e6).toFixed(2)+'M';
+    if (x >= 1e3) return (x/1e3).toFixed(2)+'K';
+    return x.toFixed(2);
+  }
+
+  // ---- Chinchilla: isoFLOP hyperbola (D=C/6N) vs the ~20-tokens/param line ----
+  (function(){
+    var TOKENS_PER_PARAM = 20;
+    var slider = document.getElementById('chin-c'), cVal = document.getElementById('chin-c-val');
+    var canvas = document.getElementById('chin-canvas'), ctx = canvas.getContext('2d');
+    var readout = document.getElementById('chin-readout');
+    var W = canvas.width, H = canvas.height;
+
+    function render(){
+      var logC = parseFloat(slider.value);
+      var C = Math.pow(10, logC);
+      cVal.textContent = C.toExponential(1);
+      var bestN = Math.sqrt(C/(6*TOKENS_PER_PARAM));
+      var bestD = TOKENS_PER_PARAM*bestN;
+      var logNmin = Math.log10(bestN)-2, logNmax = Math.log10(bestN)+2;
+      var logDmin = Math.log10(bestD)-2, logDmax = Math.log10(bestD)+2;
+
+      var isoflop = [], ratio20 = [];
+      for (var i=0;i<=200;i++){
+        var logN = logNmin + (logNmax-logNmin)*i/200;
+        var N = Math.pow(10, logN);
+        var Diso = C/(6*N);
+        if (Diso > 0) isoflop.push({x:logN, y:Math.log10(Diso)});
+        ratio20.push({x:logN, y:Math.log10(TOKENS_PER_PARAM*N)});
+      }
+      var lines = [
+        { points: isoflop, color: c.accent },
+        { points: ratio20, color: c.accent2 }
+      ];
+      var axes = G.drawLines(ctx, W, H, lines, [logNmin, logNmax], [logDmin, logDmax], {xLabel:'log10(parameters N)', yLabel:'log10(tokens D)'});
+      var mx = axes.px(Math.log10(bestN)), my = axes.py(Math.log10(bestD));
+      ctx.fillStyle = c.text; ctx.beginPath(); ctx.arc(mx,my,5,0,2*Math.PI); ctx.fill();
+      ctx.font = '11px ' + c.font; ctx.fillStyle = c.accent; ctx.fillText('constant-compute curve (D=C/6N)', axes.padL+8, axes.padT+14);
+      ctx.fillStyle = c.accent2; ctx.fillText('D = 20N', axes.padL+8, axes.padT+28);
+
+      readout.innerHTML = '<span class="k">compute-optimal N:</span> <span class="hi">'+fmtNum(bestN)+'</span> params<br>' +
+        '<span class="k">compute-optimal D:</span> <span class="hi">'+fmtNum(bestD)+'</span> tokens<br>' +
+        '<span class="k">tokens per parameter:</span> <span class="hi">'+TOKENS_PER_PARAM+'</span> (by construction — this is the empirical ratio the point is being solved to satisfy)';
+    }
+    slider.addEventListener('input', render);
+    render();
+  })();
+
+  // ---- Compute calculator ----
+  (function(){
+    var nS=document.getElementById('cc-n'), dS=document.getElementById('cc-d'), gS=document.getElementById('cc-gpus'),
+        tS=document.getElementById('cc-tflops'), pS=document.getElementById('cc-price');
+    var nV=document.getElementById('cc-n-val'), dV=document.getElementById('cc-d-val'), gV=document.getElementById('cc-gpus-val'),
+        tV=document.getElementById('cc-tflops-val'), pV=document.getElementById('cc-price-val');
+    var readout = document.getElementById('cc-readout');
+    function render(){
+      var N = Math.pow(10, +nS.value), D = Math.pow(10, +dS.value), gpus = Math.round(Math.pow(10, +gS.value));
+      var tflops = +tS.value, price = +pS.value;
+      nV.textContent = fmtNum(N); dV.textContent = fmtNum(D); gV.textContent = fmtNum(gpus);
+      tV.textContent = tflops; pV.textContent = price;
+      var flops = 6*N*D;
+      var gpuSeconds = flops / (tflops*1e12);
+      var gpuHours = gpuSeconds/3600;
+      var wallHours = gpuHours/gpus;
+      var cost = gpuHours*price;
+      readout.innerHTML = '<span class="k">total training FLOPs (C=6ND):</span> <span class="hi">'+flops.toExponential(2)+'</span><br>' +
+        '<span class="k">GPU-hours needed:</span> '+fmtNum(gpuHours)+'<br>' +
+        '<span class="k">wall-clock time on '+gpus+' GPUs:</span> <span class="hi">'+fmtNum(wallHours)+' hours</span> (≈'+(wallHours/24).toFixed(1)+' days)<br>' +
+        '<span class="k">rough cluster cost:</span> <span class="hi">$'+fmtNum(cost)+'</span>';
+    }
+    [nS,dS,gS,tS,pS].forEach(function(el){ el.addEventListener('input', render); });
+    render();
+  })();
+
+  // ---- Memory accounting ----
+  (function(){
+    var nS = document.getElementById('mem-n'), actS = document.getElementById('mem-act'), gpuS = document.getElementById('mem-gpu');
+    var nV = document.getElementById('mem-n-val'), actV = document.getElementById('mem-act-val'), gpuV = document.getElementById('mem-gpu-val');
+    var stack = document.getElementById('mem-stack');
+    var readout = document.getElementById('mem-readout');
+    var actLabels = ['low','medium','high'];
+    var actMultipliers = [0.5, 3, 12]; // GB per B params, illustrative activation-memory scaling with batch*seq
+
+    function render(){
+      var nB = +nS.value, actLevel = +actS.value, gpuGB = +gpuS.value;
+      nV.textContent = nB; actV.textContent = actLabels[actLevel]; gpuV.textContent = gpuGB;
+      var params = nB*1e9;
+      var weightsGB = params*2/1e9, gradsGB = params*2/1e9, momGB = params*4/1e9, varGB = params*4/1e9, masterGB = params*4/1e9;
+      var actGB = nB*actMultipliers[actLevel];
+      var total = weightsGB+gradsGB+momGB+varGB+masterGB+actGB;
+      var segs = [
+        {label:'bf16 weights', gb:weightsGB, color:c.accent},
+        {label:'bf16 grads', gb:gradsGB, color:c.accent500},
+        {label:'Adam momentum (fp32)', gb:momGB, color:c.accent2},
+        {label:'Adam variance (fp32)', gb:varGB, color:c.accent2},
+        {label:'fp32 master weights', gb:masterGB, color:c.text},
+        {label:'activations', gb:actGB, color:'#999'}
+      ];
+      stack.innerHTML = '';
+      stack.style.flexDirection = 'row';
+      segs.forEach(function(s){
+        var div = document.createElement('div'); div.className='mem-seg';
+        div.style.width = (100*s.gb/total)+'%'; div.style.background = s.color;
+        div.textContent = s.gb>total*0.06 ? s.label : '';
+        stack.appendChild(div);
+      });
+      var gpusNeeded = Math.ceil(total/gpuGB);
+      readout.innerHTML = '<span class="k">total memory needed:</span> <span class="hi">'+total.toFixed(0)+' GB</span><br>' +
+        '<span class="k">GPUs needed at '+gpuGB+'GB each (state-sharded, e.g. FSDP):</span> <span class="hi">'+gpusNeeded+'</span>' +
+        (gpusNeeded===1 ? '' : '<br><span style="opacity:0.6">this is exactly why large models need FSDP/ZeRO sharding or tensor parallelism across multiple GPUs before training can even start</span>');
+    }
+    [nS,actS,gpuS].forEach(function(el){ el.addEventListener('input', render); });
+    render();
+  })();
+
+  // ---- Parallelism explorer ----
+  (function(){
+    var grid = document.getElementById('par-grid');
+    var readout = document.getElementById('par-readout');
+    var btns = document.querySelectorAll('#par-btns button');
+    var descriptions = {
+      dp: 'Every GPU holds a full copy of the model and processes a different slice of the batch; gradients are averaged (all-reduced) across GPUs after each step. Simple, but memory-hungry — no sharding of the model itself.',
+      tp: 'A single layer\'s matrix multiply is split across GPUs (e.g. each GPU holds a slice of every weight matrix\'s columns). Requires fast interconnect since GPUs must synchronize <em>within</em> every layer\'s forward/backward pass.',
+      pp: 'Different GPUs own different contiguous ranges of layers; a batch is split into micro-batches that flow through the pipeline like an assembly line. Communication is only at stage boundaries, but naive pipelining leaves GPUs idle ("bubbles") waiting for work.',
+      fsdp: 'Fully Sharded Data Parallel / ZeRO: each GPU permanently stores only a shard of the parameters, gradients, and optimizer state, and gathers the full weights just-in-time for each layer\'s compute, then releases them. Removes the "full copy on every GPU" cost of plain data parallelism.'
+    };
+    function render(mode){
+      grid.innerHTML = '';
+      for (var i=0;i<16;i++){
+        var cell = document.createElement('div'); cell.className='gpu-cell';
+        var color = c.accent400, label='';
+        if (mode==='dp'){ color = c.accent; label='full'; }
+        if (mode==='tp'){ color = i%4===0?c.accent:c.accent400; label = 'cols '+(i%4); }
+        if (mode==='pp'){ var stage = Math.floor(i/4); color = ['#7fb', c.accent400, c.accent, c.accent2][stage%4]; label='L'+(stage*8)+'-'+(stage*8+7); }
+        if (mode==='fsdp'){ color = c.accent500; label='shard '+i; }
+        cell.style.background = color; cell.style.color = mode==='pp' ? '#111':'#fff';
+        cell.textContent = label;
+        grid.appendChild(cell);
+      }
+      readout.innerHTML = descriptions[mode];
+    }
+    btns.forEach(function(b){
+      b.addEventListener('click', function(){
+        btns.forEach(function(x){x.className='';});
+        b.className='llmt-primary';
+        render(b.getAttribute('data-p'));
+      });
+    });
+    render('dp');
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

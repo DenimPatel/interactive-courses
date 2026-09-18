@@ -1,0 +1,512 @@
+---
+title: "Building with LLMs, Interactively — Part 2: Tokens, windows and budgets"
+description: "Byte-pair encoding, why a token is not a word, why tokenizers differ per model family, and the context window as a contested budget with an output reserve."
+permalink: "/ai/building-with-llms/tokens-and-budgets/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Tokens, windows and budgets</h1>
+    <p>The model never sees your words. It sees integers from a vocabulary its tokenizer built, and the mapping from text to those integers is neither obvious nor portable. Before you can reason about cost, latency or context, you need a working model of two things: what a token actually is, and why the context window is a budget you spend deliberately rather than a bucket you fill until it breaks.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="bpe">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Byte-pair encoding, in one idea</h2></div>
+    <p class="g-eyebrow">Start from bytes, merge what repeats</p>
+    <p>Byte-pair encoding begins with the smallest possible alphabet — bytes — and repeatedly merges the pair of symbols that occurs most often in the training text into a new single symbol. Run that loop a few tens of thousands of times and the vocabulary fills up with the units that actually recur: whole common words, frequent fragments like <code>##ing</code>, <code>ation</code> or <code>pre</code>, and the space that begins a word as its own marker. A token is one of those learned units. Nothing in the definition says "word"; the algorithm optimises frequency, not linguistics.</p>
+    <p>The consequence is that a word boundary is invisible to the model. Common words cost one token each; a rare word shatters into a stem plus continuation pieces; a string the tokenizer never saw during training shatters all the way down to bytes. Below is a toy model of that behaviour — it is not any vendor's tokenizer, but it produces the same shapes: frequent short words stay whole, long or rare words split, and single non-alphanumeric characters become tokens of their own.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tok-bench-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Tokens per character for five kinds of text. The highlighted bar is the passage currently tokenized below.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Preset passage <span class="val">0</span></label><input type="range" id="tok-preset" min="0" max="4" step="1" value="0"></div>
+        <div class="g-field"><label>Or type your own <span class="val" id="tok-preset-name">English prose</span></label><input type="text" id="tok-input" spellcheck="false" value="The quick brown fox jumps over the lazy dog, then it runs away into the deep forest."></div>
+        <div class="g-tokens" id="tok-chips"></div>
+        <div class="g-readout" id="tok-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Durable idea:</b> a tokenizer is a compression scheme tuned on a corpus. Its output is only meaningful relative to the exact vocabulary and merge list that produced it.</span></div>
+  </section>
+
+  <section class="g-step" id="not-a-word">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>A token is not a word, and not a character</h2></div>
+    <p class="g-eyebrow">Three different units, three different counts</p>
+    <p>It is tempting to treat "token" as a synonym for "word" and multiply by a price. The three units move independently, and their ratio depends entirely on what the text is made of. English prose is the best case: it lands near <b>four characters per token</b>, or roughly <b>1.3 tokens per word</b>, because its frequent words and morphemes were merged. Source code is worse, because identifiers, punctuation and indentation are not natural-language statistics. Non-Latin scripts are worse still: a script whose characters are individually rare in the training mix gets tokenized nearly character by character, so a single Chinese or Japanese word can cost several tokens where its English translation costs one.</p>
+    <p>Numbers are the quiet trap. Whether <code>128000</code>, <code>3.14159</code> or <code>2026-09-15</code> is one token or four depends on what the merge list happened to capture, and the answer differs between one model family and the next. This is why arithmetic is a poor first task for a language model, and why "the model got the digit wrong" is often a tokenization fact before it is a reasoning fact.</p>
+    <div class="g-grid3" style="margin-top:14px;">
+      <div class="g-card">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">English prose</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.45;">≈ 4 characters / token</div>
+        <p style="font-size:12.5px;opacity:.8;margin:6px 0 0;">≈ 1.3 tokens / word. Frequent words and morphemes merged whole.</p>
+      </div>
+      <div class="g-card">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">Source code &amp; URLs</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.45;">≈ 2–3 characters / token</div>
+        <p style="font-size:12.5px;opacity:.8;margin:6px 0 0;">Identifiers, punctuation and query strings fragment into many pieces.</p>
+      </div>
+      <div class="g-card">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">Non-Latin scripts, emoji, digits</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.45;">≈ 1 character / token or worse</div>
+        <p style="font-size:12.5px;opacity:.8;margin:6px 0 0;">Rare symbols fall back toward bytes; a number's split is arbitrary.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Trap:</b> estimating cost, or a context budget, from a character count silently inflates or deflates by a factor of four depending on the language and the payload. Count tokens, not letters.</span></div>
+  </section>
+
+  <section class="g-step" id="families">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Tokenizers differ per model family</h2></div>
+    <p class="g-eyebrow">Counts and ids are not portable</p>
+    <p>Each model family trains its own tokenizer over its own data mix, so it has a different vocabulary size, a different merge list, and therefore a different number of tokens for the same sentence. The integer <em>id</em> that stands for a token is even less meaningful: it is a serial number into that family's embedding table, assigned by construction order, not by any property of the text. Token <code>#18447</code> in one family and <code>#18447</code> in another have nothing whatsoever to do with each other.</p>
+    <p>The demo below sends the current passage through two mock tokenizers with different hash functions. The token strings are identical; the ids are entirely different. That is the whole point — a count from a tokenizer you are not actually going to call is a guess, and the estimate is only trustworthy when it comes from the same model version you will run.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tok-id-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Two mock vocabularies number the same tokens differently. IDs are arbitrary serial numbers into a family's embedding table.</p>
+      </div>
+      <div class="g-controls">
+        <p style="font-size:13px;line-height:1.6;margin-top:0;">Token counts are a property of a <em>tokenizer</em>, not of text. The passage in the bench above is re-tokenized here, so editing it changes both demos.</p>
+        <div class="g-readout" id="tok-id-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Practical rule:</b> count tokens with the exact tokenizer for the exact model version you will call, and re-count after every model upgrade. A token-count regression test is cheap insurance against a silent context overflow.</span></div>
+  </section>
+
+  <section class="g-step" id="budget">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The context window is a budget</h2></div>
+    <p class="g-eyebrow">Line items, and a reserve for the answer</p>
+    <p>The context window is the maximum number of tokens the model can attend to in a single call — the prompt plus the completion. Everything the model knows about this request must fit inside it: the system instructions, the few-shot examples, the retrieved passages, the conversation history, and then the answer it is about to write. Treat it as a budget with named line items, and reserve room for the output <em>first</em>, because a truncated answer is usually worse than a shorter prompt.</p>
+    <p>Drag the line items below. The stacked column is one prompt's composition against its window, the dashed line is the ceiling, and the readout warns before the input plus the reserve overruns it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tok-budget-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">One stacked column: system, examples, retrieved, history, the reserved output, and what is left unused.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Context window (tokens) <span class="val">128000</span></label><input type="range" id="cb-window" min="8000" max="200000" step="1000" value="128000"></div>
+        <div class="g-field"><label>System instructions <span class="val">500</span></label><input type="range" id="cb-system" min="0" max="4000" step="50" value="500"></div>
+        <div class="g-field"><label>Few-shot examples <span class="val">1200</span></label><input type="range" id="cb-examples" min="0" max="8000" step="100" value="1200"></div>
+        <div class="g-field"><label>Retrieved documents <span class="val">3000</span></label><input type="range" id="cb-retrieved" min="0" max="20000" step="250" value="3000"></div>
+        <div class="g-field"><label>Conversation history <span class="val">2000</span></label><input type="range" id="cb-history" min="0" max="40000" step="250" value="2000"></div>
+        <div class="g-field"><label>Reserved for output <span class="val">1000</span></label><input type="range" id="cb-output" min="0" max="16000" step="250" value="1000"></div>
+        <div class="g-readout" id="cb-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="tok-window-source"></p>
+    <p>Nominal window sizes are a marketing number, not a working capacity. The middle of a long context is where information gets lost: accuracy is highest for material at the very start and the very end and sags in between, so a fact parked at position 40,000 of a 128,000-token window can be effectively absent. <span id="tok-rot-band"></span>. Read the window as an upper bound you should rarely approach.</p>
+    <p class="g-source" id="tok-rot-source"></p>
+    <div class="g-warn">⚠️ <span><b>Trap:</b> "the window got bigger" is not the same as "you can use it all." A 1M-token window does not give you a 1M-token working memory; it gives you a larger budget inside which the same primacy-and-recency curve still applies.</span></div>
+    <p>Two more line items deserve names. Prefix caching lets a provider reuse the computation for a byte-identical prompt prefix, so keeping stable content first and volatile content last is a budget decision as well as a latency one. <span id="tok-cache-note"></span></p>
+    <p class="g-source" id="tok-cache-source"></p>
+  </section>
+
+  <section class="g-step" id="what-fits">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>What fits, given a cost per item</h2></div>
+    <p class="g-eyebrow">Turn the budget into a count</p>
+    <p>Most context decisions are really a packing problem: given a window, a reserve for the answer, some fixed overhead, and a per-item token cost, how many items fit? Each retrieved chunk, few-shot example or tool result has a price in tokens, and the number that fits falls as that price rises. The demo sweeps the per-item cost and plots the count that fits; the marker is the cost you currently have selected.</p>
+    <p>The design lesson is to measure items in tokens before you decide how many to buy. Ten chunks of 800 tokens and twenty chunks of 400 tokens occupy the same budget but behave very differently in retrieval quality — and neither is free. <span id="tok-price-note"></span></p>
+    <p class="g-source" id="tok-price-source"></p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tok-fit-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Items that fit versus the token cost of one item. The dashed line marks your current choice.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Context window (tokens) <span class="val">128000</span></label><input type="range" id="fit-window" min="8000" max="200000" step="1000" value="128000"></div>
+        <div class="g-field"><label>Fixed overhead (system + tools) <span class="val">2000</span></label><input type="range" id="fit-fixed" min="0" max="8000" step="100" value="2000"></div>
+        <div class="g-field"><label>Reserved for output <span class="val">2000</span></label><input type="range" id="fit-reserve" min="0" max="16000" step="250" value="2000"></div>
+        <div class="g-field"><label>Tokens per item <span class="val">800</span></label><input type="range" id="fit-per" min="100" max="4000" step="50" value="800"></div>
+        <div class="g-readout" id="fit-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> every later part spends this budget — examples, retrieved chunks, tool definitions, and the model's own reasoning. The lever is almost never the input; as the price table below shows, it is the output.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>Short answer</th></tr></thead>
+      <tbody>
+        <tr><td>What is a token?</td><td>A learned subword unit. BPE starts from bytes and merges the most frequent pairs repeatedly.</td></tr>
+        <tr><td>Is a token a word?</td><td>No. Common words are one token; rare or foreign words split into several; scripts and numbers vary.</td></tr>
+        <tr><td>How big is an English token?</td><td>Roughly four characters, or about 1.3 tokens per word — for English prose only.</td></tr>
+        <tr><td>Can I reuse a token count across models?</td><td>No. Tokenizers differ per family; count with the exact model version you will call.</td></tr>
+        <tr><td>What does a token id mean?</td><td>Nothing. It is an arbitrary serial number into that family's embedding table.</td></tr>
+        <tr><td>What is the context window?</td><td>The most tokens one call can attend to — prompt plus completion. A budget with line items.</td></tr>
+        <tr><td>What should I reserve first?</td><td>The output. A truncated answer is usually worse than a shorter prompt.</td></tr>
+        <tr><td>Does a bigger window mean more usable memory?</td><td>No. Accuracy sags in the middle of a long context; the window is an upper bound you rarely want.</td></tr>
+        <tr><td>How do I decide how many chunks to send?</td><td>Convert each item to tokens and solve the packing problem against the usable budget.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Sennrich, Haddow &amp; Birch, <a href="https://arxiv.org/abs/1508.07909">"Neural Machine Translation of Rare Words with Subword Units"</a>, ACL 2016 (arXiv:1508.07909, 2015) — the paper that brought byte-pair encoding to neural models.</li>
+      <li>Kudo &amp; Richardson, <a href="https://arxiv.org/abs/1808.06226">"SentencePiece: A simple and language independent subword tokenizer and detokenizer"</a>, EMNLP 2018 (arXiv:1808.06226) — the unigram/LM subword view and the family of vocabularies in wide use.</li>
+      <li>OpenAI, <a href="https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken">"How to count tokens with tiktoken"</a>, 2023 — the practical reason token counts are model-specific and must be measured, not estimated.</li>
+      <li>Liu et al., <a href="https://arxiv.org/abs/2307.03172">"Lost in the Middle: How Language Models Use Long Contexts"</a>, TACL 2024 (arXiv:2307.03172) — the U-shaped accuracy curve behind the context-rot argument.</li>
+      <li>Chroma, <a href="https://research.trychroma.com/context-rot">"Context Rot"</a>, July 2025 — degradation that begins well below the advertised window on many models.</li>
+      <li>Anthropic, <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Prompt caching</a> and OpenAI, <a href="https://platform.openai.com/docs/guides/prompt-caching">Prompt caching guide</a> — cache-read multipliers and the minimum cacheable length that shape prompt layout.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Tokens are the atoms; sampling is what turns a distribution over them into text. Next: how temperature, top-p and top-k reshape that distribution, why temperature 0 is not deterministic, and what logprobs can and cannot tell you about confidence.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  var FALLBACK = {
+    context_windows: {
+      source: "Vendor model cards and API docs, retrieved 2026-09. Offline fallback constants; treat every window as a dated snapshot.",
+      items: [{ model: "GPT-4o", tokens: 128000 }, { model: "Claude 3.7 Sonnet / 4.x", tokens: 200000 }]
+    },
+    context_rot: {
+      source: "Liu et al., 'Lost in the Middle' (arXiv:2307.03172, TACL 2024); Chroma, 'Context Rot' (2025-07). Offline fallback constants.",
+      bands: [
+        { position: "start (primacy)", relativeAccuracy: 1.0 },
+        { position: "middle", relativeAccuracy: 0.62 },
+        { position: "end (recency)", relativeAccuracy: 0.95 }
+      ]
+    },
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens. Offline fallback constants.",
+      outputInputRatio: "Output is the expensive side at every vendor in the table: 3x to 5x the input price, so the lever is shortening the output."
+    },
+    prompt_cache: {
+      source: "Anthropic prompt-caching docs (2024-08) and OpenAI prompt-caching docs (2024-10). Offline fallback constants.",
+      anthropicCacheReadMultiplier: 0.1, minCacheableTokens: 1024
+    }
+  };
+
+  var PRESETS = [
+    { name: "English prose", text: "The quick brown fox jumps over the lazy dog, then it runs away into the deep forest." },
+    { name: "Source code", text: "function tokenize(text) { return text.match(/[A-Za-z0-9]+/g); }" },
+    { name: "A URL", text: "https://api.example.com/v1/models?limit=100&after=abc123xyz" },
+    { name: "Digits", text: "2026-09-15 128000 3.14159 1000000 42 777 8675309" },
+    { name: "Emoji / CJK", text: "你好，世界！🙂🚀 café naïve — 東京 Tokyo" }
+  ];
+
+  function currentText() { return el('tok-input').value; }
+
+  // ------------------------------------------------------------------
+  // Demo A — the tokenizer bench
+  // ------------------------------------------------------------------
+  var setupA = Guide.setupCanvas(el('tok-bench-canvas'), 640, 320, drawA);
+  function drawA() {
+    if (!setupA) return;
+    var text = currentText();
+    var toks = AppSim.tokenize(text);
+    el('tok-chips').innerHTML = toks.map(function (t) {
+      return '<span class="g-tok">' + esc(t) + '</span>';
+    }).join('');
+    var data = PRESETS.map(function (p) {
+      var tpc = AppSim.countTokens(p.text) / (p.text.length || 1);
+      return {
+        label: p.name, value: tpc, valueLabel: tpc.toFixed(2) + ' tok/char',
+        color: p.text === text ? c.accent : c.accent400
+      };
+    });
+    var maxV = data.reduce(function (m, d) { return Math.max(m, d.value); }, 0) * 1.12;
+    Guide.drawBars(setupA.ctx, 640, 320, data, {
+      padL: 122, padR: 156, padT: 34, padB: 14, maxV: maxV, fontSize: 11.5, gap: 8
+    });
+    var ctx = setupA.ctx;
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('tokens per character, by kind of text', 14, 18);
+    var words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    var idx = -1;
+    PRESETS.forEach(function (p, i) { if (p.text === text) idx = i; });
+    el('tok-preset-name').textContent = idx >= 0 ? PRESETS[idx].name : 'custom text';
+    el('tok-readout').innerHTML =
+      '<div><span class="k">characters</span> <span class="hi">' + Guide.fmtNum(text.length) + '</span></div>' +
+      '<div><span class="k">words</span> ' + Guide.fmtNum(words) + '</div>' +
+      '<div><span class="k">tokens</span> <span class="hi">' + Guide.fmtNum(toks.length) + '</span></div>' +
+      '<div><span class="k">tokens / word</span> ' + (words ? (toks.length / words).toFixed(2) : '—') + '</div>' +
+      '<div><span class="k">tokens / character</span> ' + (text.length ? (toks.length / text.length).toFixed(2) : '—') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo B — ids are arbitrary and family-specific
+  // ------------------------------------------------------------------
+  var setupB = Guide.setupCanvas(el('tok-id-canvas'), 640, 300, drawB);
+  function hashId(tok, salt) {
+    var h = (2166136261 ^ salt) >>> 0;
+    for (var i = 0; i < tok.length; i++) {
+      h ^= tok.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h % 50000;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 300;
+    ctx.clearRect(0, 0, W, H);
+    var toks = AppSim.tokenize(currentText()).slice(0, 12);
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the same text, numbered by two different mock tokenizers', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText('token', 18, 40); ctx.fillText('family A id', 300, 40); ctx.fillText('family B id', 452, 40);
+    ctx.fillStyle = c.accent400; ctx.font = '10px ' + c.font;
+    ctx.fillText('an id is an arbitrary serial number, not a meaning', 18, 56);
+    toks.forEach(function (t, i) {
+      var y = 76 + i * 18;
+      var idA = hashId(t, 0x9e3779b9), idB = hashId(t, 0x85ebca6b);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(152, y - 4); ctx.lineTo(294, y - 4); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(152, y - 4); ctx.lineTo(446, y - 4); ctx.stroke();
+      ctx.fillStyle = c.accent100 || 'rgba(43,95,255,0.08)';
+      ctx.fillRect(18, y - 13, 130, 16);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.mono; ctx.textAlign = 'left';
+      ctx.fillText(t.slice(0, 18), 24, y);
+      ctx.fillStyle = c.accent700; ctx.fillText('#' + idA, 300, y);
+      ctx.fillStyle = c.accent2; ctx.fillText('#' + idB, 452, y);
+    });
+    var diff = 0;
+    toks.forEach(function (t) { if (hashId(t, 0x9e3779b9) !== hashId(t, 0x85ebca6b)) diff++; });
+    el('tok-id-readout').innerHTML =
+      '<div><span class="k">tokens shown</span> <span class="hi">' + toks.length + '</span></div>' +
+      '<div><span class="k">ids that differ across families</span> ' + diff + ' / ' + toks.length + '</div>' +
+      '<div class="k">a token count is only meaningful inside one tokenizer</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo C — the context budget
+  // ------------------------------------------------------------------
+  var C = {
+    window: el('cb-window'), system: el('cb-system'), examples: el('cb-examples'),
+    retrieved: el('cb-retrieved'), history: el('cb-history'), output: el('cb-output')
+  };
+  var setupC = Guide.setupCanvas(el('tok-budget-canvas'), 640, 380, drawC);
+  function drawC() {
+    if (!setupC) return;
+    var win = +C.window.value, system = +C.system.value, examples = +C.examples.value,
+      retrieved = +C.retrieved.value, history = +C.history.value, output = +C.output.value;
+    var b = AppSim.ctxBudget({
+      window: win, reserveOutput: output,
+      segments: [
+        { name: 'system', tokens: system }, { name: 'examples', tokens: examples },
+        { name: 'retrieved', tokens: retrieved }, { name: 'history', tokens: history }
+      ]
+    });
+    var items = [
+      { name: 'system', value: system, color: c.accent700 },
+      { name: 'examples', value: examples, color: c.accent },
+      { name: 'retrieved', value: retrieved, color: '#c9a227' },
+      { name: 'history', value: history, color: c.accent400 },
+      { name: 'output reserve', value: output, color: c.accent2 },
+      { name: 'unused', value: Math.max(0, b.remaining), color: c.divider }
+    ];
+    var maxTotal = Math.max(win, b.used + output) * 1.03;
+    var geo = Guide.drawStackedColumns(setupC.ctx, 640, 380,
+      [{ label: 'this prompt', segments: items.map(function (it) { return { value: it.value, color: it.color, name: it.name }; }) }],
+      { maxTotal: maxTotal, padL: 20, padR: 20, padT: 74, padB: 28 });
+    var ctx = setupC.ctx;
+    var wy = geo.py(win);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(geo.padL, wy); ctx.lineTo(620, wy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('window ' + Guide.fmtNum(win), geo.padL + 2, wy - 4);
+    ctx.font = '11px ' + c.font;
+    items.forEach(function (it, i) {
+      var col = i % 3, row = Math.floor(i / 3);
+      var x = 22 + col * 205, y = 22 + row * 18;
+      ctx.fillStyle = it.color; ctx.fillRect(x, y - 9, 10, 10);
+      ctx.fillStyle = c.text; ctx.textAlign = 'left';
+      ctx.fillText(it.name + '  ' + Guide.fmtNum(it.value), x + 15, y);
+    });
+    var pct = win ? (b.used / win * 100) : 0;
+    el('cb-readout').innerHTML =
+      '<div><span class="k">input used</span> <span class="hi">' + Guide.fmtNum(b.used) + '</span> tok (' + pct.toFixed(0) + '% of window)</div>' +
+      '<div><span class="k">output reserved</span> ' + Guide.fmtNum(output) + ' tok</div>' +
+      '<div><span class="k">budget remaining</span> <span class="' + (b.over ? 'bad' : 'hi') + '">' + Guide.fmtNum(Math.max(0, b.remaining)) + '</span> tok</div>' +
+      (b.over ? '<div class="bad">over by ' + Guide.fmtNum(b.overflow) + ' tok — the input competes with the answer</div>'
+        : '<div class="k">the largest line item is the first thing to cut</div>');
+  }
+
+  // ------------------------------------------------------------------
+  // Demo D — what fits
+  // ------------------------------------------------------------------
+  var D = { window: el('fit-window'), per: el('fit-per'), reserve: el('fit-reserve'), fixed: el('fit-fixed') };
+  var setupD = Guide.setupCanvas(el('tok-fit-canvas'), 640, 320, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var win = +D.window.value, per = +D.per.value, reserve = +D.reserve.value, fixed = +D.fixed.value;
+    var budget = Math.max(0, win - reserve - fixed);
+    var perClean = Math.max(1, per);
+    var data = [];
+    for (var p = 100; p <= 4000; p += 100) data.push({ x: p, y: Math.floor(budget / p) });
+    var maxY = data.reduce(function (m, d) { return Math.max(m, d.y); }, 0) || 1;
+    var geo = Guide.drawColumns(setupD.ctx, 640, 320, data, {
+      padL: 58, padR: 18, padT: 30, padB: 34, minY: 0, maxY: maxY * 1.08,
+      xRange: [0, 4100], xLabel: 'tokens per item (chunk, example, or document)', color: c.accent400
+    });
+    var ctx = setupD.ctx;
+    var fits = Math.floor(budget / perClean);
+    var X = geo.px(perClean), Y = geo.py(fits);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(X, geo.padT); ctx.lineTo(X, geo.padT + geo.plotH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(X, Y, 4, 0, 2 * Math.PI); ctx.fillStyle = c.accent2; ctx.fill();
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('how many whole items fit', 14, 16);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent2;
+    ctx.fillText('at ' + Guide.fmtNum(perClean) + ' tok/item → ' + Guide.fmtNum(fits) + ' fit', X + 6, geo.padT + 12);
+    var leftover = budget - fits * perClean;
+    el('fit-readout').innerHTML =
+      '<div><span class="k">usable budget</span> <span class="hi">' + Guide.fmtNum(budget) + '</span> tok <span class="k">(window − reserve − fixed)</span></div>' +
+      '<div><span class="k">per item</span> ' + Guide.fmtNum(perClean) + ' tok · <span class="k">items that fit</span> <span class="hi">' + Guide.fmtNum(fits) + '</span></div>' +
+      '<div><span class="k">leftover after packing</span> ' + Guide.fmtNum(leftover) + ' tok</div>' +
+      '<div class="k">one more item would need ' + Guide.fmtNum(perClean - leftover) + ' more tokens</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // binding + numbers
+  // ------------------------------------------------------------------
+  function syncPreset() {
+    el('tok-input').value = PRESETS[+el('tok-preset').value].text;
+    drawAll();
+  }
+  function drawAll() { drawA(); drawB(); drawC(); drawD(); }
+
+  Guide.bindSliders([el('tok-preset')], syncPreset);
+  el('tok-input').addEventListener('input', drawAll);
+  Guide.bindSliders([C.window, C.system, C.examples, C.retrieved, C.history, C.output], drawC);
+  Guide.bindSliders([D.window, D.fixed, D.reserve, D.per], drawD);
+
+  function setSources(data) {
+    var cw = (data && data.context_windows) || FALLBACK.context_windows;
+    var rot = (data && data.context_rot) || FALLBACK.context_rot;
+    var price = (data && data.pricing) || FALLBACK.pricing;
+    var cache = (data && data.prompt_cache) || FALLBACK.prompt_cache;
+    el('tok-window-source').textContent = cw.source || FALLBACK.context_windows.source;
+    el('tok-rot-source').textContent = rot.source || FALLBACK.context_rot.source;
+    el('tok-price-source').textContent = price.source || FALLBACK.pricing.source;
+    el('tok-cache-source').textContent = cache.source || FALLBACK.prompt_cache.source;
+    if (rot.bands && rot.bands.length >= 3) {
+      el('tok-rot-band').textContent = 'Relative accuracy is ' + rot.bands[0].relativeAccuracy.toFixed(2) +
+        ' at the start, ' + rot.bands[1].relativeAccuracy.toFixed(2) + ' in the middle and ' +
+        rot.bands[2].relativeAccuracy.toFixed(2) + ' at the end';
+    }
+    el('tok-price-note').textContent = price.outputInputRatio || FALLBACK.pricing.outputInputRatio;
+    el('tok-cache-note').textContent = 'A cacheable prefix is at least ' +
+      Guide.fmtNum(cache.minCacheableTokens || 1024) + ' tokens, and a cache read bills at about ' +
+      Math.round((cache.anthropicCacheReadMultiplier || 0.1) * 100) + '% of the input price.';
+  }
+
+  function applyNumbers(data) {
+    var cw = (data && data.context_windows) || FALLBACK.context_windows;
+    if (cw.items && cw.items.length) {
+      var w = cw.items[0].tokens;
+      if (w) {
+        C.window.value = Math.min(200000, w);
+        D.window.value = Math.min(200000, w);
+      }
+    }
+    setSources(data);
+    drawAll();
+  }
+
+  // First paint runs synchronously from the fallback, then the fetch refines it.
+  applyNumbers(FALLBACK);
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'tokens-and-budgets-bpe',
+      kind: 'choice',
+      prompt: 'What does byte-pair encoding actually do to build a vocabulary?',
+      options: [
+        { label: 'It repeatedly merges the most frequent adjacent pair of symbols into one new symbol.' },
+        { label: 'It segments text on whitespace and punctuation to recover whole words.' },
+        { label: 'It applies a grammar to identify nouns, verbs and other parts of speech.' },
+        { label: 'It maps each Unicode character to exactly one token.' }
+      ],
+      explanation: 'BPE starts from bytes and merges the most frequent adjacent pair, over and over. The result is frequency-driven subword units, with no notion of a word boundary — which is why a token is not a word.'
+    },
+    {
+      id: 'tokens-and-budgets-tokens-per-word',
+      kind: 'numeric',
+      prompt: 'A 100-word English passage tokenizes to about 130 tokens. To one decimal place, how many tokens are there per word?',
+      answer: 1.3,
+      unit: 'tokens per word',
+      tolerance: 0.05,
+      explanation: '130 tokens ÷ 100 words = 1.3 tokens per word. This is the English-prose rule of thumb (about four characters per token); code, numbers and non-Latin scripts are far higher.'
+    },
+    {
+      id: 'tokens-and-budgets-portable',
+      kind: 'choice',
+      prompt: 'You measure a prompt as 5,000 tokens with one model\'s tokenizer. What is that count worth for a different model family?',
+      options: [
+        { label: 'Nothing reliable — tokenizers differ per family, so re-count with the exact model version.' },
+        { label: 'Exactly the same, because tokens are a property of the text.' },
+        { label: 'Within 1 token, since all modern tokenizers share a vocabulary.' },
+        { label: 'It only changes for non-English text.' }
+      ],
+      explanation: 'Each family trains its own vocabulary and merge list, and the numeric ids are arbitrary serial numbers into that family\'s embedding table. A token count is only meaningful inside the tokenizer that produced it.'
+    },
+    {
+      id: 'tokens-and-budgets-fits',
+      kind: 'numeric',
+      prompt: 'A 200,000-token window reserves 8,000 tokens for the output and spends 12,000 on system and tools. Each retrieved chunk costs 900 tokens. How many whole chunks fit?',
+      answer: 200,
+      unit: 'chunks',
+      tolerance: 1,
+      explanation: 'Usable budget = 200,000 − 8,000 − 12,000 = 180,000. 180,000 ÷ 900 = 200, so exactly 200 whole chunks fit — and none of that budget is left for the answer beyond the reserve.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

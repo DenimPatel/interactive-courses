@@ -1,0 +1,548 @@
+---
+title: "Training a vision-language model"
+description: "The staged recipe, freezing schedules and data mixtures, what breaks along the way, preference tuning on multimodal pairs, and the reinforcement-learning stage that turns a vision-language model into a reasoner."
+permalink: "/ai/multimodal/training-a-vlm/"
+section: "ai"
+series: "multimodal"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-mix td:first-child { white-space: nowrap; font-family: var(--font-mono); font-size: 12px; }
+  .g-note { font-size: 12px; opacity: 0.72; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multimodal %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Multimodal Models</span>
+    <h1>Training a vision-language model</h1>
+    <p>Nobody trains a vision-language model from scratch. A vision-language model is one that reads an image and writes text about it, and the surprising part is that neither of its two large halves is built here. The vision tower &mdash; the half that turns pixels into vectors &mdash; arrives pretrained, meaning someone else already trained it on a large pile of images, and the language model arrives pretrained too, meaning it already knows how to read and write text. The whole job is to teach those two finished parts to work together without wrecking either one. A recipe is the plan that does this, and it is run in stages: separate training phases, one after another, each with its own settings. First the bridge &mdash; the small learned module that translates vision vectors into vectors the language model accepts &mdash; is warmed up against a frozen language model, where frozen means its weights are held fixed and receive no updates. Then the language model is opened up, so its weights can finally move, and trained with the bridge on a large mixed corpus, a big collection of examples that blends several kinds of task. Finally a smaller instruction set turns the result into something that follows directions. Each stage has its own freezing pattern &mdash; its own answer to which parts are allowed to learn &mdash; its own data, and its own characteristic failure. This part walks the schedule, prices its stages, and shows what happens when it is run too hard.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="stages">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The three stages</h2></div>
+    <p class="g-eyebrow">Warm up the adapter, open the language model, then instruct</p>
+    <p>Stage one is the bridge's turn. The vision tower and the language model are both frozen, and only the bridge is trained: either the projector, a small module that maps each vision vector into the language model's own width, or the Q-Former, a small transformer that reads the patches with a fixed set of learned queries and returns a handful of vectors. The data is usually a few hundred thousand caption pairs, where each pair is one image together with a sentence describing it. The point is not to teach anything new; it is to bring the bridge's random initialisation &mdash; the random weight values it starts from before any training at all &mdash; into a regime where its gradients are small and sensible before those gradients are allowed to flow into the language model. A gradient is the training signal that says how each of those weights should change, so a large, structured gradient is a violent instruction aimed at a model that was working fine. Skipping this step is one of the most common ways to destroy a good checkpoint, where a checkpoint is a saved set of trained weights. The reason is that a randomly initialised projector produces large, structured errors, and backpropagating them &mdash; sending those error signals backward through the network so they update weights &mdash; into a frozen-but-now-trainable language model is an efficient way to erase its text ability in a few hundred steps.</p>
+    <p>Stage two unfreezes the language model, meaning its weights are now allowed to update, and trains it together with the bridge on a much larger mixture &mdash; a blend of several datasets rather than a single one. That blend includes captions, visual question answering (questions about an image, paired with short answers), OCR (reading text that appears inside the image), and grounding (answering with a location, such as which region the named object occupies). This is where the model actually learns to use the image, and it is also where forgetting happens. The mechanism is worth naming: because the language model's weights are now moving on data that is mostly images, nothing in the objective is protecting the text knowledge those weights encoded before, so that knowledge can quietly erode. The literature calls this catastrophic forgetting. Stage three is instruction tuning on a smaller, higher-quality set of visual dialogue, where each item is a request paired with the reply it should produce. It is usually run with the vision tower still frozen, and it is what turns a captioning and answering system into an assistant. Some recipes unfreeze the vision tower for the last stage; the toggle below lets you see what that costs.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="train-gantt-canvas" width="520" height="250"></canvas>
+        <p class="g-canvas-hint">The schedule: one row per component, one column per stage, filled where the component is trainable and hatched where it is frozen. Stage widths follow the sliders.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Stage 1 · warm-up <span class="val">1</span></label><input type="range" id="train-s1" min="1" max="8" step="1" value="1"></div>
+        <div class="g-field"><label>Stage 2 · pretraining <span class="val">3</span></label><input type="range" id="train-s2" min="1" max="12" step="1" value="3"></div>
+        <div class="g-field"><label>Stage 3 · instruction <span class="val">1</span></label><input type="range" id="train-s3" min="1" max="8" step="1" value="1"></div>
+        <div class="g-field"><label>Unfreeze vision tower <span class="val">off</span></label><input type="range" id="train-vision" min="0" max="1" step="1" value="0"></div>
+        <div class="g-readout" id="train-gantt-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> describe the three stages and what each trains, say which components are frozen in each, read a data mixture, explain catastrophic forgetting of text ability and why the warm-up exists, say what multimodal DPO adds to the recipe, and say how group-relative reinforcement learning sharpens a model on questions whose answers can be checked. (DPO is a preference-tuning method that learns from pairs of better and worse answers instead of from one correct answer.) These are also the questions worth asking of any recipe you meet, not only this one.</span></div>
+    <div class="g-toc">
+      <a href="#frozen">2 · What is frozen when</a>
+      <a href="#mixture">3 · The data mixture</a>
+      <a href="#breaks">4 · What breaks</a>
+      <a href="#preference">5 · Preference tuning on pairs</a>
+      <a href="#rl">6 · RL and reasoning post-training</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="frozen">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>What is frozen when</h2></div>
+    <p class="g-eyebrow">Three components, three schedules</p>
+    <p>The freezing schedule &mdash; the per-stage list of which components are allowed to learn and which are held fixed &mdash; is the schedule's whole content, and the pattern in this demo is the LLaVA shape, named after the model that made it standard. The projector is trainable in every stage. The language model is frozen in stage one and trainable from stage two onward. The vision tower is frozen throughout unless the toggle is on, in which case it joins from stage two. Because the language model is a billion-parameter object &mdash; a parameter being one learned number in the network, so a billion of them is roughly the size of the whole text model &mdash; and the projector is a few tens of millions, the jump in trainable parameters between stage one and stage two is a factor of hundreds. Put a number on it and the reason for the separate first step is plain: warming up the bridge alone moves tens of millions of weights, while the opening step of stage two moves billions. That is exactly why stage one must exist as a separate, gentle step rather than as the first iteration of stage two.</p>
+    <p>There is a second reason the pattern matters. The language model carries text ability that was expensive to obtain: it reasons, follows instructions and writes fluently, and those skills were paid for with a very large text corpus. There is no stage in this recipe whose data is mostly text, so the training signal is dominated by images. That matters because any step that moves the language model's weights is a step that can move them away from fluency, reasoning and instruction following, and the data mixture &mdash; the deliberate blend of text and image examples &mdash; is the only thing holding that line. Nothing in the multimodal objective marks the text weights as off-limits, so they are free to move until something else holds them in place. The bars below price each stage; the curve in the next-but-one step is what happens to the text side of the ledger, the running account of what the original model could still do.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="train-parts-canvas" width="460" height="230"></canvas>
+        <p class="g-canvas-hint">Trainable parameters by stage, in billions, under the freeze pattern above. The projector is a rounding error next to the language model, which is the point of warming it up alone.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="train-parts-readout"></div>
+        <p class="g-mini">Rough sizes: projector 21 M, language model 7.0 B, vision tower 0.30 B. The numbers scale with the choice in the previous part.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>The unfreeze decision is the expensive one.</b> Training the vision tower multiplies the vision-side compute and adds a second source of catastrophic forgetting, because the encoder may lose the general visual features that a contrastive pretraining run paid for &mdash; contrastive pretraining being the earlier stage that taught the encoder to match images with their captions, which is where its broad visual knowledge comes from. Most recipes leave it frozen and spend the budget on data instead.</span></div>
+  </section>
+
+  <section class="g-step" id="mixture">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The data mixture</h2></div>
+    <p class="g-eyebrow">Captions teach alignment, VQA teaches use, instructions teach behaviour</p>
+    <p>The data changes with the stage because the objective &mdash; the quantity the model is being trained to improve &mdash; does. Stage one wants pairs that are easy and unambiguous, so it uses caption data, where the only thing to learn is which image vector corresponds to which caption. Stage two needs the model to extract information the captions never mentioned, such as the text on a sign or where a small object sits, so it mixes in visual question answering, OCR and grounding sets, and it deliberately keeps some text-only data to slow the drift in language ability. A caption is a weak teaching signal for a specific question, because the same photo can be described in many correct ways; a question-answer item instead asks one thing and expects a short, definite reply, which is why stage two needs it. Stage three is small and curated, meaning every example was chosen or written on purpose rather than scraped in bulk: the answers are long and conversational, and the point is the format of the interaction rather than the volume of the signal.</p>
+    <table class="g-cheat g-mix">
+      <thead><tr><th>Stage</th><th>Typical mixture</th><th>Scale</th><th>What it teaches</th></tr></thead>
+      <tbody>
+        <tr><td>1 · warm-up</td><td>Caption pairs; CC3M, LAION, alt text</td><td>~0.5 M pairs</td><td>Project the vision features into the language model's space</td></tr>
+        <tr><td>2 · pretraining</td><td>Captions + VQA + OCR + grounding + a little text-only</td><td>~1 M+ samples</td><td>Ground answers in the image, and stop the language model drifting</td></tr>
+        <tr><td>3 · instruction</td><td>Short visual dialogues, detailed descriptions, refusals</td><td>~0.5 M turns</td><td>Follow instructions, answer at the right length, admit uncertainty</td></tr>
+        <tr><td>4 · preference</td><td>Pairs of responses to the same image, one preferred</td><td>~10 K&ndash;100 K pairs</td><td>Prefer the careful answer over the confident wrong one</td></tr>
+      </tbody>
+    </table>
+    <div class="g-goal">💡 <span><b>The mixture is where the deployment shows up.</b> A model trained mostly on short captions is a strong captioner and a weak assistant; a model trained mostly on long instruction answers becomes verbose and starts describing things that are not there. When a failure looks like a behaviour, look at the mixture before looking at the architecture. That order matters because the mixture is cheap to change and the architecture is not, so it is usually the first lever worth pulling.</span></div>
+  </section>
+
+  <section class="g-step" id="breaks">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>What breaks</h2></div>
+    <p class="g-eyebrow">The trade the schedule is trying to keep</p>
+    <p>Turning up the language model's learning rate &mdash; the step size training takes when it updates weights, so a larger value moves them further per example &mdash; or leaving it unfrozen for too long without text data, produces a characteristic curve: visual question answering improves while text benchmarks fall. A benchmark is a fixed test set used to score a model, so a falling number means measured ability, not one unlucky answer. The model is being optimised for the multimodal objective, and the text ability that the objective does not directly reward is free to erode. The failure is quiet, because the model still produces fluent sentences; it has lost some of the reasoning and world knowledge that made those sentences correct. Picture two runs at the same budget: one spends every batch on images and scores higher on visual question answering, while one keeps a quarter of its batches as plain text and scores a little lower on images but holds its reasoning. Mixing in text-only data, lowering the learning rate, or freezing for more of training all trade multimodal accuracy for retention, and no recipe escapes the trade entirely.</p>
+    <p>Two other failures are worth naming because they look like bugs and are not. The first is that OCR and small-text reading remain weak long after captioning looks solved. The reason is resolution: characters are small and fine, and the default pipeline &mdash; the fixed chain of resizing and patching that turns a picture into tokens &mdash; has already thrown that fine detail away before the language model sees anything, which is the previous part's compression in action. The second is that grounding, the ability to point at the object it just named, lags behind naming it. Naming only needs the right features to exist somewhere in the image token set, while grounding needs them in the right place: a model can tell that a dog is present from a blurred patch and still not be able to say which patch it occupies.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="train-curve-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">A sketch of the trade: VQA accuracy rises and text benchmark accuracy falls as the language model is tuned harder on multimodal data. The marker is the current setting.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Language model tuning <span class="val">0.4</span></label><input type="range" id="train-lr" min="0" max="10" step="1" value="4"></div>
+        <div class="g-readout" id="train-curve-readout"></div>
+        <p class="g-mini">The curves are illustrative, not measured: the shape is the claim, plus the fact that the two lines cross rather than rise together.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Text-only data is the standard antidote.</b> Keeping a fraction of pure-language batches in the mixture is the cheapest way to hold the text side of the ledger, and it costs image throughput rather than model capacity &mdash; throughput being how many examples the run gets through per unit of time, so a text batch is spent on language instead of images and the image side learns a little slower. Recipes that drop it for speed report exactly the forgetting curve above.</span></div>
+  </section>
+
+  <section class="g-step" id="preference">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Preference tuning on pairs</h2></div>
+    <p class="g-eyebrow">Learning from better and worse, not from right and wrong</p>
+    <p>Supervised tuning &mdash; also called supervised fine-tuning, or SFT &mdash; needs a reference answer for every prompt, and for a multimodal question there is often no single right answer. Ask ten people to describe a photograph and you get ten different sentences; none is wrong, so treating one of them as the target teaches the model to imitate that style rather than to prefer a better answer. Preference tuning takes a different route: it asks for two responses, marks one preferred, and trains the model to raise the likelihood of the chosen one relative to the rejected one. No reference answer is needed, only a judgement about which of the two is better. In multimodal DPO &mdash; direct preference optimisation, the objective that adapts this idea to image-conditioned pairs &mdash; the pair shares the same image. Because the two answers look at the same pixels, the difference between them is usually carefulness rather than perception, so what is learned is to stop over-claiming. A reference model &mdash; a frozen copy of the model from before this stage &mdash; anchors the update, keeping the trained model from wandering too far, and the coefficient $\beta$ controls how far the policy, meaning the model being trained, is allowed to drift from it. Small $\beta$ learns preferences fast but drifts far and reward-hacks, meaning it exploits the preference signal rather than genuinely getting better; large $\beta$ stays close and barely moves.</p>
+    <p>The plot below shows the two failure modes as functions of $\beta$: held-out preference accuracy &mdash; scores on pairs the training run never saw, so the number measures generalisation rather than memorisation &mdash; which rises as the model is allowed to move, and the rate at which it drifts into confidently wrong answers. The sweet spot is the region where accuracy has risen but hacking has not yet climbed &mdash; and it is narrow enough that $\beta$ is treated as a real hyperparameter, a setting you tune by experiment and defend with evidence, rather than as a formality.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="train-dpo-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">Held-out preference accuracy and the rate of confident hallucination against the DPO coefficient β. Both are fractions, so they share one axis.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>β <span class="val">0.20</span></label><input type="range" id="train-beta" min="0" max="10" step="1" value="3"></div>
+        <div class="g-readout" id="train-dpo-readout"></div>
+        <p class="g-mini">Small β moves far from the reference model; large β barely moves. The hallucination curve is what makes the small-β end dangerous rather than merely different.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="rl">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>RL and reasoning post-training</h2></div>
+    <p class="g-eyebrow">The group is its own baseline</p>
+    <p>Preference tuning taught the model which of two answers a person would rather have. A newer stage asks a sharper question: among all the answers the model <em>could</em> produce, which ones are actually correct? That is a reinforcement-learning problem, and reinforcement learning here means training by trial and reward rather than by imitation: the model generates its own attempts, something scores them, and the update makes the better attempts more likely and the worse ones less likely. The immediate difficulty is that a reward is only a number, and a number means nothing on its own. A score of 0.6 is good or bad depending on what the model usually gets on that prompt, so every method in this family needs a <em>baseline</em> &mdash; a reference point for what an ordinary attempt scores &mdash; because without one the update cannot tell a genuine improvement from a lucky draw. Proximal policy optimisation, or PPO, the method that dominated reinforcement learning for language models, learns that baseline with a second network called a <em>critic</em>, trained to predict the reward the policy is about to receive. The critic roughly doubles the memory, needs its own tuning, and in a vision-language model it must also learn to read the image, because the reward it predicts depends on what was in the picture. That is a great deal of machinery to bolt onto the last stage of a recipe.</p>
+    <p><em>Group relative policy optimisation</em>, or GRPO, removes the critic by noticing where a baseline can be had for free. For a single prompt, sample not one response but a whole <em>group</em> of them &mdash; typically four to sixteen attempts at the same question &mdash; and score every attempt in the group with the reward function. The group's own average score is then the baseline. Each attempt's <em>advantage</em>, the quantity the update actually consumes, is its reward minus the group mean, divided by the group's spread, so that a response better than its siblings gets a positive advantage and its tokens are made more likely, while a response worse than its siblings gets a negative advantage and is suppressed. No critic network, no value head, no second model to train: the group is the baseline, and the reward scale cancels out of the ratio entirely. That one substitution is why GRPO spread through the open-model releases of 2025, and it was the method behind DeepSeek-R1's reasoning behaviour. The reward has to be computable without a person in the loop, because the group must be scored automatically and repeatedly. For a text model the checkable rewards are mathematics and code, where the final answer can be verified by a parser or a test run; for a vision-language model they are precisely the tasks the earlier parts of this volume set up: a chart question with a known answer, a document question that must quote the right field, a bounding box scored by how much it overlaps the true one, or a visual arithmetic problem whose final number can be read and compared. That recipe &mdash; reinforcement learning against a rule that can be checked, rather than against a human preference &mdash; is what produces the &ldquo;thinking&rdquo; vision-language models, which write out a chain of intermediate reasoning before committing to an answer. On the text side the proof was DeepSeek-R1; among open multimodal models, GLM-4.1V-Thinking and the reasoning-tuned Qwen3-VL variants are the same move applied to images.</p>
+    <p>The plot below is the mechanism, not the reward. It shows one prompt's group of sampled attempts on a reward axis, the group mean as the dashed line they are measured against, and each attempt's deviation from that line as a bar. The slider sets how many attempts the group contains, which is the method's main tuning knob and its main cost. With only two attempts the baseline is the average of two samples, so one lucky draw receives an enormous advantage and the update chases it; as the group grows the mean becomes a stabler estimate of what this prompt is worth to the model, the advantages shrink toward the group's genuine spread, and the signal is cleaner. The price is that every attempt in the group is a full generation, so a group of sixteen costs eight times the sampling compute of a group of two for the same number of prompts. Move the slider and watch the readout's advantages settle: at two attempts they are pinned near plus and minus one, and by sixteen the outliers separate from the pack.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="train-grpo-canvas" width="460" height="280"></canvas>
+        <p class="g-canvas-hint">One prompt's sampled group on a reward axis, the group mean as the baseline, and each attempt's signed distance from that mean. The advantages in the readout come from <code>Multimodal.rl.groupAdvantage</code>.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Group size G <span class="val">8</span></label><input type="range" id="train-rl-group" min="2" max="16" step="1" value="8"></div>
+        <div class="g-readout" id="train-grpo-readout"></div>
+        <p class="g-mini">Advantage = (reward minus group mean) / group spread. Small groups give a noisy baseline; large groups give a stable one and cost more samples per prompt.</p>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Where this stage sits.</b> Supervised tuning teaches the format of an answer, preference tuning teaches which of two answers is more careful, and group-relative reinforcement learning teaches correctness on questions that can be checked. They stack rather than replace one another, and the open recipes that produce a reasoning model run the earlier stages first, because a model that cannot follow the answer format will not reliably emit something a verifier can read. The cost of the stage is verbosity: a chain of intermediate reasoning is many more tokens and a longer wait, a deliberate trade of latency for accuracy on the hard cases.</span></div>
+    <div class="g-warn">⚠ <span><b>An uninformative reward is worse than none.</b> Group-relative advantages depend entirely on the reward being able to rank attempts within the group. If every attempt scores the same &mdash; because the verifier is too coarse, or the question too easy, or the answers too similar &mdash; then the group's spread is zero and every advantage is zero, so no gradient flows at all. A reward that is merely noisy is worse still, because it ranks attempts at random and the update reinforces whichever attempt happened to be scored highest. Getting the reward right, not the optimiser, is the hard part of this stage.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The staging recipe, the instruction-tuning data, and the methods that followed it. Read them in this order and the arc runs from the three-stage schedule, through the mixture and unfreezing decisions that refine it, to the objectives that teach a trained model to prefer a better answer, and finally to the reinforcement-learning stage that teaches it to check one.</p>
+    <ul class="g-refs">
+      <li>Haotian Liu, Chunyuan Li, Qingyang Wu and Yong Jae Lee, <a href="https://arxiv.org/abs/2304.08485">"Visual Instruction Tuning"</a>, 2023 &mdash; LLaVA's two-stage recipe: projector warm-up, then instruction tuning.</li>
+      <li>Haotian Liu, Chunyuan Li, Yuheng Li and Yong Jae Lee, <a href="https://arxiv.org/abs/2310.03744">"Improved Baselines with Visual Instruction Tuning"</a>, 2023 &mdash; the stage-two mixture, unfreezing decisions and the 665K instruction set.</li>
+      <li>Qinghao Ye, Haiyang Xu, Guohai Xu and coauthors, <a href="https://arxiv.org/abs/2308.12038">"mPLUG-Owl: Modularization Empowers Large Language Models with Multimodality"</a>, 2023 &mdash; staged training with a modular visual interface and an explicit forgetting discussion.</li>
+      <li>Rafael Rafailov, Archit Sharma, Eric Mitchell and coauthors, <a href="https://arxiv.org/abs/2305.18290">"Direct Preference Optimization: Your Language Model is Secretly a Reward Model"</a>, 2023 &mdash; the objective that multimodal DPO adapts to image-conditioned pairs.</li>
+      <li>DeepSeek-AI, Daya Guo, Dejian Yang and coauthors, <a href="https://arxiv.org/abs/2501.12948">"DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"</a>, 2025 &mdash; group-relative policy optimisation and the verifiable-reward recipe behind the reasoning wave.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>Warm-up stage</td><td>Train the bridge alone against a frozen language model on caption data</td></tr>
+        <tr><td>Joint pretraining</td><td>Unfreeze the language model, train it with the bridge on a mixed multimodal corpus</td></tr>
+        <tr><td>Instruction tuning</td><td>Small, curated visual dialogues that turn a captioner into an assistant</td></tr>
+        <tr><td>Catastrophic forgetting</td><td>Text ability degrades as the language model is tuned on image-dominated data</td></tr>
+        <tr><td>Freezing schedule</td><td>Which components receive gradients in which stage; the schedule's real content</td></tr>
+        <tr><td>Data mixture</td><td>The per-stage blend of captions, VQA, OCR, grounding and text-only data</td></tr>
+        <tr><td>Grounding lag</td><td>Naming an object is easier than pointing at it, so grounding trains last and lags</td></tr>
+        <tr><td>Preference tuning</td><td>Train on chosen/rejected pairs rather than on a single reference answer</td></tr>
+        <tr><td>DPO</td><td>Direct preference objective; $\beta$ sets how far the policy may drift from the reference</td></tr>
+        <tr><td>RL post-training</td><td>Sample attempts, score them, and update toward the better ones; no reference answer</td></tr>
+        <tr><td>GRPO</td><td>Group-relative policy optimisation: advantage = (reward minus group mean) / group spread, no critic</td></tr>
+        <tr><td>Verifiable reward</td><td>A score a rule can compute &mdash; a checked answer, a matched box &mdash; instead of a human preference</td></tr>
+        <tr><td>Thinking VLM</td><td>A model that writes intermediate reasoning before answering, bought with RL and paid for in latency</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A trained model still invents objects that are not in the picture. Nothing in this recipe removes that habit &mdash; training shapes which answers are preferred, not whether the model can tell when it does not know. The next part is about why that happens, why some image tokens are ignored, and how the benchmarks are built to catch it.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.multimodal teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/multimodal-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia, MM = Multimodal, c = Guide.colors();
+
+  var STAGES = ['projector warm-up', 'joint pretraining', 'instruction tuning'];
+  var ROWS = ['Vision tower', 'Projector', 'Language model'];
+  var stageSteps = [1, 3, 1];
+  var unfreezeVision = false;
+
+  var P_PROJECTOR = 21e6, P_LLM = 7.0e9, P_VISION = 0.304e9;
+
+  var lrX = 0.4;
+  var BETAS = [0.02, 0.05, 0.08, 0.12, 0.16, 0.2, 0.3, 0.4, 0.55, 0.7, 0.9];
+  var betaIdx = 5;
+
+  function fmtB(v) { return (v / 1e9).toFixed(v >= 1e9 ? 2 : 3) + ' B'; }
+
+  // Trainable flags: row 0 vision, row 1 projector, row 2 llm; per stage.
+  function trainable(row, stage) {
+    if (row === 1) return true;
+    if (row === 2) return stage >= 1;
+    if (row === 0) return unfreezeVision && stage >= 1;
+    return false;
+  }
+
+  // ---- 1. gantt ------------------------------------------------------------
+  var ganttSetup = Guide.setupCanvas(document.getElementById('train-gantt-canvas'), 520, 250, function () { drawGantt(); });
+
+  function drawGantt() {
+    if (!ganttSetup) return;
+    var ctx = ganttSetup.ctx, W = 520, H = 250;
+    ctx.clearRect(0, 0, W, H);
+    var padL = 118, padR = 16, padT = 46, padB = 30;
+    var plotW = W - padL - padR;
+    var total = stageSteps[0] + stageSteps[1] + stageSteps[2];
+    var rowH = (H - padT - padB) / ROWS.length;
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('training schedule · ' + total + ' relative steps', 12, 22);
+    ctx.restore();
+    var x = padL;
+    for (var s = 0; s < 3; s++) {
+      var w = plotW * stageSteps[s] / total;
+      ctx.save();
+      ctx.fillStyle = 'rgba(43,95,255,0.06)';
+      ctx.fillRect(x, padT, w, H - padT - padB);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.strokeRect(x, padT, w, H - padT - padB);
+      ctx.restore();
+      x += w;
+    }
+    for (var r = 0; r < ROWS.length; r++) {
+      var y = padT + r * rowH;
+      ctx.save();
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(ROWS[r], padL - 8, y + rowH * 0.62);
+      ctx.restore();
+      x = padL;
+      for (s = 0; s < 3; s++) {
+        var ww = plotW * stageSteps[s] / total;
+        var on = trainable(r, s);
+        ctx.save();
+        if (on) {
+          ctx.fillStyle = c.accent;
+          ctx.fillRect(x + 2, y + 6, Math.max(2, ww - 4), rowH - 12);
+          ctx.fillStyle = '#fff'; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+          if (ww > 52) ctx.fillText('trainable', x + ww / 2, y + rowH * 0.58);
+        } else {
+          ctx.fillStyle = 'rgba(120,120,120,0.16)';
+          ctx.fillRect(x + 2, y + 6, Math.max(2, ww - 4), rowH - 12);
+          ctx.strokeStyle = 'rgba(120,120,120,0.5)'; ctx.lineWidth = 1;
+          ctx.setLineDash([4, 3]);
+          ctx.strokeRect(x + 2.5, y + 6.5, Math.max(2, ww - 5), rowH - 13);
+          ctx.setLineDash([]);
+          ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+          if (ww > 52) ctx.fillText('frozen', x + ww / 2, y + rowH * 0.58);
+        }
+        ctx.restore();
+        x += ww;
+      }
+    }
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center';
+    x = padL;
+    for (s = 0; s < 3; s++) {
+      var ww2 = plotW * stageSteps[s] / total;
+      if (ww2 > 60) ctx.fillText('S' + (s + 1), x + ww2 / 2, H - 12);
+      x += ww2;
+    }
+    ctx.restore();
+    var el = document.getElementById('train-gantt-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">steps S1 / S2 / S3</span> ' + stageSteps.join(' / ') + '</div>' +
+        '<div><span class="k">vision tower</span> ' + (unfreezeVision ? 'unfrozen from S2' : 'frozen throughout') + '</div>' +
+        '<div><span class="k">projector</span> trainable in all stages</div>' +
+        '<div><span class="k">language model</span> frozen in S1, trainable after</div>' +
+        '<div class="g-mini">Stage one is small on purpose. Its job is to make the bridge safe before the language model sees its gradients.</div>';
+    }
+  }
+
+  // ---- 2. trainable parameters by stage -----------------------------------
+  var partsSetup = Guide.setupCanvas(document.getElementById('train-parts-canvas'), 460, 230, function () { drawParts(); });
+
+  function stageParams(s) {
+    var v = P_PROJECTOR;
+    if (trainable(2, s)) v += P_LLM;
+    if (trainable(0, s)) v += P_VISION;
+    return v;
+  }
+
+  function drawParts() {
+    if (!partsSetup) return;
+    var rows = [0, 1, 2].map(function (s) {
+      var v = stageParams(s);
+      return { label: 'Stage ' + (s + 1), value: v, valueLabel: fmtB(v), color: s === 1 ? c.accent : 'rgba(93,133,253,0.55)' };
+    });
+    var maxV = Math.max.apply(null, rows.map(function (r) { return r.value; })) * 1.12;
+    Guide.drawBars(partsSetup.ctx, 460, 230, rows, { padL: 80, padR: 90, padT: 34, padB: 12, maxV: maxV, fontSize: 12 });
+    var ctx = partsSetup.ctx;
+    ctx.save();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('trainable parameters per stage', 44, 14);
+    ctx.restore();
+    var el = document.getElementById('train-parts-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">stage 1</span> ' + fmtB(stageParams(0)) + ' (projector only)</div>' +
+        '<div><span class="k">stage 2</span> <span class="hi">' + fmtB(stageParams(1)) + '</span> (+ language model)</div>' +
+        '<div><span class="k">stage 3</span> ' + fmtB(stageParams(2)) + (unfreezeVision ? ' (+ vision tower)' : '') + '</div>' +
+        '<div class="g-mini">Stage 2 trains roughly three hundred times as many parameters as stage 1, which is why stage 1 is a warm-up and not a first epoch.</div>';
+    }
+  }
+
+  // ---- 4. forgetting curve -------------------------------------------------
+  var curvePlot = GM.plot(document.getElementById('train-curve-canvas'), {
+    W: 460, H: 280, xRange: [0, 1], yRange: [0, 1],
+    xLabel: 'language model tuning intensity', yLabel: 'accuracy',
+    onResize: function () { drawCurve(); }
+  });
+
+  function vqaAt(x) { return 0.45 + 0.32 * (1 - Math.exp(-3.2 * x)); }
+  function textAt(x) { return 0.74 - 0.42 * Math.pow(x, 1.4); }
+
+  function drawCurve() {
+    if (!curvePlot) return;
+    curvePlot.clear();
+    curvePlot.axes({ xLabel: 'language model tuning intensity', yLabel: 'accuracy' });
+    curvePlot.curve(function (x) { return vqaAt(x); }, { color: c.accent, width: 2.6, samples: 48 });
+    curvePlot.curve(function (x) { return textAt(x); }, { color: c.accent2, width: 2.6, samples: 48 });
+    curvePlot.vline(lrX, { color: c.text, dashed: true, width: 1.2, label: 'now', labelY: 0.06 });
+    curvePlot.legend([
+      { label: 'VQA accuracy', color: c.accent },
+      { label: 'text benchmark accuracy', color: c.accent2 }
+    ], { dy: 6 });
+    var el = document.getElementById('train-curve-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">tuning intensity</span> <span class="hi">' + lrX.toFixed(2) + '</span></div>' +
+        '<div><span class="k">VQA accuracy</span> ' + Guide.fmtPct(vqaAt(lrX), 1) + '</div>' +
+        '<div><span class="k">text accuracy</span> <span class="bad">' + Guide.fmtPct(textAt(lrX), 1) + '</span></div>' +
+        '<div><span class="k">forgetting</span> ' + Guide.fmtPct(0.74 - textAt(lrX), 1) + ' lost</div>' +
+        '<div class="g-mini">The two lines cross: past that point the multimodal gain is paid for with text ability. Text-only batches in the mixture flatten the falling curve.</div>';
+    }
+  }
+
+  // ---- 5. DPO --------------------------------------------------------------
+  var dpoPlot = GM.plot(document.getElementById('train-dpo-canvas'), {
+    W: 460, H: 280, xRange: [0, 1], yRange: [0, 1],
+    xLabel: 'DPO coefficient β', yLabel: 'fraction',
+    onResize: function () { drawDpo(); }
+  });
+
+  function prefAt(beta) { return 0.60 + 0.30 * (1 - Math.exp(-8 * beta)); }
+  function hackAt(beta) { return 0.46 * Math.exp(-9 * beta); }
+  function driftAt(beta) { return 2.4 * Math.exp(-7 * beta); }
+
+  function drawDpo() {
+    if (!dpoPlot) return;
+    var beta = BETAS[betaIdx];
+    dpoPlot.clear();
+    dpoPlot.axes({ xLabel: 'DPO coefficient β', yLabel: 'fraction' });
+    dpoPlot.curve(function (x) { return prefAt(x); }, { color: c.accent, width: 2.6, samples: 48 });
+    dpoPlot.curve(function (x) { return hackAt(x); }, { color: c.accent2, width: 2.6, samples: 48 });
+    dpoPlot.vline(beta, { color: c.text, dashed: true, width: 1.2, label: 'β = ' + beta, labelY: 0.06 });
+    dpoPlot.legend([
+      { label: 'held-out preference accuracy', color: c.accent },
+      { label: 'confident hallucination rate', color: c.accent2 }
+    ], { dy: 6 });
+    var el = document.getElementById('train-dpo-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">β</span> <span class="hi">' + beta + '</span></div>' +
+        '<div><span class="k">preference accuracy</span> ' + Guide.fmtPct(prefAt(beta), 1) + '</div>' +
+        '<div><span class="k">hallucination rate</span> <span class="bad">' + Guide.fmtPct(hackAt(beta), 1) + '</span></div>' +
+        '<div><span class="k">drift from reference</span> ' + driftAt(beta).toFixed(2) + ' nats</div>' +
+        '<div class="g-mini">Small β buys preference accuracy by drifting far from the reference and over-claiming. Large β stays safe and learns little.</div>';
+    }
+  }
+
+  function redraw() { drawGantt(); drawParts(); drawCurve(); drawDpo(); drawGrpo(); }
+
+  // ---- 6. GRPO group advantages -------------------------------------------
+  var RL_POOL = [0.28, 0.54, 0.61, 0.39, 0.77, 0.49, 0.46, 0.88, 0.34, 0.57, 0.43, 0.65, 0.51, 0.23, 0.70, 0.48];
+  var rlGroupSize = 8;
+
+  var grpoPlot = GM.plot(document.getElementById('train-grpo-canvas'), {
+    W: 460, H: 280, xRange: [-0.5, 15.5], yRange: [0, 1],
+    xLabel: 'sampled response in the group', yLabel: 'reward',
+    onResize: function () { drawGrpo(); }
+  });
+
+  function drawGrpo() {
+    if (!grpoPlot) return;
+    var rewards = RL_POOL.slice(0, rlGroupSize);
+    var g = MM.rl.groupAdvantage(rewards);
+    grpoPlot.clear();
+    var ticks = [];
+    for (var t = 0; t < rewards.length; t++) ticks.push(t);
+    grpoPlot.axes({
+      xLabel: 'sampled response in the group', yLabel: 'reward',
+      xTicks: ticks, xFormat: function (v) { return 'r' + (v + 1); },
+      yFormat: function (v) { return v.toFixed(1); }
+    });
+    grpoPlot.columns(rewards.map(function (r, i) {
+      return { x0: i - 0.26, x1: i + 0.26, h: r, color: r >= g.mean ? c.accent : c.accent2 };
+    }), { base: g.mean, alpha: 0.28 });
+    grpoPlot.hline(g.mean, { color: c.text, dashed: true, label: 'group mean', labelX: 0.1 });
+    grpoPlot.points(rewards.map(function (r, i) { return [i, r]; }), { color: c.accent, r: 4.5, stroke: '#fff', width: 1.4 });
+    grpoPlot.legend([
+      { label: 'sampled reward', color: c.accent },
+      { label: 'above the group mean', color: c.accent, swatch: true },
+      { label: 'below the group mean', color: c.accent2, swatch: true }
+    ], { dy: 6 });
+    var el = document.getElementById('train-grpo-readout');
+    if (el) {
+      var best = Math.max.apply(null, g.advantages);
+      var worst = Math.min.apply(null, g.advantages);
+      el.innerHTML =
+        '<div><span class="k">group size G</span> <span class="hi">' + rlGroupSize + '</span> attempts</div>' +
+        '<div><span class="k">group mean</span> ' + g.mean.toFixed(3) + '</div>' +
+        '<div><span class="k">group spread</span> ' + g.std.toFixed(3) + '</div>' +
+        '<div><span class="k">best advantage</span> <span class="hi">+' + best.toFixed(2) + '</span></div>' +
+        '<div><span class="k">worst advantage</span> <span class="bad">' + worst.toFixed(2) + '</span></div>' +
+        '<div class="g-mini">Advantage is measured in units of the group&rsquo;s own spread, so it says how unusual an attempt was for this prompt rather than how high its raw score was. More attempts make the baseline steadier and cost more sampling.</div>';
+    }
+  }
+
+  Guide.bindSliders(document.querySelectorAll('#train-s1'), function (el) {
+    stageSteps[0] = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#train-s2'), function (el) {
+    stageSteps[1] = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#train-s3'), function (el) {
+    stageSteps[2] = parseInt(el.value, 10);
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#train-vision'), function (el) {
+    unfreezeVision = parseInt(el.value, 10) === 1;
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = unfreezeVision ? 'on' : 'off';
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#train-lr'), function (el) {
+    lrX = parseInt(el.value, 10) / 10;
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#train-beta'), function (el) {
+    betaIdx = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = BETAS[betaIdx];
+    redraw();
+  });
+  Guide.bindSliders(document.querySelectorAll('#train-rl-group'), function (el) {
+    rlGroupSize = parseInt(el.value, 10);
+    var valEl = el.parentElement ? el.parentElement.querySelector('.val') : null;
+    if (valEl) valEl.textContent = rlGroupSize;
+    redraw();
+  });
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'training-warmup',
+      kind: 'choice',
+      prompt: 'Why does the recipe warm up the projector against a frozen language model before unfreezing the language model?',
+      options: [
+        { label: 'A randomly initialised bridge produces large structured errors, and sending those gradients into the language model damages it.', correct: true },
+        { label: 'The projector cannot be trained once the language model has any gradients at all.', correct: false },
+        { label: 'Warm-up is where the vision tower learns to see, and it needs isolation to do so.', correct: false }
+      ],
+      explanation: 'Stage one exists to move the bridge into a sensible regime cheaply. Only the projector receives gradients, so the language model cannot be hurt by the random initialisation of the adapter.'
+    },
+    {
+      id: 'training-stage2-params',
+      kind: 'numeric',
+      prompt: 'A projector has 21 million parameters and the language model has 7.0 billion. If stage 2 trains both and the vision tower stays frozen, how many billions of parameters are trainable? Enter a number like 7.02.',
+      answer: 7.02,
+      tolerance: 0.06,
+      unit: 'billion',
+      explanation: 'Trainable = 7.0 B + 0.021 B = 7.021 B, which rounds to about 7.02 billion. The projector is a rounding error next to the language model, which is why warming it up alone is cheap.'
+    },
+    {
+      id: 'training-forgetting',
+      kind: 'choice',
+      prompt: 'What does catastrophic forgetting look like when the language model is tuned too hard on multimodal data?',
+      options: [
+        { label: 'Visual question answering improves while text benchmarks quietly fall.', correct: true },
+        { label: 'Both multimodal and text accuracy fall together, since the objective is one loss.', correct: false },
+        { label: 'The model stops producing fluent text and answers entirely in image tokens.', correct: false }
+      ],
+      explanation: 'The multimodal objective does not directly reward text ability, so it can erode while the visual metric rises. The failure is quiet because the output stays fluent; the knowledge and reasoning behind it are what degrade.'
+    },
+    {
+      id: 'training-dpo',
+      kind: 'choice',
+      prompt: 'In multimodal DPO, what does the coefficient β control?',
+      options: [
+        { label: 'How far the trained policy is allowed to drift from the reference model.', correct: true },
+        { label: 'How many image tokens the preference pairs are allowed to contain.', correct: false },
+        { label: 'The fraction of preference pairs that are chosen versus rejected.', correct: false }
+      ],
+      explanation: 'Beta is the strength of the anchor to the reference policy. Small beta lets the model move far and learn preferences fast, at the risk of drifting into confidently wrong answers; large beta stays close and changes little.'
+    },
+    {
+      id: 'training-grpo',
+      kind: 'choice',
+      prompt: 'How does GRPO obtain the baseline that turns a raw reward into an advantage?',
+      options: [
+        { label: 'It samples a group of responses to the same prompt and uses the group\'s own mean and spread as the baseline, so no critic network is trained.', correct: true },
+        { label: 'It trains a separate value network to predict the expected reward, as PPO does.', correct: false },
+        { label: 'It compares each response against a single human-preferred answer, as DPO does.', correct: false }
+      ],
+      explanation: 'GRPO computes advantage = (reward minus group mean) / group spread from a group of sampled attempts. The group supplies its own baseline, which removes the critic PPO needs; DPO instead learns from a chosen/rejected pair, and PPO trains a value network to estimate the baseline.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

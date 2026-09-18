@@ -1,0 +1,1054 @@
+---
+title: "Bundle Adjustment & Structure from Motion, Interactively"
+description: "The reprojection-error cost over every camera and every point, why it connects straight back to Gauss-Newton and Levenberg-Marquardt, and a toy structure-from-motion demo you run yourself."
+permalink: "/vision/multi-view-geometry/sfm/"
+section: "vision"
+series: "multi_view_geometry"
+redirect_from:
+  - /multi-view-geometry-sfm.html
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }} · {{ site.title }}</title>
+<meta name="description" content="{{ page.description }}">
+<link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+{% include favicon.html %}
+<style>
+  .mvg { max-width: 1180px; }
+  .mvg .page-header { padding-top: clamp(32px, 6vw, 56px); }
+  .mvg-step { padding: 48px 0; border-top: 1px solid var(--color-divider); }
+  .mvg-step:first-of-type { border-top: none; }
+  .mvg-step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--color-text); color: var(--color-bg);
+    font-family: var(--font-heading); font-weight: 600; font-size: 14px; flex: 0 0 auto;
+  }
+  .mvg-step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .mvg-step-head h2 { margin: 0; font-size: clamp(22px, 3vw, 28px); }
+  .mvg-eyebrow {
+    font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--color-accent-700); margin: 0 0 4px 42px;
+  }
+  .mvg-goal {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-100); border-left: 3px solid var(--color-accent);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-goal b { color: var(--color-accent-800); }
+  .mvg-warn {
+    display: flex; gap: 10px; margin: 16px 0 20px; padding: 12px 14px;
+    background: var(--color-accent-2-100); border-left: 3px solid var(--color-accent-2);
+    border-radius: var(--radius-sm); font-size: 14px; line-height: 1.55;
+  }
+  .mvg-warn b { color: var(--color-accent-2-800); }
+  .mvg-math {
+    font-family: var(--font-mono); font-size: 13.5px; background: var(--color-surface);
+    padding: 12px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0 0 16px;
+    line-height: 1.7;
+  }
+  .mvg-math sub, .mvg-math sup, p sub, p sup, td sub, td sup {
+    font-size: 0.72em;
+  }
+  .mvg-matrix-eq { display: inline-flex; align-items: center; gap: 8px; vertical-align: middle; flex-wrap: wrap; }
+  .mvg-matrix-wrap { display: inline-flex; align-items: stretch; vertical-align: middle; }
+  .mvg-bracket {
+    font-family: var(--font-mono); font-size: 2.6em; font-weight: 300; line-height: 1;
+    display: flex; align-items: center; transform: scaleX(0.6); user-select: none; opacity: 0.85;
+  }
+  .mvg-bracket-sm { font-size: 1.9em; }
+  .mvg-matrix-grid {
+    display: inline-grid; grid-template-columns: repeat(3, minmax(1.7em, auto));
+    align-items: center; justify-items: end; gap: 4px 16px; padding: 2px 8px;
+  }
+  .mvg-matrix-grid.cols-2 { grid-template-columns: repeat(2, minmax(2.2em, auto)); }
+  .mvg-matrix-grid.cols-1 { grid-template-columns: minmax(2.2em, auto); }
+  .mvg-demo {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
+    background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+    box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
+    margin-top: 8px;
+  }
+  .mvg-canvas-wrap { flex: 1 1 420px; min-width: 280px; }
+  .mvg-plot3d { width: 100%; height: 420px; background: var(--color-neutral-100); border-radius: var(--radius-sm); cursor: grab; }
+  .mvg-plot3d:active { cursor: grabbing; }
+  .mvg-canvas-hint { font-size: 11px; opacity: 0.6; margin-top: 6px; }
+  .mvg-controls { flex: 1 1 260px; min-width: 240px; font-size: 13.5px; }
+  .mvg-field { margin-bottom: 14px; }
+  .mvg-field label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12.5px; color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+  .mvg-field label span.val { font-family: var(--font-mono); color: var(--color-text); }
+  .mvg-field input[type=range] { width: 100%; accent-color: var(--color-accent); }
+  .mvg-btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .mvg-btnrow button {
+    font-family: var(--font-heading); font-weight: 600; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 7px 13px; border-radius: var(--radius-md);
+  }
+  .mvg-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .mvg-btnrow button:disabled { opacity: 0.45; cursor: default; }
+  .mvg-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .mvg-readout .k { opacity: 0.6; }
+  .mvg-readout .hi { color: var(--color-accent-700); font-weight: 600; }
+  .mvg-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; opacity: 0.85; }
+  .mvg-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .mvg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .mvg-costchart { width: 100%; height: 140px; background: var(--color-bg); border-radius: var(--radius-sm); display: block; margin-top: 12px; }
+  .mvg-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .mvg-cheat th, .mvg-cheat td { padding: 10px 12px; border-bottom: 1px solid var(--color-divider); vertical-align: top; text-align: left; }
+  .mvg-cheat th { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6; }
+  .mvg-next {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 24px; padding: 18px; background: var(--color-surface); border-radius: var(--radius-md);
+  }
+  @media (max-width: 640px) {
+    .mvg-eyebrow { margin-left: 0; }
+    .mvg-step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.multi_view_geometry %}
+
+<main>
+<div class="wrap mvg">
+  <section class="page-header">
+    <span class="section-kicker">Interactive guide · Part 15 of {{ site.data.series.multi_view_geometry.parts | size }}</span>
+    <h1>Bundle Adjustment &amp; Structure from Motion</h1>
+    <p>Every part so far used two or three cameras. Real reconstructions — a phone scan, a drone survey, a SLAM map — use dozens to thousands of views of hundreds of thousands of points. Making every camera and every point agree with every observation, all at once, is <strong>bundle adjustment</strong>: the payoff this whole series has been building toward, and the finale of this guide.</p>
+  </section>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+{% raw %}
+  <section class="mvg-step" id="setup">
+    <div class="mvg-step-head"><span class="mvg-step-num">0</span><h2>From pairs and triples to everything at once</h2></div>
+    <p class="mvg-eyebrow">Setup</p>
+    <p><strong>Structure from Motion (SfM)</strong> is the general problem: given a pile of overlapping photos with unknown camera poses, recover both the 3D structure of the scene <em>and</em> where every camera was standing. A typical pipeline chains together everything from this series: match features and estimate <var>F</var>/<var>E</var> between pairs (Part 6), recover relative poses (Part 10), triangulate an initial point cloud (Part 10), extend to more views via point transfer (Part 12) — and then, because every step so far only used two or three views at a time, small errors accumulate. <strong>Bundle adjustment</strong> is the cleanup step that fixes that: refine every camera pose and every 3D point together, so the whole reconstruction agrees with every single observation as well as possible.</p>
+  </section>
+
+  <section class="mvg-step" id="bamath">
+    <div class="mvg-step-head"><span class="mvg-step-num">1</span><h2>One cost function, all cameras, all points</h2></div>
+    <p class="mvg-eyebrow">Foundations</p>
+    <p>Stack every camera's pose and every point's position into one big set of unknowns. For every observation — camera <var>i</var> seeing point <var>j</var> at pixel <var>x&#8261;&#8352;</var> — define a reprojection residual, and sum the squared residuals over the whole dataset:</p>
+    <div class="mvg-math">C = &sum;&#8261;,&#8352; ‖&#960;(camera&#8261;, point&#8352;) − x&#8261;&#8352;‖&#178;</div>
+{% endraw %}    <p>That's it — that's the entire bundle adjustment problem. It looks just like the robot localization cost function from the <a href="{{ '/vision/nonlinear-optimization/gradient-descent/' | relative_url }}">Nonlinear Optimization series</a> — because it <em>is</em> the same kind of problem: a sum of squared nonlinear residuals, minimized with exactly the same machinery. <strong>Gauss-Newton</strong> and, in practice, <strong>Levenberg-Marquardt</strong> (see <a href="{{ '/vision/nonlinear-optimization/gradient-descent/' | relative_url }}">Part 5 of that series</a> and its treatment of <a href="{{ '/vision/nonlinear-optimization/3d-rotations/' | relative_url }}">3D rotations</a>, since camera orientations live on the same curved rotation manifold) are the standard solvers — this is literally the textbook motivating example for why that series' machinery exists. And when the same optimization runs incrementally, one new camera pose at a time, as a robot moves — instead of once, in a batch, over a fixed photo set — it's <a href="{{ '/vision/nonlinear-optimization/slam/' | relative_url }}">SLAM</a>: the online sibling of this page's offline problem.</p>{% raw %}
+    <div class="mvg-goal">💡 <span><b>Why it's hard:</b> the unknowns can number in the millions (thousands of 6-DOF camera poses plus millions of 3D points), so real bundle-adjustment solvers (Ceres, g2o, GTSAM) exploit the fact that most cameras don't see most points — the Jacobian is enormous but extremely sparse — to make this tractable at scale.</span></div>
+  </section>
+
+  <section class="mvg-step" id="demo">
+    <div class="mvg-step-head"><span class="mvg-step-num">2</span><h2>Working example: a toy structure-from-motion pipeline</h2></div>
+    <p class="mvg-eyebrow">Interactive · the finale</p>
+    <div class="mvg-goal">🎯 <b>Learning goal:</b> watch a noisy, roughly-triangulated point cloud snap into place as bundle adjustment iterates — and watch the cost curve fall the way every method in the optimization series did.</div>
+{% endraw %}    <p>Five cameras (fixed, known poses — as if already calibrated by the earlier parts of this series) each observe the cube's 8 corners, with pixel noise added. Corners are first <b>initialized</b> by linear triangulation (Part 10) from the first two cameras that see them — a fast but rough estimate. Click <b>Run bundle adjustment</b> to jointly refine every point's position against <em>every</em> camera that observed it, via Gauss-Newton, and watch the cost fall and the reconstructed cube tighten up around the truth. For a non-iterative weak-perspective alternative to this iterative refinement, see affine factorization (<a href="{{ '/vision/multi-view-geometry/factorization/' | relative_url }}">Part 14</a>).</p>{% raw %}
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s2-plot3d" class="mvg-plot3d"></div>
+        <p class="mvg-canvas-hint">Drag to orbit, scroll to zoom. Diamonds = the 5 fixed cameras.</p>
+        <div class="mvg-legend">
+          <span><i style="background:var(--color-text)"></i>true cube</span>
+          <span><i style="background:#9b9797"></i>triangulated init</span>
+          <span><i style="background:var(--color-accent-2)"></i>after bundle adjustment</span>
+        </div>
+        <canvas id="s2-costchart" class="mvg-costchart"></canvas>
+        <p class="mvg-canvas-hint">Total reprojection cost vs. iteration.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Pixel noise σ <span class="val" id="s2-noiseval"></span></label><input type="range" id="s2-noise" min="0" max="10" step="0.2" value="5"></div>
+        <div class="mvg-field" style="display:flex; align-items:center; gap:8px; justify-content:flex-start;">
+          <input type="checkbox" id="s2-optposes" style="width:auto; accent-color:var(--color-accent);">
+          <label for="s2-optposes" style="margin:0; display:inline; font-size:13px;">also optimize camera poses (δ on SO(3), see below)</label>
+        </div>
+        <div class="mvg-btnrow">
+          <button id="s2-step" class="mvg-primary">Step ▸</button>
+          <button id="s2-run">Run</button>
+          <button id="s2-newscene">New noisy scene</button>
+        </div>
+        <div class="mvg-readout" id="s2-readout"></div>
+      </div>
+    </div>
+    <p>With the checkbox off, this demo only refines the <em>points</em>, holding the 5 camera poses fixed, exactly as before. Check it and every camera's pose is <em>also</em> perturbed away from truth at scene start (simulating imperfect initial calibration) and refined every step — jointly with the points, using the block-coordinate version of the same Gauss-Newton loop above (points refined with poses held fixed, then poses refined with points held fixed, repeated). Camera 0 is always left untouched — that pins the gauge freedom explained below.</p>
+    <div class="mvg-demo" style="margin-top:14px;">
+      <div class="mvg-canvas-wrap">
+        <canvas id="s2-sparsity" class="mvg-costchart" style="height:230px;"></canvas>
+        <p class="mvg-canvas-hint">Jacobian sparsity: one row per observation, columns are the 5×6 camera-pose block <span style="color:var(--color-accent)">■</span> followed by the 8×3 point block <span style="color:var(--color-accent-2)">■</span>. Each row only touches <em>one</em> camera-column-group and <em>one</em> point-column-group.</p>
+      </div>
+      <div class="mvg-canvas-wrap">
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <div><canvas id="s2-Ucc"></canvas><p class="mvg-canvas-hint" style="text-align:center;">U<sub>cc</sub> (30×30)</p></div>
+          <div><canvas id="s2-W"></canvas><p class="mvg-canvas-hint" style="text-align:center;">W (30×24)</p></div>
+          <div><canvas id="s2-Vpp"></canvas><p class="mvg-canvas-hint" style="text-align:center;">V<sub>pp</sub> (24×24)</p></div>
+        </div>
+        <p class="mvg-canvas-hint">|J&#7488;J| for this exact toy problem, split into camera-camera, camera-point, and point-point blocks. Only the block-diagonal structure of U<sub>cc</sub> and V<sub>pp</sub> is exploited by the Schur complement below — W is left dense.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="sparsity">
+    <div class="mvg-step-head"><span class="mvg-step-num">3</span><h2>The Jacobian is almost all zeros</h2></div>
+    <p class="mvg-eyebrow">Why naive bundle adjustment doesn't scale</p>
+    <p>Stack every camera's 6 pose unknowns and every point's 3 position unknowns into one long vector, and stack every residual (one observation, camera <var>i</var> seeing point <var>j</var>) into one long vector <var>r</var>. Gauss-Newton needs the Jacobian <var>J = &part;r/&part;(cameras, points)</var> of that whole residual vector. Here's the fact that makes bundle adjustment special: the residual for observation <var>(i,j)</var> is <var>r&#8261;&#8352; = &#960;(camera&#8261;, point&#8352;) − x&#8261;&#8352;</var> — it is a function of <em>exactly two</em> blocks of unknowns, camera <var>i</var>'s 6 params and point <var>j</var>'s 3 params, and literally nothing else. Its derivative with respect to every other camera's params and every other point's params is exactly, structurally zero — not small, zero.</p>
+    <p>So each row-pair of <var>J</var> (one observation, 2 rows for <var>u,v</var>) has nonzero entries in only 9 of the (6·#cameras + 3·#points) columns. Grouping columns as "all camera blocks" then "all point blocks", <var>J</var> splits cleanly:</p>
+    <div class="mvg-math">J = [ J<sub>c</sub> &nbsp;|&nbsp; J<sub>p</sub> ]&nbsp;&nbsp;&nbsp;&nbsp;— one row-block per observation (i,j):<br>&nbsp;&nbsp;row (i,j):&nbsp; zeros … &nbsp;&#8593;&nbsp;&nbsp; &#8202;&part;r&#8261;&#8352;/&part;camera&#8261;&#8202;&nbsp;&nbsp; &#8593;&nbsp; … zeros&nbsp;&nbsp;|&nbsp;&nbsp; zeros … &nbsp;&#8593;&nbsp;&nbsp; &#8202;&part;r&#8261;&#8352;/&part;point&#8352;&#8202;&nbsp;&nbsp; &#8593;&nbsp; … zeros</div>
+    <p>Rendered as a grid (rows = observations, columns = parameters), the camera half of <var>J</var> looks block-diagonal-ish — each row lights up exactly one 6-wide camera stripe — and the point half looks the same with 3-wide point stripes. The demo above renders this pattern for the toy 5-camera, 8-point cube directly: <a href="#demo">scroll up</a> and toggle "optimize camera poses" to see it change shape live as visibility changes.</p>
+    <div class="mvg-warn">&#9888; <span><b>Why this matters:</b> real reconstructions have thousands of cameras and hundreds of thousands to millions of points. <var>J&#7488;J</var> — the matrix Gauss-Newton actually needs to invert — is <var>(6m+3n)×(6m+3n)</var>. For 2,000 cameras and 500,000 points that's a <var>1,512,000 × 1,512,000</var> matrix. Forming it densely, let alone inverting it, is completely out of the question — but well over 99.9% of its entries are exact zeros, because most cameras don't see most points. Exploiting that sparsity, rather than fighting it, is the entire subject of the next section.</span></div>
+  </section>
+
+  <section class="mvg-step" id="schur">
+    <div class="mvg-step-head"><span class="mvg-step-num">4</span><h2>Eliminate the points first: the Schur complement</h2></div>
+    <p class="mvg-eyebrow">The one trick that makes BA practical</p>
+    <p>The Gauss-Newton normal equations are <var>J&#7488;J&#183;&Delta; = −J&#7488;r</var>. Split the unknown update <var>&Delta;</var> into a camera part <var>&Delta;c</var> and a point part <var>&Delta;p</var>, and — because <var>J = [J<sub>c</sub>|J<sub>p</sub>]</var> — the normal equations split into a matching 2×2 block system:</p>
+    <div class="mvg-math">
+      <span class="mvg-matrix-eq">
+        <span class="mvg-matrix-wrap">
+          <span class="mvg-bracket mvg-bracket-sm" aria-hidden="true">[</span>
+          <span class="mvg-matrix-grid cols-2">
+            <span>U<sub>cc</sub></span><span>W</span>
+            <span>W<sup>T</sup></span><span>V<sub>pp</sub></span>
+          </span>
+          <span class="mvg-bracket mvg-bracket-sm" aria-hidden="true">]</span>
+        </span>
+        <span class="mvg-matrix-wrap">
+          <span class="mvg-bracket mvg-bracket-sm" aria-hidden="true">[</span>
+          <span class="mvg-matrix-grid cols-1">
+            <span>&Delta;c</span>
+            <span>&Delta;p</span>
+          </span>
+          <span class="mvg-bracket mvg-bracket-sm" aria-hidden="true">]</span>
+        </span>
+        =
+        <span class="mvg-matrix-wrap">
+          <span class="mvg-bracket mvg-bracket-sm" aria-hidden="true">[</span>
+          <span class="mvg-matrix-grid cols-1">
+            <span>e<sub>c</sub></span>
+            <span>e<sub>p</sub></span>
+          </span>
+          <span class="mvg-bracket mvg-bracket-sm" aria-hidden="true">]</span>
+        </span>
+      </span>
+    </div>
+    <p>where <var>U<sub>cc</sub> = J<sub>c</sub>&#7488;J<sub>c</sub></var>, <var>V<sub>pp</sub> = J<sub>p</sub>&#7488;J<sub>p</sub></var>, <var>W = J<sub>c</sub>&#7488;J<sub>p</sub></var>, and <var>e<sub>c</sub>, e<sub>p</sub></var> are the matching pieces of <var>−J&#7488;r</var>. The sparsity from the last section says something very precise about these three blocks: an entry of <var>U<sub>cc</sub></var> connecting camera <var>i</var> to camera <var>i&prime;</var> (<var>i≠i&prime;</var>) sums over residuals that depend on <em>both</em> cameras' params at once — but no residual ever does, since one observation only ever involves one camera. So <var>U<sub>cc</sub></var> is exactly block-diagonal (one 6×6 block per camera), and by the identical argument so is <var>V<sub>pp</sub></var> (one 3×3 block per point). Only <var>W</var>, whose <var>(i,j)</var> block sums over the single residual that <em>does</em> involve both camera <var>i</var> and point <var>j</var>, is nonzero off the block-diagonal — dense-ish, patterned by whichever cameras actually see whichever points.</p>
+    <p>A block-diagonal matrix inverts block-by-block, for free (invert each tiny 3×3 point block independently — trivial compared to inverting the whole thing). That's the opening <var>V<sub>pp</sub></var> gives you. Take the bottom block row of the system, <var>W&#7488;&Delta;c + V<sub>pp</sub>&Delta;p = e<sub>p</sub></var>, and solve it for <var>&Delta;p</var>:</p>
+    <div class="mvg-math">&Delta;p = V<sub>pp</sub>&#8315;&#185;(e<sub>p</sub> − W&#7488;&Delta;c)</div>
+    <p>Substitute that into the top block row, <var>U<sub>cc</sub>&Delta;c + W&Delta;p = e<sub>c</sub></var>, and the <var>&Delta;p</var> terms rearrange into a system purely in <var>&Delta;c</var> — the <strong>Schur complement</strong>, a.k.a. the <strong>reduced camera system</strong>:</p>
+    <div class="mvg-math">(U<sub>cc</sub> − W V<sub>pp</sub>&#8315;&#185;W&#7488;) &Delta;c = e<sub>c</sub> − W V<sub>pp</sub>&#8315;&#185;e<sub>p</sub></div>
+    <div class="mvg-goal">💡 <span><b>Why this is the trick:</b> the reduced system is dense in general (points couple cameras that share them), but it's only <var>6m×6m</var> in the camera params alone — no points anywhere in it. Real scenes have far more points than cameras (millions of points, thousands of cameras), so this is a dramatically smaller dense solve than the full <var>(6m+3n)×(6m+3n)</var> system. Solve it for <var>&Delta;c</var> first, then back-substitute into the <var>&Delta;p</var> equation above using the already-computed, already-cheap <var>V<sub>pp</sub>&#8315;&#185;</var> — no additional dense linear algebra required. This one identity — eliminate the (numerous, cheaply-invertible) points, solve a much smaller dense system for the (few, expensive) cameras, back-substitute — is exactly what Ceres, g2o, GTSAM, and COLMAP's bundle adjuster all do under the hood. Without it, large-scale bundle adjustment simply would not run.</span></div>
+{% endraw %}    <p>How dense the reduced system actually is depends on the <strong>visibility graph</strong>: the bipartite graph with cameras on one side, points on the other, and an edge for every observation. <var>W</var>'s nonzero pattern <em>is</var> this graph, and <var>W V<sub>pp</sub>&#8315;&#185;W&#7488;</var> fills in a camera-camera entry exactly when two cameras share at least one point — so a well-connected scene (lots of shared points between many camera pairs) gives a denser but still far smaller reduced system, while a weakly-connected scene (long chains of cameras with thin overlap, or loops that barely close) gives a sparser reduced system that's <em>harder to solve well</em> — the same weak connectivity that lets small errors accumulate and drift, the failure mode that motivates <a href="{{ '/vision/multi-view-geometry/sfm-pipelines/' | relative_url }}">incremental SfM's loop-closure problem</a> later in this series.</p>{% raw %}
+  </section>
+
+  <section class="mvg-step" id="robust">
+    <div class="mvg-step-head"><span class="mvg-step-num">5</span><h2>Robust losses: the outlier problem lives inside the optimizer too</h2></div>
+    <p class="mvg-eyebrow">IRLS: same machinery, one extra step</p>
+{% endraw %}    <p><a href="{{ '/vision/multi-view-geometry/ransac/' | relative_url }}">RANSAC</a> filters out most bad correspondences before bundle adjustment ever runs — but "most" isn't "all." A handful of bad matches always survive: a repeated texture, a moving object, a mismatch just inside the inlier threshold. Plain squared loss <var>&rho;(r) = r&#178;</var> gives every residual influence proportional to <var>2r</var> — so one leftover outlier residual, ten times larger than the rest, pulls on the solution ten times harder than any good one, and can visibly drag a converged reconstruction off course. This is the exact same failure mode that motivated RANSAC in the first place, just relocated: now it's happening <em>inside</em> the optimizer, on data RANSAC already mostly cleaned.</p>{% raw %}
+    <p>The fix is the same idea as RANSAC's inlier threshold, made smooth and differentiable: a <strong>robust loss</strong> <var>&rho;(r)</var> that grows like <var>r&#178;</var> for small residuals (so it still behaves like ordinary least squares near the optimum) but grows much more slowly — or not at all — for large ones.</p>
+    <div class="mvg-math">Huber: &nbsp; &rho;(r) = &#189;r&#178; &nbsp;&nbsp;if |r| &le; &delta;,&nbsp;&nbsp;&nbsp; &delta;(|r| − &#189;&delta;) &nbsp;&nbsp;if |r| &gt; &delta;<br>&nbsp;&nbsp;— quadratic near zero, linear beyond &delta;: caps an outlier's influence at a constant rather than letting it grow with r.</div>
+    <div class="mvg-math">Cauchy / Lorentzian: &nbsp; &rho;(r) = (c&#178;/2)&#183;log(1 + r&#178;/c&#178;)<br>&nbsp;&nbsp;— grows only logarithmically for large r: even more aggressive down-weighting than Huber, but non-convex, so it can (rarely) trap Gauss-Newton in a bad local minimum.</div>
+    <div class="mvg-math">Tukey's biweight: &nbsp; &rho;(r) = (c&#178;/6)&#183;[1 − (1 − (r/c)&#178;)&#179;] &nbsp;&nbsp;if |r| &le; c,&nbsp;&nbsp;&nbsp; c&#178;/6 &nbsp;&nbsp;if |r| &gt; c<br>&nbsp;&nbsp;— fully <em>saturates</em>: past the cutoff c the loss is flat, its gradient is exactly zero, and the residual is hard-rejected — it stops influencing the solve at all.</div>
+    <p>None of these need a new solver. Each robust loss can be implemented as plain <em>weighted</em> least squares, where the weight is recomputed from the current residual at every iteration — <strong>Iteratively Reweighted Least Squares (IRLS)</strong>:</p>
+    <div class="mvg-math">w(r) = &rho;&prime;(r) / r &nbsp;&nbsp;&nbsp;&nbsp;(recomputed every iteration from the current r)<br>normal equations become:&nbsp; J&#7488;WJ&#183;&Delta; = −J&#7488;Wr,&nbsp; W = diag(w(r&#8321;), w(r&#8322;), …)</div>
+    <p>At the current estimate, compute every residual, turn it into a weight <var>w(r)</var> (1 for a small residual, shrinking toward 0 for a large one), solve the ordinary weighted Gauss-Newton step — the exact same <var>J&#7488;J</var>, same block-sparse structure, same Schur complement from the last section, just with each observation's contribution to <var>U<sub>cc</sub></var>, <var>V<sub>pp</sub></var>, <var>W</var>, <var>e<sub>c</sub></var>, <var>e<sub>p</sub></var> scaled by its current weight — then repeat. Robust bundle adjustment isn't a different algorithm; it's this exact same machinery with one extra reweighting pass bolted onto the top of every iteration.</p>
+    <div class="mvg-goal">🎯 <b>Learning goal:</b> watch a single gross outlier observation visibly break an L2 solve while Huber and Cauchy solves barely notice it, live, as you drag the outlier further from where it should be.</div>
+    <p>One 3D point is observed by 4 fixed cameras. Camera 0's observation can be dragged arbitrarily far from its true pixel (simulating one bad correspondence that survived RANSAC); the other three stay clean. Each checked loss is solved to convergence via IRLS from the same initial triangulation, and its result is plotted against ground truth.</p>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s3-plot3d" class="mvg-plot3d" style="height:340px;"></div>
+        <p class="mvg-canvas-hint">Black = ground truth, diamonds = cameras (camera 0 is the one with the draggable outlier).</p>
+        <div class="mvg-legend" id="s3-legend"></div>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Outlier magnitude (px off) <span class="val" id="s3-outlierval"></span></label><input type="range" id="s3-outlier" min="0" max="250" step="2" value="0"></div>
+        <div class="mvg-field" style="display:flex; flex-direction:column; gap:6px;">
+          <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="s3-l2" checked style="width:auto;"> L2 (plain squared loss)</label>
+          <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="s3-huber" checked style="width:auto;"> Huber (&delta; = 3px)</label>
+          <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="s3-cauchy" checked style="width:auto;"> Cauchy (c = 3px)</label>
+          <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="s3-tukey" checked style="width:auto;"> Tukey (c = 6px)</label>
+        </div>
+        <div class="mvg-readout" id="s3-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="gauge">
+    <div class="mvg-step-head"><span class="mvg-step-num">6</span><h2>Gauge freedom: the whole reconstruction can float</h2></div>
+    <p class="mvg-eyebrow">A hidden rank deficiency</p>
+    <p>Reprojection error depends only on the geometry <em>between</em> cameras and points — how each camera's ray relates to each point, not where the whole configuration happens to sit in an abstract world frame. Concretely: take every camera pose and every 3D point and apply the exact same rigid transform (a rotation and translation — or, since scale is separately unobservable from monocular two-view geometry too, as Part 10's four-candidate-pose decomposition of <var>E</var> only fixes <var>t</var> up to scale, a full similarity transform including a uniform scale factor) to <em>all of them at once</em>. Every camera-to-point ray is exactly preserved — same direction, same relative depth ratios — so every reprojected pixel is bit-for-bit unchanged and the cost <var>C</var> doesn't move by a single floating-point unit.</p>
+    <p>A direction that changes every unknown but leaves the cost function exactly flat is, by definition, a direction of zero curvature — a null vector of the Hessian <var>J&#7488;J</var>. So <var>J&#7488;J</var> is exactly rank-deficient by the dimension of that invariance group: <strong>6</strong> if only a rigid transform is free (3 rotation + 3 translation), <strong>7</strong> if scale is unconstrained too (the monocular case, by default — see Part 10). A rank-deficient Hessian can't be inverted; naive Gauss-Newton on an un-anchored bundle-adjustment problem is solving a system with infinitely many equally-good solutions differing only by where the whole reconstruction sits, and the linear solve either fails outright or wanders arbitrarily along that flat direction.</p>
+    <div class="mvg-goal">💡 <span><b>The fix: fix the datum.</b> Remove exactly as many degrees of freedom as the invariance group has, by hand, before optimizing: pin one camera's pose outright (camera 0 = identity rotation, origin — 6 DOF gone), and, if scale is also free, additionally fix one distance (e.g. force the baseline between cameras 0 and 1 to be exactly 1 — the 7th DOF gone). With those pinned, the remaining Hessian is full rank and invertible, and the solver converges to one specific reconstruction instead of drifting along the flat valley.</span></div>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap">
+        <div id="s4-plot3d" class="mvg-plot3d" style="height:340px;"></div>
+        <p class="mvg-canvas-hint">Drag the sliders — with the datum free, the cube and cameras visibly move but the cost stays ≈0. Pin camera 0 and moving them stops being free.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Rotation about y (°) <span class="val" id="s4-rot-val"></span></label><input type="range" id="s4-rot" min="-180" max="180" step="1" value="0"></div>
+        <div class="mvg-field"><label>Translation <span class="val" id="s4-trans-val"></span></label><input type="range" id="s4-trans" min="-3" max="3" step="0.05" value="0"></div>
+        <div class="mvg-field"><label>Scale <span class="val" id="s4-scale-val"></span></label><input type="range" id="s4-scale" min="0.4" max="2.5" step="0.02" value="1"></div>
+        <div class="mvg-field" style="display:flex; align-items:center; gap:8px;">
+          <input type="checkbox" id="s4-pin" style="width:auto;"><label for="s4-pin" style="margin:0; display:inline;">pin camera 0 (fix the datum)</label>
+        </div>
+        <div class="mvg-readout" id="s4-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="lie">
+    <div class="mvg-step-head"><span class="mvg-step-num">7</span><h2>Updating rotations without breaking them</h2></div>
+    <p class="mvg-eyebrow">SO(3), SE(3), and why the demo above froze poses in the first place</p>
+    <p>A rotation matrix <var>R</var> has 9 numbers but only 3 real degrees of freedom — the other 6 are eaten by the orthogonality constraint <var>R&#7488;R = I</var>. An ordinary Gauss-Newton step treats every unknown as free: <var>R + &Delta;R</var> for some 3×3 <var>&Delta;R</var> straight out of the normal equations. Do that even once and <var>R + &Delta;R</var> is, generically, no longer orthogonal — not a rotation at all anymore, and every camera that "drifts off SO(3)" this way corrupts the whole reconstruction it feeds into.</p>
+{% endraw %}    <p>The fix reuses the skew-symmetric matrix <var>[·]&#215;</var> from the <a href="{{ '/vision/multi-view-geometry/epipolar/' | relative_url }}">essential-matrix derivation</a> (<var>E = [t]&#215;R</var>), where <var>[v]&#215;</var> is the matrix with <var>[v]&#215;w = v&#215;w</var>. Instead of updating <var>R</var> additively, update it <em>multiplicatively</em> by a small rotation built from a free 3-vector <var>&delta;</var> via the matrix exponential:</p>{% raw %}
+    <div class="mvg-math">R<sub>new</sub> = R<sub>old</sub>&#183;exp([&delta;]&#215;) &nbsp;&approx;&nbsp; R<sub>old</sub>&#183;(I + [&delta;]&#215;) &nbsp;&nbsp;for small &delta; &#8712; &#8477;&#179;</div>
+    <p>Because <var>exp([&delta;]&#215;)</var> is a genuine rotation matrix for <em>any</em> <var>&delta;</var> (it's the Rodrigues formula — the same exponential map that turns an axis-angle vector into a rotation), <var>R<sub>new</sub></var> is automatically, exactly orthogonal again — no re-normalization hack required. Gauss-Newton's actual unknown for the rotation part is the free 3-vector <var>&delta;</var>, not the 9 entries of <var>R</var> itself; the Jacobian column for "camera <var>i</var>'s rotation" is <var>&part;r/&part;&delta;</var>, evaluated at <var>&delta;=0</var>. Paired with 3 more unknowns for translation, that's exactly the 6 pose DOF per camera claimed all the way back at the start of this section.</p>
+    <p>This is precisely the missing piece the toy demo skipped by freezing camera poses: naively perturbing <var>R</var>'s 9 numbers and adding the result back is exactly the trap described above. The "optimize camera poses" toggle in the demo implements the rule on this page — every pose update is <var>R &larr; R&#183;exp([&delta;]&#215;)</var>, computed by finite-differencing the reprojection residual with respect to <var>&delta;</var> at <var>&delta;=0</var>, never by touching <var>R</var>'s entries directly.</p>
+    <div class="mvg-goal">&#127919; <b>Learning goal:</b> apply the same 100 small increments three different ways and watch the orthogonality error <var>&#8214;R&#7488;R &minus; I&#8214;</var> behave. Naive additive updates drift off the manifold quadratically (the curve lifts off immediately); additive + polar re-orthonormalization repairs the damage after the fact; the exponential map never leaves the manifold at all — its error is floating-point zero by construction.</div>
+    <div class="mvg-demo">
+      <div class="mvg-canvas-wrap" style="flex-basis:100%;">
+        <canvas id="s7-canvas" width="720" height="280" style="width:100%; max-width:720px; height:auto; display:block; background:var(--color-neutral-100); border-radius:var(--radius-sm);"></canvas>
+        <p class="mvg-canvas-hint">Orthogonality error per applied increment (log scale feel: the additive curve is visually off the chart within ~10 steps). Green = exp map (Rodrigues), blue = additive + polar repair, red = raw additive.</p>
+      </div>
+      <div class="mvg-controls">
+        <div class="mvg-field"><label>Increment size |&delta;| (rad) <span class="val" id="s7-stepval"></span></label><input type="range" id="s7-step" min="0.005" max="0.2" step="0.005" value="0.05"></div>
+        <div class="mvg-readout" id="s7-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mvg-step" id="cheatsheet">
+    <div class="mvg-step-head"><span class="mvg-step-num">✓</span><h2>Series recap</h2></div>
+    <p class="mvg-eyebrow">The whole pipeline, end to end</p>
+    <div style="overflow-x:auto;">
+    <table class="mvg-cheat">
+      <thead><tr><th>Part</th><th>Question answered</th></tr></thead>
+      <tbody>
+        <tr><td>1 · Pinhole camera</td><td>How does one camera turn a 3D point into a pixel?</td></tr>
+        <tr><td>2 · Epipolar geometry</td><td>Given a match in one image, where can it be in another?</td></tr>
+        <tr><td>3 · Homography</td><td>When can one image predict another exactly?</td></tr>
+        <tr><td>4 · Triangulation &amp; pose</td><td>Given two views, where exactly is the 3D point?</td></tr>
+        <tr><td>5 · Trifocal tensor</td><td>What does a third view add?</td></tr>
+        <tr><td>6 · Bundle adjustment</td><td>How do all cameras and all points agree at once?</td></tr>
+        <tr><td>Schur complement</td><td><code>(U<sub>cc</sub> − WV<sub>pp</sub>&#8315;&#185;W&#7488;)&Delta;c = e<sub>c</sub> − WV<sub>pp</sub>&#8315;&#185;e<sub>p</sub></code> — eliminate the (many, cheap) points, solve the much smaller (few, dense) camera-only system, back-substitute</td></tr>
+        <tr><td>Robust losses</td><td>Huber: quadratic/linear split at <var>&delta;</var>; Cauchy: <code>(c&#178;/2)log(1+r&#178;/c&#178;)</code>; Tukey: saturates to zero gradient past <var>c</var></td></tr>
+        <tr><td>IRLS weight</td><td><code>w(r) = &rho;&prime;(r)/r</code>, recomputed from the current residual every iteration — robust BA is ordinary BA plus this one reweighting step</td></tr>
+        <tr><td>Gauge freedom</td><td>rigid transform of the whole reconstruction is invisible to cost &rArr; <var>J&#7488;J</var> is rank-deficient by 6 (rigid) or 7 (+scale); fix by pinning camera 0 (and one baseline length)</td></tr>
+        <tr><td>SE(3) pose update</td><td><code>R<sub>new</sub> = R<sub>old</sub>&#183;exp([&delta;]&#215;)</code> — update via the exponential map, never additively on <var>R</var>'s 9 entries</td></tr>
+      </tbody>
+    </table>
+    </div>
+{% endraw %}    <p style="margin-top:20px;">That's the field, start to finish: perspective projection sets up the problem, epipolar geometry and homographies constrain matches between views, triangulation and the trifocal tensor turn constraints into 3D structure, and bundle adjustment ties the whole thing together into one globally consistent reconstruction — the same nonlinear least-squares machinery from the <a href="{{ '/vision/nonlinear-optimization/gradient-descent/' | relative_url }}">Nonlinear Optimization series</a>, aimed at cameras and 3D points instead of a single robot.</p>{% raw %}
+  </section>
+{% endraw %}
+
+  <div class="mvg-next">
+    <span>Bundle adjustment is the optimizer. The system built around it — turning an unordered folder of photos into a registered reconstruction, incrementally or all at once — is next.</span>
+    <a class="btn btn-secondary" href="{{ '/vision/multi-view-geometry/sfm-pipelines/' | relative_url }}">Continue: SfM pipelines →</a>
+  </div>
+</div>
+
+{% include series-prevnext.html series=site.data.series.multi_view_geometry %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="stats-rule"></div>
+    <p style="margin:0;">Have a milestone to add? <a href="https://github.com/DenimPatel/AI">Contribute on GitHub</a>.</p>
+  </div>
+</footer>
+
+{% raw %}
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  var COLOR_TEXT = css('--color-text') || '#201e1d';
+  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
+  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+
+  function gaussianNoise(std){
+    var u = Math.max(Math.random(), 1e-9), v = Math.random();
+    return std * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v);
+  }
+
+  var MVG = {};
+  MVG.sub = function(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; };
+  MVG.add = function(a,b){ return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]; };
+  MVG.scale = function(a,s){ return [a[0]*s,a[1]*s,a[2]*s]; };
+  MVG.dot = function(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; };
+  MVG.cross = function(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; };
+  MVG.norm = function(a){ return Math.hypot(a[0],a[1],a[2]); };
+  MVG.normalize = function(a){ var n=MVG.norm(a)||1; return [a[0]/n,a[1]/n,a[2]/n]; };
+  MVG.matVec = function(R,v){ return [MVG.dot(R[0],v),MVG.dot(R[1],v),MVG.dot(R[2],v)]; };
+  MVG.orbitCamera = function(az, el, dist, lookAt){
+    lookAt = lookAt || [0,0,0];
+    var C = [ lookAt[0] + dist*Math.cos(el)*Math.sin(az), lookAt[1] + dist*Math.sin(el), lookAt[2] + dist*Math.cos(el)*Math.cos(az) ];
+    var forward = MVG.normalize(MVG.sub(lookAt, C));
+    var right = MVG.normalize(MVG.cross(forward, [0,1,0]));
+    var down = MVG.cross(forward, right);
+    return { C: C, R: [right, down, forward] };
+  };
+  MVG.worldToCamera = function(cam, X){ return MVG.matVec(cam.R, MVG.sub(X, cam.C)); };
+  MVG.project = function(K, cam, X){
+    var Xc = MVG.worldToCamera(cam, X);
+    if (Xc[2] <= 1e-6) return null;
+    return { u: K.fx*Xc[0]/Xc[2] + K.cx, v: K.fy*Xc[1]/Xc[2] + K.cy, depth: Xc[2] };
+  };
+
+  function matTMatN(A){ var m=A.length,n=A[0].length,R=[]; for (var i=0;i<n;i++) R.push(new Array(n).fill(0));
+    for (var i=0;i<n;i++) for (var j=0;j<n;j++){ var s=0; for (var k=0;k<m;k++) s+=A[k][i]*A[k][j]; R[i][j]=s; } return R; }
+  function matTVecN(A,b){ var m=A.length,n=A[0].length,r=new Array(n).fill(0); for (var i=0;i<n;i++){ var s=0; for (var k=0;k<m;k++) s+=A[k][i]*b[k]; r[i]=s; } return r; }
+  function solveLinearN(A,b){
+    var n=A.length; var M=A.map(function(row,i){ return row.concat([b[i]]); });
+    for (var col=0; col<n; col++){
+      var piv=col; for (var r=col+1;r<n;r++) if (Math.abs(M[r][col])>Math.abs(M[piv][col])) piv=r;
+      var tmp=M[col]; M[col]=M[piv]; M[piv]=tmp; var pv=M[col][col]; if (Math.abs(pv)<1e-12) continue;
+      for (var r2=0;r2<n;r2++){ if (r2===col) continue; var f=M[r2][col]/pv; for (var c2=col;c2<=n;c2++) M[r2][c2]-=f*M[col][c2]; }
+    }
+    return M.map(function(row,i){ return row[i]===0?0:row[n]/row[i]; });
+  }
+  function projectionMatrix(K, cam){
+    var Kmat=[[K.fx,0,K.cx],[0,K.fy,K.cy],[0,0,1]];
+    var t = MVG.scale(MVG.matVec(cam.R, cam.C), -1);
+    var Rt34 = [ cam.R[0].concat([t[0]]), cam.R[1].concat([t[1]]), cam.R[2].concat([t[2]]) ];
+    var P = [[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<4;j++){ var s=0; for (var k=0;k<3;k++) s+=Kmat[i][k]*Rt34[k][j]; P[i][j]=s; }
+    return P;
+  }
+  function scaleRow(r,s){ return r.map(function(v){ return v*s; }); }
+  function sub4(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2],a[3]-b[3]]; }
+  function triangulateLinear(P1, x1, P2, x2){
+    var A = [
+      sub4(scaleRow(P1[2], x1[0]), P1[0]),
+      sub4(scaleRow(P1[2], x1[1]), P1[1]),
+      sub4(scaleRow(P2[2], x2[0]), P2[0]),
+      sub4(scaleRow(P2[2], x2[1]), P2[1])
+    ];
+    var A3 = A.map(function(r){ return [r[0],r[1],r[2]]; });
+    var b = A.map(function(r){ return -r[3]; });
+    return solveLinearN(matTMatN(A3), matTVecN(A3,b));
+  }
+
+  function reprojResidual(K, cam, X, obs){
+    var p = MVG.project(K, cam, X);
+    if (!p) return [1e3,1e3];
+    return [p.u-obs[0], p.v-obs[1]];
+  }
+  function numJacobianPoint(K, cam, X, eps){
+    eps = eps||1e-4;
+    var J=[];
+    for (var d=0; d<3; d++){
+      var Xp=X.slice(), Xm=X.slice(); Xp[d]+=eps; Xm[d]-=eps;
+      var rp=reprojResidual(K,cam,Xp,[0,0]), rm=reprojResidual(K,cam,Xm,[0,0]);
+      J.push([(rp[0]-rm[0])/(2*eps), (rp[1]-rm[1])/(2*eps)]);
+    }
+    return J;
+  }
+  // One Gauss-Newton iteration, refining every point against every camera that observed it.
+  function refineAllPoints(K, cams, allObs, Xs){
+    var newXs = Xs.map(function(X, pi){
+      var H=[[0,0,0],[0,0,0],[0,0,0]], g=[0,0,0];
+      for (var c=0;c<cams.length;c++){
+        var obs = allObs[pi][c];
+        if (!obs) continue;
+        var r = reprojResidual(K, cams[c], X, obs);
+        var J = numJacobianPoint(K, cams[c], X);
+        for (var d1=0; d1<3; d1++){
+          g[d1] += J[d1][0]*r[0] + J[d1][1]*r[1];
+          for (var d2=0; d2<3; d2++) H[d1][d2] += J[d1][0]*J[d2][0] + J[d1][1]*J[d2][1];
+        }
+      }
+      var delta = solveLinearN(H, g.map(function(v){return -v;}));
+      return [X[0]+delta[0], X[1]+delta[1], X[2]+delta[2]];
+    });
+    var cost = 0;
+    newXs.forEach(function(X, pi){
+      for (var c=0;c<cams.length;c++){
+        var obs = allObs[pi][c];
+        if (!obs) continue;
+        var r = reprojResidual(K, cams[c], X, obs);
+        cost += 0.5*(r[0]*r[0]+r[1]*r[1]);
+      }
+    });
+    return { Xs: newXs, cost: cost };
+  }
+  function totalCost(K, cams, allObs, Xs){
+    var cost = 0;
+    Xs.forEach(function(X, pi){
+      for (var c=0;c<cams.length;c++){
+        var obs = allObs[pi][c];
+        if (!obs) continue;
+        var r = reprojResidual(K, cams[c], X, obs);
+        cost += 0.5*(r[0]*r[0]+r[1]*r[1]);
+      }
+    });
+    return cost;
+  }
+
+  // ---------- Lie-algebra pose machinery: R_new = R_old . exp([delta]_x) ----------
+  function skew3(v){ return [[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]]; }
+  function matMul3(A,B){
+    var R=[[0,0,0],[0,0,0],[0,0,0]];
+    for (var i=0;i<3;i++) for (var j=0;j<3;j++){ var s=0; for (var k=0;k<3;k++) s+=A[i][k]*B[k][j]; R[i][j]=s; }
+    return R;
+  }
+  function transpose3(A){ return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]]; }
+  // Rodrigues' formula: exp([v]_x) as an exact rotation matrix, for any v (not just small).
+  function expmapSO3(v){
+    var theta = MVG.norm(v);
+    if (theta < 1e-12) return [[1,0,0],[0,1,0],[0,0,1]];
+    var k = MVG.scale(v, 1/theta);
+    var K = skew3(k), KK = matMul3(K,K);
+    var s = Math.sin(theta), c = 1-Math.cos(theta);
+    var R = [[1,0,0],[0,1,0],[0,0,1]];
+    for (var i=0;i<3;i++) for (var j=0;j<3;j++) R[i][j] += s*K[i][j] + c*KK[i][j];
+    return R;
+  }
+  function cloneCam(cam){ return { R: [cam.R[0].slice(),cam.R[1].slice(),cam.R[2].slice()], C: cam.C.slice() }; }
+  function cloneCams(cams){ return cams.map(cloneCam); }
+  // Small perturbation of a camera pose, used to simulate an imperfect initial calibration.
+  function perturbCam(cam, rotStd, transStd){
+    var dRot = [gaussianNoise(rotStd),gaussianNoise(rotStd),gaussianNoise(rotStd)];
+    var dTrans = [gaussianNoise(transStd),gaussianNoise(transStd),gaussianNoise(transStd)];
+    return { R: matMul3(cam.R, expmapSO3(dRot)), C: MVG.add(cam.C, dTrans) };
+  }
+  // Perturb a camera's pose by a small 6-vector [rotation delta (3) | translation delta (3)],
+  // exactly the R_new = R_old . exp([delta]_x) update rule.
+  function applyPoseDelta(cam, delta6){
+    return { R: matMul3(cam.R, expmapSO3([delta6[0],delta6[1],delta6[2]])), C: MVG.add(cam.C, [delta6[3],delta6[4],delta6[5]]) };
+  }
+  // Numeric 2x6 Jacobian of the reprojection residual w.r.t. a camera's [delta_rot(3), delta_trans(3)] at delta=0.
+  function numJacobianPose(K, cam, X, eps){
+    eps = eps||1e-4;
+    var J=[];
+    for (var d=0; d<6; d++){
+      var dp=[0,0,0,0,0,0], dm=[0,0,0,0,0,0]; dp[d]=eps; dm[d]=-eps;
+      var rp = reprojResidual(K, applyPoseDelta(cam,dp), X, [0,0]);
+      var rm = reprojResidual(K, applyPoseDelta(cam,dm), X, [0,0]);
+      J.push([(rp[0]-rm[0])/(2*eps), (rp[1]-rm[1])/(2*eps)]);
+    }
+    return J; // 6 rows (params) x 2 cols (u,v) — same shape convention as numJacobianPoint
+  }
+  // One Gauss-Newton sweep over camera poses (points held fixed), skipping index skipIdx (the pinned datum camera).
+  function refineAllPoses(K, cams, allObs, Xs, skipIdx){
+    var newCams = cams.map(function(cam, ci){
+      if (ci === skipIdx) return cam;
+      var H=[]; for (var a=0;a<6;a++) H.push(new Array(6).fill(0));
+      var g=new Array(6).fill(0);
+      for (var pi=0; pi<Xs.length; pi++){
+        var obs = allObs[pi][ci];
+        if (!obs) continue;
+        var r = reprojResidual(K, cam, Xs[pi], obs);
+        var J = numJacobianPose(K, cam, Xs[pi]);
+        for (var d1=0; d1<6; d1++){
+          g[d1] += J[d1][0]*r[0] + J[d1][1]*r[1];
+          for (var d2=0; d2<6; d2++) H[d1][d2] += J[d1][0]*J[d2][0] + J[d1][1]*J[d2][1];
+        }
+      }
+      var delta = solveLinearN(H, g.map(function(v){return -v;}));
+      return applyPoseDelta(cam, delta);
+    });
+    return newCams;
+  }
+  // Assemble the exact (small) J^T J for the toy problem, split into Ucc / W / Vpp blocks, plus the raw
+  // observation-by-parameter sparsity grid — used purely to visualize the structure from sections 3-4.
+  function buildBlocksAndSparsity(K, cams, Xs, allObs){
+    var nc = cams.length, np = Xs.length;
+    var colCamW = 6, colPtW = 3;
+    var Ucc = []; for (var i=0;i<nc*colCamW;i++) Ucc.push(new Array(nc*colCamW).fill(0));
+    var Vpp = []; for (var i=0;i<np*colPtW;i++) Vpp.push(new Array(np*colPtW).fill(0));
+    var W = []; for (var i=0;i<nc*colCamW;i++) W.push(new Array(np*colPtW).fill(0));
+    var sparsityRows = []; // { camIdx, ptIdx }
+    for (var pi=0; pi<np; pi++){
+      for (var ci=0; ci<nc; ci++){
+        var obs = allObs[pi][ci];
+        if (!obs) continue;
+        sparsityRows.push({ camIdx: ci, ptIdx: pi });
+        var Jc = numJacobianPose(K, cams[ci], Xs[pi]);   // 6 x 2
+        var Jp = numJacobianPoint(K, cams[ci], Xs[pi]);  // 3 x 2
+        var co = ci*colCamW, po = pi*colPtW;
+        for (var a=0;a<6;a++){
+          for (var b=0;b<6;b++) Ucc[co+a][co+b] += Jc[a][0]*Jc[b][0] + Jc[a][1]*Jc[b][1];
+          for (var b2=0;b2<3;b2++) W[co+a][po+b2] += Jc[a][0]*Jp[b2][0] + Jc[a][1]*Jp[b2][1];
+        }
+        for (var a2=0;a2<3;a2++) for (var b3=0;b3<3;b3++) Vpp[po+a2][po+b3] += Jp[a2][0]*Jp[b3][0] + Jp[a2][1]*Jp[b3][1];
+      }
+    }
+    return { Ucc:Ucc, W:W, Vpp:Vpp, nc:nc, np:np, colCamW:colCamW, colPtW:colPtW, sparsityRows:sparsityRows };
+  }
+  function drawMatrixHeatmap(canvas, M, color, cell){
+    cell = cell || 4;
+    var rows = M.length, cols = M[0].length;
+    var dpr = window.devicePixelRatio||1;
+    canvas.width = cols*cell*dpr; canvas.height = rows*cell*dpr;
+    canvas.style.width = (cols*cell)+'px'; canvas.style.height = (rows*cell)+'px';
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    var maxAbs = 1e-9;
+    for (var i=0;i<rows;i++) for (var j=0;j<cols;j++) maxAbs = Math.max(maxAbs, Math.abs(M[i][j]));
+    ctx.fillStyle = COLOR_DIVIDER; ctx.fillRect(0,0,cols*cell,rows*cell);
+    for (var r=0;r<rows;r++){
+      for (var c=0;c<cols;c++){
+        var a = Math.min(1, Math.abs(M[r][c])/maxAbs);
+        if (a < 0.02) continue;
+        ctx.fillStyle = color; ctx.globalAlpha = 0.12 + 0.88*a;
+        ctx.fillRect(c*cell, r*cell, cell, cell);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawSparsityGrid(canvas, blocks){
+    var nc = blocks.nc, np = blocks.np, camW = blocks.colCamW, ptW = blocks.colPtW;
+    var totalCols = nc*camW + np*ptW, rows = blocks.sparsityRows.length;
+    var dpr = window.devicePixelRatio||1;
+    var cellW = Math.max(2, Math.min(8, Math.floor((canvas.clientWidth||300)/totalCols)));
+    var cellH = Math.max(2, Math.min(10, Math.floor(200/Math.max(rows,1))));
+    canvas.width = totalCols*cellW*dpr; canvas.height = rows*cellH*dpr;
+    canvas.style.width = (totalCols*cellW)+'px'; canvas.style.height = (rows*cellH)+'px';
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle = COLOR_DIVIDER; ctx.fillRect(0,0,totalCols*cellW, rows*cellH);
+    blocks.sparsityRows.forEach(function(row, ri){
+      ctx.fillStyle = COLOR_ACCENT;
+      ctx.fillRect(row.camIdx*camW*cellW, ri*cellH, camW*cellW, cellH);
+      ctx.fillStyle = COLOR_ACCENT2;
+      ctx.fillRect(nc*camW*cellW + row.ptIdx*ptW*cellW, ri*cellH, ptW*cellW, cellH);
+    });
+  }
+
+  // ---------- shared scene: cube ----------
+  var CUBE_R = 0.9;
+  var CUBE_VERTS = [];
+  [-1,1].forEach(function(sx){ [-1,1].forEach(function(sy){ [-1,1].forEach(function(sz){
+    CUBE_VERTS.push([sx*CUBE_R, sy*CUBE_R, sz*CUBE_R]);
+  }); }); });
+  function vi(x,y,z){ return ((x>0?1:0)<<2) | ((y>0?1:0)<<1) | (z>0?1:0); }
+  var CUBE_EDGES = [];
+  [-1,1].forEach(function(sy){ [-1,1].forEach(function(sz){ CUBE_EDGES.push([vi(-1,sy,sz), vi(1,sy,sz)]); }); });
+  [-1,1].forEach(function(sx){ [-1,1].forEach(function(sz){ CUBE_EDGES.push([vi(sx,-1,sz), vi(sx,1,sz)]); }); });
+  [-1,1].forEach(function(sx){ [-1,1].forEach(function(sy){ CUBE_EDGES.push([vi(sx,sy,-1), vi(sx,sy,1)]); }); });
+  function cubeLineTraceFromVerts(verts, color, width, opacity){
+    var xs=[], ys=[], zs=[];
+    CUBE_EDGES.forEach(function(e){
+      var a=verts[e[0]], b=verts[e[1]];
+      xs.push(a[0],b[0],null); ys.push(a[1],b[1],null); zs.push(a[2],b[2],null);
+    });
+    return { type:'scatter3d', mode:'lines', x:xs, y:ys, z:zs, line:{ color:color, width:width||4 }, opacity: opacity===undefined?1:opacity, hoverinfo:'skip' };
+  }
+  function camMarkersTrace(cams, color){
+    return { type:'scatter3d', mode:'markers', x:cams.map(function(c){return c.C[0];}), y:cams.map(function(c){return c.C[1];}), z:cams.map(function(c){return c.C[2];}),
+      marker:{ size:6, color:color, symbol:'diamond' }, hoverinfo:'skip' };
+  }
+  function layout3d(){
+    return {
+      autosize:true, margin:{l:0,r:0,t:0,b:0}, showlegend:false, paper_bgcolor:'transparent',
+      scene: {
+        xaxis:{ range:[-6,6], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'x' },
+        yaxis:{ range:[-6,6], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'y' },
+        zaxis:{ range:[-6,6], backgroundcolor:'transparent', gridcolor:COLOR_DIVIDER, zerolinecolor:COLOR_DIVIDER, color:COLOR_TEXT, title:'z' },
+        aspectmode:'cube', camera:{ eye:{x:1.4,y:-1.4,z:1.0} }
+      }
+    };
+  }
+
+  // ---------- Step 2: toy SfM / bundle-adjustment demo ----------
+  (function(){
+    var div = document.getElementById('s2-plot3d');
+    var chart = document.getElementById('s2-costchart'), chartCtx = chart.getContext('2d');
+    var sparsityCanvas = document.getElementById('s2-sparsity');
+    var UccCanvas = document.getElementById('s2-Ucc'), WCanvas = document.getElementById('s2-W'), VppCanvas = document.getElementById('s2-Vpp');
+    var K = { fx: 460, fy: 460, cx: 0, cy: 0 };
+    // TRUE_CAMS: ground truth, never mutated — this is what actually generated every observation.
+    var TRUE_CAMS = [0,1,2,3,4].map(function(i){ return MVG.orbitCamera(i*1.256 + 0.3, 0.28 + 0.12*Math.sin(i*1.7), 7, [0,0,0]); });
+    // CAMS: the working estimate the demo optimizes against — equals TRUE_CAMS when pose-optimization is off
+    // (matching the original page's "poses fixed, known" demo exactly), or a perturbed copy when it's on.
+    var CAMS = cloneCams(TRUE_CAMS);
+
+    var noiseEl = document.getElementById('s2-noise');
+    var optPosesEl = document.getElementById('s2-optposes');
+    var Xs, costHistory, iterCount;
+
+    function buildObservations(){
+      var noise = parseFloat(noiseEl.value);
+      return CUBE_VERTS.map(function(Xt){
+        return TRUE_CAMS.map(function(c){
+          var p = MVG.project(K, c, Xt);
+          if (!p) return null;
+          return [p.u + gaussianNoise(noise), p.v + gaussianNoise(noise)];
+        });
+      });
+    }
+
+    var allObs;
+
+    function initFromTriangulation(){
+      return CUBE_VERTS.map(function(_, pi){
+        var visible = [];
+        for (var c=0;c<CAMS.length;c++) if (allObs[pi][c]) visible.push(c);
+        if (visible.length < 2) return [0,0,0];
+        var c1 = visible[0], c2 = visible[1];
+        var P1 = projectionMatrix(K, CAMS[c1]), P2 = projectionMatrix(K, CAMS[c2]);
+        return triangulateLinear(P1, allObs[pi][c1], P2, allObs[pi][c2]);
+      });
+    }
+
+    function drawStructurePanels(){
+      var blocks = buildBlocksAndSparsity(K, CAMS, Xs, allObs);
+      drawSparsityGrid(sparsityCanvas, blocks);
+      drawMatrixHeatmap(UccCanvas, blocks.Ucc, COLOR_ACCENT, 4);
+      drawMatrixHeatmap(WCanvas, blocks.W, COLOR_TEXT, 4);
+      drawMatrixHeatmap(VppCanvas, blocks.Vpp, COLOR_ACCENT2, 4);
+    }
+
+    function drawCostChart(){
+      var W = chart.width = chart.clientWidth * (window.devicePixelRatio||1);
+      var H = chart.height = 140 * (window.devicePixelRatio||1);
+      chartCtx.clearRect(0,0,W,H);
+      if (costHistory.length < 2) return;
+      var maxC = Math.max.apply(null, costHistory) * 1.05 || 1;
+      chartCtx.strokeStyle = COLOR_ACCENT2; chartCtx.lineWidth = 2 * (window.devicePixelRatio||1);
+      chartCtx.beginPath();
+      costHistory.forEach(function(c, i){
+        var x = (i/(costHistory.length-1)) * W;
+        var y = H - 10 - (c/maxC) * (H-20);
+        if (i===0) chartCtx.moveTo(x,y); else chartCtx.lineTo(x,y);
+      });
+      chartCtx.stroke();
+    }
+
+    function render(){
+      var initVerts = window.__mvgInit;
+      // per-point mean reprojection residual (across the cameras that see it) for coloring
+      var ptResid = CUBE_VERTS.map(function(_, pi){
+        var s = 0, n = 0;
+        CAMS.forEach(function(c, ci){
+          if (!allObs[pi][ci]) return;
+          var r = reprojResidual(K, c, Xs[pi], allObs[pi][ci]);
+          s += Math.hypot(r[0], r[1]); n++;
+        });
+        return n ? s/n : 0;
+      });
+      Plotly.react(div, [
+        cubeLineTraceFromVerts(CUBE_VERTS, COLOR_TEXT, 4, 0.9),
+        cubeLineTraceFromVerts(initVerts, '#9b9797', 2, 0.5),
+        cubeLineTraceFromVerts(Xs, COLOR_ACCENT2, 3, 1),
+        { type:'scatter3d', mode:'markers',
+          x: Xs.map(function(X){return X[0];}), y: Xs.map(function(X){return X[1];}), z: Xs.map(function(X){return X[2];}),
+          marker:{ size:6, color: ptResid, colorscale:'RdYlGn', reversescale:true, showscale:false, line:{width:1, color:'#fff'} }, hoverinfo:'skip' },
+        camMarkersTrace(CAMS, COLOR_ACCENT)
+      ], layout3d(), { displayModeBar:false, responsive:true });
+
+      drawCostChart();
+      drawStructurePanels();
+      var meanErr = 0;
+      Xs.forEach(function(X,i){ meanErr += MVG.norm(MVG.sub(X, CUBE_VERTS[i])); });
+      meanErr /= Xs.length;
+      var worst = 0;
+      ptResid.forEach(function(v,i){ if (v > ptResid[worst]) worst = i; });
+      var readout =
+        '<div><span class="k">iteration</span> = <span class="hi">' + iterCount + '</span></div>' +
+        '<div><span class="k">total reprojection cost</span> = <span class="hi">' + costHistory[costHistory.length-1].toFixed(1) + '</span></div>' +
+        '<div><span class="k">mean point error vs. truth</span> = ' + meanErr.toFixed(3) + '</div>' +
+        '<div><span class="k">worst point by residual</span> = #' + worst + ' at <span class="hi">' + ptResid[worst].toFixed(2) + ' px</span> mean <span style="opacity:.6">(markers colored green&rarr;red by residual)</span></div>';
+      if (optPosesEl.checked){
+        var meanCamErr = 0;
+        CAMS.forEach(function(c,i){ meanCamErr += MVG.norm(MVG.sub(c.C, TRUE_CAMS[i].C)); });
+        meanCamErr /= CAMS.length;
+        readout += '<div><span class="k">mean camera-center error vs. truth</span> = ' + meanCamErr.toFixed(3) + ' <span style="opacity:.6">(camera 0 pinned)</span></div>';
+      }
+      document.getElementById('s2-readout').innerHTML = readout;
+      document.getElementById('s2-noiseval').textContent = parseFloat(noiseEl.value).toFixed(1) + ' px';
+    }
+
+    function newScene(){
+      CAMS = optPosesEl.checked ? TRUE_CAMS.map(function(c){ return perturbCam(c, 0.05, 0.15); }) : cloneCams(TRUE_CAMS);
+      allObs = buildObservations();
+      Xs = initFromTriangulation();
+      window.__mvgInit = Xs.map(function(X){ return X.slice(); });
+      iterCount = 0;
+      costHistory = [ totalCost(K, CAMS, allObs, Xs) ];
+      render();
+    }
+
+    function step(){
+      var res = refineAllPoints(K, CAMS, allObs, Xs);
+      Xs = res.Xs;
+      if (optPosesEl.checked){
+        // Block-coordinate sweep: points already refined above (poses fixed); now refine poses
+        // (points fixed), pinning camera 0 as the gauge datum — see the gauge-freedom section.
+        CAMS = refineAllPoses(K, CAMS, allObs, Xs, 0);
+      }
+      iterCount++;
+      var cost = totalCost(K, CAMS, allObs, Xs);
+      costHistory.push(cost);
+      render();
+      return cost < 1e-3 || (costHistory.length > 3 && Math.abs(costHistory[costHistory.length-1]-costHistory[costHistory.length-2]) < 1e-4);
+    }
+
+    var running = false, timer = null;
+    function stopRun(){ running = false; if (timer){ clearInterval(timer); timer=null; } document.getElementById('s2-run').textContent = 'Run'; }
+
+    document.getElementById('s2-step').addEventListener('click', step);
+    document.getElementById('s2-run').addEventListener('click', function(){
+      if (running){ stopRun(); return; }
+      running = true; document.getElementById('s2-run').textContent = 'Stop';
+      var count = 0;
+      timer = setInterval(function(){
+        var done = step();
+        count++;
+        if (done || count > 25) stopRun();
+      }, 260);
+    });
+    document.getElementById('s2-newscene').addEventListener('click', function(){ stopRun(); newScene(); });
+    noiseEl.addEventListener('change', function(){ stopRun(); newScene(); });
+    optPosesEl.addEventListener('change', function(){ stopRun(); newScene(); });
+    window.addEventListener('resize', drawCostChart);
+
+    newScene();
+  })();
+
+  // ---------- Step 5: robust loss playground ----------
+  (function(){
+    var div = document.getElementById('s3-plot3d');
+    if (!div) return;
+    var K = { fx: 420, fy: 420, cx: 0, cy: 0 };
+    var CAMS3 = [0,1,2,3].map(function(i){ return MVG.orbitCamera(i*1.65 + 0.4, 0.3 + 0.1*Math.sin(i*2.1), 6, [0,0,0]); });
+    var TRUE_X = [0.25, -0.2, 0.35];
+    var HUBER_DELTA = 3, CAUCHY_C = 3;
+
+    function huberWeight(r){ var a = Math.abs(r); return a<=HUBER_DELTA ? 1 : HUBER_DELTA/a; }
+    function cauchyWeight(r){ return 1/(1 + (r*r)/(CAUCHY_C*CAUCHY_C)); }
+    var TUKEY_C = 6;
+    function tukeyWeight(r){
+      var a = Math.abs(r);
+      if (a >= TUKEY_C) return 0;
+      var q = 1 - (a*a)/(TUKEY_C*TUKEY_C);
+      return q*q;
+    }
+
+    // clean observations, fixed once per page load (small realistic noise, not the outlier)
+    var cleanObs = CAMS3.map(function(c){
+      var p = MVG.project(K, c, TRUE_X);
+      return [p.u + gaussianNoise(0.6), p.v + gaussianNoise(0.6)];
+    });
+
+    function solveIRLS(obsList, weightFn, iters){
+      // init from a clean 2-view triangulation using cameras 1 & 2 (never the outlier camera 0)
+      var P1 = projectionMatrix(K, CAMS3[1]), P2 = projectionMatrix(K, CAMS3[2]);
+      var X = triangulateLinear(P1, obsList[1], P2, obsList[2]);
+      for (var it=0; it<iters; it++){
+        var H=[[0,0,0],[0,0,0],[0,0,0]], g=[0,0,0];
+        for (var c=0;c<CAMS3.length;c++){
+          var r = reprojResidual(K, CAMS3[c], X, obsList[c]);
+          var rn = Math.hypot(r[0],r[1]) || 1e-9;
+          var w = weightFn ? weightFn(rn) : 1;
+          var J = numJacobianPoint(K, CAMS3[c], X);
+          for (var d1=0; d1<3; d1++){
+            g[d1] += w*(J[d1][0]*r[0] + J[d1][1]*r[1]);
+            for (var d2=0; d2<3; d2++) H[d1][d2] += w*(J[d1][0]*J[d2][0] + J[d1][1]*J[d2][1]);
+          }
+        }
+        var delta = solveLinearN(H, g.map(function(v){return -v;}));
+        X = [X[0]+delta[0], X[1]+delta[1], X[2]+delta[2]];
+      }
+      return X;
+    }
+
+    var outlierEl = document.getElementById('s3-outlier');
+    var l2El = document.getElementById('s3-l2'), huberEl = document.getElementById('s3-huber'), cauchyEl = document.getElementById('s3-cauchy'), tukeyEl = document.getElementById('s3-tukey');
+
+    var layoutOpts = layout3d();
+
+    function update(){
+      var mag = parseFloat(outlierEl.value);
+      var dir = MVG.normalize([1, 0.6, 0]);
+      var cleanP0 = MVG.project(K, CAMS3[0], TRUE_X);
+      var obsList = cleanObs.slice();
+      obsList[0] = [cleanP0.u + dir[0]*mag, cleanP0.v + dir[1]*mag];
+
+      var results = {
+        l2: solveIRLS(obsList, null, 15),
+        huber: solveIRLS(obsList, huberWeight, 15),
+        cauchy: solveIRLS(obsList, cauchyWeight, 15),
+        tukey: solveIRLS(obsList, tukeyWeight, 15)
+      };
+
+      var traces = [
+        { type:'scatter3d', mode:'markers', x:[TRUE_X[0]], y:[TRUE_X[1]], z:[TRUE_X[2]], marker:{size:7,color:COLOR_TEXT}, hoverinfo:'skip' },
+        camMarkersTrace(CAMS3, COLOR_ACCENT)
+      ];
+      var legend = '';
+      function addPt(key, color, label, on){
+        if (!on) return;
+        var X = results[key];
+        traces.push({ type:'scatter3d', mode:'markers', x:[X[0]], y:[X[1]], z:[X[2]], marker:{size:7,color:color,symbol:'diamond'}, hoverinfo:'skip' });
+        var err = MVG.norm(MVG.sub(X, TRUE_X));
+        legend += '<span><i style="background:'+color+'"></i>'+label+' (err '+err.toFixed(2)+')</span>';
+      }
+      addPt('l2', COLOR_ACCENT2, 'L2', l2El.checked);
+      addPt('huber', COLOR_ACCENT, 'Huber', huberEl.checked);
+      addPt('cauchy', '#9b6bd1', 'Cauchy', cauchyEl.checked);
+      addPt('tukey', '#2a9d5c', 'Tukey', tukeyEl.checked);
+
+      Plotly.react(div, traces, layoutOpts, { displayModeBar:false, responsive:true });
+      document.getElementById('s3-legend').innerHTML = legend || '<span style="opacity:.6">toggle a loss to show it</span>';
+      document.getElementById('s3-outlierval').textContent = mag.toFixed(0) + ' px';
+      document.getElementById('s3-readout').innerHTML =
+        '<div><span class="k">outlier on camera 0</span> = ' + mag.toFixed(0) + ' px off truth</div>' +
+        '<div><span class="k">L2 point error</span> = <span class="hi">' + MVG.norm(MVG.sub(results.l2, TRUE_X)).toFixed(3) + '</span></div>' +
+        '<div><span class="k">Huber point error</span> = ' + MVG.norm(MVG.sub(results.huber, TRUE_X)).toFixed(3) + '</div>' +
+        '<div><span class="k">Cauchy point error</span> = ' + MVG.norm(MVG.sub(results.cauchy, TRUE_X)).toFixed(3) + '</div>' +
+        '<div><span class="k">Tukey point error</span> = ' + MVG.norm(MVG.sub(results.tukey, TRUE_X)).toFixed(3) + ' <span style="opacity:.6">(redescending: full rejection past c, strongest outlier immunity — but a bad c can reject good data too)</span></div>';
+    }
+
+    [outlierEl, l2El, huberEl, cauchyEl, tukeyEl].forEach(function(el){ el.addEventListener('input', update); });
+    update();
+  })();
+
+  // ---------- Step 6: gauge freedom ----------
+  (function(){
+    var div = document.getElementById('s4-plot3d');
+    if (!div) return;
+    var K = { fx: 460, fy: 460, cx: 0, cy: 0 };
+    var TRUE_CAMS4 = [0,1,2].map(function(i){ return MVG.orbitCamera(i*1.9 + 0.5, 0.3, 6.5, [0,0,0]); });
+    var trueObs = CUBE_VERTS.map(function(Xt){ return TRUE_CAMS4.map(function(c){ var p = MVG.project(K,c,Xt); return [p.u,p.v]; }); });
+
+    function rotY(deg){
+      var t = deg*Math.PI/180, c=Math.cos(t), s=Math.sin(t);
+      return [[c,0,s],[0,1,0],[-s,0,c]];
+    }
+
+    var rotEl = document.getElementById('s4-rot'), transEl = document.getElementById('s4-trans'), scaleEl = document.getElementById('s4-scale'), pinEl = document.getElementById('s4-pin');
+
+    function update(){
+      var Rw = rotY(parseFloat(rotEl.value));
+      var t = [parseFloat(transEl.value), parseFloat(transEl.value)*0.4, parseFloat(transEl.value)*0.7];
+      var s = parseFloat(scaleEl.value);
+      var pin = pinEl.checked;
+
+      function transformPoint(X){ return MVG.add(MVG.scale(MVG.matVec(Rw, X), s), t); }
+      function transformCam(cam){ return { C: MVG.add(MVG.scale(MVG.matVec(Rw, cam.C), s), t), R: matMul3(cam.R, transpose3(Rw)) }; }
+
+      var newVerts = CUBE_VERTS.map(transformPoint);
+      // With the datum pinned, camera 0 is deliberately excluded from the transform: the rest of the
+      // reconstruction moves relative to a camera that no longer moves with it — the gauge freedom is gone.
+      var newCams = TRUE_CAMS4.map(function(c,i){ return (pin && i===0) ? c : transformCam(c); });
+
+      var cost = 0;
+      newVerts.forEach(function(X, pi){
+        newCams.forEach(function(c, ci){
+          var r = reprojResidual(K, c, X, trueObs[pi][ci]);
+          cost += 0.5*(r[0]*r[0]+r[1]*r[1]);
+        });
+      });
+
+      Plotly.react(div, [
+        cubeLineTraceFromVerts(CUBE_VERTS, COLOR_DIVIDER, 2, 0.6),
+        cubeLineTraceFromVerts(newVerts, COLOR_ACCENT2, 3, 1),
+        camMarkersTrace(newCams, COLOR_ACCENT)
+      ], layout3d(), { displayModeBar:false, responsive:true });
+
+      document.getElementById('s4-rot-val').textContent = parseFloat(rotEl.value).toFixed(0) + '°';
+      document.getElementById('s4-trans-val').textContent = parseFloat(transEl.value).toFixed(2);
+      document.getElementById('s4-scale-val').textContent = parseFloat(scaleEl.value).toFixed(2) + '×';
+      document.getElementById('s4-readout').innerHTML =
+        '<div><span class="k">total reprojection cost</span> = <span class="hi">' + cost.toExponential(2) + '</span></div>' +
+        '<div>' + (pin
+          ? '<span style="opacity:.8">camera 0 pinned — moving the sliders now visibly costs something</span>'
+          : '<span style="opacity:.8">datum free — cost stays ≈0 for any slider value: this is the gauge null space</span>') + '</div>';
+    }
+
+    [rotEl, transEl, scaleEl].forEach(function(el){ el.addEventListener('input', update); });
+    pinEl.addEventListener('change', update);
+    update();
+  })();
+
+  // ---------- Step 7: rotation-update comparison (additive vs exp-map) ----------
+  (function(){
+    var canvas = document.getElementById('s7-canvas');
+    if (!canvas) return;
+    var ctx = canvas.getContext('2d');
+    var stepEl = document.getElementById('s7-step');
+    var W = canvas.width, H = canvas.height;
+
+    function orthErr(R){
+      var RtR = matMul3(transpose3(R), R);
+      var e = 0;
+      for (var i=0;i<3;i++) for (var j=0;j<3;j++){ var v = RtR[i][j] - (i===j?1:0); e += v*v; }
+      return Math.sqrt(e);
+    }
+    // Gram-Schmidt row re-orthonormalization (cheap stand-in for a full polar repair)
+    function reorthonormalize(R){
+      var r0 = [R[0][0],R[0][1],R[0][2]], r1 = [R[1][0],R[1][1],R[1][2]];
+      function norml(v){ var n = Math.hypot(v[0],v[1],v[2])||1; return [v[0]/n,v[1]/n,v[2]/n]; }
+      r0 = norml(r0);
+      var d = r0[0]*r1[0] + r0[1]*r1[1] + r0[2]*r1[2];
+      r1 = norml([r1[0]-d*r0[0], r1[1]-d*r0[1], r1[2]-d*r0[2]]);
+      var r2 = [ (r0[1]*r1[2]-r0[2]*r1[1]), (r0[2]*r1[0]-r0[0]*r1[2]), (r0[0]*r1[1]-r0[1]*r1[0]) ];
+      return [r0, r1, r2];
+    }
+
+    function update(){
+      var step = parseFloat(stepEl.value);
+      document.getElementById('s7-stepval').textContent = step.toFixed(3) + ' rad';
+      var axis = MVG.normalize([1, 0.3, 0.2]);
+      var w = MVG.scale(axis, step);
+      var Wx = skew3(w);
+      var Rexp = [[1,0,0],[0,1,0],[0,0,1]];
+      var Radd = [[1,0,0],[0,1,0],[0,0,1]];
+      var Rpol = [[1,0,0],[0,1,0],[0,0,1]];
+      var errsExp = [], errsAdd = [], errsPol = [];
+      for (var k=0; k<100; k++){
+        Rexp = matMul3(Rexp, expmapSO3(w));            // multiplicative: stays on SO(3)
+        Radd = [[ Radd[0][0]+Wx[0][0], Radd[0][1]+Wx[0][1], Radd[0][2]+Wx[0][2] ],
+                [ Radd[1][0]+Wx[1][0], Radd[1][1]+Wx[1][1], Radd[1][2]+Wx[1][2] ],
+                [ Radd[2][0]+Wx[2][0], Radd[2][1]+Wx[2][1], Radd[2][2]+Wx[2][2] ]]; // additive: leaves SO(3)
+        Rpol = reorthonormalize(Radd);                  // additive, repaired after the fact
+        errsExp.push(orthErr(Rexp));
+        errsAdd.push(orthErr(Radd));
+        errsPol.push(orthErr(Rpol));
+      }
+
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(0,0,0,0.04)'; ctx.fillRect(0,0,W,H);
+      var padL = 60, padB = 30, padT = 14, padR = 14;
+      var maxE = Math.max(1e-3, Math.max.apply(null, errsAdd));
+      function X(i){ return padL + (i/(errsAdd.length-1))*(W-padL-padR); }
+      function Y(v){ return H-padB - (Math.min(v, maxE)/maxE)*(H-padT-padB); }
+      ctx.strokeStyle = COLOR_DIVIDER; ctx.lineWidth = 1; ctx.font = '10px monospace'; ctx.fillStyle = COLOR_TEXT;
+      for (var g=0; g<=3; g++){
+        var gy = padT + (g/3)*(H-padT-padB);
+        ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W-padR, gy); ctx.stroke();
+        ctx.globalAlpha = 0.7; ctx.fillText((maxE*(1-g/3)).toExponential(0), 4, gy+3); ctx.globalAlpha = 1;
+      }
+      function series(vals, color, lw){
+        ctx.strokeStyle = color; ctx.lineWidth = lw;
+        ctx.beginPath();
+        vals.forEach(function(v,i){ if (i===0) ctx.moveTo(X(i), Y(v)); else ctx.lineTo(X(i), Y(v)); });
+        ctx.stroke();
+      }
+      series(errsAdd, '#c23b3b', 2.2);
+      series(errsPol, COLOR_ACCENT, 2.2);
+      series(errsExp, '#2a9d5c', 2.6);
+      ctx.fillStyle = '#c23b3b'; ctx.fillText('raw additive R + [δ]×', padL+8, padT+12);
+      ctx.fillStyle = COLOR_ACCENT; ctx.fillText('additive + re-orthonormalized', padL+8, padT+26);
+      ctx.fillStyle = '#2a9d5c'; ctx.fillText('exp map: R·exp([δ]×)  — never leaves SO(3)', padL+8, padT+40);
+      ctx.fillStyle = COLOR_TEXT;
+      ctx.fillText('increment #', W/2-24, H-8);
+
+      document.getElementById('s7-readout').innerHTML =
+        '<div><span class="k">after 100 increments</span>: exp-map &#8214;R&#7488;R&minus;I&#8214; = <span class="hi">' + errsExp[99].toExponential(1) + '</span>, repaired = ' + errsPol[99].toExponential(1) + ', raw additive = <span class="hi" style="color:#c23b3b">' + errsAdd[99].toExponential(1) + '</span></div>' +
+        '<div style="opacity:.65">Every BA/SLAM codebase updates rotations multiplicatively for exactly this reason — this page&#8217;s refineAllPoses uses applyPoseDelta &rarr; expmapSO3.</div>';
+    }
+    stepEl.addEventListener('input', update);
+    update();
+  })();
+
+})();
+</script>
+{% endraw %}
+</body>
+</html>

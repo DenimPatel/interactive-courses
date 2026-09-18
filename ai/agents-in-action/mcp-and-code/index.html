@@ -1,0 +1,615 @@
+---
+title: "Agents in Action, Interactively — Part 4: MCP, skills, and code execution"
+description: "The protocol and its stateless core; tool-definition bloat; SKILL.md's three loading stages; and why the context window is not a data bus."
+permalink: "/ai/agents-in-action/mcp-and-code/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>MCP, skills, and code execution</h1>
+    <p>An agent is only as useful as the things you connect to it, and two connector stories now dominate: the Model Context Protocol for tools and data, and Agent Skills for know-how. Both arrive with the same hidden bill — everything you expose has to be described somewhere, and the description is paid for in the model's context. This part follows a protocol exchange lane by lane, then measures what tool definitions actually cost, then shows the loading trick that keeps skills small, and ends on the rule that saves the most tokens of all: stop ferrying data through the window and let code do it.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="protocol">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The protocol, lane by lane</h2></div>
+    <p class="g-eyebrow">Host, client, server — and a stateless core</p>
+    <p>The <strong>Model Context Protocol</strong> (MCP) is a wire format for letting a model talk to tools and data sources through a uniform interface instead of bespoke glue per integration. Anthropic introduced it in November 2024 and donated it to the Linux Foundation; the spec is versioned by date. The revisions you will see named are <code>2024-11-05</code>, <code>2025-03-26</code> and <code>2025-06-18</code>, with a 2026 revision that streamlines the core toward a <strong>stateless request/response model</strong> — explicit session handles rather than per-connection state — so a server can be scaled horizontally behind a load balancer. Treat any specific revision as checkable against <a href="https://modelcontextprotocol.io/">modelcontextprotocol.io</a>; clients and servers lag the spec by months.</p>
+    <p>There are three roles, and keeping them apart is the whole mental model. The <strong>host</strong> is your application, the thing holding the model and its context. The <strong>client</strong> is the protocol endpoint inside the host: it speaks JSON-RPC, matches request ids to responses, and owns the session. The <strong>server</strong> is what exposes capabilities — tools, resources, prompts — over that protocol. The host never speaks MCP; the client does.</p>
+    <div class="g-code"><span class="k">// the shape of every exchange: a JSON-RPC request, id-matched to a response</span>
+{ <span class="s">"jsonrpc"</span>: "2.0", <span class="s">"id"</span>: 2, <span class="s">"method"</span>: "tools/list", <span class="s">"params"</span>: {} }
+{ <span class="s">"jsonrpc"</span>: "2.0", <span class="s">"id"</span>: 2, <span class="s">"result"</span>: { <span class="s">"tools"</span>: [
+    { <span class="s">"name"</span>: "search_docs", <span class="s">"description"</span>: "Search the docs corpus",
+      <span class="s">"inputSchema"</span>: { <span class="s">"type"</span>: "object", <span class="s">"properties"</span>: { <span class="s">"query"</span>: { <span class="s">"type"</span>: "string" } } } }
+] } }</div>
+    <p>Step through the exchange below. The three lanes are the three roles; each arrow is one JSON-RPC message, and the animation is only a walk through the handshake an agent performs before it can do anything at all.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mcp-seq-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">One arrow per message. Without session state, every request could be served by a different replica.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Message <span class="val">11</span></label><input type="range" id="mcp-seq-step" min="1" max="11" step="1" value="11"></div>
+        <div class="g-btnrow">
+          <button id="mcp-seq-play">Play sequence</button>
+          <button id="mcp-seq-stateless">Stateless core</button>
+        </div>
+        <div class="g-readout" id="mcp-seq-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mcp-source"></p>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> MCP standardises <b>how capabilities are described and invoked</b>. It does not decide what goes in the model's context — that is still your call, and it is where the next three sections look.</span></div>
+  </section>
+
+  <section class="g-step" id="tool-bloat">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Tool definitions are a system-prompt tax</h2></div>
+    <p class="g-eyebrow">N servers × M tools × schema tokens, before the user speaks</p>
+    <p>Here is the part of MCP that surprises people. The <code>tools/list</code> result is not a catalogue the model browses on demand; the client hands it to the model as a tool-definition block that sits in the prompt on <em>every</em> call. A tool is not just a name. It is a name, a description written for the model, and a JSON Schema for its arguments — and a faithful schema for one non-trivial tool can run to several hundred tokens once you describe every parameter, enum and nested object.</p>
+    <p>So the cost is multiplicative. Five servers exposing a dozen tools each, at two or three hundred schema tokens per tool, is fifteen thousand tokens of standing instruction before the user types a word. Those tokens are billed as input on every turn. They compete with the retrieved documents and the transcript for the same budget. And they are the reason a "small" agent that connects to ten services starts to feel slow and expensive without any of its actual work getting harder.</p>
+    <p>Drag the sliders below. The stacked column is the prompt against a fixed window; the line is where the output reserve begins. The readout reports the point at which the user's own query no longer fits — the number of servers at which you have spent the window on describing what you could do.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mcp-bloat-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Tool schemas are a line item like any other. The interesting number is the one at which the query gets squeezed out.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>MCP servers <span class="val">6</span></label><input type="range" id="mcp-servers" min="1" max="20" step="1" value="6"></div>
+        <div class="g-field"><label>Tools per server <span class="val">10</span></label><input type="range" id="mcp-tools" min="1" max="40" step="1" value="10"></div>
+        <div class="g-field"><label>Avg schema tokens per tool <span class="val">220</span></label><input type="range" id="mcp-schema" min="40" max="800" step="10" value="220"></div>
+        <div class="g-field"><label>Context window <span class="val">128000</span></label><input type="range" id="mcp-window" min="16000" max="200000" step="1000" value="128000"></div>
+        <div class="g-readout" id="mcp-bloat-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mcp-windows-source"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> "just connect every server" is a context decision, not an integration decision. A tool nobody calls still costs tokens on every request, and it also gives the model more near-miss choices to be wrong about.</span></div>
+  </section>
+
+  <section class="g-step" id="skills">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Agent Skills and SKILL.md's three stages</h2></div>
+    <p class="g-eyebrow">Metadata always, instructions on invocation, resources on demand</p>
+    <p>Tools tell an agent what it can <em>do</em>; skills tell it how your team <em>does things</em>. An <strong>Agent Skill</strong> is a folder with a <code>SKILL.md</code> file — a name, a description, and a body of instruction that may reference scripts and other files. The design trick is not the file format but the <strong>progressive disclosure</strong>: the skill is loaded in three stages, and only the first is unconditional.</p>
+    <p>The <strong>metadata</strong> — name and description, a few dozen tokens — is the only part resident in context all the time, so the model knows the skill exists and when it might apply. The <strong>instructions</strong>, the body of <code>SKILL.md</code>, are pulled in only when the skill is invoked. The <strong>resources</strong> it points at — scripts, templates, reference tables — are loaded only when a step actually needs them, and often they are never loaded into the model at all because they are executed rather than read.</p>
+    <p>That is what makes a library of skills affordable: twenty skills can be resident for the price of the metadata, because nineteen of them are sitting on disk unread. The comparison below puts progressive disclosure next to the naive alternative — loading every skill in full — against a small agent's window. Toggle how many skills are invoked and whether their resources are loaded.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mcp-skills-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Two columns, same skill library: progressive disclosure versus loading everything. The dashed line is the window.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Skills available <span class="val">12</span></label><input type="range" id="mcp-skill-count" min="1" max="24" step="1" value="12"></div>
+        <div class="g-field"><label>Skills invoked this turn <span class="val">3</span></label><input type="range" id="mcp-skill-invoked" min="0" max="24" step="1" value="3"></div>
+        <div class="g-btnrow">
+          <button id="mcp-skill-resources">Resources on demand</button>
+        </div>
+        <div class="g-readout" id="mcp-skills-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mcp-skills-source"></p>
+  </section>
+
+  <section class="g-step" id="not-a-bus">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The context window is not a data bus</h2></div>
+    <p class="g-eyebrow">Let code move the data; bring back only the answer</p>
+    <p>Once an agent has tools, the tempting design is to use the context window as the channel between them: call a tool, paste the result into the transcript, call the next tool, paste that result, and so on. Each hop is a full round trip, each result is billed as input on every subsequent turn, and the intermediate values you will never look at again accumulate forever. Ten steps of a data-shuffling analysis can put more tokens through the window than the final answer is worth by two orders of magnitude.</p>
+    <p>The alternative is to treat code as the tool. Give the agent a sandbox with your data reachable and let it <strong>write one program that does the whole job</strong> — filter, join, aggregate, compare — and return only the result. The intermediate rows, the fifty megabytes of JSON, the loop over a thousand files: none of it enters the context, because none of it needs to. This is also exactly how a skill's resources work: a reference table is not read into the prompt, it is queried.</p>
+    <p>The comparison below runs the same multi-step analysis both ways. Increase the number of steps or the size of each intermediate result and watch the sequential path's token count bend quadratic while the code path barely moves.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mcp-code-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Three measures, two designs. Each bar is normalised within its own group; the labels carry the real values.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Analysis steps <span class="val">8</span></label><input type="range" id="mcp-steps" min="2" max="20" step="1" value="8"></div>
+        <div class="g-field"><label>Tokens per intermediate result <span class="val">1200</span></label><input type="range" id="mcp-result" min="200" max="4000" step="100" value="1200"></div>
+        <div class="g-readout" id="mcp-code-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mcp-cost-source"></p>
+    <p class="g-source" id="mcp-agents-source"></p>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> the window is a <b>working set for reasoning</b>, not a channel for bytes. Push data movement into code, keep decisions in the context, and the same agent gets cheaper, faster and more accurate at once.</span></div>
+    <div class="g-warn">⚠️ <span><b>Not free:</b> code execution needs a sandbox, a language runtime, permissions on the data, and a story for what happens when the script fails. Where the environment cannot provide that — a pure API agent with no shell — sequential tool calls are the honest choice, and the bill above is what they cost.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What are MCP's three roles?</td><td>Host (your app), client (the JSON-RPC endpoint inside it), server (what exposes tools, resources, prompts).</td></tr>
+        <tr><td>What changed in the 2026 spec revision?</td><td>The core moves toward stateless request/response with explicit session handles, so servers scale horizontally. Verify the revision against the spec.</td></tr>
+        <tr><td>Where do tool definitions live?</td><td>In the system prompt of every call — name, description and JSON Schema, billed as input every time.</td></tr>
+        <tr><td>How do you size the bill?</td><td>Servers × tools per server × average schema tokens, against the window you actually have left after the output reserve.</td></tr>
+        <tr><td>How is a SKILL.md loaded?</td><td>Three stages: metadata always in context, instructions on invocation, resources on demand.</td></tr>
+        <tr><td>Why does that matter?</td><td>A library of skills costs the metadata of all of them plus the body of the one in use, not the sum of every body.</td></tr>
+        <tr><td>Why is the window not a data bus?</td><td>Every intermediate result is re-sent on every later turn. Code moves data locally and returns only the answer.</td></tr>
+        <tr><td>When is code the wrong answer?</td><td>When there is no sandbox, no runtime, or no safe permission model — then sequential calls are the honest fallback.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Anthropic, <a href="https://www.anthropic.com/news/model-context-protocol">"Introducing the Model Context Protocol"</a>, 25 November 2024 — the announcement, and the host/client/server framing.</li>
+      <li>Model Context Protocol, <a href="https://modelcontextprotocol.io/specification/2025-06-18">specification</a> — dated revisions; the place to check what the core actually says before quoting a revision number.</li>
+      <li>Linux Foundation, <a href="https://www.linuxfoundation.org/press/linux-foundation-announces-the-formation-of-the-agentic-ai-foundation">Agentic AI Foundation announcement</a> — MCP's donation and the vendor-neutral home it now sits in.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/code-execution-with-mcp">"Code execution with MCP"</a>, 2025 — the argument this part's fourth section makes: present tools as code APIs and keep intermediate results out of the context.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/news/agent-skills">"Introducing Agent Skills"</a>, 2025 — <code>SKILL.md</code> and the three-stage progressive disclosure it is built around.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — the write/select/compress/isolate taxonomy that tool definitions and skills are both spending against.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Tools, skills and code all fight for the same window — and the agent's own history is the term that grows without bound. Next: the four kinds of memory, and what compaction quietly destroys.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    mcp: {
+      source: "Model Context Protocol, introduced by Anthropic 2024-11-25 and donated to the Linux Foundation; spec revisions are dated (2024-11-05, 2025-03-26, 2025-06-18). The 2026 revision streamlines the core toward a stateless request/response model with explicit session handles, so a server can scale horizontally without sticky state. Treat the specific revision and its date as checkable against modelcontextprotocol.io; clients and servers lag the spec by months. Skills: with a SKILL.md file loaded in three stages — metadata always, instructions on invocation, resources on demand.",
+      specRevisions: ["2024-11-05", "2025-03-26", "2025-06-18", "2026 (stateless core)"],
+      skillStages: ["metadata (name + description, always in context)", "instructions (SKILL.md body, loaded when the skill is invoked)", "resources (scripts and files, loaded on demand)"]
+    },
+    context_windows: {
+      source: "Vendor model cards and API docs, retrieved 2026-09. Offline fallback constants.",
+      items: [{ model: "GPT-4o", tokens: 128000 }, { model: "Claude 3.7 Sonnet / 4.x", tokens: 200000 }]
+    },
+    agents: {
+      source: "Anthropic, 'Effective context engineering for AI agents' (2025-09-29) for the write/select/compress/isolate taxonomy. Offline fallback constants.",
+      compactionTax: "Compaction is lossy and adversarial: an evicted fact is indistinguishable from a fact that never existed, so the agent silently redoes work."
+    },
+    cost_latency: {
+      source: "Latency definitions follow the serving guide (TTFT, TPOT, goodput). The agent-loop cost is arithmetic: each turn resends the whole prior context. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — the MCP handshake, lane by lane
+  // ------------------------------------------------------------------
+  var LANES = [
+    { label: 'Host', sub: 'your app + model', x: 112 },
+    { label: 'MCP client', sub: 'JSON-RPC endpoint', x: 320 },
+    { label: 'MCP server', sub: 'tools / resources', x: 528 }
+  ];
+  var MSGS = [
+    { f: 0, t: 1, label: 'initialize', note: 'The host opens a session with its client; protocol version and capabilities are declared up front.' },
+    { f: 1, t: 2, label: 'initialize', note: 'The client is the protocol endpoint. The host never speaks MCP; the client does.' },
+    { f: 2, t: 1, label: 'initialize result', note: 'The server answers with its protocol version and the capabilities it supports.' },
+    { f: 1, t: 0, label: 'ready', note: 'The client reports readiness to the host. Nothing is in the model context yet.' },
+    { f: 0, t: 1, label: 'tools/list', note: 'Discovery: which tools does this server expose?' },
+    { f: 1, t: 2, label: 'tools/list', note: 'A JSON-RPC request, id-matched to its response.' },
+    { f: 2, t: 1, label: 'tool definitions', note: 'Each entry is a name, a description and a JSON Schema for the arguments — tokens the model pays for on every call.' },
+    { f: 0, t: 1, label: 'tools/call', note: 'The model chose a tool; the host dispatches the call with the arguments it produced.' },
+    { f: 1, t: 2, label: 'tools/call', note: 'The call carries the tool name and the arguments as JSON.' },
+    { f: 2, t: 1, label: 'result (content blocks)', note: 'The server returns content blocks, not model tokens.' },
+    { f: 1, t: 0, label: 'result', note: 'The host appends this to the model context — the boundary where protocol data becomes context budget.' }
+  ];
+  var A = { step: 11, stateless: false };
+  window.__MCP_REVS = FALLBACK.mcp.specRevisions;
+  var setupA = Guide.setupCanvas(el('mcp-seq-canvas'), 640, 340, drawA);
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('MCP handshake — one arrow per JSON-RPC message' + (A.stateless ? '  ·  stateless core' : ''), 16, 20);
+
+    var topY = 66, botY = 292;
+    LANES.forEach(function (l) {
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(l.x, topY); ctx.lineTo(l.x, botY); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.accent700; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(l.label, l.x, 42);
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font;
+      ctx.fillText(l.sub, l.x, 55);
+    });
+
+    var shown = Math.max(0, Math.min(MSGS.length, isFinite(A.step) ? A.step : 1));
+    MSGS.forEach(function (m, i) {
+      if (i >= shown) return;
+      var y = 84 + i * 19;
+      var x0 = LANES[m.f].x, x1 = LANES[m.t].x;
+      var isCur = i === shown - 1;
+      var col = isCur ? c.accent2 : c.accent;
+      var label = m.label;
+      if (A.stateless && (label === 'tools/list' || label === 'tools/call')) label = label + ' + session';
+      Guide.drawArrow(ctx, x0, y, x1, y, { color: col, width: isCur ? 2.2 : 1.4, head: 7 });
+      ctx.fillStyle = isCur ? c.accent2 : c.text;
+      ctx.font = (isCur ? '600 ' : '') + '9px ' + c.font;
+      ctx.textAlign = 'center';
+      ctx.fillText(label, (x0 + x1) / 2, y - 4);
+    });
+
+    if (A.stateless) {
+      ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('stateless core: each request self-describing + session handle → any replica can serve it', 16, botY + 26);
+    } else {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('stateful connection: the session lives with one server instance', 16, botY + 26);
+    }
+
+    var cur = MSGS[Math.max(0, shown - 1)];
+    el('mcp-seq-readout').innerHTML =
+      '<div><span class="k">message</span> <span class="hi">' + shown + ' / ' + MSGS.length + '</span>' +
+      ' &nbsp; <span class="k">' + cur.label + '</span></div>' +
+      '<div class="k">' + cur.note + '</div>' +
+      '<div class="k">' + (A.stateless
+        ? 'Spec revisions to check: ' + (window.__MCP_REVS || []).join(' · ')
+        : 'Toggle the stateless core to see what the 2026 revision changes about scaling.') + '</div>';
+  }
+  Guide.bindSliders([el('mcp-seq-step')], function () {
+    A.step = parseInt(el('mcp-seq-step').value, 10);
+    drawA();
+  });
+  Guide.loop({
+    onStep: function () {
+      A.step = A.step >= MSGS.length ? 1 : A.step + 1;
+      el('mcp-seq-step').value = A.step;
+      drawA();
+    },
+    button: el('mcp-seq-play'), interval: 650, playLabel: 'Play sequence', pauseLabel: 'Pause'
+  });
+  el('mcp-seq-stateless').addEventListener('click', function () {
+    A.stateless = !A.stateless;
+    this.className = A.stateless ? 'g-primary' : '';
+    this.textContent = A.stateless ? 'Stateless core on' : 'Stateless core';
+    drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — tool-definition bloat against the window
+  // ------------------------------------------------------------------
+  var B = {
+    servers: el('mcp-servers'), tools: el('mcp-tools'),
+    schema: el('mcp-schema'), window: el('mcp-window')
+  };
+  var setupB = Guide.setupCanvas(el('mcp-bloat-canvas'), 640, 360, drawB);
+  var BASE_SYSTEM = 800, BASE_CONVO = 600, QUERY = 300, OUTPUT_RESERVE = 1000;
+  function drawB() {
+    if (!setupB) return;
+    var servers = +B.servers.value, tools = +B.tools.value, schema = +B.schema.value, window = +B.window.value;
+    var toolTokens = servers * tools * schema;
+    var segments = [
+      { name: 'system + instructions', tokens: BASE_SYSTEM },
+      { name: 'tool definitions', tokens: toolTokens },
+      { name: 'conversation so far', tokens: BASE_CONVO },
+      { name: 'user query', tokens: QUERY }
+    ];
+    var b = AppSim.ctxBudget({ window: window, reserveOutput: OUTPUT_RESERVE, segments: segments });
+    var colours = [c.accent400, c.accent2, '#c9a227', c.accent];
+    var columns = [{
+      label: 'this prompt',
+      segments: segments.map(function (s, i) { return { value: s.tokens, color: colours[i], name: s.name }; })
+    }];
+    var geo = Guide.drawStackedColumns(setupB.ctx, 640, 360, columns, {
+      maxTotal: Math.max(window, b.used) * 1.04, padL: 54, padR: 16, padT: 46, padB: 40, gap: 2
+    });
+    var ctx = setupB.ctx;
+    var budgetY = geo.py(window - OUTPUT_RESERVE);
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(geo.padL, budgetY); ctx.lineTo(628, budgetY); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('input budget after the ' + Guide.fmtNum(OUTPUT_RESERVE) + '-token output reserve', geo.padL + 2, budgetY - 4);
+
+    var usedY = geo.py(b.used);
+    ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font;
+    ctx.fillText(Guide.fmtNum(b.used) + ' tok', geo.padL + 92, Math.max(30, usedY - 4));
+
+    segments.forEach(function (s, i) {
+      var lx = 16 + i * 154;
+      ctx.fillStyle = colours[i]; ctx.fillRect(lx, 10, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(s.name, lx + 12, 19);
+    });
+
+    var toolShare = b.used ? toolTokens / b.used : 0;
+    var roomForTools = window - OUTPUT_RESERVE - BASE_SYSTEM - BASE_CONVO - QUERY;
+    var perServer = tools * schema;
+    var maxServers = perServer > 0 ? Math.floor(roomForTools / perServer) : Infinity;
+    el('mcp-bloat-readout').innerHTML =
+      '<div><span class="k">tool definitions</span> <span class="hi">' + Guide.fmtNum(toolTokens) + '</span> tok' +
+      ' &nbsp; <span class="k">= </span>' + servers + ' × ' + tools + ' × ' + schema + '</div>' +
+      '<div><span class="k">share of prompt</span> ' + (toolShare * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">of the window</span> ' + (100 * toolTokens / window).toFixed(0) + '%</div>' +
+      '<div><span class="k">remaining</span> <span class="' + (b.over ? 'bad' : 'hi') + '">' + Guide.fmtNum(b.remaining) + '</span> tok' +
+      (b.over ? ' — over budget: the query is being squeezed out or truncated' : ' left after the query') + '</div>' +
+      '<div class="k">at these settings the query stops fitting at <b>' + (isFinite(maxServers) ? maxServers : '—') +
+      '</b> servers (' + Guide.fmtNum(perServer) + ' tok of schema per server)</div>';
+  }
+  Guide.bindSliders([B.servers, B.tools, B.schema, B.window], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — SKILL.md progressive disclosure
+  // ------------------------------------------------------------------
+  var C = { count: el('mcp-skill-count'), invoked: el('mcp-skill-invoked'), resources: false };
+  var setupC = Guide.setupCanvas(el('mcp-skills-canvas'), 640, 360, drawC);
+  var META_TOK = 28, BODY_TOK = 720, RES_TOK = 2600, SKILL_WINDOW = 32000;
+  function drawC() {
+    if (!setupC) return;
+    var skills = +C.count.value;
+    if (!isFinite(skills)) skills = 1;
+    if (+C.invoked.max !== skills) C.invoked.max = skills;
+    var invoked = +C.invoked.value;
+    if (!isFinite(invoked)) invoked = 0;
+    invoked = Math.min(invoked, skills);
+    if (+C.invoked.value !== invoked) {
+      C.invoked.value = invoked;
+      var vspan = C.invoked.parentElement ? C.invoked.parentElement.querySelector('.val') : null;
+      if (vspan) vspan.textContent = invoked;
+    }
+    var loadedResources = C.resources ? invoked : 0;
+
+    var progMeta = skills * META_TOK, progBody = invoked * BODY_TOK, progRes = loadedResources * RES_TOK;
+    var naiveMeta = skills * META_TOK, naiveBody = skills * BODY_TOK, naiveRes = skills * RES_TOK;
+    var progTotal = progMeta + progBody + progRes;
+    var naiveTotal = naiveMeta + naiveBody + naiveRes;
+
+    var palette = [c.accent400, c.accent, c.accent2];
+    var columns = [
+      { label: 'progressive disclosure', segments: [
+        { value: progMeta, color: palette[0] }, { value: progBody, color: palette[1] }, { value: progRes, color: palette[2] }] },
+      { label: 'load every skill in full', segments: [
+        { value: naiveMeta, color: palette[0] }, { value: naiveBody, color: palette[1] }, { value: naiveRes, color: palette[2] }] }
+    ];
+    var geo = Guide.drawStackedColumns(setupC.ctx, 640, 360, columns, {
+      maxTotal: Math.max(naiveTotal, progTotal) * 1.06, padL: 54, padR: 16, padT: 52, padB: 40, gap: 60
+    });
+    var ctx = setupC.ctx;
+    var wy = geo.py(SKILL_WINDOW);
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(geo.padL, wy); ctx.lineTo(628, wy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('agent window ' + Guide.fmtNum(SKILL_WINDOW), geo.padL + 2, wy - 4);
+
+    var labels = ['metadata (always resident)', 'instructions (on invocation)', 'resources (on demand)'];
+    var legendY = 14;
+    labels.forEach(function (t, i) {
+      var lx = 16 + i * 208;
+      ctx.fillStyle = palette[i]; ctx.fillRect(lx, legendY, 9, 9);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(t, lx + 12, legendY + 9);
+    });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('progressive ' + Guide.fmtNum(progTotal) + ' tok', geo.px(0) - 46, geo.py(progTotal) - 6);
+    ctx.fillText('naive ' + Guide.fmtNum(naiveTotal) + ' tok', geo.px(1) - 30, Math.max(34, geo.py(naiveTotal) - 6));
+
+    el('mcp-skills-readout').innerHTML =
+      '<div><span class="k">library</span> <span class="hi">' + skills + '</span> skills, ' + invoked + ' invoked, resources ' + (C.resources ? 'loaded for invoked' : 'not loaded') + '</div>' +
+      '<div><span class="k">progressive</span> <span class="hi">' + Guide.fmtNum(progTotal) + '</span> tok' +
+      ' &nbsp; <span class="k">naive</span> <span class="' + (naiveTotal > SKILL_WINDOW ? 'bad' : '') + '">' + Guide.fmtNum(naiveTotal) + '</span> tok</div>' +
+      '<div><span class="k">metadata is unconditional</span> ' + Guide.fmtNum(progMeta) + ' tok = ' + skills + ' × ' + META_TOK +
+      ' &nbsp; <span class="k">ratio</span> ' + (progTotal > 0 ? (naiveTotal / progTotal).toFixed(1) : '—') + '×</div>' +
+      '<div class="k">' + (naiveTotal > SKILL_WINDOW
+        ? 'loading the library in full no longer fits the window — progressive disclosure is what makes a skill catalogue affordable'
+        : 'the contrast shrinks as the library shrinks; the loading stages are the point, not the ratio') + '</div>';
+  }
+  Guide.bindSliders([C.count, C.invoked], drawC);
+  el('mcp-skill-resources').addEventListener('click', function () {
+    C.resources = !C.resources;
+    this.className = C.resources ? 'g-primary' : '';
+    this.textContent = C.resources ? 'Resources loaded' : 'Resources on demand';
+    drawC();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — code execution versus sequential tool calls
+  // ------------------------------------------------------------------
+  var D = { steps: el('mcp-steps'), result: el('mcp-result') };
+  var setupD = Guide.setupCanvas(el('mcp-code-canvas'), 640, 340, drawD);
+  var FIXED_CTX = 2300, OUTPUT_PER_CALL = 250, FINAL_TOK = 180;
+  var SCRIPT = 'import json, glob\nrows = []\nfor f in glob.glob("data/*.json"):\n    rows += json.load(open(f))["records"]\nby = {}\nfor r in rows:\n    by[r["source"]] = by.get(r["source"], 0) + r["tokens"]\nprint(sorted(by.items(), key=lambda kv: -kv[1])[:5])';
+  var SCRIPT_TOK = AppSim.countTokens(SCRIPT);
+  var PRICES = { inputPerM: 3, outputPerM: 15, cachedPerM: 0.3 };
+  function sequentialCost(steps, result) {
+    var tokens = 0, ms = 0;
+    for (var i = 0; i < steps; i++) {
+      var prefix = FIXED_CTX + i * result;
+      tokens += prefix + OUTPUT_PER_CALL;
+      ms += AppSim.latencyModel({ prefixTokens: prefix, ttftBaseMs: 40, outputTokens: OUTPUT_PER_CALL, tpotMs: 25 }).e2eMs;
+    }
+    return { calls: steps, tokens: tokens, ms: ms };
+  }
+  function codeCost() {
+    var prefix = FIXED_CTX + SCRIPT_TOK;
+    var tokens = prefix + FINAL_TOK;
+    var ms = AppSim.latencyModel({ prefixTokens: prefix, ttftBaseMs: 40, outputTokens: 400, tpotMs: 25 }).e2eMs;
+    return { calls: 1, tokens: tokens, ms: ms };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var steps = +D.steps.value, result = +D.result.value;
+    var seq = sequentialCost(steps, result), code = codeCost();
+    var groups = [
+      { label: 'tool calls', seq: seq.calls, code: code.calls, fmt: function (v) { return v + ''; } },
+      { label: 'tokens through context', seq: seq.tokens, code: code.tokens, fmt: function (v) { return Guide.fmtNum(v); } },
+      { label: 'latency', seq: seq.ms, code: code.ms, fmt: function (v) { return Guide.fmtMs(v); } }
+    ];
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('same ' + steps + '-step analysis, two designs', 16, 20);
+    ctx.fillStyle = c.accent2; ctx.fillRect(16, 30, 9, 9);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.fillText('sequential tool calls', 29, 38);
+    ctx.fillStyle = c.accent; ctx.fillRect(160, 30, 9, 9);
+    ctx.fillStyle = c.text; ctx.fillText('one script, result only', 173, 38);
+
+    var padT = 58, groupH = (H - padT - 30) / groups.length;
+    groups.forEach(function (g, gi) {
+      var y0 = padT + gi * groupH;
+      var maxV = Math.max(g.seq, g.code) || 1;
+      var barH = 16, gap = 5;
+      ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(g.label, 16, y0 + 12);
+      var barX = 176, barW = 400;
+      [[g.seq, c.accent2, 'sequential'], [g.code, c.accent, 'code']].forEach(function (pair, pi) {
+        var by = y0 + 2 + pi * (barH + gap);
+        var w = barW * (pair[0] / maxV);
+        ctx.fillStyle = pair[1];
+        ctx.fillRect(barX, by, Math.max(2, w), barH);
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(g.fmt(pair[0]), barX + Math.max(2, w) + 6, by + 12);
+      });
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(16, y0 + groupH - 6); ctx.lineTo(624, y0 + groupH - 6); ctx.stroke();
+    });
+
+    var seqCost = AppSim.costModel({ inputTokens: seq.tokens, outputTokens: seq.calls * OUTPUT_PER_CALL, calls: 1, prices: PRICES });
+    var codeCostM = AppSim.costModel({ inputTokens: code.tokens, outputTokens: 400, calls: 1, prices: PRICES });
+    el('mcp-code-readout').innerHTML =
+      '<div><span class="k">tool calls</span> sequential <span class="hi">' + seq.calls + '</span> · code ' + code.calls + '</div>' +
+      '<div><span class="k">tokens through context</span> sequential <span class="hi">' + Guide.fmtNum(seq.tokens) + '</span> · code ' + Guide.fmtNum(code.tokens) +
+      ' (' + (seq.tokens / Math.max(1, code.tokens)).toFixed(1) + '× fewer)</div>' +
+      '<div><span class="k">wall clock</span> ' + Guide.fmtMs(seq.ms) + ' → ' + Guide.fmtMs(code.ms) +
+      ' &nbsp; <span class="k">cost</span> $' + seqCost.total.toFixed(4) + ' → $' + codeCostM.total.toFixed(4) + '</div>' +
+      '<div class="k">' + (result > 2000
+        ? 'intermediate results are large: the sequential path is re-sending values nobody will read again'
+        : 'the gap widens with the size of each intermediate result and the number of steps') + '</div>';
+  }
+  Guide.bindSliders([D.steps, D.result], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var mcp = (data && data.mcp) || FALLBACK.mcp;
+    el('mcp-source').textContent = mcp.source || FALLBACK.mcp.source;
+    el('mcp-skills-source').textContent = mcp.source || FALLBACK.mcp.source;
+    window.__MCP_REVS = mcp.specRevisions || FALLBACK.mcp.specRevisions;
+
+    if (data && data.cost_latency && data.cost_latency.source) {
+      el('mcp-cost-source').textContent = data.cost_latency.source;
+    } else {
+      el('mcp-cost-source').textContent = FALLBACK.cost_latency.source;
+    }
+
+    var agents = (data && data.agents) || FALLBACK.agents;
+    el('mcp-agents-source').textContent = agents.source || FALLBACK.agents.source;
+
+    if (data && data.context_windows && data.context_windows.source) {
+      el('mcp-windows-source').textContent = data.context_windows.source;
+    } else {
+      el('mcp-windows-source').textContent = FALLBACK.context_windows.source;
+    }
+
+    if (data && data.context_windows && data.context_windows.items && data.context_windows.items.length) {
+      var toks = data.context_windows.items.map(function (it) { return it.tokens; }).filter(function (t) { return t > 0; });
+      var maxTok = Math.max.apply(null, toks);
+      B.window.max = Math.max(200000, maxTok);
+      B.window.value = maxTok;
+    }
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'mcp-and-code-roles',
+      kind: 'choice',
+      prompt: 'In MCP, which component actually speaks the protocol?',
+      options: [
+        { label: 'The client inside the host; the host itself never speaks MCP.', correct: true },
+        { label: 'The host, which also holds the model.', correct: false },
+        { label: 'The model, via tool calls.', correct: false },
+        { label: 'The server, which drives the conversation.', correct: false }
+      ],
+      explanation: 'Three roles: host (your application, holding model and context), client (the JSON-RPC endpoint inside the host, which owns the session and matches request ids), and server (what exposes tools, resources and prompts).'
+    },
+    {
+      id: 'mcp-and-code-stateless',
+      kind: 'choice',
+      prompt: 'What does the 2026 spec revision streamline the core toward?',
+      options: [
+        { label: 'A stateless request/response model with explicit session handles, so servers scale horizontally.', correct: true },
+        { label: 'Removing JSON-RPC in favour of gRPC.', correct: false },
+        { label: 'Bundling tool schemas into the client instead of the server.', correct: false },
+        { label: 'Making tool definitions optional in the model context.', correct: false }
+      ],
+      explanation: 'Session state moves out of the connection and into an explicit handle carried by the request, so any replica can serve it. Verify the revision and its date against the published specification — clients and servers lag it.'
+    },
+    {
+      id: 'mcp-and-code-schema-budget',
+      kind: 'numeric',
+      prompt: 'An agent connects 8 MCP servers, each exposing 12 tools, and each tool\'s name, description and schema costs 250 tokens on average. How many tokens of tool definitions sit in the system prompt on every call?',
+      answer: 24000,
+      unit: "tokens",
+      tolerance: 1,
+      explanation: 'The cost is multiplicative: 8 servers × 12 tools × 250 schema tokens = 24,000 tokens of standing instruction, billed as input on every call and competing with the transcript and any retrieved documents.'
+    },
+    {
+      id: 'mcp-and-code-skill-stages',
+      kind: 'choice',
+      prompt: 'Which part of an Agent Skill is resident in context all the time?',
+      options: [
+        { label: 'Only the metadata — name and description; instructions load on invocation and resources on demand.', correct: true },
+        { label: 'The whole SKILL.md body, so the model always knows the procedure.', correct: false },
+        { label: 'Its scripts and templates, so they can be edited in place.', correct: false },
+        { label: 'Nothing; skills are retrieved only when the model explicitly asks.', correct: false }
+      ],
+      explanation: 'Progressive disclosure is the design: a few dozen tokens of metadata per skill keep the catalogue discoverable, and the body and resources are paid for only when that skill is actually used.'
+    },
+    {
+      id: 'mcp-and-code-not-a-bus',
+      kind: 'choice',
+      prompt: 'Why is the context window a bad channel for moving data between tools?',
+      options: [
+        { label: 'Every intermediate result is re-sent on every later turn, so the cost compounds while the data is never read again.', correct: true },
+        { label: 'Tool results are compressed and lose precision in the transcript.', correct: false },
+        { label: 'The window cannot hold more than one tool result at a time.', correct: false },
+        { label: 'Providers bill tool results at the output price.', correct: false }
+      ],
+      explanation: 'The window is a working set for reasoning, not a data bus. Letting code pull the data locally and return only the result keeps the intermediate bytes out of the context entirely — the same principle that makes a skill\'s resources executable rather than readable.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

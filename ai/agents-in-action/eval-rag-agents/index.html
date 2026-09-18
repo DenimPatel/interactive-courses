@@ -1,0 +1,506 @@
+---
+title: "Agents in Action, Interactively — Part 11: Evaluating RAG and agents"
+description: "Component-wise metrics for a retrieval pipeline, end-state versus trajectory grading for agents, pass^k reliability, cost per completed task, and why public benchmark numbers do not transfer to your task."
+permalink: "/ai/agents-in-action/eval-rag-agents/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Evaluating RAG and agents</h1>
+    <p>A single end-to-end score tells you that something is wrong and nothing about what. This part breaks the pipeline into stages so a number localises a failure, then takes on the part that makes agents genuinely hard to grade: two runs can reach the same correct end state while one of them loops, overspends and violates a constraint on the way. We separate those questions, add reliability and cost to the scoreboard, and finish on why a public benchmark number is a weak predictor of your task.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="component-wise">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Grade the pipeline, not just the answer</h2></div>
+    <p class="g-eyebrow">A number that points at a stage</p>
+    <p>A retrieval-augmented pipeline has stages, and each stage fails in its own way. <strong>Retrieval</strong> can miss the evidence the answer needed — measured by context recall. <strong>Reranking</strong> can keep the wrong chunk in a wide candidate set — measured by context precision. <strong>Generation</strong> can produce an answer that is fluent but not grounded in the context it was given — measured by faithfulness. And a fourth, quieter failure sits between them: the right evidence was retrieved and then not used, because it landed in the middle of a long context. Only end-to-end task accuracy catches that one.</p>
+    <p>Measure every stage, and a low end-to-end score stops being a verdict and becomes a diagnosis. The demo below starts with a weak pipeline and lets you switch on the fixes. Watch the end-to-end number stay stubbornly low until you fix <em>the stage the label names as the bottleneck</em> — fixing the others does almost nothing.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="rag-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Three stages with their own metrics. The red outline is the weakest stage; the wide bar is the end-to-end task accuracy it caps.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="rag-hybrid">Hybrid retrieval (lexical + dense)</button>
+          <button id="rag-rerank">Retrieve wide, rerank narrow</button>
+          <button id="rag-grounding">Grounding instructions + citations</button>
+        </div>
+        <div class="g-readout" id="rag-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="rag-metrics-source"></p>
+    <div class="g-goal">💡 <span><b>Component metrics are diagnostic, not decorative.</b> A retrieval failure and a grounding failure need opposite fixes; an end-to-end score that merges them sends you to the wrong one half the time.</span></div>
+  </section>
+
+  <section class="g-step" id="end-state-trajectory">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>End state versus trajectory</h2></div>
+    <p class="g-eyebrow">Same destination, very different runs</p>
+    <p>For a question-answering system the answer is the artifact. For an agent, the artifact is a <em>run</em>: a sequence of tool calls that leaves the world in some state. There are two independent questions, and conflating them hides the failures that matter in production. Did the world end up right — is the database row correct, the file written, the ticket closed? That is the <strong>end-state</strong> check, and it is objective and cheap. Was the path sane — bounded steps, bounded cost, no forbidden action, no repeated identical call? That is the <strong>trajectory</strong> check, and it is what a safety incident or a runaway bill actually is.</p>
+    <p>The two runs below reach the same correct end state. Run A does it in six steps at $0.12 with no violation. Run B does it in thirty-four steps at $0.98 and writes a file outside its sandbox once on the way. An end-state-only eval passes both. Move the trajectory weight and decide for yourself where a run like B should land.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="traj-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Both runs end correct. Steps, cost and the safety flag are the only things that separate them — and only a trajectory score sees them.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Trajectory weight <span class="val">0.5</span></label><input type="range" id="traj-weight" min="0" max="1" step="0.05" value="0.5"></div>
+        <div class="g-readout" id="traj-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> an agent that reaches the right answer through a forbidden path is not a success you can ship. Grade the trajectory on the constraints you actually care about — steps, spend, permissions, loop detection — or those failures reach production unmeasured.</span></div>
+  </section>
+
+  <section class="g-step" id="passk">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>pass@k says capability; pass^k says reliability</h2></div>
+    <p class="g-eyebrow">The number that decays as you raise k</p>
+    <p><strong>pass@k</strong> asks: did the agent solve the task in <em>at least one</em> of k attempts? It rises with k, and it is how capability benchmarks report. <strong>pass^k</strong> asks the opposite: did it solve the task in <em>all</em> k attempts? It falls with k, and it is the number a product needs, because a user who runs the same task tomorrow does not get to pick the best of ten tries. If a task succeeds 90% of the time, an agent's pass@10 is almost certain but its pass^10 — ten clean runs in a row — is 0.35. Move the per-attempt success rate and watch the two curves pull apart.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="passk-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Both curves come from the same per-attempt rate. pass@k climbs toward 1; pass^k falls away from it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Per-attempt success rate <span class="val">0.90</span></label><input type="range" id="passk-p" min="0.5" max="0.99" step="0.01" value="0.9"></div>
+        <div class="g-readout" id="passk-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Report both, or you are hiding the reliability gap.</b> A capability number that rises with k and a reliability number that falls with k are computed from the same runs; publishing only the first is how a demo becomes an outage.</span></div>
+  </section>
+
+  <section class="g-step" id="benchmarks">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Public benchmarks do not transfer</h2></div>
+    <p class="g-eyebrow">A leaderboard is a shortlist, not a measurement</p>
+    <p>The named benchmarks are worth knowing — SWE-bench Verified for repo issue resolution, τ²-bench for tool-agent-user dialogue with a verifiable database end state, GAIA for multi-step assistant work, OSWorld for computer use. Each is graded differently, and each has a specific reason its score is a weak predictor of yours: training-data leakage inflates any benchmark that has been public long enough; the scaffold (the prompt, the tools, the loop) often contributes more variance than the model; the environment version changes the score; the grader can be gamed or can hide partial credit. A high public score means "this family is worth trying", not "this will work on your task".</p>
+    <p>The scatter below plots a public benchmark score against a hypothetical held-out score on your own task, for twelve model-plus-scaffold combinations. At low shared structure the correlation is near zero. Raise the overlap slider only if your task genuinely resembles the benchmark — and note that even moderate overlap leaves most of the variance unexplained.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="transfer-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Each dot is one system. x = public benchmark score; y = your held-out task score. The line is the least-squares fit.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Shared structure with the benchmark <span class="val">0.10</span></label><input type="range" id="transfer-overlap" min="0" max="1" step="0.05" value="0.1"></div>
+        <div class="g-readout" id="transfer-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="rag-bench-source"></p>
+    <div class="g-warn">⚠️ <span><b>Build your own held-out set with verifiable end states.</b> A task set you can grade automatically — a test that passes, a database row that matches, a file whose checksum is right — is worth more than any leaderboard position, and it is the only thing your change can be measured against.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the harness</th></tr></thead>
+      <tbody>
+        <tr><td>Retrieval missed the evidence</td><td>Low context recall. Fix with hybrid retrieval, query transforms, a wider candidate set.</td></tr>
+        <tr><td>The wrong chunk was kept</td><td>Low context precision. Fix with reranking, better chunking, metadata filters.</td></tr>
+        <tr><td>Fluid but ungrounded answer</td><td>Low faithfulness. Fix with grounding instructions, citations, retrieval-gated answers.</td></tr>
+        <tr><td>Right evidence, unused</td><td>Retrieved-but-not-used (the middle-of-context effect). Only end-to-end accuracy sees it.</td></tr>
+        <tr><td>Did the agent succeed?</td><td>End state: is the world left correct? Objective and cheap — build it first.</td></tr>
+        <tr><td>Was the run acceptable?</td><td>Trajectory: steps, cost, permission violations, repeated calls. A separate question.</td></tr>
+        <tr><td>What does pass@k hide?</td><td>Reliability. pass^k — solved on every one of k attempts — is the product number.</td></tr>
+        <tr><td>What is the cost metric?</td><td>Cost per completed task, not cost per call. Failures are paid for too.</td></tr>
+        <tr><td>Can I use a public score?</td><td>As a shortlist only. Leakage, scaffold, environment and grader all break the transfer.</td></tr>
+        <tr><td>What do I measure on?</td><td>A held-out task set with verifiable end states of your own.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024 — the benchmark, its harness, and the scaffold-dependence its own authors document.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — verifiable database end states and the pass^k reliability measure.</li>
+      <li>Mialon et al., <a href="https://arxiv.org/abs/2311.12983">"GAIA: a benchmark for General AI Assistants"</a>, 2023 — multi-step assistant tasks and the exact-answer grading that hides partial credit.</li>
+      <li>Xie et al., <a href="https://arxiv.org/abs/2404.07972">"OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks in Real Computer Environments"</a>, NeurIPS 2024 — computer-use grading against environment state, and the version sensitivity.</li>
+      <li>Es et al., <a href="https://arxiv.org/abs/2309.15217">"RAGAS: Automated Evaluation of Retrieval Augmented Generation"</a>, EACL 2024 — faithfulness, answer relevance, context precision and context recall as the component metrics used here.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/news/contextual-retrieval">"Introducing Contextual Retrieval"</a>, 19 September 2024 — component-level failure rates as hybrid retrieval, BM25 and reranking are added one at a time.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Evaluation needs evidence, and evidence needs traces. Next: the telemetry substrate — spans, logged context, prompt versions, PII redaction, online and A/B evaluation, and the dashboard where quality, cost and latency finally meet.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); τ-bench (Yao et al., arXiv:2406.12045, 2024) and τ²-bench (2025, which introduced pass^k); GAIA (Mialon et al., arXiv:2311.12983, 2023); OSWorld (Xie et al., arXiv:2404.07972, 2024); HELM (Liang et al., arXiv:2211.09110, 2022). Public scores are contaminated by training-data leakage, scaffolding differences and harness version drift. Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" },
+        { name: "GAIA", measures: "multi-step assistant tasks needing web, files and reasoning", caveat: "answer-string grading hides partially-correct trajectories" },
+        { name: "OSWorld", measures: "real computer use across applications", caveat: "environment version changes the score; pin it" }
+      ]
+    },
+    rag: {
+      source: "RAGAS metrics (Es et al., arXiv:2309.15217, EACL 2024): faithfulness, answer relevance, context precision, context recall. Component-level numbers are benchmark-specific and do not transfer directly. Offline fallback constants.",
+      metrics: ["faithfulness", "answer relevance", "context precision", "context recall"],
+      failureModes: [
+        { mode: "Missing evidence", metric: "context recall", fix: "hybrid retrieval, query transforms, larger candidate set" },
+        { mode: "Wrong chunk retrieved", metric: "context precision", fix: "reranking, better chunking, metadata filters" },
+        { mode: "Answer not grounded in the context", metric: "faithfulness", fix: "grounding instructions, citations, retrieval-gated answers" },
+        { mode: "Retrieved but not used (middle of long context)", metric: "end-to-end task accuracy", fix: "reorder context, retrieve fewer and better chunks" },
+        { mode: "Agent answers without retrieving", metric: "tool-call rate / retrieval rate", fix: "prompt and tool design; measure it, do not assume it" }
+      ]
+    },
+    benchmark_card: {
+      source: "Dated reference card, retrieved 2026-09. Scores are deliberately omitted where they change weekly. Fill in live numbers from the leaderboards, with the date.",
+      rows: [
+        { benchmark: "SWE-bench Verified", measures: "repo issue resolution", graded: "test suite passes", caveat: "scaffold dominates" },
+        { benchmark: "τ²-bench", measures: "tool-agent-user tasks", graded: "database end state", caveat: "user simulator sensitive" },
+        { benchmark: "GAIA", measures: "multi-step assistant work", graded: "exact answer", caveat: "hides partial credit" },
+        { benchmark: "OSWorld", measures: "computer use", graded: "environment state", caveat: "pin the environment version" }
+      ]
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — component-wise RAG evaluation
+  // ------------------------------------------------------------------
+  var S = { hybrid: false, rerank: false, grounding: false };
+  var setupA = Guide.setupCanvas(el('rag-canvas'), 640, 360, drawA);
+  function ragMetrics() {
+    return {
+      recall: 0.70 + (S.hybrid ? 0.16 : 0) + (S.rerank ? 0.03 : 0),
+      precision: 0.42 + (S.rerank ? 0.33 : 0) + (S.hybrid ? 0.06 : 0),
+      faithfulness: 0.78 + (S.grounding ? 0.16 : 0),
+      usage: 0.80 + (S.rerank ? 0.05 : 0)
+    };
+  }
+  function drawStage(ctx, x, y, w, h, title, sub, value, bottleneck) {
+    ctx.fillStyle = 'rgba(43,95,255,0.06)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = bottleneck ? c.accent2 : c.divider; ctx.lineWidth = bottleneck ? 2 : 1;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(title, x + 10, y + 20);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    ctx.fillText(sub, x + 10, y + 36);
+    ctx.fillStyle = c.divider; ctx.fillRect(x + 10, y + 46, w - 20, 8);
+    ctx.fillStyle = bottleneck ? c.accent2 : c.accent;
+    ctx.fillRect(x + 10, y + 46, (w - 20) * value, 8);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+    ctx.fillText(Guide.fmtPct(value, 0), x + 10, y + 68);
+    if (bottleneck) { ctx.fillStyle = c.accent2; ctx.fillText('bottleneck', x + w - 62, y + 68); }
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var m = ragMetrics();
+    var e2e = m.recall * m.faithfulness * (0.55 + 0.45 * m.precision) * m.usage;
+    var stages = [
+      { title: 'Retrieve', sub: 'context recall', v: m.recall },
+      { title: 'Rerank', sub: 'context precision', v: m.precision },
+      { title: 'Generate', sub: 'faithfulness', v: m.faithfulness }
+    ];
+    var worst = 0;
+    stages.forEach(function (s, i) { if (s.v < stages[worst].v) worst = i; });
+    var xs = [24, 232, 440], bw = 176, y = 34, bh = 84;
+    stages.forEach(function (s, i) {
+      drawStage(ctx, xs[i], y, bw, bh, s.title, s.sub, s.v, i === worst);
+      if (i < 2) Guide.drawArrow(ctx, xs[i] + bw + 2, y + bh / 2, xs[i + 1] - 4, y + bh / 2, { color: c.divider, width: 2, head: 7 });
+    });
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('end-to-end task accuracy', 24, 158);
+    ctx.fillStyle = c.divider; ctx.fillRect(24, 168, 592, 30);
+    ctx.fillStyle = e2e >= 0.6 ? c.accent : c.accent2;
+    ctx.fillRect(24, 168, 592 * e2e, 30);
+    ctx.fillStyle = c.text; ctx.font = '600 14px ' + c.font;
+    ctx.fillText(Guide.fmtPct(e2e, 0), 34, 189);
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('weakest stage: ' + stages[worst].title + ' (' + stages[worst].sub + ' ' + Guide.fmtPct(stages[worst].v, 0) + ')', 24, 222);
+    ctx.fillStyle = c.accent700; ctx.font = '11px ' + c.font;
+    ctx.fillText('fix that stage first \u2014 improving the others barely moves the bar', 24, 242);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.fillText('the "retrieved but not used" term sits inside end-to-end accuracy; reranking narrows it by retrieving fewer, better chunks', 24, 264);
+    el('rag-readout').innerHTML =
+      '<div><span class="k">recall</span> ' + Guide.fmtPct(m.recall, 0) + ' \u00b7 <span class="k">precision</span> ' + Guide.fmtPct(m.precision, 0) + ' \u00b7 <span class="k">faithfulness</span> ' + Guide.fmtPct(m.faithfulness, 0) + '</div>' +
+      '<div><span class="k">end-to-end accuracy</span> <span class="hi">' + Guide.fmtPct(e2e, 0) + '</span></div>' +
+      '<div class="k">bottleneck: ' + stages[worst].title.toLowerCase() + ' \u2014 that is the stage to fix</div>';
+  }
+  function wireToggle(id, key) {
+    el(id).addEventListener('click', function () {
+      S[key] = !S[key];
+      this.className = S[key] ? 'g-primary' : '';
+      drawA();
+    });
+  }
+  wireToggle('rag-hybrid', 'hybrid');
+  wireToggle('rag-rerank', 'rerank');
+  wireToggle('rag-grounding', 'grounding');
+
+  // ------------------------------------------------------------------
+  // Demo B — end state versus trajectory
+  // ------------------------------------------------------------------
+  var RUNS = [
+    { name: 'Run A', steps: 6, cost: 0.12, violation: false, traj: 0.95 },
+    { name: 'Run B', steps: 34, cost: 0.98, violation: true, traj: 0.35 }
+  ];
+  var setupB = Guide.setupCanvas(el('traj-canvas'), 640, 320, drawB);
+  function drawBar(ctx, x, y, w, h, frac, color, label) {
+    ctx.fillStyle = c.divider; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = color; ctx.fillRect(x, y, w * Math.max(0, Math.min(1, frac)), h);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right';
+    ctx.fillText(label, x - 6, y + h - 1);
+    ctx.textAlign = 'left';
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var w = +el('traj-weight').value;
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('both runs end with the same correct database state', 24, 18);
+    RUNS.forEach(function (run, i) {
+      var y = 40 + i * 120;
+      ctx.fillStyle = c.accent700; ctx.font = '600 13px ' + c.font;
+      ctx.fillText(run.name, 24, y + 14);
+      ctx.fillStyle = c.accent; ctx.font = '11px ' + c.font;
+      ctx.fillText('end state: correct \u2713', 96, y + 14);
+      drawBar(ctx, 120, y + 26, 220, 14, run.steps / 40, c.accent400, 'steps ' + run.steps);
+      drawBar(ctx, 120, y + 48, 220, 14, run.cost / 1.0, c.accent400, '$' + run.cost.toFixed(2));
+      drawBar(ctx, 120, y + 70, 220, 14, run.traj, c.accent400, 'trajectory ' + run.traj.toFixed(2));
+      if (run.violation) {
+        ctx.fillStyle = c.accent2; ctx.font = '600 11px ' + c.font;
+        ctx.fillText('\u26a0 wrote outside the sandbox once', 120, y + 104);
+      } else {
+        ctx.fillStyle = c.accent700; ctx.font = '11px ' + c.font;
+        ctx.fillText('no constraint violations', 120, y + 104);
+      }
+      var combined = (1 - w) * 1.0 + w * run.traj;
+      drawBar(ctx, 400, y + 26, 216, 22, combined, combined >= 0.7 ? c.accent : c.accent2, 'combined ' + combined.toFixed(2));
+    });
+    var cA = (1 - w) * 1.0 + w * RUNS[0].traj;
+    var cB = (1 - w) * 1.0 + w * RUNS[1].traj;
+    el('traj-readout').innerHTML =
+      '<div><span class="k">end-state score</span> Run A 1.00 \u00b7 Run B 1.00 \u00b7 an end-state-only eval passes both</div>' +
+      '<div><span class="k">trajectory score</span> Run A 0.95 \u00b7 Run B 0.35 (one violation, 5.7\u00d7 the steps)</div>' +
+      '<div><span class="k">combined at weight ' + w.toFixed(2) + '</span> <span class="hi">A ' + cA.toFixed(2) + ' \u00b7 B ' + cB.toFixed(2) + '</span></div>' +
+      (cB >= 0.7 ? '<div class="k">Run B still passes \u2014 the trajectory weight is too low for a violation</div>'
+                 : '<div class="bad">Run B fails once the path is graded \u2014 which is the production-relevant verdict</div>');
+  }
+  Guide.bindSliders([el('traj-weight')], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — pass@k versus pass^k
+  // ------------------------------------------------------------------
+  var setupC = Guide.setupCanvas(el('passk-canvas'), 640, 320, drawC);
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    var p = +el('passk-p').value;
+    var at = [], kk = [];
+    for (var k = 1; k <= 10; k++) {
+      at.push({ x: k, y: 1 - Math.pow(1 - p, k) });
+      kk.push({ x: k, y: Math.pow(p, k) });
+    }
+    var axes = Guide.drawLines(ctx, W, H,
+      [
+        { points: at, color: c.accent, width: 2.4 },
+        { points: kk, color: c.accent2, width: 2.4 }
+      ],
+      [1, 10], [0, 1],
+      { xLabel: 'attempts k', yLabel: 'fraction of tasks', padL: 52, padB: 30 });
+    ctx.fillStyle = c.accent; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('pass@k \u2014 solved in at least one of k', axes.padL + 8, axes.padT + 14);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('pass^k \u2014 solved in all k', axes.padL + 8, axes.padT + 30);
+    var p10 = at[9].y, k10 = kk[9].y;
+    el('passk-readout').innerHTML =
+      '<div><span class="k">per-attempt success</span> ' + Guide.fmtPct(p, 0) + '</div>' +
+      '<div><span class="k">pass@10</span> <span class="hi">' + Guide.fmtPct(p10, 0) + '</span> \u00b7 <span class="k">pass^10</span> <span class="hi">' + Guide.fmtPct(k10, 0) + '</span></div>' +
+      '<div class="k">capability looks fine at ' + Guide.fmtPct(p10, 0) + '; ten clean runs in a row is ' + Guide.fmtPct(k10, 0) + '</div>';
+  }
+  Guide.bindSliders([el('passk-p')], drawC);
+
+  // ------------------------------------------------------------------
+  // Demo D — benchmark transfer
+  // ------------------------------------------------------------------
+  var PUB = [0.72, 0.68, 0.75, 0.61, 0.80, 0.66, 0.70, 0.58, 0.77, 0.63, 0.69, 0.74];
+  var setupD = Guide.setupCanvas(el('transfer-canvas'), 640, 320, drawD);
+  function pearson(xs, ys) {
+    var n = xs.length, mx = 0, my = 0, i;
+    for (i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
+    mx /= n; my /= n;
+    var sxy = 0, sxx = 0, syy = 0;
+    for (i = 0; i < n; i++) {
+      var dx = xs[i] - mx, dy = ys[i] - my;
+      sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+    }
+    return sxy / Math.sqrt(Math.max(1e-12, sxx * syy));
+  }
+  function transferData(overlap) {
+    var r = AppSim.rng(321);
+    var xs = [], ys = [];
+    PUB.forEach(function (px) {
+      xs.push(px);
+      var y = 0.5 + overlap * 1.15 * (px - 0.68) + 0.16 * AppSim.gaussian(r);
+      ys.push(Math.max(0.05, Math.min(0.98, y)));
+    });
+    return { xs: xs, ys: ys, r: pearson(xs, ys) };
+  }
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 320;
+    var overlap = +el('transfer-overlap').value;
+    var d = transferData(overlap);
+    ctx.clearRect(0, 0, W, H);
+    var padL = 60, padR = 20, padT = 26, padB = 40;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    function px(v) { return padL + plotW * (v - 0.55) / 0.30; }
+    function py(v) { return padT + plotH * (1 - v); }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('public benchmark score', padL + plotW / 2, H - 4);
+    ctx.save(); ctx.translate(14, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('your held-out task score', 0, 0); ctx.restore();
+    ctx.textAlign = 'left';
+    d.xs.forEach(function (x, i) {
+      ctx.beginPath(); ctx.arc(px(x), py(d.ys[i]), 5, 0, 2 * Math.PI);
+      ctx.fillStyle = i % 2 ? c.accent : c.accent400; ctx.fill();
+    });
+    var mx = 0, my = 0;
+    d.xs.forEach(function (x, i) { mx += x; my += d.ys[i]; });
+    mx /= d.xs.length; my /= d.ys.length;
+    var sxy = 0, sxx = 0;
+    d.xs.forEach(function (x, i) { sxy += (x - mx) * (d.ys[i] - my); sxx += (x - mx) * (x - mx); });
+    var slope = sxy / Math.max(1e-12, sxx), intercept = my - slope * mx;
+    ctx.strokeStyle = c.accent700; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(px(0.55), py(intercept + slope * 0.55));
+    ctx.lineTo(px(0.85), py(intercept + slope * 0.85));
+    ctx.stroke(); ctx.setLineDash([]);
+    el('transfer-readout').innerHTML =
+      '<div><span class="k">Pearson r</span> <span class="hi">' + d.r.toFixed(2) + '</span> \u00b7 <span class="k">R\u00b2</span> ' + (d.r * d.r).toFixed(2) + '</div>' +
+      '<div><span class="k">shared structure</span> ' + Guide.fmtPct(overlap, 0) + ' of the benchmark\u2019s shape</div>' +
+      (Math.abs(d.r) < 0.3
+        ? '<div class="bad">the public score explains almost none of your task \u2014 leakage, scaffold and grader differ</div>'
+        : '<div class="k">even this much overlap leaves most of the variance unexplained</div>');
+  }
+  Guide.bindSliders([el('transfer-overlap')], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — also sets the cited source strings
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var ragSrc = (data && data.rag && data.rag.source) || FALLBACK.rag.source;
+    var benchSrc = (data && data.benchmark_card && data.benchmark_card.source) || FALLBACK.benchmark_card.source;
+    if (el('rag-metrics-source')) el('rag-metrics-source').textContent = ragSrc;
+    if (el('rag-bench-source')) el('rag-bench-source').textContent = benchSrc;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'eval-rag-agents-context-recall',
+      kind: 'choice',
+      prompt: 'Your RAG answers confidently miss facts that are present in the corpus. Which component metric localises that failure?',
+      options: [
+        { label: 'Context recall — the retrieval stage failed to fetch the evidence.' },
+        { label: 'Faithfulness — the answer was not grounded in the context.' },
+        { label: 'Context precision — the wrong chunk was kept.' },
+        { label: 'Answer relevance — the answer drifted off-topic.' }
+      ],
+      explanation: 'If the evidence is in the corpus but not in the retrieved context, the failure is at retrieval and context recall is the metric that moves. Faithfulness would only be implicated if the evidence had been retrieved and then contradicted.'
+    },
+    {
+      id: 'eval-rag-agents-passk-def',
+      kind: 'choice',
+      prompt: 'What does pass^k measure, and how does it move as k rises?',
+      options: [
+        { label: 'The fraction of tasks solved on all k attempts; it falls as k rises.' },
+        { label: 'The fraction of tasks solved on at least one of k attempts; it rises as k rises.' },
+        { label: 'The average score across k attempts; it stays flat.' },
+        { label: 'The cost of k attempts; it rises linearly.' }
+      ],
+      explanation: 'pass^k is the reliability counterpart to pass@k. It requires every attempt to succeed, so it decays as k grows — which is what a user experiences when they run the same task repeatedly.'
+    },
+    {
+      id: 'eval-rag-agents-passk-calc',
+      kind: 'numeric',
+      prompt: 'An agent solves a task on 90% of attempts. What is its pass^3 for that task?',
+      answer: 0.729,
+      unit: 'pass^3',
+      tolerance: 0.005,
+      explanation: 'pass^3 requires success on all three independent attempts: 0.9 × 0.9 × 0.9 = 0.729. The pass@3 figure would be 1 − 0.1³ = 0.999, a very different story.'
+    },
+    {
+      id: 'eval-rag-agents-cost-task',
+      kind: 'numeric',
+      prompt: 'An agent costs $0.40 per run and completes the task on 25% of runs. What is its cost per completed task, in dollars?',
+      answer: 1.6,
+      unit: 'USD',
+      tolerance: 0.02,
+      explanation: 'Every completed task requires, on average, 1 / 0.25 = 4 runs, so the cost per completed task is 4 × $0.40 = $1.60. Failures are paid for too, which is why the metric is cost per completed task, not cost per call.'
+    },
+    {
+      id: 'eval-rag-agents-transfer',
+      kind: 'choice',
+      prompt: 'Why does a high score on a public agent benchmark not predict your task?',
+      options: [
+        { label: 'Training-data leakage, scaffold differences, environment drift and grader design all break the transfer.' },
+        { label: 'The benchmark is smaller than your task set, so it is noisier.' },
+        { label: 'Public benchmarks only measure capability, never reliability.' },
+        { label: 'It does predict it, as long as you use the same model.' }
+      ],
+      explanation: 'A public score is a shortlist signal. Leakage inflates it, the scaffold often contributes more variance than the model, the environment version changes it, and the grader can hide partial credit — so the only trustworthy measurement is your own held-out set with verifiable end states.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

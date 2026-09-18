@@ -1,0 +1,670 @@
+---
+title: "Building with LLMs, Interactively — Part 8: Reasoning: CoT, self-consistency, and what reasoning models changed"
+description: "Chain-of-thought and \"let's think step by step\" as prompting history; self-consistency as the first test-time-compute pattern; and why prescribing reasoning now often fights the model's learned policy."
+permalink: "/ai/building-with-llms/reasoning/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Reasoning: CoT, self-consistency, and what reasoning models changed</h1>
+    <p>For three years the highest-leverage sentence in a prompt was "let's think step by step". It still works on models that were never trained to reason, and it is now frequently the wrong thing to say to a model that was. This part treats chain-of-thought as history rather than advice: what the 2022 papers actually showed, how self-consistency turned sampling into the first test-time-compute pattern, and what changed when labs started training the search into the weights with reinforcement learning on verifiable rewards.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="chain-of-thought">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Chain of thought, as history</h2></div>
+    <p class="g-eyebrow">A prompt technique that turned out to be a capability</p>
+    <p>Wei et al. (arXiv:2201.11903, 2022) showed that giving a model a few worked examples in which the reasoning is written out — not just the answer — lifted accuracy sharply on multi-step arithmetic, commonsense and symbolic tasks. Kojima et al. (arXiv:2205.11916, 2022) then removed the examples entirely: appending the five words <em>"Let's think step by step"</em> to a zero-shot question produced most of the gain. Both results were surprising in the same way. Nothing was retrained; the only change was that the model emitted intermediate text before committing to an answer.</p>
+    <p>The mechanism is now uncontroversial. A decoder-only transformer performs a fixed amount of computation per emitted token, so a model that answers in one token has one token's worth of serial depth to work with. Writing the intermediate values out loud buys more serial computation, and it also changes what the later tokens attend to: the running result is in the context, so the next step conditions on it. Multi-step reliability is therefore multiplicative, which is the whole problem:</p>
+    <div class="g-math g-katex">$$P(\text{chain correct}) \;=\; \prod_{i=1}^{N} p_i \;\approx\; p^{N}$$</div>
+    <p>At <var>p</var> = 0.66 per hop, a five-hop problem lands at 0.13. Raise the per-hop probability to 0.93 and the same five hops land at 0.70. Nothing about the model's knowledge changed — only whether it was allowed to externalise each intermediate step.</p>
+    <p>Toggle the trace and step the chain below. The bars are a seeded mock over 240 trials of the same arithmetic task; the chain is one representative trial, hop by hop.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="reasoning-chain-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Left: one trial's hops. Right: seeded accuracy with and without a written trace, over the same task.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Hops in the task <span class="val">5</span></label><input type="range" id="reasoning-hops" min="2" max="8" step="1" value="5"></div>
+        <div class="g-btnrow">
+          <button id="reasoning-trace-toggle" class="g-primary">Reasoning trace: on</button>
+        </div>
+        <div class="g-btnrow">
+          <button id="reasoning-play">Play chain</button>
+        </div>
+        <div class="g-readout" id="reasoning-chain-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> chain-of-thought is not a trick for extracting hidden knowledge. It is <b>test-time compute</b> — trading output tokens for serial depth and a working memory of intermediate results.</span></div>
+  </section>
+
+  <section class="g-step" id="self-consistency">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Self-consistency: sample many, take the majority</h2></div>
+    <p class="g-eyebrow">The first test-time-compute pattern</p>
+    <p>Wang et al. (arXiv:2203.11171, 2022) noticed that a single greedy chain is one sample from a distribution, and that its errors are not evenly distributed. Different chains fail in different places, so the <em>correct</em> final answer tends to be the one reached by the largest number of independent reasoning paths. Sample <var>N</var> chains at a non-zero temperature, take the majority vote over final answers, and accuracy climbs with <var>N</var> — no retraining, no reward model, just more sampling. This is the ancestor of every test-time-compute method that followed.</p>
+    <p>The arithmetic is a variance argument. If each chain is right with probability <var>p</var> &gt; ½ and the chains are conditionally independent given the question, the majority of <var>N</var> chains is right with probability approaching 1 as <var>N</var> grows. The gains are front-loaded: most of the improvement arrives in the first handful of samples, then flattens, and the <var>N</var> chains cost <var>N</var> times the output tokens. Independence is the load-bearing assumption, and it is the first thing to break — a model that is systematically wrong about a question will produce <var>N</var> confidently wrong chains and the majority vote runs off the cliff with them.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="reasoning-sc-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Left: the tally of one sample of <var>N</var> chains. Right: majority-vote accuracy against <var>N</var>, from a seeded mock of 400 trials per point.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Chains sampled (N) <span class="val">9</span></label><input type="range" id="reasoning-sc-n" min="1" max="31" step="2" value="9"></div>
+        <div class="g-field"><label>Single-chain accuracy (p) <span class="val">55</span></label><input type="range" id="reasoning-sc-p" min="30" max="90" step="5" value="55"></div>
+        <div class="g-btnrow">
+          <button id="reasoning-sc-resample">Resample chains</button>
+        </div>
+        <div class="g-readout" id="reasoning-sc-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> majority voting assumes the errors are independent and that the majority is reachable. With a shared systematic misconception — a misread question, a poisoned fact in the context — more samples buy more confidence in the same wrong answer, and the cost is linear in <var>N</var>.</span></div>
+  </section>
+
+  <section class="g-step" id="test-time-compute">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Spending thinking tokens</h2></div>
+    <p class="g-eyebrow">Accuracy against budget, and the point where more is worse</p>
+    <p>Self-consistency spends compute by sampling wider. A reasoning model spends it by thinking longer inside a single trajectory: the output is a long internal chain, and the model decides when to stop. Either way the same tradeoff appears. Accuracy rises with test-time compute and then saturates — a pattern often summarised as a log-linear curve, <em>a</em> + <em>b</em>·log(tokens), with a ceiling set by the task and the base capability. Past saturation, extra tokens buy latency and cost and nothing else.</p>
+    <p>There is a second, sharper effect that only shows up with trained reasoning models. A model trained with RL on verifiable rewards has learned <em>how</em> to allocate its thinking; a prompt that prescribes the shape of that thinking competes with the policy. Early in the budget the prescription can even help — it nudges a lazy trajectory — but as the budget grows it starts to override decisions the model was trained to make, and quality falls below the plain model at the same budget. The curve below makes that crossing explicit.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="reasoning-effort-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Seeded mock accuracy against thinking-token budget. The dashed marker is where a prescriptive prompt stops helping a reasoning model.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Thinking-token budget <span class="val">2000</span></label><input type="range" id="reasoning-effort" min="0" max="8000" step="250" value="2000"></div>
+        <div class="g-btnrow">
+          <button id="reasoning-effort-toggle" class="g-primary">Show prescriptive prompt</button>
+        </div>
+        <div class="g-readout" id="reasoning-effort-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The rule of thumb:</b> spend more thinking tokens while the curve is still climbing, and stop when it flattens. The flattening point is a property of the <b>task</b>, not of the model, and it must be measured — a budget set by intuition is usually either wasteful or starved.</span></div>
+  </section>
+
+  <section class="g-step" id="prompting-vs-training">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Prompting versus training</h2></div>
+    <p class="g-eyebrow">Where the prompt stops helping</p>
+    <p>The 2022 technique and the 2025 policy are not the same lever. A prompt reshapes the conditioning text of a fixed policy; a reasoning-trained model has internalised a search procedure into its weights through RLVR — reinforcement learning from verifiable rewards, with GRPO as the widely used optimiser. On easy tasks the two are hard to tell apart, because the prompt is enough. As difficulty rises, the prompt's ceiling appears: it can encourage more steps, but it cannot add a verification habit or a backtracking policy the model was never trained to have. That is why the same "think step by step" instruction is a large win on a base model and a coin flip on a reasoning model.</p>
+    <p>Note the caveat that the tuning source states plainly: RLVR trains on checkable outcomes, so a verifier that grades the final answer but not the reasoning invites reward hacking — the model learns to satisfy the checker rather than solve the task. A prompt cannot fix a policy trained against a weak checker.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="reasoning-prompt-vs-train-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Seeded mock accuracy against task difficulty, three ways of getting the answer: plain base model, base model plus a CoT prompt, and a reasoning-trained model.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Task difficulty (hops) <span class="val">5</span></label><input type="range" id="reasoning-difficulty" min="1" max="12" step="1" value="5"></div>
+        <div class="g-readout" id="reasoning-prompt-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="reasoning-tuning-source"></p>
+  </section>
+
+  <section class="g-step" id="when-to-think">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>When to think, and when not to</h2></div>
+    <p class="g-eyebrow">A decision, not a default</p>
+    <p>Reasoning is a cost centre with an uneven return, so the operational question is routing rather than maximising. Spend thinking tokens when the task is verifiable, multi-step, and wrong answers are expensive: arithmetic over retrieved figures, code that must pass tests, tool sequences whose intermediate state matters, or any problem where an intermediate result can be checked before it is used. Do not spend them on classification, extraction, formatting, rewriting or retrieval of a single fact — these have flat curves, and the extra tokens are pure latency.</p>
+    <p>The useful architecture is a cascade. Try the cheap path first, check it with something that is genuinely deterministic — a parser, a unit test, a schema validator, a calculator — and escalate to a larger budget only when the check fails. That is self-consistency generalised: the point was never "sample more", it was "have a way to tell which sample is right". Where no verifier exists, the honest position is that more thinking gives you a better-looking answer, not a more reliable one.</p>
+    <div class="g-warn">⚠️ <span><b>Two failure modes in one line each:</b> prescribing "think step by step" to a model trained to reason can <b>degrade</b> it by overriding its learned budget policy; and raising the thinking budget on an unverifiable task can <b>buy confidence without correctness</b>. Measure the curve before you spend on it.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What does chain-of-thought actually buy?</td><td>Serial computation and intermediate results in the context — test-time compute, not hidden knowledge.</td></tr>
+        <tr><td>Why does multi-step accuracy fall so fast?</td><td>Reliability is multiplicative across hops: <var>p<sup>N</sup></var>, so 0.9 per hop is 0.35 over ten hops.</td></tr>
+        <tr><td>What is self-consistency?</td><td>Sample <var>N</var> chains, take the majority answer. The first test-time-compute pattern; accuracy rises with <var>N</var> then flattens.</td></tr>
+        <tr><td>When does majority voting fail?</td><td>When errors are correlated — a shared misreading or a poisoned fact. More samples then amplify one wrong answer.</td></tr>
+        <tr><td>Why can "think step by step" hurt now?</td><td>It competes with the budget policy an RL-trained model already learned, and it spends tokens on shape rather than search.</td></tr>
+        <tr><td>What did RLVR change?</td><td>Verifiable rewards trained the search into the weights, so the model allocates its own thinking instead of following a prompt template.</td></tr>
+        <tr><td>Where should the thinking budget be spent?</td><td>Verifiable, multi-step, high-cost-of-error tasks. Route cheap tasks to cheap paths and escalate on a failed check.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Wei et al., <a href="https://arxiv.org/abs/2201.11903">"Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"</a>, NeurIPS 2022 — the few-shot worked-example result.</li>
+      <li>Kojima et al., <a href="https://arxiv.org/abs/2205.11916">"Large Language Models are Zero-Shot Reasoners"</a>, NeurIPS 2022 — "Let's think step by step", with no examples at all.</li>
+      <li>Wang et al., <a href="https://arxiv.org/abs/2203.11171">"Self-Consistency Improves Chain of Thought Reasoning in Language Models"</a>, ICLR 2023 — the majority-vote-over-samples pattern.</li>
+      <li>Lightman et al., <a href="https://arxiv.org/abs/2305.20050">"Let's Verify Step by Step"</a>, 2023 — process supervision: grading the reasoning, not only the answer.</li>
+      <li>Snell et al., <a href="https://arxiv.org/abs/2408.03314">"Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters"</a>, 2024 — when spending at inference beats a bigger base model.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2501.12948">"DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"</a>, 2025 — RLVR and GRPO at scale, including the emergent long chain.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">"Building effective agents"</a>, December 2024 — the evaluation-and-check pattern the cascade builds on.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Reasoning gets you to an answer; the next problem is getting that answer into a shape a program can read without praying to a regex. Next: the ladder from politely asking for JSON to a decoder that cannot emit anything else.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    tuning: {
+      source: "LoRA (Hu et al., arXiv:2106.09685, ICLR 2022); QLoRA (Dettmers et al., arXiv:2305.14314, NeurIPS 2023); DPO (Rafailov et al., arXiv:2305.18290, NeurIPS 2023); KTO (Ethayarajh et al., arXiv:2402.01306, 2024); ORPO (Hong, Lee & Thorne, arXiv:2403.07691, 2024); GRPO introduced in DeepSeekMath (Shao et al., arXiv:2402.03300, 2024) and used at scale for DeepSeek-R1 (arXiv:2501.12948, 2025). RLVR trains on programmatically checkable outcomes. Offline fallback constants.",
+      methods: [
+        { method: "GRPO / RLVR", trains: "verifiable rewards", cost: "high", note: "For reasoning and tool use where correctness is checkable; reward hacking is the main failure mode." }
+      ],
+      rewardHacking: "A verifier that checks the final answer but not the reasoning invites shortcut policies: exploit the checker, not solve the task."
+    },
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08); tau-bench (Yao et al., arXiv:2406.12045, 2024) and tau-squared-bench (2025) for tool-agent-user interaction; GAIA (Mialon et al., arXiv:2311.12983, 2023); OSWorld (Xie et al., arXiv:2404.07972, 2024); HELM (Liang et al., arXiv:2211.09110, 2022). Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: []
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — a chain-of-thought toggle on a multi-hop task
+  // ------------------------------------------------------------------
+  var A = { hops: el('reasoning-hops'), trace: true, cursor: 99 };
+  var setupA = Guide.setupCanvas(el('reasoning-chain-canvas'), 640, 340, drawA);
+  var TASK_START = 17;
+  var TASK_OPS = [
+    { sym: '+', n: 23 }, { sym: '×', n: 3 }, { sym: '−', n: 19 },
+    { sym: '×', n: 2 }, { sym: '+', n: 41 }, { sym: '−', n: 13 },
+    { sym: '×', n: 5 }, { sym: '−', n: 7 }
+  ];
+  function applyOp(v, op) { return op.sym === '+' ? v + op.n : (op.sym === '×' ? v * op.n : v - op.n); }
+  function chainValues(hops) {
+    var vals = [TASK_START];
+    for (var i = 0; i < hops; i++) vals.push(applyOp(vals[i], TASK_OPS[i]));
+    return vals;
+  }
+  function hopLabel(i, hops) {
+    var vals = chainValues(hops);
+    return vals[i] + ' ' + TASK_OPS[i].sym + ' ' + TASK_OPS[i].n + ' = ' + vals[i + 1];
+  }
+  function chainAccuracy(hops, trace) {
+    var T = 240, ok = 0, p = trace ? 0.93 : 0.66;
+    for (var t = 0; t < T; t++) {
+      var r = AppSim.rng(1000 + t * 97 + hops * 13 + (trace ? 5 : 0));
+      var good = true;
+      for (var i = 0; i < hops; i++) { if (r() >= p) { good = false; break; } }
+      if (good) ok++;
+    }
+    return ok / T;
+  }
+  function chainTrial(hops, trace) {
+    var p = trace ? 0.93 : 0.66;
+    var r = AppSim.rng(7 + hops * 31 + (trace ? 5 : 0));
+    var steps = [], good = true;
+    for (var i = 0; i < hops; i++) {
+      var pass = r() < p;
+      if (!pass) good = false;
+      steps.push({ pass: pass, label: hopLabel(i, hops) });
+    }
+    return { steps: steps, good: good };
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var hops = parseInt(A.hops.value, 10);
+    var vals = chainValues(hops);
+    var trial = chainTrial(hops, A.trace);
+    var shown = A.trace ? Math.min(A.cursor, hops) : 0;
+
+    ctx.textAlign = 'left';
+    ctx.font = '600 12px ' + c.font; ctx.fillStyle = c.text;
+    ctx.fillText(A.trace ? 'with a reasoning trace — one hop at a time' : 'answer only — no intermediate values written down', 16, 20);
+
+    var rowY = 44, rowH = 25;
+    ctx.font = '11px ' + c.font;
+    if (A.trace) {
+      for (var i = 0; i < hops; i++) {
+        var y = rowY + i * rowH;
+        var visible = i < shown;
+        ctx.globalAlpha = visible ? 1 : 0.3;
+        ctx.fillStyle = visible ? (trial.steps[i].pass ? c.accent700 : c.accent2) : c.divider;
+        ctx.beginPath(); ctx.arc(26, y + 5, 6, 0, 2 * Math.PI); ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text;
+        ctx.fillText('hop ' + (i + 1) + ':  ' + (visible ? trial.steps[i].label : '?  ?  ?'), 40, y + 10);
+        if (visible) {
+          ctx.fillStyle = trial.steps[i].pass ? c.accent700 : c.accent2;
+          ctx.fillText(trial.steps[i].pass ? 'ok' : 'slip', 320, y + 10);
+        }
+      }
+      ctx.fillStyle = c.text;
+      ctx.fillText('final answer:  ' + (shown >= hops ? String(vals[hops]) : '…'), 40, rowY + hops * rowH + 18);
+    } else {
+      ctx.fillStyle = c.text;
+      ctx.fillText('start ' + TASK_START + '  →  ' + hops + ' hops solved silently  →  one final answer', 40, rowY + 12);
+      for (var j = 0; j < hops; j++) {
+        ctx.fillStyle = c.divider;
+        ctx.fillRect(40 + j * 34, rowY + 26, 26, 14);
+      }
+      ctx.fillStyle = c.text;
+      ctx.fillText('every intermediate value has to survive one forward pass', 40, rowY + 62);
+      ctx.fillStyle = trial.good ? c.accent700 : c.accent2;
+      ctx.fillText('representative trial: ' + (trial.good ? 'correct' : 'wrong — one bad hop poisons the chain'), 40, rowY + 84);
+    }
+
+    // right panel — accuracy bars
+    var px = 404, pw = 200;
+    ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text; ctx.textAlign = 'left';
+    ctx.fillText('seeded accuracy · 240 trials', px, 20);
+    var plain = chainAccuracy(hops, false);
+    var traced = chainAccuracy(hops, true);
+    function bar(y, label, v, col) {
+      ctx.font = '11px ' + c.font; ctx.fillStyle = c.text; ctx.textAlign = 'left';
+      ctx.fillText(label, px, y + 11);
+      ctx.textAlign = 'right'; ctx.fillText((v * 100).toFixed(0) + '%', px + pw, y + 11);
+      ctx.fillStyle = c.divider; ctx.fillRect(px, y + 18, pw, 16);
+      ctx.fillStyle = col; ctx.fillRect(px, y + 18, Math.max(1, pw * v), 16);
+    }
+    bar(48, 'answer only', plain, c.accent400);
+    bar(108, 'with trace', traced, c.accent);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('per hop: 0.66 vs 0.93', px, 160);
+    ctx.fillText('P(chain) = p^' + hops, px, 176);
+    ctx.fillText('lift: ' + (traced - plain >= 0 ? '+' : '') + ((traced - plain) * 100).toFixed(0) + ' pts', px, 192);
+
+    el('reasoning-chain-readout').innerHTML =
+      '<div><span class="k">task</span> start ' + TASK_START + ' over ' + hops + ' hops → ' + vals[hops] + '</div>' +
+      '<div><span class="k">answer only</span> <span class="hi">' + (plain * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">with trace</span> <span class="hi">' + (traced * 100).toFixed(0) + '%</span></div>' +
+      '<div><span class="k">gap</span> ' + ((traced - plain) * 100).toFixed(0) + ' points from output tokens alone</div>' +
+      '<div class="k">the chain is one seeded trial; the bars are the distribution</div>';
+  }
+  Guide.bindSliders([A.hops], function () { A.cursor = 99; drawA(); });
+  el('reasoning-trace-toggle').addEventListener('click', function () {
+    A.trace = !A.trace;
+    this.className = A.trace ? 'g-primary' : '';
+    this.textContent = A.trace ? 'Reasoning trace: on' : 'Reasoning trace: off';
+    A.cursor = 99;
+    drawA();
+  });
+  var Aplay = Guide.loop({
+    onStep: function () {
+      var hops = parseInt(A.hops.value, 10);
+      if (!A.trace) {
+        A.trace = true;
+        el('reasoning-trace-toggle').className = 'g-primary';
+        el('reasoning-trace-toggle').textContent = 'Reasoning trace: on';
+      }
+      if (A.cursor >= hops) { A.cursor = 0; Aplay.stop(); drawA(); return; }
+      A.cursor += 1;
+      drawA();
+      if (A.cursor >= hops) Aplay.stop();
+    },
+    button: el('reasoning-play'), interval: 650, playLabel: 'Play chain', pauseLabel: 'Pause'
+  });
+  el('reasoning-play').addEventListener('click', function () {
+    if (A.cursor >= parseInt(A.hops.value, 10)) A.cursor = 0;
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — self-consistency: majority vote over N sampled chains
+  // ------------------------------------------------------------------
+  var B = { n: el('reasoning-sc-n'), p: el('reasoning-sc-p'), seed: 11 };
+  var setupB = Guide.setupCanvas(el('reasoning-sc-canvas'), 640, 360, drawB);
+  var SC_LABELS = ['A (correct)', 'B', 'C', 'D'];
+  function sampleChain(r, pCorrect) {
+    var u = r();
+    if (u < pCorrect) return 0;
+    return 1 + Math.min(2, Math.floor((u - pCorrect) / (1 - pCorrect) * 3));
+  }
+  function scTally(n, pCorrect, seed) {
+    var r = AppSim.rng(seed + n * 53);
+    var counts = [0, 0, 0, 0];
+    for (var i = 0; i < n; i++) counts[sampleChain(r, pCorrect)]++;
+    var best = 0;
+    for (var j = 1; j < 4; j++) if (counts[j] > counts[best]) best = j;
+    return { counts: counts, majority: best };
+  }
+  function majorityAccuracy(n, pCorrect, seed) {
+    var T = 400, ok = 0;
+    for (var t = 0; t < T; t++) {
+      var r = AppSim.rng(seed + t * 131 + n * 17);
+      var counts = [0, 0, 0, 0];
+      for (var i = 0; i < n; i++) counts[sampleChain(r, pCorrect)]++;
+      var best = 0;
+      for (var j = 1; j < 4; j++) if (counts[j] > counts[best]) best = j;
+      if (best === 0) ok++;
+    }
+    return ok / T;
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 360;
+    ctx.clearRect(0, 0, W, H);
+    var n = parseInt(B.n.value, 10);
+    var pCorrect = parseInt(B.p.value, 10) / 100;
+    var tally = scTally(n, pCorrect, B.seed);
+
+    // left panel — the tally of one sample
+    ctx.font = '600 11px ' + c.font; ctx.fillStyle = c.text; ctx.textAlign = 'left';
+    ctx.fillText('one sample of ' + n + ' chains', 20, 20);
+    var maxCount = Math.max.apply(null, tally.counts) || 1;
+    var bx = 92, bw = 200;
+    tally.counts.forEach(function (cnt, i) {
+      var y = 44 + i * 34;
+      ctx.font = '11px ' + c.font; ctx.fillStyle = c.text; ctx.textAlign = 'right';
+      ctx.fillText(SC_LABELS[i], bx - 8, y + 14);
+      ctx.fillStyle = c.divider; ctx.fillRect(bx, y, bw, 20);
+      ctx.fillStyle = i === 0 ? c.accent : c.accent400;
+      ctx.fillRect(bx, y, Math.max(0, bw * (cnt / maxCount)), 20);
+      ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+      ctx.fillText(cnt + '×', bx + Math.max(6, bw * (cnt / maxCount)) + 4, y + 14);
+    });
+    ctx.fillStyle = tally.majority === 0 ? c.accent700 : c.accent2;
+    ctx.font = '600 11px ' + c.font;
+    ctx.fillText('majority: ' + SC_LABELS[tally.majority].split(' ')[0] + (tally.majority === 0 ? ' ✓' : ' ✗'), 20, 190);
+
+    // right panel — majority-vote accuracy against N
+    var rx0 = 350, ry0 = 50, rw = 274, rh = 250;
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(rx0, ry0); ctx.lineTo(rx0, ry0 + rh); ctx.lineTo(rx0 + rw, ry0 + rh); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+    ctx.textAlign = 'center'; ctx.fillText('chains sampled (N)', rx0 + rw / 2, ry0 + rh + 22);
+    ctx.save(); ctx.translate(14, ry0 + rh / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('majority-vote accuracy', 0, 0); ctx.restore();
+    ctx.textAlign = 'right';
+    ctx.fillText('100%', rx0 - 5, ry0 + 4);
+    ctx.fillText('50%', rx0 - 5, ry0 + rh / 2 + 3);
+    ctx.fillText('0%', rx0 - 5, ry0 + rh);
+
+    function X(nn) { return rx0 + rw * (nn - 1) / 30; }
+    function Y(v) { return ry0 + rh * (1 - v); }
+
+    // single-chain reference
+    ctx.strokeStyle = c.accent2; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(rx0, Y(pCorrect)); ctx.lineTo(rx0 + rw, Y(pCorrect)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.accent2; ctx.textAlign = 'left'; ctx.font = '10px ' + c.font;
+    ctx.fillText('p = ' + (pCorrect * 100).toFixed(0) + '% (single chain)', rx0 + 5, Y(pCorrect) - 5);
+
+    var pts = [];
+    for (var k = 1; k <= 31; k += 2) pts.push({ x: k, y: majorityAccuracy(k, pCorrect, B.seed) });
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 2.2; ctx.beginPath();
+    pts.forEach(function (pt, i) { if (i === 0) ctx.moveTo(X(pt.x), Y(pt.y)); else ctx.lineTo(X(pt.x), Y(pt.y)); });
+    ctx.stroke();
+    ctx.fillStyle = c.accent;
+    pts.forEach(function (pt) { ctx.beginPath(); ctx.arc(X(pt.x), Y(pt.y), 2.4, 0, 2 * Math.PI); ctx.fill(); });
+
+    var here = pts.filter(function (pt) { return pt.x === n; })[0];
+    if (here) {
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(X(n), ry0); ctx.lineTo(X(n), ry0 + rh); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(X(n), Y(here.y), 6, 0, 2 * Math.PI);
+      ctx.fillStyle = c.accent2; ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText((here.y * 100).toFixed(0) + '%', X(n), Y(here.y) - 11);
+    }
+
+    var gain = (here ? here.y : pCorrect) - pCorrect;
+    el('reasoning-sc-readout').innerHTML =
+      '<div><span class="k">N</span> ' + n + ' &nbsp; <span class="k">single chain</span> ' + (pCorrect * 100).toFixed(0) + '%' +
+      ' &nbsp; <span class="k">majority</span> <span class="hi">' + ((here ? here.y : pCorrect) * 100).toFixed(0) + '%</span></div>' +
+      '<div><span class="k">gain from sampling</span> <span class="hi">+' + (gain * 100).toFixed(0) + ' pts</span>' +
+      ' &nbsp; <span class="k">output cost</span> ' + n + '×</div>' +
+      '<div><span class="k">votes</span> ' + tally.counts.join(' / ') + '</div>' +
+      '<div class="k">gains front-load: expect most of the lift in the first 5–9 chains</div>';
+  }
+  Guide.bindSliders([B.n, B.p], drawB);
+  el('reasoning-sc-resample').addEventListener('click', function () { B.seed = B.seed + 7; drawB(); });
+
+  // ------------------------------------------------------------------
+  // Demo C — the reasoning-effort dial
+  // ------------------------------------------------------------------
+  var C = { budget: el('reasoning-effort'), showPrompt: true };
+  var setupC = Guide.setupCanvas(el('reasoning-effort-canvas'), 640, 340, drawC);
+  var CROSSOVER = 2273;
+  function effortCurves(b) {
+    var reason = 0.55 + 0.40 * (1 - Math.exp(-b / 1500));
+    var presc = Math.max(0, Math.min(1, reason + 0.05 - 0.000022 * b));
+    var baseCot = 0.42 + 0.30 * (1 - Math.exp(-b / 2500));
+    return { reason: reason, presc: presc, baseCot: baseCot };
+  }
+  function drawC() {
+    if (!setupC) return;
+    var b = parseInt(C.budget.value, 10);
+    var series = [];
+    var ptsBase = [], ptsReason = [], ptsPresc = [];
+    for (var x = 0; x <= 8000; x += 100) {
+      var v = effortCurves(x);
+      ptsBase.push({ x: x, y: v.baseCot });
+      ptsReason.push({ x: x, y: v.reason });
+      ptsPresc.push({ x: x, y: v.presc });
+    }
+    series.push({ points: ptsBase, color: '#c9a227', width: 2 });
+    series.push({ points: ptsReason, color: c.accent, width: 2.6 });
+    if (C.showPrompt) series.push({ points: ptsPresc, color: c.accent2, width: 2.2, dashed: true });
+    var axes = Guide.drawLines(setupC.ctx, 640, 340, series, [0, 8000], [0, 1],
+      { xLabel: 'thinking-token budget', yLabel: 'mock accuracy', padL: 56, padB: 32, padT: 28 });
+
+    var ctx = setupC.ctx;
+    // crossover marker
+    if (C.showPrompt) {
+      var cx = axes.px(CROSSOVER);
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('prompt stops helping ≈ ' + CROSSOVER + ' tok', Math.min(cx + 5, 430), axes.padT + 12);
+    }
+    // current budget marker
+    var bx = axes.px(b);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(bx, axes.padT); ctx.lineTo(bx, axes.padT + axes.plotH); ctx.stroke();
+    ctx.globalAlpha = 1;
+    var v = effortCurves(b);
+    function dot(y, col) {
+      ctx.beginPath(); ctx.arc(bx, axes.py(y), 5, 0, 2 * Math.PI);
+      ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    dot(v.baseCot, '#c9a227'); dot(v.reason, c.accent);
+    if (C.showPrompt) dot(v.presc, c.accent2);
+
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = '#c9a227'; ctx.fillText('base model + CoT prompt', axes.padL + 8, axes.padT + 14);
+    ctx.fillStyle = c.accent; ctx.fillText('reasoning model, plain prompt', axes.padL + 8, axes.padT + 28);
+    if (C.showPrompt) { ctx.fillStyle = c.accent2; ctx.fillText('reasoning model + "think step by step"', axes.padL + 8, axes.padT + 42); }
+
+    var delta = v.presc - v.reason;
+    el('reasoning-effort-readout').innerHTML =
+      '<div><span class="k">budget</span> ' + Guide.fmtNum(b) + ' thinking tokens</div>' +
+      '<div><span class="k">reasoning model</span> <span class="hi">' + (v.reason * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">base + CoT</span> ' + (v.baseCot * 100).toFixed(0) + '%</div>' +
+      (C.showPrompt
+        ? '<div><span class="k">+ prescriptive prompt</span> ' + (v.presc * 100).toFixed(0) + '% → ' +
+          (delta < -0.005 ? '<span class="bad">hurts by ' + Math.abs(delta * 100).toFixed(0) + ' pts</span>'
+            : (delta > 0.005 ? '<span class="hi">helps by ' + (delta * 100).toFixed(0) + ' pts</span>' : 'about neutral')) + '</div>'
+        : '<div class="k">prescriptive-prompt curve hidden</div>') +
+      '<div class="k">past the crossover the prompt competes with the learned budget policy</div>';
+  }
+  Guide.bindSliders([C.budget], drawC);
+  el('reasoning-effort-toggle').addEventListener('click', function () {
+    C.showPrompt = !C.showPrompt;
+    this.className = C.showPrompt ? 'g-primary' : '';
+    this.textContent = C.showPrompt ? 'Show prescriptive prompt' : 'Hide prescriptive prompt';
+    drawC();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — prompting versus training across task difficulty
+  // ------------------------------------------------------------------
+  var D = { difficulty: el('reasoning-difficulty') };
+  var setupD = Guide.setupCanvas(el('reasoning-prompt-vs-train-canvas'), 640, 320, drawD);
+  var SERIES = [
+    { key: 'base', label: 'base model, plain prompt', per: 0.72, color: '#c9a227' },
+    { key: 'cot', label: 'base model + CoT prompt', per: 0.90, color: c.accent400 },
+    { key: 'trained', label: 'reasoning-trained model', per: 0.985, color: c.accent700 }
+  ];
+  function evalAccuracy(per, d) {
+    var T = 200, ok = 0;
+    for (var t = 0; t < T; t++) {
+      var r = AppSim.rng(Math.round(per * 10000) + t * 71 + d * 29);
+      var good = true;
+      for (var i = 0; i < d; i++) { if (r() >= per) { good = false; break; } }
+      if (good) ok++;
+    }
+    return ok / T;
+  }
+  function drawD() {
+    if (!setupD) return;
+    var d = parseInt(D.difficulty.value, 10);
+    var pts = SERIES.map(function (s) {
+      var arr = [];
+      for (var i = 1; i <= 12; i++) arr.push({ x: i, y: evalAccuracy(s.per, i) });
+      return { points: arr, color: s.color, width: 2.4 };
+    });
+    var axes = Guide.drawLines(setupD.ctx, 640, 320, pts, [1, 12], [0, 1],
+      { xLabel: 'task difficulty (hops)', yLabel: 'seeded accuracy', padL: 56, padB: 32, padT: 30 });
+    var ctx = setupD.ctx;
+    var cx = axes.px(d);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, axes.padT + axes.plotH); ctx.stroke();
+    ctx.globalAlpha = 1;
+    var vals = SERIES.map(function (s) { return evalAccuracy(s.per, d); });
+    SERIES.forEach(function (s, i) {
+      ctx.beginPath(); ctx.arc(cx, axes.py(vals[i]), 5, 0, 2 * Math.PI);
+      ctx.fillStyle = s.color; ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    });
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    SERIES.forEach(function (s, i) {
+      ctx.fillStyle = s.color;
+      ctx.fillText(s.label + '  ' + (vals[i] * 100).toFixed(0) + '%', axes.padL + 8, axes.padT + 14 + i * 14);
+    });
+    var promptGain = vals[1] - vals[0];
+    var trainGain = vals[2] - vals[1];
+    el('reasoning-prompt-readout').innerHTML =
+      '<div><span class="k">difficulty</span> ' + d + ' hops</div>' +
+      '<div><span class="k">base → +CoT prompt</span> ' + (vals[0] * 100).toFixed(0) + '% → ' +
+        (vals[1] * 100).toFixed(0) + '% <span class="hi">(+' + (promptGain * 100).toFixed(0) + ')</span></div>' +
+      '<div><span class="k">+CoT → reasoning-trained</span> ' + (vals[1] * 100).toFixed(0) + '% → ' +
+        (vals[2] * 100).toFixed(0) + '% <span class="hi">(+' + (trainGain * 100).toFixed(0) + ')</span></div>' +
+      '<div class="k">' + (trainGain > promptGain
+        ? 'the trained policy is doing work no prompt can add'
+        : 'at this difficulty the prompt still closes most of the gap') + '</div>';
+  }
+  Guide.bindSliders([D.difficulty], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    var src = [];
+    if (data && data.tuning && data.tuning.source) src.push(data.tuning.source);
+    if (data && data.evals && data.evals.source) src.push(data.evals.source);
+    el('reasoning-tuning-source').textContent = src.join(' ') || FALLBACK.tuning.source;
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); drawC(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'reasoning-cot-history',
+      kind: 'choice',
+      prompt: 'What did Kojima et al. (2022) add to the chain-of-thought recipe?',
+      options: [
+        { label: 'They showed that the phrase "Let\'s think step by step" alone, with no worked examples, recovers most of the gain.', correct: true },
+        { label: 'They showed that chain-of-thought only works when the examples are ordered by difficulty.', correct: false },
+        { label: 'They showed that reasoning must be trained into the weights; prompting alone does nothing.', correct: false },
+        { label: 'They showed that a majority vote over samples replaces the need for any reasoning text.', correct: false }
+      ],
+      explanation: 'Wei et al. used few-shot worked examples; Kojima et al. removed them and showed a zero-shot instruction, "Let\'s think step by step", produced most of the improvement. No weights changed in either case.'
+    },
+    {
+      id: 'reasoning-self-consistency',
+      kind: 'choice',
+      prompt: 'Why does sampling many chains and taking the majority improve accuracy?',
+      options: [
+        { label: 'Independent chains tend to fail in different places, so the correct answer is reached by most paths.', correct: true },
+        { label: 'The majority vote filters out grammatically invalid chains.', correct: false },
+        { label: 'Sampling at temperature gives the model more parameters to use.', correct: false },
+        { label: 'The largest model among the samples wins the vote.', correct: false }
+      ],
+      explanation: 'Self-consistency exploits error diversity: chain errors are roughly independent, so aggregating final answers concentrates on the answer most paths reach. When a systematic misconception is shared, the errors correlate and the vote amplifies the wrong answer instead.'
+    },
+    {
+      id: 'reasoning-chain-numeric',
+      kind: 'numeric',
+      prompt: 'A five-hop task has per-hop reliability 0.9 and the hops are independent. What is the probability the whole chain is correct?',
+      answer: 0.59049,
+      unit: 'probability',
+      tolerance: 0.01,
+      explanation: 'Reliability multiplies across hops: 0.9^5 = 0.59049, about 0.59. This is why writing the trace out — which is what raises the per-hop probability — matters more than a marginally better final-answer prompt.'
+    },
+    {
+      id: 'reasoning-prescriptive-hurts',
+      kind: 'choice',
+      prompt: 'Why can telling a reasoning-trained model to "think step by step" hurt?',
+      options: [
+        { label: 'It competes with the budget policy the model learned through RLVR, and spends tokens on shape rather than search.', correct: true },
+        { label: 'Reasoning models cannot parse imperative instructions.', correct: false },
+        { label: 'The phrase resets the model\'s context window to zero.', correct: false },
+        { label: 'It forces greedy decoding, which removes all diversity.', correct: false }
+      ],
+      explanation: 'A model trained with verifiable rewards has internalised how to allocate its thinking. A prescriptive prompt overrides those learned decisions — it may nudge a lazy trajectory early on, but past the crossover it lowers quality at the same budget.'
+    },
+    {
+      id: 'reasoning-budget-routing',
+      kind: 'choice',
+      prompt: 'When is spending more thinking tokens least likely to pay off?',
+      options: [
+        { label: 'Classification, extraction, formatting or retrieving a single fact — tasks with a flat accuracy curve.', correct: true },
+        { label: 'Multi-step arithmetic over retrieved figures.', correct: false },
+        { label: 'Writing code that must pass a test suite.', correct: false },
+        { label: 'Tool sequences where the intermediate state is checkable.', correct: false }
+      ],
+      explanation: 'Test-time compute pays on tasks that are verifiable, multi-step and expensive to get wrong. On cheap, single-step tasks the curve is flat, so extra thinking tokens are pure latency and cost.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

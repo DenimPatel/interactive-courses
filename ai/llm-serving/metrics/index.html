@@ -1,0 +1,549 @@
+---
+title: "LLM Serving, Interactively — Part 3: TTFT, TPOT and goodput"
+description: "The four numbers that describe a serving system, why percentiles beat means, how the throughput–latency frontier and goodput turn an SLO into a measurable target, and what a token actually costs."
+permalink: "/ai/llm-serving/metrics/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-verdict { font-family: var(--font-mono); font-size: 12px; margin-top: 8px; }
+  .g-verdict .mem { color: var(--color-accent-2-700); font-weight: 600; }
+  .g-verdict .cmp { color: var(--color-accent-700); font-weight: 600; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 3 of 20</span>
+    <h1>TTFT, TPOT and goodput</h1>
+    <p>A serving system is described by four numbers, and none of them is "latency". This part defines them, shows why the mean is the wrong statistic, builds the throughput–latency frontier the rest of the series keeps referring back to, and ends with the two numbers finance actually asks for.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="four-numbers">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The four numbers</h2></div>
+    <p class="g-eyebrow">One request, four clocks</p>
+    <p><strong>TTFT</strong> (time to first token) is arrival-to-first-token: queueing, scheduling, the whole prompt prefill, and the first decode step. <strong>TPOT</strong> (time per output token), also called inter-token latency or ITL, is the steady-state gap between tokens after the first. <strong>Throughput</strong> is tokens per second produced by the whole deployment. <strong>Goodput</strong> is throughput that also meets the latency SLO — the only one of the four that a user can feel.</p>
+    <p>A single request is a sequence of phases, and the two headline metrics are measured at different places inside it. Drag the phase sliders to watch the measured TTFT and TPOT markers move; toggle streaming to see what "latency" means to a user watching tokens arrive. The <a href="{{ '/ai/llm-training/evaluation/' | relative_url }}">training guide's evaluation chapter</a> covers how a single benchmark number is constructed — serving metrics are the production analogue, sampled continuously rather than measured once.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="lat-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">One request&#8217;s timeline: queue, schedule, prefill, first token, decode steps, detokenize, flush. Marker lines are measured TTFT and TPOT.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Queue wait (ms) <span class="val">300</span></label><input type="range" id="lat-queue" min="0" max="3000" step="50" value="300"></div>
+        <div class="g-field"><label>Prompt tokens <span class="val">512</span></label><input type="range" id="lat-prompt" min="128" max="8192" step="128" value="512"></div>
+        <div class="g-field"><label>Decode step, TPOT (ms) <span class="val">20</span></label><input type="range" id="lat-tpot" min="5" max="80" step="1" value="20"></div>
+        <div class="g-btnrow"><button id="lat-stream" class="g-primary">Streaming: on</button></div>
+        <div class="g-readout" id="lat-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="percentiles">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Percentiles, not means</h2></div>
+    <p class="g-eyebrow">The tail is the product</p>
+    <p>A mean latency is the average of an experience almost nobody has. Latency distributions are right-skewed: a tight median with a long tail of queueing, preemption and retries. Percentiles describe the experience users actually report — p50 is the typical request, p99 is the one that generates the support ticket. This is why SLOs are written at p95 or p99, never at the mean.</p>
+    <p>The demo injects a 2% straggler population into a deterministic sample of 600 requests. The mean barely notices; the p99 moves several-fold. Every tail-hiding bug in a serving stack hides here, and the frontier in the next section is the tool for finding it.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="tail-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Same sample, before and after 2% of requests become stragglers. Bars share a scale, so the p99 jump is not an artefact of normalisation.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="tail-readout"></div>
+        <div class="g-goal" style="margin-top:12px;">💡 <span><b>Rule of thumb:</b> if your dashboard shows average latency, you are not measuring latency. Report p50, p95 and p99 together, and alert on the p99 burn rate rather than a mean threshold.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="frontier">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The throughput–latency frontier</h2></div>
+    <p class="g-eyebrow">The demo the series refers back to</p>
+    <p>Serving has no single "speed". Push more requests per second through a fixed deployment and throughput rises until the hardware saturates, then latency rises while throughput stops moving. The result is a curve, not a number: for every operating point there is a throughput and a latency distribution, and the useful question is where on that curve a deployment should sit for a given SLO.</p>
+    <p>This sweep runs the shared discrete-event simulator at twenty arrival rates — a Poisson workload, continuous batching, a real scheduler and KV capacity — and plots p50/p99 TTFT and TPOT against achieved tokens/s. Drag the two SLO lines (or the sliders) and the goodput card recomputes against the sampled requests. The knee is the point worth building a capacity plan around.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap" style="flex:1 1 520px;">
+        <canvas id="front-canvas" width="760" height="400"></canvas>
+        <p class="g-canvas-hint">Log–log axes. Four latency series against achieved throughput; two draggable SLO thresholds; a marker for the selected operating load.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Max sequences (capacity) <span class="val">24</span></label><input type="range" id="fe-cap" min="8" max="64" step="1" value="24"></div>
+        <div class="g-field"><label>Decode step (ms) <span class="val">20</span></label><input type="range" id="fe-step" min="10" max="40" step="1" value="20"></div>
+        <div class="g-field"><label>Operating load (req/s) <span class="val">5.5</span></label><input type="range" id="fe-load" min="0.3" max="6" step="0.1" value="5.5"></div>
+        <div class="g-field"><label>TTFT SLO (ms) <span class="val">500</span></label><input type="range" id="fe-ttft" min="50" max="2000" step="10" value="500"></div>
+        <div class="g-field"><label>TPOT SLO (ms) <span class="val">30</span></label><input type="range" id="fe-tpot" min="5" max="120" step="1" value="30"></div>
+        <div class="g-readout" id="fe-readout"></div>
+      </div>
+    </div>
+    <div class="g-verdict" id="fe-verdict"></div>
+  </section>
+
+  <section class="g-step" id="goodput">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Goodput</h2></div>
+    <p class="g-eyebrow">Throughput that counts</p>
+    <p>Raw throughput rewards a server for generating tokens that arrive too late to be useful. Goodput applies the SLO as a filter first, then counts: the fraction of requests whose TTFT and TPOT both meet target, the requests/s that satisfy it, and the tokens/s they carry. A deployment can show 1,200 tokens/s of throughput and 40% goodput simultaneously — the other 60% are requests the user abandoned or the client timed out on.</p>
+    <p>Goodput is the objective a scheduler actually optimises, and it is the quantity that jumps when prefill and decode are split into separate pools. Watch it change in the frontier demo as the SLO lines move: tightening TPOT by 10 ms can cost a larger fraction of goodput than doubling capacity buys back.</p>
+    <div class="g-goal">💡 <span><b>Define the unit:</b> goodput is always "requests meeting <em>both</em> a TTFT and a TPOT target". A single latency target lets a system pass by being fast on the metric it controls and slow on the one the user feels.</span></div>
+  </section>
+
+  <section class="g-step" id="streaming">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>What streaming does to "latency"</h2></div>
+    <p class="g-eyebrow">Perceived time is not total time</p>
+    <p>Without streaming, a user waits for the entire response before seeing anything, so perceived latency equals end-to-end time — often tens of seconds. With streaming, first content arrives at TTFT and the response grows under the user's eyes; perceived latency collapses to TTFT, and TPOT becomes the visible "typing speed". The same backend, the same total time, two completely different experiences.</p>
+    <p>This is why TTFT and TPOT are reported separately rather than collapsed into a single end-to-end number, and why a chunked prefill that spikes ITL is a visible regression even when throughput is flat. The streaming toggle in the first demo moves the "first content" marker; everything to its right is perceived as already-arriving work.</p>
+  </section>
+
+  <section class="g-step" id="tails">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Where tail latency comes from</h2></div>
+    <p class="g-eyebrow">A checklist, not a mystery</p>
+    <p>Tail latency is rarely one bug; it is a queueing system telling you which resource ran out. The usual suspects: <strong>queueing</strong> when arrival rate approaches service rate (the frontier is steep here); <strong>head-of-line blocking</strong> when a long prompt or a long generation occupies the batch; <strong>preemption</strong> when KV pressure forces a running request to be recomputed or swapped; <strong>chunked-prefill ITL spikes</strong> when a large prompt is interleaved with decode; <strong>cold start</strong> when an autoscaler adds a replica and the first request pays for weight loading; and <strong>retries</strong> that multiply load exactly when the system is already saturated.</p>
+    <p>The <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">scheduler</a> decides which of these you get. p99 TTFT that degrades while p50 is flat almost always means the queue, not the kernels — check the frontier before optimising the model.</p>
+  </section>
+
+  <section class="g-step" id="slo">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Writing a defensible SLO</h2></div>
+    <p class="g-eyebrow">Pick a percentile, a target and a window</p>
+    <p>An SLO is three numbers: a percentile, a threshold, and a measurement window. "p99 TTFT under 2 s over 28 days" is defensible; "fast" is not. Pair every latency target with a goodput floor so the system cannot pass by refusing work, and state the workload the number was measured on — prompt length, output length and arrival rate change it completely.</p>
+    <table class="g-cheat">
+      <thead><tr><th>Metric</th><th>Typical target</th><th>What it protects</th></tr></thead>
+      <tbody>
+        <tr><td>TTFT p50 / p99</td><td>200 ms / 2 s</td><td>Perceived responsiveness, prefix-cache hits</td></tr>
+        <tr><td>TPOT p50 / p99</td><td>20 ms / 80 ms</td><td>Reading speed; streaming smoothness under load</td></tr>
+        <tr><td>Goodput fraction</td><td>≥ 99% of admitted requests</td><td>Throughput that is actually useful</td></tr>
+        <tr><td>Error / timeout rate</td><td>&lt; 0.1%</td><td>Retry storms and silent shedding</td></tr>
+      </tbody>
+    </table>
+    <p>Numbers are illustrative; the structure is not. The <a href="{{ '/ai/llm-serving/glossary/' | relative_url }}">glossary</a> collects the definitions, and Part 20 turns them into capacity and cost.</p>
+  </section>
+
+  <section class="g-step" id="cost">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>tok/s/GPU and dollars per million tokens</h2></div>
+    <p class="g-eyebrow">The two numbers finance asks for</p>
+    <p>Throughput per GPU is the deliverable of every efficiency technique in this series. Cost per million output tokens is that number divided into the GPU's hourly price and its utilisation. A deployment at 1,000 tokens/s per GPU on a 2 USD/hr instance with 70% utilisation costs about 0.79 USD per million output tokens — a figure you can compare directly to an API list price. Move the sliders and watch the comparison change; the point is that cost is a consequence of goodput, not a separate problem.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="cost-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Self-hosted cost per million output tokens against historical API list prices. Bars are USD per million output tokens.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>GPU cost (USD / hour) <span class="val">2.0</span></label><input type="range" id="cost-gpu" min="0.5" max="10" step="0.1" value="2.0"></div>
+        <div class="g-field"><label>Tokens/s per GPU <span class="val">1000</span></label><input type="range" id="cost-tps" min="200" max="4000" step="50" value="1000"></div>
+        <div class="g-field"><label>GPU utilisation (%) <span class="val">70</span></label><input type="range" id="cost-util" min="30" max="100" step="1" value="70"></div>
+        <div class="g-readout" id="cost-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="cost-source"></p>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Metrics turn into concurrency the moment you size the KV cache. Next: bytes per token for real model geometries.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.__SERVING_NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK_PRICING = {
+    source: "Historical vendor list prices, early-to-mid 2025, USD per 1M tokens. Offline fallback constants.",
+    items: [
+      { model: "GPT-4o mini", outputPerMUSD: 0.6 },
+      { model: "GPT-4o", outputPerMUSD: 10.0 },
+      { model: "Claude 3.5 Sonnet", outputPerMUSD: 15.0 },
+      { model: "Gemini 2.0 Flash", outputPerMUSD: 0.4 },
+      { model: "DeepSeek-V3", outputPerMUSD: 1.1 }
+    ]
+  };
+
+  // ------------------------------------------------------------------
+  // Demo A — latency anatomy
+  // ------------------------------------------------------------------
+  var A = { queue: el('lat-queue'), prompt: el('lat-prompt'), tpot: el('lat-tpot'), streaming: true };
+  var OUT_TOKENS = 200;
+  var setupA = Guide.setupCanvas(el('lat-canvas'), 640, 300, drawA);
+
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 300;
+    var q = parseFloat(A.queue.value);
+    var prompt = parseFloat(A.prompt.value);
+    var tpot = parseFloat(A.tpot.value);
+    var schedule = 3, prefill = prompt / 3000 * 1000, decode = OUT_TOKENS * tpot;
+    var detok = 8, flush = 20;
+    var total = q + schedule + prefill + decode + detok + flush;
+    var padL = 60, padR = 18, padT = 42, padB = 40;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    function px(t) { return padL + plotW * t / total; }
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    var ticks = 5;
+    for (var k = 0; k <= ticks; k++) {
+      var tv = total * k / ticks;
+      ctx.fillText(Guide.fmtMs(tv), px(tv), H - 8);
+    }
+
+    var y = padT + plotH / 2 - 16, barH = 32;
+    var segs = [
+      { v: q, color: '#c9c3ba', name: 'queue' },
+      { v: schedule, color: c.accent400, name: 'schedule' },
+      { v: prefill, color: c.accent700, name: 'prefill' },
+      { v: decode, color: c.accent, name: 'decode' },
+      { v: detok, color: c.accent2, name: 'detok' },
+      { v: flush, color: c.text, name: 'flush' }
+    ];
+    var x = padL;
+    segs.forEach(function (s) {
+      var w = plotW * s.v / total;
+      ctx.fillStyle = s.color; ctx.globalAlpha = s.color === c.text ? 0.5 : 1;
+      ctx.fillRect(x, y, Math.max(0.5, w), barH); ctx.globalAlpha = 1;
+      if (w > 42) {
+        ctx.fillStyle = s.color === '#c9c3ba' || s.color === c.accent400 ? c.text : '#fff';
+        ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText(s.name, x + w / 2, y + barH / 2 + 3);
+      }
+      x += w;
+    });
+    // decode tick marks for the first few tokens
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1;
+    for (var t = 1; t <= Math.min(OUT_TOKENS, 12); t++) {
+      var tx = px(q + schedule + prefill + t * tpot);
+      ctx.beginPath(); ctx.moveTo(tx, y); ctx.lineTo(tx, y + barH); ctx.stroke();
+    }
+
+    var ttft = q + schedule + prefill + tpot;
+    function marker(t, label, color) {
+      var mx = px(t);
+      ctx.strokeStyle = color; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(mx, padT - 8); ctx.lineTo(mx, padT + plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(label, Math.min(mx + 4, W - 90), padT - 14);
+    }
+    marker(ttft, 'TTFT ' + Guide.fmtMs(ttft), c.accent2);
+    // TPOT bracket
+    var d0 = px(q + schedule + prefill + tpot), d1 = px(q + schedule + prefill + 2 * tpot);
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(d0, y + barH + 8); ctx.lineTo(d1, y + barH + 8); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(d0, y + barH + 4); ctx.lineTo(d0, y + barH + 12); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(d1, y + barH + 4); ctx.lineTo(d1, y + barH + 12); ctx.stroke();
+    ctx.fillStyle = c.accent2; ctx.textAlign = 'center';
+    ctx.fillText('TPOT ' + Guide.fmtMs(tpot), (d0 + d1) / 2, y + barH + 26);
+    // first content marker
+    var fc = A.streaming ? ttft : total;
+    ctx.fillStyle = c.accent700; ctx.textAlign = 'left';
+    ctx.fillText((A.streaming ? 'first content (streaming) ' : 'first content (buffered) ') + Guide.fmtMs(fc), padL + 2, padT - 30);
+
+    el('lat-readout').innerHTML =
+      '<div><span class="k">TTFT</span> <span class="hi">' + Guide.fmtMs(ttft) + '</span></div>' +
+      '<div><span class="k">TPOT</span> ' + Guide.fmtMs(tpot) + ' &nbsp; <span class="k">decode total</span> ' + Guide.fmtMs(decode) + '</div>' +
+      '<div><span class="k">end to end</span> ' + Guide.fmtMs(total) + '</div>' +
+      '<div><span class="k">user sees first content at</span> <span class="hi">' + Guide.fmtMs(fc) + '</span></div>';
+  }
+  Guide.bindSliders([A.queue, A.prompt, A.tpot], drawA);
+  el('lat-stream').addEventListener('click', function () {
+    A.streaming = !A.streaming;
+    this.textContent = 'Streaming: ' + (A.streaming ? 'on' : 'off');
+    this.className = A.streaming ? 'g-primary' : '';
+    drawA();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — mean vs p99
+  // ------------------------------------------------------------------
+  var tailData = (function () {
+    var rng = Guide.seededRandom(42);
+    function gauss() {
+      var u = 0, v = 0;
+      while (u === 0) u = rng();
+      while (v === 0) v = rng();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    function ln(mean, cv) {
+      var vN = (cv * mean) * (cv * mean);
+      var mu = Math.log(mean * mean / Math.sqrt(mean * mean + vN));
+      var sg = Math.sqrt(Math.log(1 + vN / (mean * mean)));
+      return Math.exp(mu + sg * gauss());
+    }
+    var N = 600, base = [];
+    for (var i = 0; i < N; i++) base.push(ln(200, 0.08));
+    var after = base.slice();
+    var nstr = Math.round(N * 0.02);
+    for (var k = 0; k < nstr; k++) after[Math.floor((k + 0.5) * N / nstr)] = 950;
+    return { base: base, after: after };
+  })();
+  var setupC = Guide.setupCanvas(el('tail-canvas'), 640, 300, drawC);
+  function drawC() {
+    if (!setupC) return;
+    function mean(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+    var mb = mean(tailData.base), ma = mean(tailData.after);
+    var p99b = ServingSim.percentile(tailData.base, 99), p99a = ServingSim.percentile(tailData.after, 99);
+    var data = [
+      { label: 'mean · base', value: mb, valueLabel: mb.toFixed(0) + ' ms', color: c.accent400 },
+      { label: 'mean · +2% stragglers', value: ma, valueLabel: ma.toFixed(0) + ' ms', color: c.accent },
+      { label: 'p99 · base', value: p99b, valueLabel: p99b.toFixed(0) + ' ms', color: c.accent400 },
+      { label: 'p99 · +2% stragglers', value: p99a, valueLabel: p99a.toFixed(0) + ' ms', color: c.accent2 }
+    ];
+    Guide.drawBars(setupC.ctx, 640, 300, data, { maxV: p99a * 1.1, padL: 132 });
+    el('tail-readout').innerHTML =
+      '<div><span class="k">mean change</span> <span class="hi">+' + ((ma / mb - 1) * 100).toFixed(1) + '%</span> (' + mb.toFixed(0) + ' → ' + ma.toFixed(0) + ' ms)</div>' +
+      '<div><span class="k">p99 change</span> <span class="hi">' + (p99a / p99b).toFixed(1) + '×</span> (' + p99b.toFixed(0) + ' → ' + p99a.toFixed(0) + ' ms)</div>' +
+      '<div class="k">2% of requests at 950 ms; the mean barely moves, p99 pays for all of them.</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo C — frontier sweep + goodput
+  // ------------------------------------------------------------------
+  var HORIZON = 14000;
+  var F = {
+    cap: el('fe-cap'), step: el('fe-step'), load: el('fe-load'),
+    ttft: el('fe-ttft'), tpot: el('fe-tpot'), drag: null
+  };
+  var sweep = [];
+  var setupF = Guide.setupCanvas(el('front-canvas'), 760, 400, drawF);
+
+  function computeSweep() {
+    var cap = parseInt(F.cap.value, 10), step = parseInt(F.step.value, 10);
+    var out = [];
+    for (var i = 0; i < 20; i++) {
+      var rate = 0.3 + (6.0 - 0.3) * i / 19;
+      var w = ServingSim.workload({ seed: 7, rate: rate, promptMean: 512, promptCV: 0.7, decodeMean: 200, decodeCV: 0.8, horizon: HORIZON });
+      var r = ServingSim.run({
+        requests: w.requests, policy: 'fcfs', capacity: cap, kvBlocks: 2048, blockSize: 16,
+        chunkedPrefill: true, prefillTokBudget: 2048, stepMs: step, preempt: 'recompute', horizon: HORIZON
+      });
+      out.push({
+        rate: rate, tp: r.stats.throughput,
+        t50: r.stats.ttft.p50, t99: r.stats.ttft.p99,
+        d50: r.stats.tpot.p50, d99: r.stats.tpot.p99,
+        perReq: r.perReq
+      });
+    }
+    sweep = out;
+  }
+
+  function drawF() {
+    if (!setupF) return;
+    var ctx = setupF.ctx, W = 760, H = 400;
+    ctx.clearRect(0, 0, W, H);
+    if (!sweep.length) {
+      ctx.fillStyle = c.text; ctx.font = '13px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText('computing sweep…', W / 2, H / 2); return;
+    }
+    var ttftSLO = parseFloat(F.ttft.value), tpotSLO = parseFloat(F.tpot.value), load = parseFloat(F.load.value);
+    var padL = 62, padR = 22, padT = 46, padB = 44;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    var xs = [], ys = [ttftSLO, tpotSLO];
+    sweep.forEach(function (d) { xs.push(d.tp); ys.push(d.t50, d.t99, d.d50, d.d99); });
+    var xMin = Math.max(1, Math.min.apply(null, xs) * 0.75), xMax = Math.max.apply(null, xs) * 1.2;
+    var yMin = Math.max(1, Math.min.apply(null, ys) * 0.65), yMax = Math.max.apply(null, ys) * 1.5;
+    function px(v) { return padL + plotW * Math.log(Math.max(1e-9, v) / xMin) / Math.log(xMax / xMin); }
+    function py(v) { return padT + plotH * (1 - Math.log(Math.max(1e-9, v) / yMin) / Math.log(yMax / yMin)); }
+    function invPy(v) { return yMin * Math.pow(yMax / yMin, (padT + plotH - v) / plotH); }
+
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    var dec;
+    for (dec = 1; dec <= 100000; dec *= 10) {
+      if (dec >= xMin && dec <= xMax) {
+        var gx = px(dec);
+        ctx.beginPath(); ctx.moveTo(gx, padT); ctx.lineTo(gx, padT + plotH); ctx.stroke();
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText(Guide.fmtNum(dec), gx, H - 24);
+      }
+      if (dec >= yMin && dec <= yMax) {
+        var gy = py(dec);
+        ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(padL + plotW, gy); ctx.stroke();
+        ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right';
+        ctx.fillText(String(dec), padL - 6, gy + 3);
+      }
+    }
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('achieved throughput (tokens / s, log)', padL + plotW / 2, H - 8);
+    ctx.save(); ctx.translate(14, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('latency (ms, log)', 0, 0); ctx.restore();
+
+    function series(key, color, dashed) {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dashed ? [5, 4] : []);
+      ctx.beginPath();
+      sweep.forEach(function (d, i) {
+        var X = px(d.tp), Y = py(d[key]);
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      });
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    series('t50', c.accent, false);
+    series('t99', c.accent, true);
+    series('d50', c.accent2, false);
+    series('d99', c.accent2, true);
+
+    // SLO lines + handles
+    function sloLine(val, color, name) {
+      var yy = py(val);
+      ctx.strokeStyle = color; ctx.setLineDash([7, 5]); ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + plotW, yy); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(padL + plotW - 6, yy, 5, 0, 2 * Math.PI);
+      ctx.fillStyle = color; ctx.fill();
+      ctx.fillStyle = color; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(name + ' ' + val + ' ms', padL + 4, yy - 4);
+      return yy;
+    }
+    sloLine(ttftSLO, c.accent, 'TTFT SLO');
+    sloLine(tpotSLO, c.accent2, 'TPOT SLO');
+
+    // selected operating load
+    var sel = sweep[0], best = Infinity;
+    sweep.forEach(function (d) { var diff = Math.abs(d.rate - load); if (diff < best) { best = diff; sel = d; } });
+    var vx = px(sel.tp);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.45; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(vx, padT); ctx.lineTo(vx, padT + plotH); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('load ' + load.toFixed(1) + ' rps', vx, padT - 6);
+
+    // legend
+    ctx.textAlign = 'left'; ctx.font = '10px ' + c.font;
+    var lx = padL + 4, ly = padT + 12;
+    function leg(color, dashed, label, dx) {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dashed ? [5, 4] : []);
+      ctx.beginPath(); ctx.moveTo(lx + dx, ly); ctx.lineTo(lx + dx + 18, ly); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.text; ctx.fillText(label, lx + dx + 22, ly + 3);
+    }
+    leg(c.accent, false, 'TTFT p50', 0);
+    leg(c.accent, true, 'TTFT p99', 110);
+    leg(c.accent2, false, 'TPOT p50', 222);
+    leg(c.accent2, true, 'TPOT p99', 330);
+
+    var gp = ServingSim.goodput(sel.perReq, { ttftSLO: ttftSLO, tpotSLO: tpotSLO, horizon: HORIZON });
+    el('fe-readout').innerHTML =
+      '<div><span class="k">sweep</span> cap=' + F.cap.value + ' · step=' + F.step.value + ' ms · 20 rates</div>' +
+      '<div><span class="k">at ' + sel.rate.toFixed(2) + ' rps</span> <span class="hi">' + sel.tp.toFixed(0) + ' tok/s</span></div>' +
+      '<div><span class="k">TTFT</span> p50 ' + Guide.fmtMs(sel.t50) + ' · p99 ' + Guide.fmtMs(sel.t99) + '</div>' +
+      '<div><span class="k">TPOT</span> p50 ' + Guide.fmtMs(sel.d50) + ' · p99 ' + Guide.fmtMs(sel.d99) + '</div>' +
+      '<div><span class="k">goodput</span> <span class="hi">' + (gp.fraction * 100).toFixed(1) + '%</span> · ' + gp.rps.toFixed(2) + ' req/s · ' + gp.tps.toFixed(0) + ' tok/s</div>' +
+      '<div class="k">' + gp.requests + ' of ' + gp.total + ' requests meet both thresholds</div>';
+    el('fe-verdict').innerHTML = 'throughput and latency trade against each other; goodput prices the trade at the current SLO.';
+  }
+
+  function scheduleSweep() {
+    if (!ready) return;
+    el('fe-readout').innerHTML = '<span class="k">recomputing sweep…</span>';
+    clearTimeout(sweepTimer);
+    sweepTimer = setTimeout(function () { computeSweep(); drawF(); }, 140);
+  }
+  var sweepTimer = null, ready = false;
+  Guide.bindSliders([F.cap, F.step], scheduleSweep);
+  Guide.bindSliders([F.load, F.ttft, F.tpot], drawF);
+  computeSweep(); ready = true; drawF();
+
+  // drag the SLO lines
+  function frontDragStart(ev) {
+    var h = Guide.hitTest(el('front-canvas'), ev);
+    if (!sweep.length) return;
+    var padL = 62, padR = 22, padT = 46, padB = 44;
+    var plotW = 760 - padL - padR, plotH = 400 - padT - padB;
+    var ttftSLO = parseFloat(F.ttft.value), tpotSLO = parseFloat(F.tpot.value);
+    var xs = [], ys = [ttftSLO, tpotSLO];
+    sweep.forEach(function (d) { xs.push(d.tp); ys.push(d.t50, d.t99, d.d50, d.d99); });
+    var xMin = Math.max(1, Math.min.apply(null, xs) * 0.75), xMax = Math.max.apply(null, xs) * 1.2;
+    var yMin = Math.max(1, Math.min.apply(null, ys) * 0.65), yMax = Math.max.apply(null, ys) * 1.5;
+    function py(v) { return padT + plotH * (1 - Math.log(v / yMin) / Math.log(yMax / yMin)); }
+    if (h.x < padL || h.x > padL + plotW) return;
+    if (Math.abs(h.y - py(ttftSLO)) < 14) F.drag = 'ttft';
+    else if (Math.abs(h.y - py(tpotSLO)) < 14) F.drag = 'tpot';
+    else return;
+    if (ev.preventDefault) ev.preventDefault();
+    window.addEventListener('pointermove', frontDragMove);
+    window.addEventListener('pointerup', frontDragEnd);
+  }
+  function frontDragMove(ev) {
+    if (!F.drag) return;
+    var h = Guide.hitTest(el('front-canvas'), ev);
+    var padL = 62, padR = 22, padT = 46, padB = 44;
+    var plotW = 760 - padL - padR, plotH = 400 - padT - padB;
+    var ttftSLO = parseFloat(F.ttft.value), tpotSLO = parseFloat(F.tpot.value);
+    var xs = [], ys = [ttftSLO, tpotSLO];
+    sweep.forEach(function (d) { xs.push(d.tp); ys.push(d.t50, d.t99, d.d50, d.d99); });
+    var yMin = Math.max(1, Math.min.apply(null, ys) * 0.65), yMax = Math.max.apply(null, ys) * 1.5;
+    var val = yMin * Math.pow(yMax / yMin, (padT + plotH - h.y) / plotH);
+    if (F.drag === 'ttft') F.ttft.value = Math.max(50, Math.min(2000, Math.round(val / 10) * 10));
+    else F.tpot.value = Math.max(5, Math.min(120, Math.round(val)));
+    F.ttft.parentElement.querySelector('.val').textContent = F.ttft.value;
+    F.tpot.parentElement.querySelector('.val').textContent = F.tpot.value;
+    drawF();
+  }
+  function frontDragEnd() {
+    F.drag = null;
+    window.removeEventListener('pointermove', frontDragMove);
+    window.removeEventListener('pointerup', frontDragEnd);
+  }
+  el('front-canvas').addEventListener('pointerdown', frontDragStart);
+
+  // ------------------------------------------------------------------
+  // Demo D — cost card
+  // ------------------------------------------------------------------
+  var D = { gpu: el('cost-gpu'), tps: el('cost-tps'), util: el('cost-util') };
+  var PRICING = FALLBACK_PRICING;
+  var setupD = Guide.setupCanvas(el('cost-canvas'), 640, 320, drawD);
+  function selfCost() {
+    return parseFloat(D.gpu.value) / (parseFloat(D.tps.value) * parseFloat(D.util.value) / 100 * 3600) * 1e6;
+  }
+  function drawD() {
+    if (!setupD) return;
+    var self = selfCost();
+    var data = [{ label: 'self-hosted', value: self, valueLabel: self.toFixed(2) + ' USD/M', color: c.accent }];
+    (PRICING.items || []).forEach(function (it) {
+      data.push({ label: it.model, value: it.outputPerMUSD, valueLabel: it.outputPerMUSD.toFixed(2) + ' USD/M', color: c.accent400 });
+    });
+    var maxV = 0;
+    data.forEach(function (d) { if (d.value > maxV) maxV = d.value; });
+    Guide.drawBars(setupD.ctx, 640, 320, data, { maxV: maxV * 1.1, padL: 132 });
+    el('cost-readout').innerHTML =
+      '<div><span class="k">self-hosted output</span> <span class="hi">' + self.toFixed(3) + ' USD / M tokens</span></div>' +
+      '<div><span class="k">assumptions</span> ' + D.gpu.value + ' USD/hr · ' + D.tps.value + ' tok/s/GPU · ' + D.util.value + '% util</div>' +
+      '<div class="k">cost falls linearly with throughput and utilisation; goodput sets the denominator.</div>';
+  }
+  Guide.bindSliders([D.gpu, D.tps, D.util], drawD);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    if (data && data.pricing && data.pricing.items) {
+      PRICING = data.pricing;
+      el('cost-source').textContent = data.pricing.source || FALLBACK_PRICING.source;
+    } else {
+      el('cost-source').textContent = FALLBACK_PRICING.source;
+    }
+    drawD();
+  }
+
+  fetch(window.__SERVING_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers({ pricing: FALLBACK_PRICING }); });
+
+  drawA(); drawC(); drawD();
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

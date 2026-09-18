@@ -1,0 +1,568 @@
+---
+title: "LLM Serving, Interactively — Part 17: LoRA, quotas and noisy neighbours"
+description: "One base model and thousands of adapters: grouped LoRA kernels, adapter paging, the three quota dials, token buckets versus sliding windows, and virtual-token-counter fair queueing."
+permalink: "/ai/llm-serving/multi-tenancy/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .mt-split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .mt-split .g-card h3 { margin: 0 0 6px; font-size: 15px; }
+  .mt-split .g-card p { margin: 0; font-size: 13px; opacity: 0.85; line-height: 1.55; }
+  .mt-split .g-card code { font-family: var(--font-mono); font-size: 12px; }
+  .mt-col { flex-direction: column; }
+  @media (max-width: 640px) { .mt-split { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 17 of 20</span>
+    <h1>LoRA, quotas and noisy neighbours</h1>
+    <p>A served model is rarely one model. Teams fine-tune it into hundreds of adapters, tenants buy different rate limits, and one customer's 200K-token reasoning burst can wreck everyone else's p99. This part is about the machinery that keeps many tenants on one base: grouped LoRA kernels and adapter paging underneath, quota and fairness policy on top, and the measurements that tell you which of the two is actually failing.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="adapters">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>One base, many adapters</h2></div>
+    <p class="g-eyebrow">A fine-tune that is 1% of the model</p>
+    <p>Low-rank adaptation freezes the base weights and learns two small matrices per targeted layer, so a fine-tune becomes a small delta rather than a full model copy. That mechanism is the training guide's story (<a href="{{ '/ai/llm-training/finetuning/' | relative_url }}">fine-tuning</a>); the serving consequence is the interesting one. Because the adapter is so small, one base model plus N adapters is far cheaper than N models, and the adapter can be swapped per request. A rank-16 adapter on a 70B model is roughly 150–200&nbsp;MB in BF16 — under 0.3% of the base — and a host can hold thousands of them in host DRAM while the base weights stay pinned in HBM. The whole game is deciding which adapters are GPU-resident at any instant and how to run many of them in one step.</p>
+    <div class="g-goal">💡 <span><b>The shift in framing:</b> the base model is a shared, read-mostly substrate; adapters are the tenant-specific state. Serving becomes a memory-management problem over adapter bytes, exactly the way the KV cache was a memory-management problem over activation state.</span></div>
+  </section>
+
+  <section class="g-step" id="sgmv">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Batched LoRA and the SGMV kernel</h2></div>
+    <p class="g-eyebrow">One weight read, many adapters</p>
+    <p>The naive way to serve a batch that touches four adapters is four forwards, one per adapter. Each forward streams the entire base model through HBM to produce a few tokens, so the dominant cost — reading the weights — is paid four times for one scheduling opportunity. Punica's answer is Segmented Gather Matrix-Vector multiplication (SGMV): concatenate every sequence's hidden states, tag each row with its adapter, and run <em>one</em> grouped kernel per layer that gathers the right adapter's low-rank factors per row and applies the update in registers. The base weights are read once; the adapter factors are tiny and effectively free. The reported gain is up to 12× throughput over one-adapter-per-request serving, and it grows with the number of adapters because that is the number of weight reads you stop paying for.</p>
+    <div class="g-math g-katex">$$y_i = W_0 x_i + \frac{\alpha}{r}\, B_{a(i)} A_{a(i)} x_i,\qquad a(i)=\text{adapter of row } i$$</div>
+    <p>The catch is that a grouped kernel only helps when the work is grouped. Requests for different adapters have to be admitted into the same decode step — which is a scheduler decision, not a kernel one, and it is why adapter-aware batching and fair queueing (below) are the same problem seen from two sides.</p>
+    <div class="g-demo mt-col">
+      <div class="g-canvas-wrap">
+        <canvas id="mt-lora" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Naive serial forwards above; one fused SGMV step below. Press play.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="mt-lora-play">Play</button></div>
+        <div class="g-field"><label>Concurrent adapters <span class="val">6</span></label><input type="range" id="mt-lora-n" min="2" max="12" step="1" value="6"></div>
+        <div class="g-field"><label>Sequences per adapter <span class="val">3</span></label><input type="range" id="mt-lora-b" min="1" max="8" step="1" value="3"></div>
+        <div class="g-readout" id="mt-lora-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="mt-src"></p>
+  </section>
+
+  <section class="g-step" id="slora">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>S-LoRA unified paging</h2></div>
+    <p class="g-eyebrow">Adapter weights and KV in one pool</p>
+    <p>If adapters are swapped per request, GPU HBM must hold a working set of them. S-LoRA's move is to page adapter weights into the same unified memory pool that already pages the KV cache, with the same block abstraction and an LRU policy that evicts cold adapters to host DRAM. Because both live in one pool, the engine can trade adapter residency against KV residency instead of reserving a fixed slice for each. S-LoRA reports serving thousands of concurrent adapters on a single GPU, with tensor-parallel adapter shards so the paging cost is split across the same GPUs that run the base model. The residency policy is a pure cache problem, and it has a cache's behaviour: a Zipf popularity skew means a tiny resident set serves most of the traffic.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mt-paging" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Hit rate versus GPU-resident adapter capacity, for the current popularity skew.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Adapters in the catalog <span class="val">2000</span></label><input type="range" id="mt-pg-n" min="100" max="5000" step="100" value="2000"></div>
+        <div class="g-field"><label>GPU-resident capacity <span class="val">40</span></label><input type="range" id="mt-pg-c" min="4" max="200" step="4" value="40"></div>
+        <div class="g-field"><label>Zipf skew (s) <span class="val">1.0</span></label><input type="range" id="mt-pg-s" min="0.5" max="1.5" step="0.05" value="1.0"></div>
+        <div class="g-field"><label>Request rate (req/s) <span class="val">800</span></label><input type="range" id="mt-pg-rps" min="100" max="20000" step="100" value="800"></div>
+        <div class="g-readout" id="mt-paging-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="coldstart">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Adapter cold-start</h2></div>
+    <p class="g-eyebrow">Milliseconds, not the minutes a base model costs</p>
+    <p>A base-model cold start is dominated by pulling tens of gigabytes of weights and building CUDA graphs, which is where the 40–90&nbsp;s figure from Part 19 comes from. An adapter is three orders of magnitude smaller, so the arithmetic is friendly: 160&nbsp;MB over PCIe Gen4 x16 at ~25&nbsp;GB/s is about 6.4&nbsp;ms, and over Gen5 at ~64&nbsp;GB/s about 2.5&nbsp;ms. The costs that remain are the ones people forget — a graph capture or kernel-shape selection for a rank/module combination not seen before, and the fact that the first request to a cold adapter pays the whole fetch inside its own TTFT. That is why a miss shows up as a bimodal TTFT distribution rather than a uniform slowdown, and why the cache hit rate from the demo above is a latency SLO input, not just a bandwidth number.</p>
+    <div class="g-goal">💡 <span><b>Design rule:</b> keep the adapter catalog on a fast local tier and pre-warm the top of the Zipf head at startup. Paging catches the tail; pre-warming keeps the p99 of the head, which is where the latency budget actually lives.</span></div>
+  </section>
+
+  <section class="g-step" id="quotas">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>RPM, TPM and concurrency limits</h2></div>
+    <p class="g-eyebrow">Three dials that are not interchangeable</p>
+    <p>A quota surface exposes three independent knobs, and they fail in different ways. Requests per minute (RPM) caps call count and is trivially gamed by cheap requests — a tenant can spend its whole RPM budget on one-token prompts and use almost no GPU. Tokens per minute (TPM) caps the actual work and is the closest thing to a cost proxy, but a single 128K-token prompt can consume a minute's budget in one call. Concurrency caps in-flight sequences, which is the real constraint on KV residency and decode batching; it does not care about token count at all. A serious gateway limits all three, because each one is the failure mode of the other two.</p>
+    <div class="mt-split" style="margin-top:14px;">
+      <div class="g-card reveal"><h3>RPM</h3><p>Caps call count. Cheap-request flooding spends it instantly; a long prompt costs one unit. Enforce at the gateway before routing.</p></div>
+      <div class="g-card reveal"><h3>TPM</h3><p>Caps work. Needs streaming-aware accounting: a request's token total is unknown until it finishes, so reserve against the budget and reconcile on completion.</p></div>
+      <div class="g-card reveal"><h3>Concurrency</h3><p>Caps resident sequences and therefore KV pressure. The one dial that protects the engine when two tenants both go long-context at once.</p></div>
+      <div class="g-card reveal"><h3>SLO per tenant</h3><p>The point of the other three. Quotas are admission control; the SLO is what you promised once admitted, and it needs its own isolation story.</p></div>
+    </div>
+  </section>
+
+  <section class="g-step" id="buckets">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Token buckets versus sliding windows</h2></div>
+    <p class="g-eyebrow">Burst, sustained rate, and the 429 tail</p>
+    <p>A token bucket is a bucket of capacity <code>B</code> tokens that refills at <code>r</code> tokens per second; each request drains its cost, and a request that cannot be paid for gets a 429. Its virtue is that it tolerates burst up to <code>B</code> while enforcing an average of <code>r</code>, which matches how real workloads arrive: a batch job flush, then a quiet period. A fixed window does the opposite — it allows 2× the limit across a window boundary, because the last second of one window and the first of the next are both measured independently. A sliding window logs every request in the trailing interval, which is precise but costs memory proportional to request rate and still has no notion of burst. In practice: a token bucket with a modest <code>B</code> for burst and a smoothing rate near the sustained SLO is the right default, and the tail behaviour after a burst is what tenants actually complain about.</p>
+    <div class="g-demo mt-col">
+      <div class="g-canvas-wrap">
+        <canvas id="mt-bucket" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">A fixed 12-second trace, replayed. Change any slider to recompute it.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="mt-tb-play">Play</button></div>
+        <div class="g-field"><label>Bucket capacity B (tokens) <span class="val">4000</span></label><input type="range" id="mt-tb-cap" min="500" max="20000" step="500" value="4000"></div>
+        <div class="g-field"><label>Refill rate r (tokens/s) <span class="val">2000</span></label><input type="range" id="mt-tb-rate" min="200" max="10000" step="100" value="2000"></div>
+        <div class="g-field"><label>Cost per request (tokens) <span class="val">500</span></label><input type="range" id="mt-tb-cost" min="100" max="2000" step="100" value="500"></div>
+        <div class="g-field"><label>Arrival rate (req/s) <span class="val">8</span></label><input type="range" id="mt-tb-arr" min="1" max="40" step="1" value="8"></div>
+        <div class="g-readout" id="mt-bucket-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="vtc">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Virtual-token-counter fair queueing</h2></div>
+    <p class="g-eyebrow">Round-robin over requests is not fairness</p>
+    <p>Serve two tenants round-robin, one request at a time. If tenant S sends requests of 5 tokens and tenant L sends requests of 500 tokens, request-level round-robin gives S half the <em>requests</em> but roughly 1% of the <em>tokens</em> — and therefore roughly 1% of the GPU. Token counts are what the GPU spends, so token share is the fair currency. The Virtual Token Counter (VTC) scheduler makes that explicit: every tenant carries a counter of the tokens it has been served, and each decode step admits the requests of the tenant with the smallest counter, incrementing it by the tokens served. A tenant that arrives with a burst of long requests simply runs up its own counter and then waits behind lighter tenants, instead of monopolising the step. The reported effect (Sheng et al., OSDI 2024) is up to 2.9× better fairness and 6.3× lower worst-case latency than request-level round-robin.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="mt-vtc" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Cumulative tokens served, per tenant, over the same GPU-seconds.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Small-tenant request size (tokens) <span class="val">5</span></label><input type="range" id="mt-vtc-s" min="1" max="20" step="1" value="5"></div>
+        <div class="g-field"><label>Large-tenant request size (tokens) <span class="val">500</span></label><input type="range" id="mt-vtc-l" min="100" max="1000" step="50" value="500"></div>
+        <div class="g-readout" id="mt-vtc-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Why it composes with LoRA:</b> the same scheduler that equalises token share also decides which adapters share a step. VTC keeps the mix balanced; grouped batching makes the balanced mix cheap. Neither works well alone.</span></div>
+  </section>
+
+  <section class="g-step" id="isolation">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Isolation levels</h2></div>
+    <p class="g-eyebrow">From shared everything to dedicated silicon</p>
+    <p>Noisy-neighbour protection is a ladder, and each rung buys a stronger guarantee at a higher cost. Shared engine with quotas is cheapest and gives throughput isolation only if the scheduler is fair — latency is still coupled through the batch. Per-tenant queues with priorities decouple admission, but a preemption or a KV squeeze still crosses tenants. Dedicated workers per tenant (or per tenant tier) give true latency isolation and a bounded blast radius, at the cost of idle capacity and a pool per tenant. At the far end, MIG or separate GPUs give hardware isolation. The right rung is a function of the tenant's SLO and how much the provider is willing to pay for it; most production systems run two tiers — shared-with-VTC for the long tail, dedicated for the handful of tenants whose p99 is contractual.</p>
+    <div class="g-formula g-math" style="margin-top:14px;">
+      isolation&nbsp;∝&nbsp;dedicated_resources&nbsp;·&nbsp;cost&nbsp;·&nbsp;lost_utilisation
+    </div>
+  </section>
+
+  <section class="g-step" id="incident">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>The noisy-neighbour incident</h2></div>
+    <p class="g-eyebrow">What it looks like, and what you need to have measured</p>
+    <p>Tenant X ships a feature that fans out long-context reasoning calls at 5 p.m. on a shared pool. Three things happen at once. KV occupancy climbs until the engine starts preempting, so recompute work is injected into a batch that was already full. Adapter thrashing follows because the freed blocks are contested between KV and adapter weights in the unified pool, and every miss adds a PCIe fetch to some tenant's TTFT. And because the requests are long, they occupy decode slots for minutes, so the scheduler's token counters — if it had any — would have flagged the imbalance a minute before the latency did. Tenant Y, running short chat turns, sees p99 TTFT go from 300&nbsp;ms to 6&nbsp;s and starts getting 429s from its own exhausted bucket.</p>
+    <p>None of that is diagnosable from aggregate averages. The postmortem needs, per tenant and per minute: offered and admitted RPM/TPM, queue wait and KV wait separately, resident sequences, KV bytes held, adapter hit rate and PCIe swap bytes/s, preemption events, and goodput against each tenant's SLO. With those, the incident reads as a single curve — X's token share — and the fix is a policy change (a concurrency cap, a VTC guarantee, a dedicated decode pool), not a capacity purchase. Without them, it reads as "the pool got slow", and the next one reads the same way.</p>
+    <div class="g-warn">⚠ <span><b>The trap:</b> aggregate GPU utilisation stays near 100% through the whole incident. The system looked maximally efficient while a contractual SLO was burning. Utilisation is not goodput — the point Part 3 makes, and the reason per-tenant SLOs are the only signal that catches this class of failure.</span></div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Multi-tenancy in one table</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Lever</th><th>What it buys</th><th>What it costs / breaks</th></tr></thead>
+      <tbody>
+        <tr><td>Grouped LoRA (SGMV)</td><td>One base-weight read for many adapters; up to ~12× vs per-adapter forwards</td><td>Needs the scheduler to co-batch adapters; grouped-kernel overhead at tiny batch</td></tr>
+        <tr><td>Unified adapter/KV paging</td><td>Thousands of adapters on one GPU; residency follows Zipf, not reservation</td><td>Misses add PCIe fetch to TTFT; paging competes with KV under pressure</td></tr>
+        <tr><td>RPM + TPM + concurrency</td><td>Three independent failure modes each plugged</td><td>Accounting a stream's tokens requires reserve-then-reconcile</td></tr>
+        <tr><td>Token bucket</td><td>Burst up to B, average r, cheap to run</td><td>429 tail after a burst; fixed windows leak 2× at boundaries</td></tr>
+        <tr><td>VTC fair queueing</td><td>Equal token share; ~2.9× fairness, ~6.3× worst-case latency</td><td>Strong tenant guarantees need dedicated workers or MIG</td></tr>
+        <tr><td>Per-tenant goodput</td><td>Detects the incident aggregates hide</td><td>Requires per-tenant metrics at gateway and engine</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685">LoRA: Low-Rank Adaptation of Large Language Models</a>, ICLR 2022.</li>
+      <li>Chen et al., <a href="https://arxiv.org/abs/2310.18547">Punica: Multi-Tenant LoRA Serving</a>, MLSys 2024 — SGMV and the grouped-kernel design.</li>
+      <li>Sheng et al., <a href="https://arxiv.org/abs/2311.03285">S-LoRA: Serving Thousands of Concurrent LoRA Adapters</a> — unified paging of adapters and KV.</li>
+      <li>Sheng et al., <a href="https://arxiv.org/abs/2401.00558">Fairness in Serving Large Language Models</a>, OSDI 2024 — the Virtual Token Counter.</li>
+      <li>The <a href="{{ '/ai/llm-serving/paged-memory/' | relative_url }}">paged memory</a> and <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">scheduler</a> parts for the block machinery this page builds on.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Isolation and quotas decide who shares a pool. The next part decides what the pool is even being asked to serve.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__MT_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, SS = window.ServingSim, c = G.colors();
+
+  var FALLBACK = {
+    multi_tenant: {
+      source: "Adapter-serving and fairness figures: Punica (Chen et al., 'Punica: Multi-Tenant LoRA Serving', MLSys 2024, arXiv:2310.18547) introduces SGMV and reports up to 12x higher throughput than one-adapter-per-request serving. S-LoRA (Sheng et al., 'S-LoRA: Serving Thousands of Concurrent LoRA Adapters', arXiv:2311.03285) pages adapter weights and KV in one pool and reports serving thousands of adapters on a single GPU. VTC comes from Sheng et al., 'Fairness in Serving Large Language Models' (OSDI 2024, arXiv:2401.00558), which reports up to 2.9x better fairness and 6.3x lower worst-case latency than request-level round-robin. LoRA (Hu et al., arXiv:2106.09685) keeps adapters at roughly 1-2% of base parameter count; a rank-16 adapter for a 70B model is on the order of 150-200 MB in BF16. Adapter transfer times assume PCIe Gen4 x16 at ~25 GB/s and Gen5 at ~64 GB/s. These are order-of-magnitude, guide-friendly figures and vary with rank, target modules and dtype."
+    }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function applyData(d) {
+    if (d && d.model_configs && d.model_configs.items) DATA.shared = d;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+
+  var SRC = document.getElementById("mt-src");
+  if (SRC) SRC.textContent = FALLBACK.multi_tenant.source;
+
+  // ---- Demo 1: naive per-adapter forwards vs one grouped SGMV step --------
+  (function () {
+    var canvas = document.getElementById("mt-lora");
+    if (!canvas) return;
+    var nS = document.getElementById("mt-lora-n");
+    var bS = document.getElementById("mt-lora-b");
+    var readout = document.getElementById("mt-lora-readout");
+    var playBtn = document.getElementById("mt-lora-play");
+    var W = 640, H = 360, ctx = null, cursor = 0;
+
+    function compute() {
+      var n = parseInt(nS.value, 10), batch = parseInt(bS.value, 10);
+      var weightMs = 4.0, seqMs = 0.05, gatherMs = 0.06;
+      var blocks = [], t = 0, i;
+      for (i = 0; i < n; i++) {
+        var dur = weightMs + batch * seqMs;
+        blocks.push({ start: t, dur: dur });
+        t += dur;
+      }
+      var grouped = weightMs + (n * batch) * seqMs * 0.4 + gatherMs * n;
+      return { n: n, batch: batch, blocks: blocks, naive: t, grouped: grouped, speedup: t / grouped };
+    }
+
+    function render() {
+      if (!ctx) return;
+      var r = compute();
+      ctx.clearRect(0, 0, W, H);
+      var padL = 64, padR = 16, axisH = 22, headH = 18, gap = 14;
+      var plotW = W - padL - padR;
+      var panelH = (H - 2 * headH - gap - axisH - 14) / 2;
+      var laneH = Math.max(3, panelH / r.n);
+      var scale = plotW / r.naive;
+      var naiveTop = headH;
+      var groupedTop = headH + panelH + gap + headH;
+      var barH = Math.max(2, laneH * 0.7);
+
+      function alphaFor(start, end) {
+        if (cursor >= end) return 1;
+        if (cursor <= start) return 0.2;
+        return 0.5;
+      }
+      function lane(i, top) { return top + i * laneH + laneH * 0.15; }
+
+      ctx.font = "12px " + c.font;
+      ctx.textAlign = "left";
+      ctx.fillStyle = c.accent2;
+      ctx.fillText("Naive: one forward per adapter — " + G.fmtMs(r.naive) + " total", 8, 13);
+      ctx.fillStyle = c.accent;
+      ctx.fillText("Grouped SGMV: one fused kernel — " + G.fmtMs(r.grouped) + " total", 8, 13 + panelH + gap + headH);
+
+      for (var i = 0; i < r.n; i++) {
+        var b = r.blocks[i];
+        var x = padL + b.start * scale;
+        var w = Math.max(1.5, b.dur * scale);
+        ctx.globalAlpha = alphaFor(b.start, b.start + b.dur);
+        ctx.fillStyle = i % 2 ? c.accent500 : c.accent2;
+        ctx.fillRect(x, lane(i, naiveTop), w, barH);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text;
+        ctx.font = "10px " + c.mono;
+        ctx.textAlign = "right";
+        ctx.fillText("A" + i, padL - 6, lane(i, naiveTop) + barH * 0.9);
+      }
+      for (var j = 0; j < r.n; j++) {
+        ctx.globalAlpha = alphaFor(0, r.grouped);
+        ctx.fillStyle = j % 2 ? c.accent500 : c.accent;
+        ctx.fillRect(padL, lane(j, groupedTop), Math.max(1.5, r.grouped * scale), barH);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text;
+        ctx.font = "10px " + c.mono;
+        ctx.textAlign = "right";
+        ctx.fillText("A" + j, padL - 6, lane(j, groupedTop) + barH * 0.9);
+      }
+
+      // time axis
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      var axisY = H - 6;
+      ctx.beginPath(); ctx.moveTo(padL, axisY); ctx.lineTo(padL + plotW, axisY); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "center";
+      for (var k = 0; k <= 4; k++) {
+        var tv = r.naive * k / 4;
+        ctx.fillText(tv.toFixed(0) + "ms", padL + plotW * k / 4, H - 12);
+      }
+      // cursor
+      var cx = padL + Math.min(r.naive, cursor) * scale;
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, 2); ctx.lineTo(cx, H - 16); ctx.stroke();
+
+      readout.innerHTML =
+        '<span class="k">' + r.n + " adapters × " + r.batch + " seq = </span><span class=\"hi\">" + (r.n * r.batch) + " sequences</span><br>" +
+        '<span class="k">base-weight reads:</span> naive <span class="bad">' + r.n + "</span> · grouped <span class=\"hi\">1</span><br>" +
+        '<span class="k">naive:</span> ' + G.fmtMs(r.naive) + " · <span class=\"k\">grouped:</span> " + G.fmtMs(r.grouped) + "<br>" +
+        '<span class="k">speedup:</span> <span class="hi">' + r.speedup.toFixed(1) + "×</span> (Punica reports up to 12×)";
+    }
+
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([nS, bS], function () { cursor = 0; render(); });
+    G.loop({
+      button: playBtn, interval: 60,
+      onStep: function () {
+        var r = compute();
+        cursor += r.naive / 26;
+        if (cursor > r.naive * 1.05) cursor = 0;
+        render();
+      }
+    });
+    onData(render);
+  })();
+
+  // ---- Demo 2: adapter paging hit rate -----------------------------------
+  (function () {
+    var canvas = document.getElementById("mt-paging");
+    if (!canvas) return;
+    var nS = document.getElementById("mt-pg-n");
+    var cS = document.getElementById("mt-pg-c");
+    var sS = document.getElementById("mt-pg-s");
+    var rS = document.getElementById("mt-pg-rps");
+    var readout = document.getElementById("mt-paging-readout");
+    var W = 640, H = 340, ctx = null;
+    var ADAPTER_MB = 160, PCIE_GBS = 25;
+
+    function probs(N, s) {
+      var p = [], sum = 0, k;
+      for (k = 1; k <= N; k++) { var v = Math.pow(k, -s); p.push(v); sum += v; }
+      for (k = 0; k < N; k++) p[k] /= sum;
+      return p;
+    }
+    function hitAt(p, cap) {
+      var h = 0;
+      for (var i = 0; i < Math.min(cap, p.length); i++) h += p[i];
+      return h;
+    }
+    function render() {
+      if (!ctx) return;
+      var N = parseInt(nS.value, 10), cap = parseInt(cS.value, 10);
+      var s = parseFloat(sS.value), rps = parseInt(rS.value, 10);
+      var p = probs(N, s);
+      var pRef = probs(N, 0.7);
+      var cmax = Math.min(N, 200);
+      var pts = [], ptsRef = [];
+      for (var x = 1; x <= cmax; x++) {
+        pts.push({ x: x, y: hitAt(p, x) });
+        ptsRef.push({ x: x, y: hitAt(pRef, x) });
+      }
+      ctx.clearRect(0, 0, W, H);
+      var axes = G.drawLines(ctx, W, H, [
+        { points: ptsRef, color: c.divider, width: 1.5 },
+        { points: pts, color: c.accent, width: 2.5 }
+      ], [1, Math.max(2, cmax)], [0, 1], { xLabel: "GPU-resident adapters", yLabel: "cache hit rate" });
+
+      var effCap = Math.min(cap, cmax);
+      var hit = hitAt(p, effCap);
+      var cx = axes.px(effCap), cy = axes.py(hit);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, axes.padT + axes.plotH); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(cx, cy, 4.5, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("solid: Zipf s=" + s.toFixed(2) + " · grey: s=0.70", axes.padL + 6, axes.padT + 12);
+      ctx.fillText("hit " + (hit * 100).toFixed(1) + "% at " + effCap + " resident", axes.padL + 6, axes.padT + 26);
+
+      var miss = 1 - hit;
+      var swapGBs = rps * miss * ADAPTER_MB / 1024;
+      var addedMs = (ADAPTER_MB / 1024) / PCIE_GBS * 1000 + 2;
+      var hostGB = N * ADAPTER_MB / 1024;
+      readout.innerHTML =
+        '<span class="k">hit rate:</span> <span class="hi">' + (hit * 100).toFixed(1) + "%</span> · miss " + (miss * 100).toFixed(1) + "%<br>" +
+        '<span class="k">miss swap traffic:</span> ' + swapGBs.toFixed(2) + " GB/s across the pool<br>" +
+        '<span class="k">added TTFT on a miss:</span> <span class="bad">+' + addedMs.toFixed(1) + " ms</span> (160 MB @ 25 GB/s + graph select)<br>" +
+        '<span class="k">host DRAM for the catalog:</span> ' + hostGB.toFixed(1) + " GB<br>" +
+        '<span class="k">resident set:</span> ' + effCap + " of " + N + " adapters holds " + (hit * 100).toFixed(0) + "% of traffic";
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([nS, cS, sS, rS], render);
+    onData(render);
+  })();
+
+  // ---- Demo 3: token bucket -----------------------------------------------
+  (function () {
+    var canvas = document.getElementById("mt-bucket");
+    if (!canvas) return;
+    var capS = document.getElementById("mt-tb-cap");
+    var rateS = document.getElementById("mt-tb-rate");
+    var costS = document.getElementById("mt-tb-cost");
+    var arrS = document.getElementById("mt-tb-arr");
+    var readout = document.getElementById("mt-bucket-readout");
+    var playBtn = document.getElementById("mt-tb-play");
+    var W = 640, H = 300, ctx = null;
+
+    var STEP_MS = 50, HORIZON_MS = 12000, STEPS = HORIZON_MS / STEP_MS;
+    var trace = null, cursor = 0;
+
+    function build() {
+      var cap = parseInt(capS.value, 10), rate = parseInt(rateS.value, 10);
+      var cost = parseInt(costS.value, 10), arr = parseInt(arrS.value, 10);
+      var rng = G.seededRandom(1337);
+      var level = cap, events = [], allowed = 0, denied = 0;
+      var pending = 0;
+      for (var i = 0; i < STEPS; i++) {
+        var dt = STEP_MS / 1000;
+        level = Math.min(cap, level + rate * dt);
+        pending += arr * dt;
+        while (pending >= 1) {
+          pending -= 1;
+          if (level >= cost) { level -= cost; allowed++; events.push(true); }
+          else { denied++; events.push(false); }
+        }
+        trace_level_push(i, level);
+      }
+      function trace_level_push(i, lv) { levels[i] = lv; }
+      return { cap: cap, rate: rate, cost: cost, arr: arr, events: events, allowed: allowed, denied: denied, levels: levels };
+    }
+    var levels = [];
+
+    function render() {
+      if (!ctx) return;
+      ctx.clearRect(0, 0, W, H);
+      var padL = 20, padR = 16, padT = 54, padB = 28;
+      var bucketW = 120, bucketX = (W - bucketW) / 2, bucketTop = padT, bucketH = 150;
+      var shown = cursor | 0;
+      var lv = trace.levels[Math.min(shown, trace.levels.length - 1)] || 0;
+      var frac = trace.cap ? lv / trace.cap : 0;
+
+      // bucket body
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("Token bucket · " + lv.toFixed(0) + " / " + trace.cap + " tokens", W / 2, 18);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 2;
+      ctx.strokeRect(bucketX, bucketTop, bucketW, bucketH);
+      ctx.fillStyle = frac > 0.25 ? c.accent : c.accent2;
+      ctx.fillRect(bucketX + 2, bucketTop + bucketH * (1 - frac) + 2, bucketW - 4, bucketH * frac - 4);
+      ctx.fillStyle = frac > 0.4 ? "#fff" : c.text; ctx.font = "13px " + c.mono;
+      ctx.fillText((frac * 100).toFixed(0) + "%", bucketX + bucketW / 2, bucketTop + bucketH / 2 + 4);
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font;
+      ctx.fillText("refill " + trace.rate + " tok/s", bucketX + bucketW / 2, bucketTop + bucketH + 16);
+
+      // event strip
+      var stripX = 20, stripY = H - 22, stripW = W - 40, stripH = 14;
+      ctx.fillStyle = c.divider; ctx.fillRect(stripX, stripY, stripW, stripH);
+      for (var i = 0; i <= shown && i < trace.events.length; i++) {
+        var x = stripX + stripW * i / trace.events.length;
+        ctx.fillStyle = trace.events[i] ? c.accent : c.accent2;
+        ctx.fillRect(x, stripY, Math.max(1, stripW / trace.events.length), stripH);
+      }
+      ctx.fillStyle = c.text; ctx.font = "10px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("requests 200 OK (blue) / 429 (pink) · 12 s window", stripX, stripY - 4);
+
+      var total = trace.allowed + trace.denied;
+      var rate429 = total ? trace.denied / total : 0;
+      var offeredTok = total * trace.cost;
+      readout.innerHTML =
+        '<span class="k">burst tolerated:</span> <span class="hi">' + Math.floor(trace.cap / trace.cost) + " requests</span> (" + trace.cap + " tok)<br>" +
+        '<span class="k">sustained:</span> ' + (trace.rate / trace.cost).toFixed(1) + " req/s = " + trace.rate + " tok/s<br>" +
+        '<span class="k">offered load:</span> ' + trace.arr + " req/s · <span class=\"k\">429 rate:</span> <span class=\"" + (rate429 > 0.1 ? "bad" : "hi") + "\">" + (rate429 * 100).toFixed(1) + "%</span><br>" +
+        '<span class="k">offered tokens:</span> ' + offeredTok + " · allowed " + trace.allowed + " / denied " + trace.denied;
+    }
+
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    function rebuild() { trace = build(); cursor = 0; render(); }
+    G.bindSliders([capS, rateS, costS, arrS], rebuild);
+    rebuild();
+    G.loop({
+      button: playBtn, interval: 40,
+      onStep: function () {
+        cursor += 6;
+        if (cursor >= trace.events.length) cursor = 0;
+        render();
+      }
+    });
+  })();
+
+  // ---- Demo 4: VTC versus request round-robin ----------------------------
+  (function () {
+    var canvas = document.getElementById("mt-vtc");
+    if (!canvas) return;
+    var ssS = document.getElementById("mt-vtc-s");
+    var lsS = document.getElementById("mt-vtc-l");
+    var readout = document.getElementById("mt-vtc-readout");
+    var W = 640, H = 340, ctx = null;
+    var HORIZON = 12000;
+
+    function sims(ss, ls) {
+      var cs = [], cl = [], servedS = 0, servedL = 0, t;
+      var cyc = ss + ls;
+      for (t = 0; t < HORIZON; t++) {
+        if (t % cyc < ss) servedS++; else servedL++;
+        cs.push(servedS); cl.push(servedL);
+      }
+      var rr = { s: servedS, l: servedL, cs: cs, cl: cl };
+
+      servedS = 0; servedL = 0;
+      var vs = [], vl = [];
+      for (t = 0; t < HORIZON; t++) {
+        if (servedS <= servedL) servedS++; else servedL++;
+        vs.push(servedS); vl.push(servedL);
+      }
+      var vtc = { s: servedS, l: servedL, cs: vs, cl: vl };
+      return { rr: rr, vtc: vtc };
+    }
+    function jain(a, b) {
+      var s = a + b, q = a * a + b * b;
+      return q ? (s * s) / (2 * q) : 1;
+    }
+    function series(cum, color, width) {
+      var pts = [];
+      for (var t = 0; t < cum.length; t += 24) pts.push({ x: t, y: cum[t] });
+      return { points: pts, color: color, width: width };
+    }
+    function render() {
+      if (!ctx) return;
+      var ss = parseInt(ssS.value, 10), ls = parseInt(lsS.value, 10);
+      var r = sims(ss, ls);
+      ctx.clearRect(0, 0, W, H);
+      var axes = G.drawLines(ctx, W, H, [
+        series(r.rr.cl, c.accent2, 2.5),
+        series(r.rr.cs, c.accent500, 2.5),
+        series(r.vtc.cl, c.accent2, 1.5),
+        series(r.vtc.cs, c.accent500, 1.5)
+      ], [0, HORIZON], [0, HORIZON], { xLabel: "GPU-token time", yLabel: "cumulative tokens served" });
+
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("thick = round-robin over requests · thin = VTC", axes.padL + 6, axes.padT + 12);
+      ctx.fillStyle = c.accent2; ctx.fillText("pink = large tenant", axes.padL + 6, axes.padT + 26);
+      ctx.fillStyle = c.accent500; ctx.fillText("blue = small tenant", axes.padL + 6, axes.padT + 40);
+
+      var rrSmall = r.rr.s / HORIZON, rrLarge = r.rr.l / HORIZON;
+      var vSmall = r.vtc.s / HORIZON;
+      var rrReq = Math.floor(r.rr.s / ss), vtcReq = Math.floor(r.vtc.s / ss);
+      var rrWait = ls, vtcWait = 2 * ss;
+      readout.innerHTML =
+        '<span class="k">token share — RR:</span> small <span class="bad">' + (rrSmall * 100).toFixed(1) + "%</span> / large " + (rrLarge * 100).toFixed(1) + "%<br>" +
+        '<span class="k">token share — VTC:</span> small <span class="hi">' + (vSmall * 100).toFixed(0) + "%</span> / large " + (100 - vSmall * 100).toFixed(0) + "%<br>" +
+        '<span class="k">Jain fairness index:</span> RR ' + jain(r.rr.s, r.rr.l).toFixed(3) + " · VTC " + jain(r.vtc.s, r.vtc.l).toFixed(3) + "<br>" +
+        '<span class="k">small-tenant requests done:</span> RR ' + rrReq + " vs VTC " + vtcReq + " (<span class=\"hi\">" + (rrReq ? (vtcReq / rrReq).toFixed(1) : "—") + "×</span>)<br>" +
+        '<span class="k">max wait for a small request:</span> RR ~' + rrWait + " tok vs VTC ~" + vtcWait + " tok (<span class=\"hi\">" + (rrWait / vtcWait).toFixed(0) + "×</span>)";
+    }
+    ctx = G.setupCanvas(canvas, W, H, render).ctx;
+    render();
+    G.bindSliders([ssS, lsS], render);
+  })();
+
+  // ---- shared data -------------------------------------------------------
+  function boot(d) { applyData(d); }
+  fetch(window.__MT_DATA_URL).then(function (r) { return r.json(); }).then(boot).catch(function () { boot(null); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

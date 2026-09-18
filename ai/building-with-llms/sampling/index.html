@@ -1,0 +1,490 @@
+---
+title: "Building with LLMs, Interactively — Part 3: Sampling, nondeterminism and confidence"
+description: "Temperature, top-p and top-k; why temperature 0 is not deterministic; logprobs and the poor calibration of post-RLHF models."
+permalink: "/ai/building-with-llms/sampling/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Sampling, nondeterminism and confidence</h1>
+    <p>A language model does not emit a word. It emits a vector of scores over its whole vocabulary, and something downstream picks one. That picking step — the sampler — decides how creative the output looks, whether it is reproducible, and how much the model's own probabilities can be trusted. This part takes the sampler apart: softmax and temperature, top-k and top-p, the myth of the deterministic setting, and the uncomfortable gap between a model's stated confidence and its accuracy.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="logits">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>From logits to a distribution</h2></div>
+    <p class="g-eyebrow">Softmax, then a temperature dial</p>
+    <p>At each step the model produces one raw score, a <b>logit</b>, for every token in its vocabulary. Logits are unbounded and unnormalised; softmax turns them into a probability distribution by exponentiating each score and dividing by the sum. Temperature divides the logits before the exponential. A temperature below 1 sharpens the distribution — differences between scores are magnified, so the leader pulls away. A temperature above 1 flattens it, giving unlikely tokens more of a chance. Temperature does not change which token the model prefers; it changes how strongly that preference dominates.</p>
+    <p>Below is one fixed logit vector over eight candidate next words. Move the temperature and watch the bars; the other two sliders, top-k and top-p, are the truncation rules the next section takes up. The button draws one sample from the surviving distribution — through a seeded stream, so a reload reproduces the same draw.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="samp-dist-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Probability per candidate after softmax and truncation. Grey bars were cut; the labelled bar is the sampled token.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Temperature <span class="val">1.00</span></label><input type="range" id="samp-temp" min="0" max="2" step="0.05" value="1"></div>
+        <div class="g-field"><label>Top-k (keep this many) <span class="val">8</span></label><input type="range" id="samp-k" min="1" max="8" step="1" value="8"></div>
+        <div class="g-field"><label>Top-p (nucleus mass) <span class="val">1.00</span></label><input type="range" id="samp-p" min="0.1" max="1" step="0.05" value="1"></div>
+        <div class="g-btnrow"><button id="samp-draw" class="g-primary">Sample again</button></div>
+        <div class="g-tokens" id="samp-chips"></div>
+        <div class="g-readout" id="samp-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Durable idea:</b> the model gives you a ranking plus a shape; the sampler is yours to choose. Every "creative" versus "factual" setting is a decision about how much of that shape you keep.</span></div>
+  </section>
+
+  <section class="g-step" id="truncation">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Top-k, top-p, and greedy</h2></div>
+    <p class="g-eyebrow">Truncating the tail reshapes what is left</p>
+    <p>Two families of rule trim the distribution before sampling. <b>Top-k</b> keeps the <var>k</var> highest-probability tokens and discards the rest, then renormalises. It is simple, but the fixed <var>k</var> ignores shape: when the model is certain it unnecessarily admits the runners-up, and when it is genuinely uncertain it truncates a tail that might have contained the right answer. <b>Top-p</b>, or nucleus sampling, keeps the smallest set of tokens whose cumulative probability reaches <var>p</var> and drops everything beyond it. The set grows when the model is unsure and shrinks when it is confident, which is why it is the more common default.</p>
+    <p>Truncation and temperature interact. Lowering the temperature concentrates mass on the leader, which can pull the nucleus tight on its own; raising the top-p ceiling lets more of the long tail back in. The two are applied together in the demo above — a token survives only if it is inside both the top-k prefix and the nucleus, and the survivors are renormalised to sum to one.</p>
+    <div class="g-grid2" style="margin-top:14px;">
+      <div class="g-card">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">Greedy / temperature 0</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.45;">Always take the argmax</div>
+        <p style="font-size:12.5px;opacity:.8;margin:6px 0 0;">Deterministic in exact arithmetic, repetitive in practice. It is what "temperature 0" is supposed to mean.</p>
+      </div>
+      <div class="g-card">
+        <div style="font-family:var(--font-mono);font-size:11px;opacity:.6;">Top-p, then sample</div>
+        <div style="font-weight:600;font-size:13.5px;line-height:1.45;">Keep the nucleus, sample within it</div>
+        <p style="font-size:12.5px;opacity:.8;margin:6px 0 0;">The tail is removed but the head is sampled in proportion to probability, so the output varies.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Trap:</b> sampling parameters are not a "quality dial". A high temperature cannot make a weak model correct, and a low one cannot make it diverse. They trade variance for fidelity within whatever distribution the model already has.</span></div>
+  </section>
+
+  <section class="g-step" id="temp-zero">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Temperature 0 is not deterministic</h2></div>
+    <p class="g-eyebrow">Same prompt, same setting, different output</p>
+    <p>Temperature 0 removes the sampler's randomness. It does not remove the rest of the machine's. Two calls with the same prompt can still disagree because the arithmetic that produces the logits is not the same arithmetic each time. Modern serving stacks batch many requests together, and the size and composition of that batch changes the order in which floating-point reductions happen; floating-point addition is not associative, so a different order is a different number. Mixture-of-experts routing depends on the batch as well, sending the same token to a slightly different set of experts. A provider can also change weights, kernels or a default between your two calls without telling you, and a version bump is a different function.</p>
+    <p>The grid below is eight calls of one prompt at temperature 0, shown as their emitted token ids. Most positions agree — that is the greedy argmax doing its job — and a handful drift, which is the infrastructure underneath. This is why a temperature-0 test that passes today can fail tomorrow, and why evaluation harnesses pin a model version and a serving configuration rather than trusting the setting.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="samp-nondet-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Eight calls, ten positions each. Highlighted cells are positions where the batch produced a different token.</p>
+      </div>
+      <div class="g-controls">
+        <p style="font-size:13px;line-height:1.6;margin-top:0;">The drift is not sampled here; it is drawn from a seeded stream to stand in for the sources listed under the grid. Nothing in a temperature-0 call is guaranteed bit-reproducible across batches, hardware, or provider versions.</p>
+        <div class="g-readout" id="samp-nondet-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Practical rule:</b> if you need reproducibility, control the whole path — pinned model version, pinned serving configuration, batch-independent kernels — or accept that "deterministic" was always an aspiration, not a property.</span></div>
+  </section>
+
+  <section class="g-step" id="self-consistency">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Sampling the same prompt many times</h2></div>
+    <p class="g-eyebrow">Variance is information</p>
+    <p>If you sample the same question many times, the number of distinct answers is a rough proxy for how much the model actually knows. At temperature 0 every draw returns the same answer, which tells you nothing about whether that answer is stable. As temperature rises, the sampler explores more of the distribution; a question with a crisp, well-supported answer keeps returning one or two answers, while a question the model is guessing on scatters across many. This is the seed of self-consistency: sample several reasoning paths, keep the majority answer, and use the disagreement as a signal.</p>
+    <p>The chart below samples repeatedly from a small five-answer distribution and counts how many distinct answers appear as the temperature rises. It is not a real model — the point is the shape — but the shape is the reason self-consistency works on tasks with a checkable answer.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="samp-consistency-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Distinct answers (out of five) versus temperature, over the number of draws you choose.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Draws per temperature <span class="val">200</span></label><input type="range" id="sc-samples" min="20" max="500" step="10" value="200"></div>
+        <div class="g-field"><label>Seed <span class="val">7</span></label><input type="range" id="sc-seed" min="1" max="40" step="1" value="7"></div>
+        <div class="g-readout" id="sc-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Trap:</b> agreement is not correctness. Five samples converging on the same wrong answer is a confident mistake, and self-consistency will happily preserve it. Judge the majority against evidence, not against itself.</span></div>
+  </section>
+
+  <section class="g-step" id="confidence">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Logprobs and the calibration problem</h2></div>
+    <p class="g-eyebrow">A confidence signal you should not over-trust</p>
+    <p>Many APIs will return <b>logprobs</b> — the log-probability the model assigned to each token it emitted, and often the top alternatives. That is a genuine internal signal: a token with logprob near zero was almost forced, and a token with a much lower logprob was one of several live options. It is genuinely useful for flagging uncertain generations, for constrained decoding, and for detecting when the model was guessing between plausible continuations.</p>
+    <p>The trap is treating that number as a probability that the answer is <em>correct</em>. A reliability diagram plots stated confidence against observed accuracy; a perfectly calibrated model lies on the diagonal. Post-training on human preferences tends to push models off it, and the direction is usually optimism: the model says 0.9 and is right far less often. The curve below is a seeded mock of that overconfidence, not a measurement of any particular model, but the phenomenon is well documented — reinforcement learning from human feedback optimises for answers a rater prefers, and a confident tone is often preferred.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="samp-reliability-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Stated confidence (x) versus empirical accuracy (y). The dotted diagonal is perfect calibration.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Overconfidence gap <span class="val">0.38</span></label><input type="range" id="rel-gap" min="0" max="0.6" step="0.02" value="0.38"></div>
+        <div class="g-field"><label>Noise <span class="val">0.02</span></label><input type="range" id="rel-noise" min="0" max="0.08" step="0.005" value="0.02"></div>
+        <div class="g-readout" id="rel-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Carry this forward:</b> logprobs are a useful internal uncertainty signal and a poor external correctness signal. Calibrate them against a labelled set, or use them only to decide when to ask a human, retrieve more, or abstain.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>Short answer</th></tr></thead>
+      <tbody>
+        <tr><td>What turns logits into probabilities?</td><td>Softmax: exponentiate and normalise. Temperature divides the logits first.</td></tr>
+        <tr><td>What does temperature below 1 do?</td><td>Sharpens the distribution; the leader's advantage is magnified.</td></tr>
+        <tr><td>Top-k versus top-p?</td><td>Top-k keeps a fixed count; top-p keeps the smallest set reaching cumulative mass p. Top-p adapts to confidence.</td></tr>
+        <tr><td>Does temperature 0 guarantee the same output?</td><td>No. Batched floating-point reduction order, MoE routing, hardware and provider version changes all break the tie.</td></tr>
+        <tr><td>What are logprobs good for?</td><td>Flagging uncertain generations and comparing alternatives. Not for reading off the probability of being correct.</td></tr>
+        <tr><td>How do post-RLHF models calibrate?</td><td>Often badly and optimistically — stated confidence runs ahead of accuracy.</td></tr>
+        <tr><td>Why sample many times?</td><td>Distinct-answer count is a cheap uncertainty signal, and a majority vote can beat a single greedy pass.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Fan, Lewis &amp; Dauphin, <a href="https://arxiv.org/abs/1805.04833">"Hierarchical Neural Story Generation"</a>, ACL 2018 (arXiv:1805.04833) — the paper that introduced top-k sampling for open-ended generation.</li>
+      <li>Holtzman et al., <a href="https://arxiv.org/abs/1904.09751">"The Curious Case of Neural Text Degeneration"</a>, ICLR 2020 (arXiv:1904.09751) — nucleus sampling (top-p) and the argument against pure truncation by rank.</li>
+      <li>Guo et al., <a href="https://arxiv.org/abs/1706.04599">"On Calibration of Modern Neural Networks"</a>, ICML 2017 (arXiv:1706.04599) — reliability diagrams and expected calibration error, the tools this page borrows.</li>
+      <li>Kadavath et al., <a href="https://arxiv.org/abs/2207.05221">"Language Models (Mostly) Know What They Know"</a>, 2022 (arXiv:2207.05221) — models carry a usable internal sense of their own correctness, but it must be elicited and calibrated.</li>
+      <li>OpenAI, <a href="https://arxiv.org/abs/2303.08774">"GPT-4 Technical Report"</a>, 2023 (arXiv:2303.08774) — the observation that post-training on preferences reduces calibration in the direction of overconfidence.</li>
+      <li>Tian et al., <a href="https://arxiv.org/abs/2305.14975">"Just Ask for Calibration"</a>, EMNLP 2023 (arXiv:2305.14975) — eliciting calibrated probabilities in words rather than logprobs.</li>
+      <li>Thinking Machines, <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">"Defeating Nondeterminism in LLM Inference"</a>, 2025 — a concrete account of why greedy decoding drifts at the level of the batch and the kernel.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}You can now shape the distribution and read its uncertainty. Next: what a call actually costs and how long it takes — the output/input price asymmetry, TTFT versus TPOT, the quadratic cost of an agent loop, and effort as a dial.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var WORDS = ['the', 'a', 'model', 'token', 'window', 'evidence', 'probably', 'banana'];
+  var LOGITS = [4.2, 3.6, 3.1, 2.4, 1.9, 0.7, 0.2, -0.6];
+
+  function argmaxProbs() {
+    var best = 0;
+    for (var i = 1; i < LOGITS.length; i++) if (LOGITS[i] > LOGITS[best]) best = i;
+    return LOGITS.map(function (_, i) { return i === best ? 1 : 0; });
+  }
+
+  // Softmax at temp, then top-k and top-p, then renormalise the survivors.
+  function distribution(temp, k, p) {
+    var raw = temp <= 0.02 ? argmaxProbs() : Guide.softmax(LOGITS, temp);
+    var order = raw.map(function (v, i) { return { v: v, i: i }; })
+      .sort(function (a, b) { return b.v - a.v; });
+    var topK = {};
+    for (var i = 0; i < Math.min(k, order.length); i++) topK[order[i].i] = true;
+    var nucleus = {}, acc = 0;
+    for (var j = 0; j < order.length; j++) {
+      nucleus[order[j].i] = true;
+      acc += order[j].v;
+      if (acc >= p) break;
+    }
+    var survivors = {}, sum = 0;
+    raw.forEach(function (v, i) {
+      if (topK[i] && nucleus[i]) { survivors[i] = true; sum += v; }
+    });
+    if (!sum) { survivors = {}; survivors[order[0].i] = true; sum = 1; }
+    var probs = raw.map(function (v, i) { return survivors[i] ? v / sum : 0; });
+    var ids = Object.keys(survivors).map(Number).sort(function (a, b) { return a - b; });
+    return { probs: probs, survivors: ids };
+  }
+
+  function sampleFrom(probs, u) {
+    var cum = 0, pick = -1;
+    for (var i = 0; i < probs.length; i++) {
+      if (probs[i] > 0) { cum += probs[i]; if (u < cum) { pick = i; break; } }
+    }
+    if (pick < 0) {
+      for (var j = probs.length - 1; j >= 0; j--) { if (probs[j] > 0) { pick = j; break; } }
+    }
+    return pick;
+  }
+
+  function entropy(probs) {
+    var h = 0;
+    probs.forEach(function (v) { if (v > 0) h -= v * Math.log(v) / Math.LN2; });
+    return h;
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — softmax, temperature, truncation, sample
+  // ------------------------------------------------------------------
+  var A = { temp: el('samp-temp'), k: el('samp-k'), p: el('samp-p'), draw: 0 };
+  var setupA = Guide.setupCanvas(el('samp-dist-canvas'), 640, 340, drawA);
+  function drawA() {
+    if (!setupA) return;
+    var temp = +A.temp.value, k = +A.k.value, p = +A.p.value;
+    var d = distribution(temp, k, p);
+    var u = AppSim.rng(2000 + A.draw)();
+    var picked = sampleFrom(d.probs, u);
+    var W = 640, H = 340, ctx = setupA.ctx;
+    var maxP = d.probs.reduce(function (m, v) { return Math.max(m, v); }, 0) || 1;
+    var data = d.probs.map(function (v, i) {
+      return { x: i, y: v, color: d.survivors.indexOf(i) >= 0 ? c.accent : c.divider };
+    });
+    var geo = Guide.drawColumns(ctx, W, H, data, {
+      padL: 42, padR: 16, padT: 36, padB: 48, minY: 0, maxY: maxP * 1.18, xRange: [-0.5, 7.5]
+    });
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('next-token distribution · T=' + temp.toFixed(2) +
+      ' · top-k=' + k + ' · top-p=' + p.toFixed(2), 14, 18);
+    d.probs.forEach(function (v, i) {
+      var X = geo.px(i);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = i === picked ? c.accent2 : c.text;
+      ctx.font = (i === picked ? '600 ' : '') + '10px ' + c.font;
+      ctx.fillText(WORDS[i], X, H - 34);
+      ctx.font = '10px ' + c.mono;
+      ctx.fillText(v.toFixed(2), X, H - 20);
+    });
+    ctx.fillStyle = c.accent2; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('sampled', geo.px(picked), Math.max(geo.padT + 10, geo.py(d.probs[picked]) - 8));
+    el('samp-chips').innerHTML = d.survivors.map(function (i) {
+      return '<span class="g-tok">' + WORDS[i] + '<span class="id">p=' + d.probs[i].toFixed(2) + '</span></span>';
+    }).join('');
+    el('samp-readout').innerHTML =
+      '<div><span class="k">survivors</span> <span class="hi">' + d.survivors.length + '</span> of ' + WORDS.length + '</div>' +
+      '<div><span class="k">sampled token</span> <span class="hi">' + WORDS[picked] + '</span> (uniform draw u=' + u.toFixed(3) + ')</div>' +
+      '<div><span class="k">entropy of survivors</span> ' + entropy(d.probs).toFixed(2) + ' bits</div>' +
+      '<div class="k">' + (d.survivors.length === 1 ? 'a single survivor — this is the greedy case' : 'sampling within the surviving set, in proportion to probability') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo D — temperature 0 is not deterministic
+  // ------------------------------------------------------------------
+  var setupD = Guide.setupCanvas(el('samp-nondet-canvas'), 640, 340, drawD);
+  var BASE_IDS = [1204, 77, 5681, 402, 9931, 214, 6680, 12, 3311, 845];
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var ROWS = 8, COLS = 10, padL = 76, padT = 44, cellW = 54, cellH = 24;
+    var r = AppSim.rng(11);
+    var cells = [];
+    for (var row = 0; row < ROWS; row++) {
+      var line = [];
+      for (var p = 0; p < COLS; p++) {
+        var changed = p > 0 && r() < 0.14;
+        var bump = changed ? 1 + Math.floor(r() * 4) : 0;
+        line.push({ id: BASE_IDS[p] + bump, changed: changed });
+      }
+      cells.push(line);
+    }
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('one prompt · temperature 0 · eight calls in a batch', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.fillStyle = c.accent700;
+    for (var p0 = 0; p0 < COLS; p0++) {
+      ctx.textAlign = 'center';
+      ctx.fillText('pos ' + (p0 + 1), padL + p0 * cellW + cellW / 2, 36);
+    }
+    cells.forEach(function (line, r2) {
+      var y = padT + r2 * cellH;
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.mono; ctx.textAlign = 'right';
+      ctx.fillText('call ' + (r2 + 1), padL - 8, y + 15);
+      line.forEach(function (cell, p3) {
+        var x = padL + p3 * cellW;
+        ctx.fillStyle = cell.changed ? c.accent2 : (c.accent100 || 'rgba(43,95,255,0.08)');
+        ctx.fillRect(x + 1, y + 1, cellW - 3, cellH - 3);
+        ctx.fillStyle = cell.changed ? '#fff' : c.text;
+        ctx.font = '10px ' + c.mono; ctx.textAlign = 'center';
+        ctx.fillText('#' + cell.id, x + cellW / 2, y + 16);
+      });
+    });
+    var varies = 0;
+    for (var q = 0; q < COLS; q++) {
+      var set = {};
+      cells.forEach(function (line) { set[line[q].id] = true; });
+      if (Object.keys(set).length > 1) varies++;
+    }
+    var src = [
+      '· batch size and scheduling change the reduction order',
+      '· floating-point addition is not associative',
+      '· mixture-of-experts routing depends on the batch',
+      '· a provider update changes weights or kernels mid-week'
+    ];
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    src.forEach(function (s, i) { ctx.fillText(s, padL, 264 + i * 15); });
+    el('samp-nondet-readout').innerHTML =
+      '<div><span class="k">positions that vary</span> <span class="hi">' + varies + '</span> of ' + COLS + '</div>' +
+      '<div><span class="k">calls shown</span> ' + ROWS + ' · all at temperature 0</div>' +
+      '<div class="k">greedy argmax agrees where arithmetic agrees; the drift is the infrastructure</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo B — self-consistency versus temperature
+  // ------------------------------------------------------------------
+  var B = { samples: el('sc-samples'), seed: el('sc-seed') };
+  var setupB = Guide.setupCanvas(el('samp-consistency-canvas'), 640, 340, drawB);
+  var BASE_ANSWERS = [3.4, 2.6, 2.1, 1.5, 1.1];
+  function oneHot(xs) {
+    var best = 0;
+    for (var i = 1; i < xs.length; i++) if (xs[i] > xs[best]) best = i;
+    return xs.map(function (_, i) { return i === best ? 1 : 0; });
+  }
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 340;
+    var N = +B.samples.value, seed = +B.seed.value;
+    var data = [];
+    for (var t = 0; t <= 12; t++) {
+      var temp = t / 10;
+      var probs = temp <= 0.02 ? oneHot(BASE_ANSWERS) : Guide.softmax(BASE_ANSWERS, temp);
+      var r = AppSim.rng(seed * 101 + t * 31 + 7);
+      var seen = {};
+      for (var s = 0; s < N; s++) seen[sampleFrom(probs, r())] = true;
+      data.push({ x: temp, y: Object.keys(seen).length });
+    }
+    var geo = Guide.drawColumns(ctx, W, H, data, {
+      padL: 48, padR: 16, padT: 36, padB: 48, minY: 0, maxY: 5.4, xRange: [-0.12, 1.32]
+    });
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('distinct answers out of 5, over ' + N + ' draws each', 14, 18);
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'right';
+    for (var yv = 0; yv <= 5; yv++) {
+      ctx.fillText(String(yv), 40, geo.py(yv) + 3);
+    }
+    ctx.textAlign = 'center';
+    data.forEach(function (d, i) {
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      if (i % 2 === 0 || i === data.length - 1) ctx.fillText(d.x.toFixed(1), geo.px(d.x), H - 34);
+    });
+    ctx.fillText('temperature', W / 2, H - 8);
+    var at = function (tv) { return data[Math.round(tv * 10)].y; };
+    el('sc-readout').innerHTML =
+      '<div><span class="k">distinct at T=0</span> <span class="hi">' + at(0) + '</span></div>' +
+      '<div><span class="k">at T=0.5</span> ' + at(0.5) + ' · <span class="k">at T=1.0</span> <span class="hi">' + at(1.0) + '</span></div>' +
+      '<div class="k">more exploration buys more distinct answers — and more chances to disagree with the truth</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Demo C — reliability diagram
+  // ------------------------------------------------------------------
+  var C = { gap: el('rel-gap'), noise: el('rel-noise') };
+  var setupC = Guide.setupCanvas(el('samp-reliability-canvas'), 640, 340, drawC);
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 340;
+    var gap = +C.gap.value, noise = +C.noise.value;
+    var confs = [], accs = [];
+    var r = AppSim.rng(23);
+    var gapCurve = function (cf) {
+      return gap * Math.exp(-Math.pow(cf - 0.75, 2) / 0.18);
+    };
+    for (var i = 1; i <= 9; i++) {
+      var cf = i / 10;
+      var acc = cf - gapCurve(cf) + AppSim.gaussian(r) * noise;
+      confs.push(cf);
+      accs.push(Math.max(0, Math.min(1, acc)));
+    }
+    var curve = confs.map(function (cf, i) { return { x: cf, y: accs[i] }; });
+    var diag = [{ x: 0, y: 0 }, { x: 1, y: 1 }];
+    var geo = Guide.drawLines(ctx, W, H,
+      [
+        { points: diag, color: c.divider, width: 1.5, dashed: true },
+        { points: curve, color: c.accent2, width: 2.4 }
+      ],
+      [0, 1], [0, 1], { xLabel: 'stated confidence', padL: 52, padB: 36, padT: 36, yLabel: 'empirical accuracy' });
+    ctx.fillStyle = c.text; ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('reliability diagram · post-RLHF overconfidence', 14, 18);
+    curve.forEach(function (pt, idx) {
+      ctx.beginPath(); ctx.arc(geo.px(pt.x), geo.py(pt.y), 3.5, 0, 2 * Math.PI);
+      ctx.fillStyle = c.accent2; ctx.fill();
+      ctx.beginPath(); ctx.arc(geo.px(confs[idx]), geo.py(confs[idx]), 2, 0, 2 * Math.PI);
+      ctx.fillStyle = c.accent400; ctx.fill();
+    });
+    var ece = 0;
+    for (var k = 0; k < confs.length; k++) ece += Math.abs(accs[k] - confs[k]);
+    ece /= confs.length;
+    el('rel-readout').innerHTML =
+      '<div><span class="k">expected calibration error</span> <span class="hi">' + ece.toFixed(3) + '</span></div>' +
+      '<div><span class="k">at 0.9 stated confidence</span> accuracy ≈ <span class="hi">' + accs[8].toFixed(2) + '</span></div>' +
+      '<div><span class="k">at 0.5</span> accuracy ≈ ' + accs[4].toFixed(2) + '</div>' +
+      '<div class="k">' + (ece < 0.03 ? 'near the diagonal — well calibrated in this mock' : 'below the diagonal — stated confidence runs ahead of accuracy') + '</div>';
+  }
+
+  Guide.bindSliders([A.temp, A.k, A.p], drawA);
+  el('samp-draw').addEventListener('click', function () { A.draw += 1; drawA(); });
+  Guide.bindSliders([B.samples, B.seed], drawB);
+  Guide.bindSliders([C.gap, C.noise], drawC);
+
+  drawA(); drawD(); drawB(); drawC();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'sampling-temperature',
+      kind: 'choice',
+      prompt: 'What does the temperature parameter actually change?',
+      options: [
+        { label: 'It rescales the logits before softmax, sharpening or flattening the distribution.' },
+        { label: 'It edits the model weights to make the model more creative.' },
+        { label: 'It selects a fixed number of top tokens to keep.' },
+        { label: 'It sets the maximum output length.' }
+      ],
+      explanation: 'Temperature divides the logits before the exponential in softmax. Below 1 the distribution sharpens around the leader; above 1 it flattens. It does not change which token ranks first, only how much the ranking dominates.'
+    },
+    {
+      id: 'sampling-topp',
+      kind: 'numeric',
+      prompt: 'A step has probabilities [0.45, 0.30, 0.15, 0.07, 0.03] over five tokens, already sorted by probability. With top-p = 0.80, how many tokens survive in the nucleus?',
+      answer: 3,
+      unit: 'tokens',
+      tolerance: 0.5,
+      explanation: 'Cumulative mass runs 0.45, then 0.75, then 0.90. The third token is the one that crosses 0.80, so the nucleus is the first three tokens; the remaining 0.10 of mass is dropped and the survivors are renormalised.'
+    },
+    {
+      id: 'sampling-temp0',
+      kind: 'choice',
+      prompt: 'Why can two calls with the same prompt and temperature 0 return different text?',
+      options: [
+        { label: 'Batched floating-point reductions, MoE routing, hardware and provider version changes break the tie.' },
+        { label: 'Because temperature 0 secretly still samples randomly.' },
+        { label: 'Because the model has a session that accumulates state between calls.' },
+        { label: 'Because top-p overrides temperature.' }
+      ],
+      explanation: 'Temperature 0 removes the sampler\'s randomness, not the machine\'s. Batch composition changes the order of floating-point additions, expert routing depends on the batch, and a provider update is a different function entirely.'
+    },
+    {
+      id: 'sampling-logprobs',
+      kind: 'choice',
+      prompt: 'Which use of logprobs is defensible?',
+      options: [
+        { label: 'Flagging generations where the model was choosing between live options.' },
+        { label: 'Reading the logprob as the probability that the answer is factually correct.' },
+        { label: 'Assuming a high logprob means the answer cannot be wrong.' },
+        { label: 'Using logprobs to skip evaluation on high-confidence answers.' }
+      ],
+      explanation: 'Logprobs are a real internal uncertainty signal — useful for detecting guesses and routing to review. They are not calibrated probabilities of correctness, and post-RLHF models tend to be overconfident, so a high logprob does not mean the answer is right.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

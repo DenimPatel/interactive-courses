@@ -1,0 +1,756 @@
+---
+title: "LLM Serving, Interactively — Part 8: Prefix caching, radix trees and the KV hierarchy"
+description: "Reusing shared prefixes across requests: radix-tree block caches, cache-aware routing, the KV tier hierarchy, and the token count at which fetching beats recomputing."
+permalink: "/ai/llm-serving/prefix-caching/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .pc-note { font-size: 12.5px; opacity: 0.7; margin: 6px 0 0; }
+  .pc-tiers { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 10px; }
+  .pc-tier {
+    font-family: var(--font-mono); font-size: 12px; cursor: pointer;
+    border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text);
+    padding: 6px 10px; border-radius: var(--radius-md);
+  }
+  .pc-tier:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+  .pc-tier.on { background: var(--color-accent-100); border-color: var(--color-accent); color: var(--color-accent-800); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 8 of 20</span>
+    <h1>Prefix caching, radix trees and the KV hierarchy</h1>
+    <p>The training guide introduced the KV cache as what makes autoregressive decoding tractable. This part is the other half of the story: when the same tokens have already been through a model — on this replica or another one — you should not pay to process them twice. That turns the cache from a per-request scratch buffer into a shared, hierarchical, evicting, routable resource, and every one of those adjectives is where the money and the latency are won or lost.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="reuse">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The same prefix over and over</h2></div>
+    <p class="g-eyebrow">Most prompts are not unique</p>
+    <p><a href="{{ '/ai/llm-training/inference/' | relative_url }}#kvcache">The training guide's KV cache section</a> introduced the cache as an optimisation inside one request: token <var>t+1</var> needs every earlier token's key and value vectors, so we store them instead of recomputing them. The serving-scale implication is different in kind. A chat request carries a fixed system prompt, a tool schema, a policy block and a conversation history. Every one of those is text the model has already seen, and in a production fleet it has already been <em>prefilled</em>, usually thousands of times. Reusing that work is the single highest-leverage optimisation available to a serving system, because prefill is compute-bound: the prompt tokens are the expensive ones, and they are overwhelmingly shared.</p>
+    <p>The numbers are not subtle. On realistic Codex-style agentic traces, vLLM with the Mooncake Store moved the prefix cache hit rate from <strong>1.7% to 92.2%</strong>, which produced <strong>3.8&times; higher throughput</strong> and <strong>46&times; lower P50 TTFT</strong> on the same 12 GB200 GPUs. SGLang's RadixAttention, which is what most of this part describes, reported up to <strong>6.4&times;</strong> higher throughput than the prior state of the art on structured workloads where prefixes repeat. An agent that calls a tool twenty times in a loop resends the same growing transcript twenty times; without a prefix cache, nineteen of those prefill passes are pure waste. This is why <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">agent workloads invert the prefill-to-decode ratio</a>: they are mostly input, mostly repeated, and mostly cacheable.</p>
+    <div class="g-goal">💡 <span><b>The mental shift:</b> a KV block stops being owned by one request and becomes a first-class, shareable object with an identity (a hash of its token contents), a lifetime (TTL and LRU), a location (HBM, DRAM, NVMe, a peer) and a router that knows which replica holds it. Everything below is a consequence of those four properties.</span></div>
+  </section>
+
+  <section class="g-step" id="radix">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Hash-based block reuse and the radix tree</h2></div>
+    <p class="g-eyebrow">From a flat block table to a tree of shared prefixes</p>
+    <p>With PagedAttention (Part 5), the KV cache is already a set of fixed-size blocks — typically 16 tokens each — addressed by a block table. That makes prefix sharing almost free to add: hash the token contents of a block together with its parent block's hash, and two requests that produced the same tokens get the same block key. On a hit the engine points the new request's block table at the existing physical block instead of allocating one, so the memory cost of a shared prefix is paid once. Full-block hashing is exactly what vLLM's automatic prefix caching does; the chain of parent hashes is what makes a block's identity depend on its whole prefix, not just its own 16 tokens.</p>
+    <p>A radix tree generalises this to variable-length shared prefixes. Each node owns a token span, children branch where prefixes diverge, and a request's prefill walks the tree as far as it can before it has to compute anything new. That walk length <em>is</em> the number of prefill tokens avoided. The animation below feeds a seeded agent trace — one system prompt, one tool schema, eight user turns — through a radix tree and tracks what fraction of every prompt was already present. Node radius scales with the token count on the edge; colour runs from old (blue) to just-used (magenta).</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pc-tree" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Node size = tokens on that edge; colour = recency. Press play to replay the trace.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow"><button id="pc-tree-play" class="g-primary">Play</button></div>
+        <div class="g-readout" id="pc-tree-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="eviction">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Leaf-first LRU eviction</h2></div>
+    <p class="g-eyebrow">A shared cache has to forget, and it should forget leaves first</p>
+    <p>A prefix cache that never evicts is a memory leak. The naive policy — least-recently-used over all nodes — has a specific pathology in a tree: evicting an interior node orphans every subtree beneath it, including children that were used seconds ago. RadixAttention's answer is to evict <strong>leaf-first</strong>: only a node with no children is a candidate, and among candidates the least-recently-used leaf goes first. Interior (shared) nodes survive because they are what makes the cache valuable, and a leaf's parent becomes a candidate only once all its children are gone. The result is that long, heavily shared system prompts persist while one-off tails churn.</p>
+    <p>Drive the cache past its capacity below. A new request is inserted, the tree grows, and whenever the leaf count exceeds the limit the oldest leaf is dropped and its token span must be recomputed on the next hit. Watch the count of evicted tokens: that number, multiplied by the per-token prefill cost, is the price of an undersized cache.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pc-evict" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Red cross marks the most recently evicted leaf.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Cache capacity (leaves) <span class="val">5</span></label><input type="range" id="pc-evict-cap" min="2" max="8" step="1" value="5"></div>
+        <div class="g-btnrow">
+          <button id="pc-evict-play" class="g-primary">Play</button>
+          <button id="pc-evict-reset">Reset</button>
+        </div>
+        <div class="g-readout" id="pc-evict-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="routing">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Hit rate is a routing problem</h2></div>
+    <p class="g-eyebrow">A local cache gets you nothing if the next request lands elsewhere</p>
+    <p>Prefix caching inside one replica only helps requests that come back to that replica. Put eight replicas behind a load balancer and route each request to whichever worker is least busy, and every worker sees every prefix occasionally while none of them builds a useful cache. The cache is only as good as the router that feeds it. This is the same tension as <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">scheduler fairness</a>, one level up: affinity maximises hit rate, balance minimises queueing, and you cannot have both at once.</p>
+    <p>Four policies are compared below under identical traffic. Round-robin ignores the prefix entirely. Least-loaded balances queue depth but is prefix-blind. Consistent hashing sends a prefix to a fixed replica, which builds strong affinity but concentrates hot prefixes on a few workers and lets collisions evict. KV-aware routing looks at which replica already holds the longest matching prefix, falls back to load when nothing matches, and gets both. The headline is the ratio in the readout: round-robin captures roughly one-eighth of the KV-aware hit rate across eight replicas — the <var>1/N</var> you would expect from assigning independently of content.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pc-routing" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Prefix hit rate over 1,200 seeded requests, 8 replicas.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prefix slots per replica <span class="val">2</span></label><input type="range" id="pc-routing-cap" min="1" max="4" step="1" value="2"></div>
+        <div class="g-readout" id="pc-routing-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Why <var>1/N</var>:</b> round-robin decorrelates a request from everything the replica has cached, so a repeat only hits by coincidence. A content-addressed router correlates repeats by construction. The gap grows with replica count, which is why cache-aware balancing becomes mandatory, not optional, past a handful of workers.</span></div>
+  </section>
+
+  <section class="g-step" id="worth">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>What a hit is worth: TTFT and the cached-input price</h2></div>
+    <p class="g-eyebrow">2,100 ms on a miss, 190 ms on a hit</p>
+    <p>The user-visible payoff of a cache hit is time to first token. Prefilling a roughly 2,000-token prompt from scratch on a small model costs on the order of <strong>2,100 ms</strong>; reading the already-computed KV blocks and starting decode brings the same request's TTFT down to about <strong>190 ms</strong>, an order-of-magnitude difference that is the difference between an agent that feels responsive and one that does not. The effect compounds in agent loops: every tool call re-sends the transcript, so a hit on turn twenty saves the entire history's prefill again.</p>
+    <p>The cost side is a pricing problem as much as an engineering one. Every major API prices <em>cached input</em> below fresh input — DeepSeek-V3 at 0.07 versus 0.27 USD per million tokens, Anthropic's prompt-cache reads at a tenth of the base input price, Gemini's cached input at a quarter. Move the hit-rate slider and the prompt length and watch both the blended TTFT and the input bill; the model selector pulls the actual list prices (historically dated, see the source note) so the arithmetic is the vendor's, not an assertion.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pc-worth" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">TTFT is a linear mix of the miss path and the hit path at this hit rate.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prefix cache hit rate <span class="val">60</span>%</label><input type="range" id="pc-worth-hit" min="0" max="100" step="1" value="60"></div>
+        <div class="g-field"><label>Prompt tokens <span class="val">2000</span></label><input type="range" id="pc-worth-tok" min="200" max="16000" step="100" value="2000"></div>
+        <div class="g-field">
+          <label>Model <span class="val">pricing</span></label>
+          <select id="pc-worth-model"></select>
+        </div>
+        <div class="g-readout" id="pc-worth-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="pc-src-pricing"></p>
+  </section>
+
+  <section class="g-step" id="tiers">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>The KV hierarchy: HBM, DRAM, NVMe, remote</h2></div>
+    <p class="g-eyebrow">LMCache and Mooncake Store turn a cache into a storage tier</p>
+    <p>HBM is the tier that actually feeds attention, and it is the smallest and most expensive. When the prefix cache outgrows it, the obvious extension is a hierarchy: keep the hot blocks in HBM, spill the rest to host DRAM, then to local NVMe, then to a remote store shared by the whole fleet. LMCache does exactly this for vLLM, and Mooncake Store is the distributed KV store behind the Kimi/Mooncake results cited above; both make the cache a multi-tier object whose blocks can be fetched back when a request returns to them. The latency ladder is the familiar one — HBM is nanoseconds-to-microseconds away, DRAM is around a hundred microseconds, local NVMe around a millisecond, a remote fetch several milliseconds — and each tier down costs roughly an order of magnitude in access latency while buying one or two orders in capacity and a large factor in cost per byte.</p>
+    <p>The decision that matters for every request is whether to <strong>fetch</strong> the missing prefix from a lower tier or to <strong>recompute</strong> it. Recompute scales with token count — you re-run the prefill matmuls — while a fetch pays a roughly fixed access latency plus a bandwidth term that is far cheaper per token. That makes fetch beat recompute for long prefixes and lose for short ones, and the crossover for an NVMe-tier fetch sits near <strong>1,900 tokens</strong>: below that, recomputing is genuinely faster than going to disk and back. Pick a tier and move the prefix length to find the decision point.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pc-tiers-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Illustrative model, not a single benchmark: recompute is linear in tokens, fetch is a fixed access plus a cheap per-token term.</p>
+      </div>
+      <div class="g-controls">
+        <div class="pc-tiers" id="pc-tier-row">
+          <button class="pc-tier" data-tier="hbm">HBM</button>
+          <button class="pc-tier" data-tier="dram">DRAM</button>
+          <button class="pc-tier on" data-tier="nvme">NVMe</button>
+          <button class="pc-tier" data-tier="remote">Remote</button>
+        </div>
+        <div class="g-field"><label>Prefix length to restore (tokens) <span class="val">1900</span></label><input type="range" id="pc-tiers-tok" min="0" max="8000" step="100" value="1900"></div>
+        <div class="g-readout" id="pc-tiers-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="pc-src-tier"></p>
+  </section>
+
+  <section class="g-step" id="ttl">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>TTL and the agent workload</h2></div>
+    <p class="g-eyebrow">Caches are about time, not just space</p>
+    <p>Eviction is spatial pressure; TTL is temporal. Anthropic's prompt cache defaults to a five-minute lifetime and has to be refreshed or it silently misses, and every provider that charges for cache writes is pricing exactly this trade: hold a prefix longer and more requests hit it, but you occupy memory that a hot new request cannot use. Agent workloads stretch both axes hard. A long-running agent pauses for the model, for tools, for a human, for a network round trip; if the pause exceeds the TTL the next turn is a full cold prefill of the entire transcript, and the user pays both the latency and the uncached input price. The right TTL is a function of the inter-turn gap distribution, which is why cache-aware gateways now measure it rather than guessing. Set a TTL and a typical gap below to see the survive probability and what a miss costs in TTFT.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pc-ttl-canvas" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">Probability the cached prefix is still resident when the next turn arrives.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="pc-ttl-row">
+          <button data-ttl="60">TTL 1 min</button>
+          <button data-ttl="300" class="g-primary">TTL 5 min</button>
+          <button data-ttl="3600">TTL 1 h</button>
+          <button data-ttl="0">no TTL</button>
+        </div>
+        <div class="g-field"><label>Median gap between agent turns <span class="val">120</span>s</label><input type="range" id="pc-ttl-gap" min="10" max="900" step="10" value="120"></div>
+        <div class="g-readout" id="pc-ttl-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">📌 <span><b>The discipline:</b> size the cache to the working set of shared prefixes, route on prefix identity so repeats land on the replica that holds them, tier the cold blocks instead of deleting them, and treat TTL as part of the SLO. A prefix cache left at defaults is a cache that is either too small or too stale — rarely both, and rarely neither.</span></div>
+  </section>
+
+  <section class="g-step" id="cheatsheet">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">The numbers and mechanisms</p>
+    <div style="overflow-x:auto;">
+    <table class="g-cheat">
+      <thead><tr><th>Quantity</th><th>What it means</th><th>Reference point</th></tr></thead>
+      <tbody>
+        <tr><td>Prefix hit rate</td><td>Fraction of prompt tokens already present for this request</td><td>1.7% → 92.2% on Codex traces with vLLM + Mooncake</td></tr>
+        <tr><td>TTFT on miss vs hit</td><td>The user-visible payoff of a cache hit</td><td>~2,100 ms → ~190 ms for a ~2K-token prompt</td></tr>
+        <tr><td>RadixAttention</td><td>Variable-length shared-prefix tree with leaf-first LRU</td><td>Up to ~6&times; throughput on structured workloads</td></tr>
+        <tr><td>Block hashing</td><td>Chain the parent with the block's tokens to key a KV block</td><td>16-token blocks in vLLM automatic prefix caching</td></tr>
+        <tr><td>Routing</td><td>Affinity-aware balancing sends repeats to the replica that holds them</td><td>Round-robin ≈ 1/N of KV-aware hit rate over N replicas</td></tr>
+        <tr><td>Fetch vs recompute</td><td>Restore a prefix from a lower tier or re-run its prefill</td><td>NVMe fetch wins above ~1,900 tokens</td></tr>
+        <tr><td>Cached input price</td><td>Providers discount reused prompt tokens</td><td>DeepSeek-V3 0.07 vs 0.27 USD/M tokens</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Zheng et al., <a href="https://arxiv.org/abs/2312.07104">"SGLang: Efficient Execution of Structured Language Model Programs"</a> — RadixAttention and the leaf-first eviction policy.</li>
+      <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">"Efficient Memory Management for Large Language Model Serving with PagedAttention"</a> — the block table that prefix hashing builds on.</li>
+      <li>vLLM blog, <a href="https://blog.vllm.ai/">"Serving Agentic Workloads at Scale with vLLM x Mooncake"</a> — 3.8&times; throughput and 46&times; lower P50 TTFT.</li>
+      <li>Qin et al., <a href="https://arxiv.org/abs/2407.00079">"Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving"</a> — the distributed KV store used as the remote tier.</li>
+      <li>LMCache project documentation, <a href="https://github.com/LMCache/LMCache">github.com/LMCache/LMCache</a> — HBM/DRAM/NVMe tiering for vLLM.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The prefix cache decides what the model does not recompute. The next part opens the engine that computes it.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script>
+  window.__PC_DATA_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide, c = G.colors();
+
+  var FALLBACK = {
+    prefix_cache: {
+      source: "RadixAttention: SGLang paper (Zheng et al., arXiv:2312.07104), which reports up to 6.4x higher throughput than prior systems; the 6.0 here is a rounded conservative value. vLLM x Mooncake: vLLM blog 'Serving Agentic Workloads at Scale with vLLM x Mooncake' (vllm.ai/blog/2026-05-06-mooncake-store, 6 May 2026) and the Mooncake benchmark site, reporting 3.8x higher throughput and 46x lower P50 TTFT (and 8.6x lower end-to-end latency) on realistic Codex agentic traces with 12 GB200 GPUs, driven by cache hit rate rising from 1.7% to 92.2%. Tier latency: these are order-of-magnitude, guide-friendly approximations consistent with the well-known memory/tier latency tables popularised by Jeff Dean and Colin Scott's 'Latency Numbers Every Programmer Should Know' and with NVMe/network round-trip figures; they are illustrative, not a single published benchmark, and real remote-tier latency depends heavily on interconnect and fabric.",
+      radixAttentionSpeedup: 6.0,
+      vllmMooncake: { throughputX: 3.8, ttftX: 46 },
+      tierLatencyMs: { hbm: 0.001, dram: 0.1, nvme: 1.0, remote: 5.0 }
+    },
+    model_configs: {
+      source: "Official model configs and technical reports.",
+      items: [
+        { name: "Llama 3.1 8B", layers: 32, hidden: 4096, heads: 32, n_kv_heads: 8, d_head: 128, kvScheme: "GQA", totalParamsB: 8.03, activeParamsB: 8.03, contextLen: 131072 }
+      ]
+    },
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD, standard, non-batch). These rot fast; verify against the live vendor pages before relying on any number.",
+      as_of: "2025-02",
+      items: [
+        { model: "GPT-4o", inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25 },
+        { model: "GPT-4o mini", inputPerMUSD: 0.15, outputPerMUSD: 0.6, cachedInputPerMUSD: 0.075 },
+        { model: "Claude 3.5 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "Claude 3.7 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "Gemini 1.5 Flash", inputPerMUSD: 0.075, outputPerMUSD: 0.3, cachedInputPerMUSD: 0.01875 },
+        { model: "Gemini 2.0 Flash", inputPerMUSD: 0.1, outputPerMUSD: 0.4, cachedInputPerMUSD: 0.025 },
+        { model: "DeepSeek-V3", inputPerMUSD: 0.27, outputPerMUSD: 1.1, cachedInputPerMUSD: 0.07 }
+      ]
+    }
+  };
+
+  var DATA = FALLBACK;
+  var refreshers = [];
+  function onData(fn) { refreshers.push(fn); }
+  function applyData(d) {
+    if (d && d.prefix_cache) DATA = d;
+    refreshers.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
+  function pricing() { return (DATA.pricing && DATA.pricing.items) || FALLBACK.pricing.items; }
+  function paramsB() {
+    var it = DATA.model_configs && DATA.model_configs.items && DATA.model_configs.items[0];
+    return it ? it.totalParamsB : 8.03;
+  }
+
+  // ---- radix tree --------------------------------------------------------
+  function RadixTree() {
+    this.root = { id: 0, edge: [], children: [], parent: null, last: 0 };
+    this.nextId = 1;
+    this.hitIds = {};
+    this.newIds = {};
+  }
+  RadixTree.prototype.insert = function (seq, t) {
+    var node = this.root, i = 0, hit = 0;
+    this.hitIds = {}; this.newIds = {};
+    while (i < seq.length) {
+      var ch = seq[i], child = null;
+      for (var k = 0; k < node.children.length; k++) {
+        if (node.children[k].edge[0] === ch) { child = node.children[k]; break; }
+      }
+      if (!child) {
+        var nn = { id: this.nextId++, edge: seq.slice(i), children: [], parent: node, last: t };
+        node.children.push(nn); this.newIds[nn.id] = 1; node = nn; break;
+      }
+      var L = Math.min(child.edge.length, seq.length - i), common = 0;
+      while (common < L && child.edge[common] === seq[i + common]) common++;
+      hit += common;
+      if (common === child.edge.length) {
+        node = child; i += common; node.last = t; this.hitIds[node.id] = 1;
+      } else {
+        var mid = { id: this.nextId++, edge: child.edge.slice(0, common), children: [child], parent: node, last: t };
+        child.edge = child.edge.slice(common); child.parent = mid;
+        node.children[node.children.indexOf(child)] = mid;
+        node = mid; i += common; node.last = t;
+        this.hitIds[node.id] = 1;
+        if (i < seq.length) {
+          var nn2 = { id: this.nextId++, edge: seq.slice(i), children: [], parent: node, last: t };
+          node.children.push(nn2); this.newIds[nn2.id] = 1; node = nn2;
+        }
+        break;
+      }
+    }
+    return hit;
+  };
+  function leavesOf(node, out) {
+    if (!node.children.length) out.push(node);
+    else node.children.forEach(function (ch) { leavesOf(ch, out); });
+  }
+  function evictLRULeaf(tree) {
+    var leaves = []; leavesOf(tree.root, leaves);
+    if (leaves.length <= 1) return { tokens: 0, id: -1 };
+    var victim = leaves[0];
+    for (var i = 1; i < leaves.length; i++) if (leaves[i].last < victim.last) victim = leaves[i];
+    var parent = victim.parent, tokens = victim.edge.length;
+    parent.children.splice(parent.children.indexOf(victim), 1);
+    if (parent !== tree.root && parent.children.length === 0) {
+      var gp = parent.parent;
+      gp.children.splice(gp.children.indexOf(parent), 1);
+      tokens += parent.edge.length;
+    }
+    return { tokens: tokens, id: victim.id };
+  }
+  function parseColor(str) {
+    str = (str || "#2b5fff").trim();
+    if (str.charAt(0) === "#") {
+      var h = str.slice(1);
+      if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+    }
+    var m = str.match(/(\d+)[^\d]+(\d+)[^\d]+(\d+)/);
+    return m ? [+m[1], +m[2], +m[3]] : [43, 95, 255];
+  }
+  function recencyColor(last, min, max) {
+    var t = max > min ? (last - min) / (max - min) : 1;
+    t = Math.max(0, Math.min(1, t));
+    var a = parseColor(c.accent400), b = parseColor(c.accent2);
+    return "rgb(" + Math.round(a[0] + (b[0] - a[0]) * t) + "," + Math.round(a[1] + (b[1] - a[1]) * t) + "," + Math.round(a[2] + (b[2] - a[2]) * t) + ")";
+  }
+  function layoutRadix(tree) {
+    var leafN = 0, maxDepth = 0;
+    function walk(node, depth) {
+      node._depth = depth;
+      if (depth > maxDepth) maxDepth = depth;
+      if (!node.children.length) { node._x = leafN++; }
+      else {
+        node.children.forEach(function (ch) { walk(ch, depth + 1); });
+        node._x = (node.children[0]._x + node.children[node.children.length - 1]._x) / 2;
+      }
+    }
+    walk(tree.root, 0);
+    tree._leafN = Math.max(1, leafN);
+    tree._maxDepth = maxDepth;
+  }
+  function drawRadix(ctx, W, H, tree, opts) {
+    opts = opts || {};
+    layoutRadix(tree);
+    ctx.clearRect(0, 0, W, H);
+    var padL = 34, padR = 20, padT = 30, padB = 22;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+    function X(n) { return padL + (tree._leafN <= 1 ? plotW / 2 : plotW * n._x / (tree._leafN - 1)); }
+    function Y(n) { return padT + (tree._maxDepth ? plotH * n._depth / tree._maxDepth : 0); }
+    var min = Infinity, max = -Infinity;
+    (function scan(n) { min = Math.min(min, n.last); max = Math.max(max, n.last); n.children.forEach(scan); })(tree.root);
+    (function edges(n) {
+      n.children.forEach(function (ch) {
+        var onPath = opts.hitIds && opts.hitIds[ch.id];
+        ctx.strokeStyle = onPath ? c.accent : c.divider;
+        ctx.lineWidth = onPath ? 3 : 1.5;
+        ctx.beginPath(); ctx.moveTo(X(n), Y(n)); ctx.lineTo(X(ch), Y(ch)); ctx.stroke();
+        edges(ch);
+      });
+    })(tree.root);
+    (function nodes(n) {
+      var r = n.id === 0 ? 3 : Math.max(5, Math.min(17, 3.5 + Math.sqrt(n.edge.length) * 2.4));
+      ctx.beginPath(); ctx.arc(X(n), Y(n), r, 0, 2 * Math.PI);
+      ctx.fillStyle = n.id === 0 ? c.text : recencyColor(n.last, min, max);
+      ctx.fill();
+      if (opts.newIds && opts.newIds[n.id]) {
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 2.5; ctx.stroke();
+      }
+      if (opts.evictedId === n.id) {
+        ctx.strokeStyle = "#b03a2e"; ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(X(n) - r, Y(n) - r); ctx.lineTo(X(n) + r, Y(n) + r);
+        ctx.moveTo(X(n) + r, Y(n) - r); ctx.lineTo(X(n) - r, Y(n) + r);
+        ctx.stroke();
+      }
+      if (n.id !== 0 && r >= 8) {
+        ctx.fillStyle = "#fff"; ctx.font = "9px " + c.mono;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(String(n.edge.length), X(n), Y(n));
+        ctx.textBaseline = "alphabetic";
+      }
+      n.children.forEach(function (ch) { nodes(ch); });
+    })(tree.root);
+    ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";    if (opts.title) ctx.fillText(opts.title, 8, 16);
+    ctx.font = "10px " + c.font; ctx.fillStyle = c.text;
+    ctx.globalAlpha = 0.6;
+    ctx.fillText("size = tokens on edge · colour = recency (blue old → magenta new)", 8, H - 6);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- seeded conversation trace ----------------------------------------
+  var SYS = "You are a helpful assistant. Follow the policy and answer carefully.".split(/\s+/);
+  var TOOL = "Tools available: search(query), read_file(path), send_email(to, subject, body).".split(/\s+/);
+  var TURNS = [
+    "User: summarize the attached paper.",
+    "User: summarize the attached diff.",
+    "User: find the bug in this function.",
+    "User: find the bug in this test.",
+    "User: draft a reply to the customer.",
+    "User: draft a reply to the vendor.",
+    "User: explain the error in this log.",
+    "User: explain the error in this stack trace."
+  ];
+  function trace() {
+    return TURNS.map(function (t) { return { tokens: SYS.concat(TOOL, ["__turn__"]).concat(t.split(/\s+/)) }; });
+  }
+
+  // ---- Demo 1: live radix tree ------------------------------------------
+  (function () {
+    var canvas = document.getElementById("pc-tree");
+    var ctx, W = 640, H = 360;
+    var readout = document.getElementById("pc-tree-readout");
+    var playBtn = document.getElementById("pc-tree-play");
+    var reqs = trace(), tree = new RadixTree(), ri = 0, reused = 0, tokens = 0, ttfts = [], lastHit = 0;
+
+    function reset() {
+      tree = new RadixTree(); ri = 0; reused = 0; tokens = 0; ttfts = []; lastHit = 0; render();
+    }
+    function step() {
+      if (ri >= reqs.length) { reset(); return; }
+      var r = reqs[ri];
+      var hit = tree.insert(r.tokens, ri);
+      reused += hit; tokens += r.tokens.length; lastHit = hit;
+      ttfts.push(190 + (1 - hit / r.tokens.length) * (2100 - 190));
+      ri++;
+      render();
+    }
+    function render() {
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      drawRadix(ctx, W, H, tree, { hitIds: tree.hitIds, newIds: tree.newIds, title: "radix tree after " + ri + " of " + reqs.length + " requests" });
+      var rate = tokens ? reused / tokens : 0;
+      var flops = 2 * paramsB() * 1e9 * reused;
+      var meanTtft = ttfts.length ? ttfts.reduce(function (a, b) { return a + b; }, 0) / ttfts.length : 2100;
+      var leaves = []; leavesOf(tree.root, leaves);
+      var lines = [];
+      lines.push('<span class="k">prefix hit rate:</span> <span class="hi">' + (100 * rate).toFixed(1) + "%</span>");
+      lines.push('<span class="k">tokens reused:</span> ' + G.fmtNum(reused) + " of " + G.fmtNum(tokens));
+      lines.push('<span class="k">prefill FLOPs saved:</span> <span class="hi">' + (flops / 1e12).toFixed(0) + " TFLOP</span> (2·N·tokens)");
+      lines.push('<span class="k">mean TTFT:</span> <span class="hi">' + G.fmtMs(meanTtft) + "</span> vs " + G.fmtMs(2100) + " cold");
+      lines.push('<span class="k">tree:</span> ' + leaves.length + " leaves · last request hit " + lastHit + " tokens");
+      readout.innerHTML = lines.join("<br>");
+    }
+    G.loop({ button: playBtn, interval: 850, onStep: step });
+    reset();
+  })();
+
+  // ---- Demo 2: leaf-first LRU eviction -----------------------------------
+  (function () {
+    var canvas = document.getElementById("pc-evict");
+    var ctx, W = 640, H = 320;
+    var readout = document.getElementById("pc-evict-readout");
+    var capS = document.getElementById("pc-evict-cap");
+    var playBtn = document.getElementById("pc-evict-play");
+    var resetBtn = document.getElementById("pc-evict-reset");
+    var reqs = trace(), tree = new RadixTree(), ri = 0, evictedTokens = 0, evictCount = 0, evictedId = -1;
+
+    function reset() {
+      tree = new RadixTree(); ri = 0; evictedTokens = 0; evictCount = 0; evictedId = -1;
+      for (var i = 0; i < 3 && i < reqs.length; i++) { tree.insert(reqs[i].tokens, i); ri = i + 1; }
+      enforce(); render();
+    }
+    function enforce() {
+      var cap = parseInt(capS.value, 10);
+      var leaves = []; leavesOf(tree.root, leaves);
+      while (leaves.length > cap) {
+        var e = evictLRULeaf(tree);
+        if (e.id < 0) break;
+        evictedTokens += e.tokens; evictCount++; evictedId = e.id;
+        leaves = []; leavesOf(tree.root, leaves);
+      }
+    }
+    function step() {
+      var r = reqs[ri % reqs.length];
+      tree.insert(r.tokens, ri);
+      ri++;
+      enforce(); render();
+    }
+    function render() {
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      drawRadix(ctx, W, H, tree, { evictedId: evictedId, title: "cache after " + ri + " requests · capacity " + capS.value + " leaves" });
+      var leaves = []; leavesOf(tree.root, leaves);
+      var recomputeMs = evictedTokens * 1.05;
+      var lines = [];
+      lines.push('<span class="k">leaves:</span> <span class="' + (leaves.length >= +capS.value ? "bad" : "hi") + '">' + leaves.length + " / " + capS.value + "</span>");
+      lines.push('<span class="k">evictions:</span> ' + evictCount);
+      lines.push('<span class="k">tokens evicted:</span> ' + G.fmtNum(evictedTokens));
+      lines.push('<span class="k">cost of forgetting:</span> <span class="hi">' + G.fmtMs(recomputeMs) + "</span> of extra prefill");
+      readout.innerHTML = lines.join("<br>");
+    }
+    G.bindSliders([capS], function () { enforce(); render(); });
+    G.loop({ button: playBtn, interval: 900, onStep: step });
+    resetBtn.addEventListener("click", reset);
+    reset();
+  })();
+
+  // ---- Demo 3: routing bake-off -----------------------------------------
+  (function () {
+    var canvas = document.getElementById("pc-routing");
+    var ctx, W = 640, H = 320;
+    var capS = document.getElementById("pc-routing-cap");
+    var readout = document.getElementById("pc-routing-readout");
+    var R = 1200, NREP = 8, NCLASS = 16, UNIQ = 0.12, SEED = 7;
+
+    function hashStr(str) {
+      var h = 2166136261 >>> 0;
+      for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+      return h >>> 0;
+    }
+    function simulate(policy, capacity) {
+      var r = G.seededRandom(SEED), reps = [];
+      for (var i = 0; i < NREP; i++) reps.push({ cache: [], assigned: 0 });
+      var hits = 0;
+      for (var j = 0; j < R; j++) {
+        var uniq = r() < UNIQ;
+        var cls = uniq ? ("unique-" + j) : ("prefix-" + Math.floor(r() * NCLASS));
+        var rp;
+        if (policy === "rr") rp = reps[j % NREP];
+        else if (policy === "least") {
+          rp = reps[0];
+          for (var k = 1; k < NREP; k++) if (reps[k].assigned < rp.assigned) rp = reps[k];
+        } else if (policy === "hash") rp = reps[hashStr(cls) % NREP];
+        else {
+          rp = null;
+          for (var m = 0; m < NREP; m++) if (reps[m].cache.indexOf(cls) >= 0) { rp = reps[m]; break; }
+          if (!rp) {
+            rp = reps[0];
+            for (var q = 1; q < NREP; q++) if (reps[q].assigned < rp.assigned) rp = reps[q];
+          }
+        }
+        var at = rp.cache.indexOf(cls);
+        if (at >= 0) { hits++; rp.cache.splice(at, 1); rp.cache.unshift(cls); }
+        else { rp.cache.unshift(cls); if (rp.cache.length > capacity) rp.cache.pop(); }
+        rp.assigned++;
+      }
+      return hits / R;
+    }
+    function render() {
+      var capacity = parseInt(capS.value, 10);
+      var policies = [
+        { key: "rr", label: "Round-robin", color: c.accent2 },
+        { key: "least", label: "Least-loaded", color: "#c9a227" },
+        { key: "hash", label: "Consistent hash", color: c.accent500 },
+        { key: "kv", label: "KV-aware", color: c.accent }
+      ];
+      var data = policies.map(function (p) {
+        var v = simulate(p.key, capacity);
+        return { label: p.label, value: v, valueLabel: (100 * v).toFixed(1) + "%", color: p.color };
+      });
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      G.drawBars(ctx, W, H, data, { maxV: 1, padL: 110, padR: 70 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Prefix hit rate · " + R + " requests, " + NREP + " replicas, " + capacity + " slots each", 8, 14);
+      var rr = data[0].value, kv = data[3].value;
+      var ratio = rr > 0 ? kv / rr : 0;
+      readout.innerHTML =
+        '<span class="k">KV-aware vs round-robin:</span> <span class="hi">' + ratio.toFixed(1) + "× more hits</span><br>" +
+        '<span class="k">round-robin / KV-aware:</span> ' + (rr / Math.max(1e-9, kv)).toFixed(2) + " (≈ 1/" + NREP + ")<br>" +
+        '<span class="k">consistent hash builds affinity but hot prefixes collide and evict:</span> ' + (100 * data[2].value).toFixed(0) + "%";
+    }
+    G.bindSliders([capS], render);
+    render();
+  })();
+
+  // ---- Demo 4: TTFT and pricing -----------------------------------------
+  (function () {
+    var canvas = document.getElementById("pc-worth");
+    var ctx, W = 640, H = 300;
+    var hitS = document.getElementById("pc-worth-hit");
+    var tokS = document.getElementById("pc-worth-tok");
+    var modelSel = document.getElementById("pc-worth-model");
+    var readout = document.getElementById("pc-worth-readout");
+    var srcEl = document.getElementById("pc-src-pricing");
+    var modelIdx = 6;
+    var MISS_MS = 2100, HIT_MS = 190, REF_TOK = 2000;
+
+    function buildModels() {
+      var items = pricing();
+      modelSel.innerHTML = "";
+      items.forEach(function (m, i) {
+        var o = document.createElement("option");
+        o.value = String(i);
+        o.textContent = m.model + " · in " + m.inputPerMUSD + " / cached " + m.cachedInputPerMUSD + " USD/M";
+        modelSel.appendChild(o);
+      });
+      modelSel.value = String(Math.min(modelIdx, items.length - 1));
+    }
+    function render() {
+      var h = parseInt(hitS.value, 10) / 100;
+      var tok = parseInt(tokS.value, 10);
+      var items = pricing();
+      var m = items[Math.min(modelIdx, items.length - 1)] || items[0];
+      var missMs = MISS_MS * tok / REF_TOK;
+      var blend = missMs * (1 - h) + HIT_MS * h;
+      var noCacheCost = tok / 1e6 * m.inputPerMUSD;
+      var cacheCost = tok / 1e6 * (h * m.cachedInputPerMUSD + (1 - h) * m.inputPerMUSD);
+      var saved = noCacheCost > 0 ? (1 - cacheCost / noCacheCost) : 0;
+
+      var data = [
+        { label: "no cache (" + tok + " tok)", value: missMs, valueLabel: G.fmtMs(missMs), color: c.accent2 },
+        { label: "full hit", value: HIT_MS, valueLabel: G.fmtMs(HIT_MS), color: c.accent400 },
+        { label: "at " + Math.round(h * 100) + "% hit", value: blend, valueLabel: G.fmtMs(blend), color: c.accent }
+      ];
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      G.drawBars(ctx, W, H, data, { maxV: missMs, padL: 150, padR: 90 });
+      ctx.fillStyle = c.text; ctx.font = "12px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("Time to first token · " + m.model, 8, 14);
+      readout.innerHTML =
+        '<span class="k">blended TTFT:</span> <span class="hi">' + G.fmtMs(blend) + "</span> (" + G.fmtMs(missMs) + " miss → " + G.fmtMs(HIT_MS) + " hit)<br>" +
+        '<span class="k">input cost / request:</span> ' + cacheCost.toFixed(5) + " USD vs " + noCacheCost.toFixed(5) + " uncached<br>" +
+        '<span class="k">saved:</span> <span class="hi">' + (100 * saved).toFixed(1) + "%</span> · cached input " + m.cachedInputPerMUSD + " vs " + m.inputPerMUSD + " USD/M";
+    }
+    modelSel.addEventListener("change", function () { modelIdx = parseInt(modelSel.value, 10) || 0; render(); });
+    G.bindSliders([hitS, tokS], render);
+    onData(function () { buildModels(); srcEl.textContent = (DATA.pricing && DATA.pricing.source) || FALLBACK.pricing.source; render(); });
+    buildModels();
+    srcEl.textContent = FALLBACK.pricing.source;
+    render();
+  })();
+
+  // ---- Demo 5: tier economics -------------------------------------------
+  (function () {
+    var canvas = document.getElementById("pc-tiers-canvas");
+    var ctx, W = 640, H = 320;
+    var tokS = document.getElementById("pc-tiers-tok");
+    var rowEl = document.getElementById("pc-tier-row");
+    var readout = document.getElementById("pc-tiers-readout");
+    var srcEl = document.getElementById("pc-src-tier");
+    var TIERS = {
+      hbm: { label: "HBM", base: 2, slope: 0.005 },
+      dram: { label: "DRAM", base: 20, slope: 0.02 },
+      nvme: { label: "NVMe", base: 380, slope: 0.12 },
+      remote: { label: "Remote store", base: 1200, slope: 0.22 }
+    };
+    var tier = "nvme", A = 0.32, XMAX = 8000;
+
+    function recomputeMs(t) { return A * t; }
+    function fetchMs(t) { var d = TIERS[tier]; return d.base + d.slope * Math.abs(t); }
+    function crossover() {
+      var d = TIERS[tier], denom = A - d.slope;
+      var t = denom > 0 ? d.base / denom : Infinity;
+      return (t > 0 && t < XMAX) ? t : null;
+    }
+    function render() {
+      var tok = parseInt(tokS.value, 10);
+      var ptsR = [], ptsF = [], maxY = 0;
+      for (var t = 0; t <= XMAX; t += 100) {
+        var r = recomputeMs(t), f = fetchMs(t);
+        maxY = Math.max(maxY, r, f);
+        ptsR.push({ x: t, y: r }); ptsF.push({ x: t, y: f });
+      }
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      var axes = G.drawLines(ctx, W, H, [
+        { points: ptsR, color: c.accent2, width: 2.5 },
+        { points: ptsF, color: c.accent, width: 2.5 }
+      ], [0, XMAX], [0, maxY * 1.06], { xLabel: "prefix tokens to restore", yLabel: "ms" });
+      var co = crossover();
+      if (co != null) {
+        var cx = axes.px(co), cy = axes.py(recomputeMs(co));
+        ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]);
+        ctx.beginPath(); ctx.moveTo(cx, axes.padT); ctx.lineTo(cx, axes.padT + axes.plotH); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = c.accent700; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 2 * Math.PI); ctx.fill();
+        ctx.font = "11px " + c.font; ctx.textAlign = "left";
+        ctx.fillText("crossover ≈ " + G.fmtNum(Math.round(co)) + " tokens", Math.min(cx + 8, W - 170), axes.padT + 14);
+      }
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "left";
+      ctx.fillText("recompute (magenta) vs " + TIERS[tier].label + " fetch (teal)", axes.padL + 6, axes.padT + 26);
+      var r = recomputeMs(tok), f = fetchMs(tok);
+      var win = r <= f ? "recompute" : "fetch";
+      var note = tier === "nvme"
+        ? '<span class="k">below ~1,900 tokens, recomputing beats an NVMe fetch</span>'
+        : '<span class="k">tier:</span> ' + TIERS[tier].label + " (fixed access " + TIERS[tier].base + " ms, " + TIERS[tier].slope + " ms/token)";
+      readout.innerHTML =
+        '<span class="k">at ' + G.fmtNum(tok) + " tokens:</span> recompute " + G.fmtMs(r) + " · fetch " + G.fmtMs(f) + "<br>" +
+        '<span class="k">cheaper:</span> <span class="hi">' + win + "</span><br>" +
+        '<span class="k">' + TIERS[tier].label + ' crossover:</span> ' + (co == null ? "none below " + G.fmtNum(XMAX) + " tokens" : "≈ " + G.fmtNum(Math.round(co)) + " tokens") + "<br>" +
+        note;
+    }
+    rowEl.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-tier]"); if (!b) return;
+      tier = b.getAttribute("data-tier");
+      Array.prototype.forEach.call(rowEl.querySelectorAll("button"), function (x) { x.className = "pc-tier" + (x === b ? " on" : ""); });
+      render();
+    });
+    G.bindSliders([tokS], render);
+    onData(function () { srcEl.textContent = (DATA.prefix_cache && DATA.prefix_cache.source) || FALLBACK.prefix_cache.source; });
+    srcEl.textContent = FALLBACK.prefix_cache.source;
+    render();
+  })();
+
+  // ---- Demo 6: TTL survival ---------------------------------------------
+  (function () {
+    var canvas = document.getElementById("pc-ttl-canvas");
+    var ctx, W = 640, H = 220;
+    var gapS = document.getElementById("pc-ttl-gap");
+    var rowEl = document.getElementById("pc-ttl-row");
+    var readout = document.getElementById("pc-ttl-readout");
+    var ttl = 300;
+
+    function survive(gap) { return ttl <= 0 ? 0.35 : Math.exp(-gap / ttl); }
+    function render() {
+      var gap = parseInt(gapS.value, 10);
+      if (!ctx) { ctx = G.setupCanvas(canvas, W, H, function (w, h) { if (ctx) render(w, h); }).ctx; }
+      ctx.clearRect(0, 0, W, H);
+      var padL = 44, padR = 16, padT = 16, padB = 30;
+      var plotW = W - padL - padR, plotH = H - padT - padB;
+      function px(g) { return padL + plotW * g / 900; }
+      function py(p) { return padT + plotH * (1 - p); }
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH); ctx.stroke();
+      ctx.strokeStyle = c.accent; ctx.lineWidth = 2.5; ctx.beginPath();
+      for (var g = 0; g <= 900; g += 10) {
+        var X = px(g), Y = py(survive(g));
+        if (g === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.stroke();
+      var Xc = px(gap), Yc = py(survive(gap));
+      ctx.fillStyle = c.accent2; ctx.beginPath(); ctx.arc(Xc, Yc, 5, 0, 2 * Math.PI); ctx.fill();
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(Xc, padT); ctx.lineTo(Xc, padT + plotH); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.text; ctx.font = "11px " + c.font; ctx.textAlign = "center";
+      ctx.fillText("gap between turns (s)", padL + plotW / 2, H - 6);
+      ctx.textAlign = "left";
+      ctx.fillText("P(prefix still cached)", 10, padT + 10);
+      var p = survive(gap);
+      var missTtft = 2100, hitTtft = 190;
+      var blended = missTtft * (1 - p) + hitTtft * p;
+      readout.innerHTML =
+        '<span class="k">TTL:</span> ' + (ttl <= 0 ? "none (evict on pressure only)" : G.fmtMs(ttl * 1000)) + "<br>" +
+        '<span class="k">P(survive a ' + gap + "s gap):</span> <span class=\"hi\">" + (100 * p).toFixed(1) + "%</span><br>" +
+        '<span class="k">expected TTFT next turn:</span> ' + G.fmtMs(blended) + " (vs " + G.fmtMs(missTtft) + " cold)<br>" +
+        '<span class="k">miss rate:</span> <span class="' + (p < 0.5 ? "bad" : "hi") + '">' + (100 * (1 - p)).toFixed(1) + "%</span>";
+    }
+    rowEl.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-ttl]"); if (!b) return;
+      ttl = parseInt(b.getAttribute("data-ttl"), 10);
+      Array.prototype.forEach.call(rowEl.querySelectorAll("button"), function (x) { x.className = x === b ? "g-primary" : ""; });
+      render();
+    });
+    G.bindSliders([gapS], render);
+    render();
+  })();
+
+  fetch(window.__PC_DATA_URL).then(function (r) { return r.json(); }).then(applyData).catch(function () { applyData(FALLBACK); });
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

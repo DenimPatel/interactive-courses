@@ -1,0 +1,584 @@
+---
+title: "LLM Serving, Interactively — Part 13: Prefill/decode disaggregation"
+description: "Why splitting prefill and decode into separate pools tames inter-token latency, how to size each pool, how KV moves over RDMA, and what DeepSeek actually runs in production."
+permalink: "/ai/llm-serving/disaggregation/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-preset { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+  .g-preset button { font-family: var(--font-heading); font-weight: 600; font-size: 11.5px; padding: 5px 9px; border-radius: var(--radius-sm); border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text); cursor: pointer; }
+  .g-preset button:hover { background: var(--color-accent-100); border-color: var(--color-accent); }
+  .g-gauge { height: 10px; border-radius: 5px; background: var(--color-divider); overflow: hidden; margin-top: 3px; }
+  .g-gauge > i { display: block; height: 100%; background: var(--color-accent); }
+  .g-gauge.over > i { background: var(--color-accent-2); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 13 of 20</span>
+    <h1>Prefill/decode disaggregation</h1>
+    <p>Colocating prefill and decode on the same GPU is convenient and, at high load, structurally wrong. Prefill is a long compute-bound burst; decode is a steady memory-bound drip that millions of users feel as inter-token latency. Put them on one device and every prefill pauses every decode step. Disaggregation separates the two jobs into pools with different hardware, different batching policies, even different GPU counts — and pays for it by shipping the KV cache across the fabric. This part is about when that trade wins, how to size the pools, and what DeepSeek disclosed about running it at 608 billion input tokens a day.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <nav class="g-toc" aria-label="On this page">
+    <a href="#two-jobs">One pool, two jobs</a>
+    <a href="#systems">The systems</a>
+    <a href="#sizing">Sizing the pools</a>
+    <a href="#moving">Moving KV</a>
+    <a href="#overlap">Layer-wise overlap</a>
+    <a href="#loses">When it loses</a>
+    <a href="#routing">KV-aware routing</a>
+    <a href="#deepseek">DeepSeek at scale</a>
+    <a href="#domains">Two autoscalers</a>
+  </nav>
+
+  <section class="g-step" id="two-jobs">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>One pool, two jobs</h2></div>
+    <p class="g-eyebrow">The ITL spike you can see</p>
+    <p>The <a href="{{ '/ai/llm-training/inference/' | relative_url }}">training guide's inference chapter</a> framed prefill as compute-bound and decode as bandwidth-bound. On a shared engine, those two workloads contend for the same SMs: while a 4,000-token prompt is prefilled, the running decode batch waits its turn, and a user watching tokens stream sees a stall. <a href="{{ '/ai/llm-serving/metrics/' | relative_url }}">Part 3</a> named the metric — inter-token latency, or ITL — and this is the mechanism that makes its p99 ugly even when throughput looks healthy.</p>
+    <p>Chunked prefill (Part 6) mitigates this by slicing prompts into iteration-sized pieces, but the total work is unchanged: some iterations still carry prefill, and the decode step is longer. Disaggregation attacks the problem by <strong>routing each request's two phases to different GPUs</strong>. Prefill workers batch many prompts together, saturating compute with large matrix multiplies; decode workers run a steady, latency-optimised loop with a fixed batch. The prefill worker sends the resulting KV cache to the decode worker over the network, and the decode worker streams tokens back. The demo below replays both designs: the top timeline is colocated and shows a prefill spike every few iterations; the bottom keeps decode flat and exposes a small transfer segment.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gantt-canvas" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">Each bar is one engine iteration, stacked by job. Play to advance the timeline.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="gantt-play">Play</button>
+          <button id="gantt-mode" class="g-primary">Disaggregated</button>
+        </div>
+        <div class="g-readout" id="gantt-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="systems">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>DistServe, Splitwise and Mooncake</h2></div>
+    <p class="g-eyebrow">Three papers, one architecture</p>
+    <p>DistServe (OSDI 2024) introduced the formulation and reported serving <strong>7.4× more requests or 12.6× tighter SLO</strong> by splitting the phases; the widely quoted 20× is a rounded composite, not a single measurement. Splitwise (Microsoft) made the same split for a different reason — phase-specific hardware, since prefill wants compute and decode wants memory capacity. Mooncake (Moonshot/Kimi) went further and made the <em>KV cache itself</em> the centre of the system, with a KVCache-centric scheduler and a transfer engine, reporting up to <strong>525% throughput</strong> in simulation and 75% more real requests. The same architecture now ships as first-class support in vLLM and SGLang via disaggregation connectors.</p>
+    <p class="g-source" id="disagg-source"></p>
+    <div class="g-goal">💡 <span><b>The insight that unifies them:</b> once the KV cache can move independently, the GPU becomes a stateless compute resource and the cache becomes the durable thing. That is what makes per-phase sizing, per-phase autoscaling and cache-aware routing possible.</span></div>
+  </section>
+
+  <section class="g-step" id="sizing">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Sizing the pools</h2></div>
+    <p class="g-eyebrow">The input:output ratio decides everything</p>
+    <p>Pool sizing is an arithmetic question. Let \(R_p\) be prefill tokens/s per GPU and \(R_d\) decode tokens/s per GPU. For a workload with \(P\) input and \(O\) output tokens per request, the GPU-seconds needed per request are \(a = P/R_p\) for prefill and \(b = O/R_d\) for decode, so the throughput-balanced split is</p>
+    <div class="g-math g-katex">$$ \frac{N_p}{N_p+N_d} = \frac{a}{a+b} = \frac{r}{r + R_p/R_d}\quad\text{with } r = P/O. $$</div>
+    <p>Because decode is bandwidth-bound and batched, \(R_p/R_d\) is large — with representative values of 12,000 prefill and 800 decode tokens/s per GPU it is 15. That makes the optimal prefill share \(r/(r+15)\): a chat workload at \(r=4\) wants ~21% prefill, summarisation at \(r=20\) wants ~57%, and a reasoning workload at \(r=1/6\) wants ~1%. DeepSeek's disclosed ratio of 608B input to 168B output tokens (\(r=3.62\)) predicts ~19% prefill — and their deployment runs 32 prefill to 144 decode GPUs, or 18.2%. Use the presets to see each workload, then drag the split away from optimal and watch queues form.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="pool-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Bars show utilisation of each pool relative to the throughput-balanced allocation; the marker is the optimal prefill share.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-preset" id="pool-presets"></div>
+        <div class="g-field"><label>Input : output ratio r <span class="val" id="pool-r-val">4.0</span></label><input type="range" id="pool-r" min="-1" max="1.7" step="0.01" value="0.602"></div>
+        <div class="g-field"><label>Total GPUs N <span class="val" id="pool-n-val">64</span></label><input type="range" id="pool-n" min="8" max="256" step="8" value="64"></div>
+        <div class="g-field"><label>GPUs allocated to prefill <span class="val" id="pool-split-val">35%</span></label><input type="range" id="pool-split" min="0" max="100" step="1" value="35"></div>
+        <div class="g-readout" id="pool-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="moving">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Moving KV: NIXL, Mooncake Transfer Engine, RDMA</h2></div>
+    <p class="g-eyebrow">The cost you pay for freedom</p>
+    <p>The transfer is the whole bargain. A prefill worker holds a KV cache of \(2\,L\,n_{kv}d_{head}T\) bytes per sequence; for a 70B GQA model that is about 0.33&nbsp;MB per token, so a 4,000-token prompt is ~1.3&nbsp;GB. Moving that over a 400&nbsp;Gb/s (50&nbsp;GB/s) RDMA link takes ~26&nbsp;ms; over 100&nbsp;GbE it takes ~105&nbsp;ms; over NVLink it is under 3&nbsp;ms. Transfer engines (NVIDIA's NIXL, Mooncake Transfer Engine, LMCache) exist to drive RDMA queues at line rate, register GPU memory once and pipeline chunk-by-chunk, so the copy overlaps the decode that follows. MLA models cut the payload ~4.7× — DeepSeek's latent is 70&nbsp;KB/token versus ~328&nbsp;KB for a same-geometry GQA cache — which is a large part of why disaggregation is practical for them.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="xfer-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The crossing point is the minimum prompt length at which relocating the KV beats recomputing prefill in place.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Link bandwidth <span class="val" id="xfer-bw-val">50 GB/s</span></label><input type="range" id="xfer-bw" min="0" max="4" step="1" value="2"></div>
+        <div class="g-field"><label>KV scheme <span class="val" id="xfer-scheme-val">GQA 328 KB/tok</span></label><input type="range" id="xfer-scheme" min="0" max="1" step="1" value="0"></div>
+        <div class="g-btnrow"><button id="xfer-overlap" class="g-primary">Overlap transfer with decode</button></div>
+        <div class="g-readout" id="xfer-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="overlap">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Layer-wise overlap</h2></div>
+    <p class="g-eyebrow">Don't wait for the whole cache</p>
+    <p>The naive transfer waits for prefill to finish, sends the entire cache, then starts decode. Real systems pipeline at <strong>layer granularity</strong>: the prefill worker streams layer \(i\)'s KV as soon as it is computed, and the decode worker begins prefilling its own layer \(i\) state and starts generating the first token as the tail of the cache arrives. The critical path becomes the transfer of the <em>last</em> layer, not the sum of all layers, which is why the transfer segment in the demo above is narrow relative to the total. The cost of this overlap is a coupling between the two pools: they must agree on layer boundaries, paging layout and per-layer chunk sizes, which is exactly the interface NIXL and the vLLM/SGLang connectors standardise. Decode's first-token latency is then bounded by the transfer tail plus local attention, not by the full cache size.</p>
+  </section>
+
+  <section class="g-step" id="loses">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>When disaggregation loses</h2></div>
+    <p class="g-eyebrow">Short prompts and idle pools</p>
+    <p>Disaggregation is not free, and for the wrong workload it is strictly worse. It loses when:</p>
+    <ul class="g-refs">
+      <li><strong>Prompts are short.</strong> The fixed setup cost (connection, memory registration, handshake) plus the transfer latency exceeds the prefill tax you avoid. The demo above computes the break-even length; for a 50&nbsp;GB/s link and GQA it is a few hundred tokens.</li>
+      <li><strong>The pools are small or bursty.</strong> Two pools of 4 GPUs each cannot absorb each other's idle time. Disaggregation needs enough replicas that a busy period in one pool overlaps an idle period in the other.</li>
+      <li><strong>Traffic is low.</strong> Under light load, colocation's interference is invisible and splitting only adds a copy and a second failure domain.</li>
+      <li><strong>Bandwidth is scarce.</strong> If the KV transfer competes with the decode workers' own traffic, the copy shows up as ITL jitter.</li>
+    </ul>
+    <div class="g-warn">⚠️ <span><b>The honest rule:</b> disaggregate when prompts are long, load is high and steady, and the link is fast relative to the cache. Otherwise, chunked prefill in one pool is simpler and often faster.</span></div>
+  </section>
+
+  <section class="g-step" id="routing">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>KV-aware routing across pools</h2></div>
+    <p class="g-eyebrow">Where does the cache live?</p>
+    <p>Once decode workers are stateful caches, the router cannot be round-robin. It must prefer the decode worker that already holds (or can cheaply fetch) the request's prefix, balancing cache affinity against load and transfer cost — the same problem <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a> describes for a single pool, now with two hops. A production router scores candidates on prefix match length, current batch occupancy, and estimated transfer time, and it must handle the case where the best-affinity worker is saturated: recomputing a few thousand cached tokens can beat a 30&nbsp;ms transfer plus a queue. This is where the scheduler, the transfer engine and the cache hierarchy meet.</p>
+  </section>
+
+  <section class="g-step" id="deepseek">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>DeepSeek's production deployment, scaled to you</h2></div>
+    <p class="g-eyebrow">The disclosed numbers</p>
+    <p>DeepSeek's published inference overview describes one deployment unit as <strong>32 GPUs for prefill with EP32 and 144 GPUs for decode with EP144</strong>, serving all V3/R1 traffic over 24 hours: <strong>608 billion input tokens and 168 billion output tokens</strong>. 342B of the input (56.3%) hit the on-disk KV cache; average decode speed was 20–22 tokens/s. The unit sizes are not arbitrary — they are the throughput-balanced split this page computes, with a lot of spare decode batch to hit the latency target. Scale your own traffic as a fraction of theirs and watch the granularity bite.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="ds-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">One square = one 32-GPU prefill unit or one 144-GPU decode unit. Units are not perfectly divisible.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Your traffic as a fraction of DeepSeek's <span class="val" id="ds-frac-val">10%</span></label><input type="range" id="ds-frac" min="-4" max="0" step="0.05" value="-1"></div>
+        <div class="g-readout" id="ds-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="domains">
+    <div class="g-step-head"><span class="g-step-num">9</span><h2>Two autoscalers, two failure domains</h2></div>
+    <p class="g-eyebrow">The operational bill</p>
+    <p>Splitting the pools splits the operations. Prefill and decode scale on different signals — prefill on queued prefill tokens and TTFT SLO, decode on batch occupancy and ITL SLO — so they need separate autoscalers, and each can cold-start independently (a 40–90&nbsp;s weight load, Part 19). A prefill surge can leave decode idle; a decode surge can queue prefilled caches waiting for a worker. And because the KV transfer is the seam, it becomes a new failure domain: a fabric hiccup turns into dropped or delayed caches, and the router must decide between retrying, recomputing, or failing over to a colocated fallback path. The reward for all of that is a system where each job runs on the right hardware with the right batch shape, and where a latency SLO is a pool-sizing parameter rather than a hope.</p>
+    <div class="g-goal">📌 <span><b>Cross-links:</b> the KV hierarchy is <a href="{{ '/ai/llm-serving/prefix-caching/' | relative_url }}">Part 8</a>; the scheduler that decides admit vs wait is <a href="{{ '/ai/llm-serving/scheduling/' | relative_url }}">Part 7</a>; the rack-scale NVLink domain that makes the transfer cheap is <a href="{{ '/ai/llm-serving/hardware/' | relative_url }}">Part 2</a> and <a href="{{ '/ai/llm-serving/parallelism/' | relative_url }}">Part 12</a>.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Concept</th><th>What to remember</th></tr></thead>
+      <tbody>
+        <tr><td>Why disaggregate</td><td>Prefill bursts stretch decode's ITL; separate pools let each phase batch optimally</td></tr>
+        <tr><td>Optimal split</td><td>\(N_p/(N_p+N_d) = r/(r+R_p/R_d)\); DeepSeek's 3.62 ratio predicts ~19% prefill</td></tr>
+        <tr><td>Transfer volume</td><td>GQA 70B ≈ 0.33 MB/token; MLA DeepSeek ≈ 0.07 MB/token (~4.7× smaller)</td></tr>
+        <tr><td>Transfer time</td><td>1.3 GB prompt cache: ~26 ms at 50 GB/s, ~105 ms at 12.5 GB/s</td></tr>
+        <tr><td>Overlap</td><td>Stream KV per layer; critical path is the last layer, not the sum</td></tr>
+        <tr><td>Break-even</td><td>Short prompts and small/bursty pools lose; long, steady, well-connected traffic wins</td></tr>
+        <tr><td>DeepSeek unit</td><td>32 prefill GPUs (EP32) + 144 decode GPUs (EP144); 608B in / 168B out per day</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Zhong et al., <a href="https://arxiv.org/abs/2401.09670">"DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving"</a>, OSDI 2024.</li>
+      <li>Patel et al., <a href="https://arxiv.org/abs/2401.09670">"Splitwise: Efficient Generative LLM Inference Using Phase Splitting"</a> (2024).</li>
+      <li>Qin et al., <a href="https://arxiv.org/abs/2407.00079">"Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving"</a> (2024).</li>
+      <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/open-infra-index">"DeepSeek-V3/R1 Inference System Overview"</a> (2025-02-28).</li>
+      <li>vLLM, <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill.html">disaggregated prefill/decode connectors</a>.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Two dense jobs, two pools. Next: models where only a few experts work per token — and the collective that dominates them.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>
+  window.SERVING_NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";
+</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  var FALLBACK = {
+    disaggregation: {
+      source: "DistServe (Zhong et al., OSDI 2024, arXiv:2401.09670) reports 7.4x more requests or 12.6x tighter SLO by splitting prefill and decode. DeepSeek's 'DeepSeek-V3/R1 Inference System Overview' (open-infra-index, 2025-02-28) publishes the prefill/decode node split (EP32 prefill, EP144 decode) and 608B input / 168B output tokens over 24h. Mooncake (arXiv:2407.00079) reports up to 525% throughput and 75% more real requests. The 20x is a rounded composite, not a single measurement.",
+      distServeSpeedups: [7.4, 12.6, 20],
+      deepseek: { prefillGPUs: 32, decodeGPUs: 144, inputTokensPerDayB: 608, outputTokensPerDayB: 168 },
+      kimiTokensPerDayB: 100
+    },
+    kv_scheme_savings: {
+      source: "Computed from the official configs (formula: bytes/token = 2 x layers x n_kv_heads x d_head x 2 bytes for FP16 K and V; MLA caches a 512-element latent plus a 64-element RoPE key per layer).",
+      items: [
+        { scheme: "GQA", bytesPerTokenFP16: 327680 },
+        { scheme: "MLA", bytesPerTokenFP16: 70272 }
+      ]
+    }
+  };
+  var NUM = FALLBACK;
+  var srcEl = document.getElementById('disagg-source');
+  function apply(nums) {
+    NUM = nums || FALLBACK;
+    if (srcEl && NUM.disaggregation && NUM.disaggregation.source) {
+      srcEl.textContent = "Sources: " + NUM.disaggregation.source;
+    }
+  }
+  apply(FALLBACK);
+  fetch(window.SERVING_NUMBERS_URL).then(function (r) { return r.json(); }).then(apply).catch(function () { /* fallback already applied */ });
+
+  function ds() {
+    return (NUM.disaggregation && NUM.disaggregation.deepseek) || FALLBACK.disaggregation.deepseek;
+  }
+  function kvBytesPerToken(scheme) {
+    var items = (NUM.kv_scheme_savings && NUM.kv_scheme_savings.items) || FALLBACK.kv_scheme_savings.items;
+    var want = scheme === 1 ? "MLA" : "GQA";
+    for (var i = 0; i < items.length; i++) if (items[i].scheme === want) return items[i].bytesPerTokenFP16;
+    return scheme === 1 ? 70272 : 327680;
+  }
+
+  // ---- Demo a: colocated vs disaggregated timelines ----
+  (function () {
+    var canvas = document.getElementById('gantt-canvas');
+    var ctx = canvas.getContext('2d');
+    var readout = document.getElementById('gantt-readout');
+    var playBtn = document.getElementById('gantt-play');
+    var modeBtn = document.getElementById('gantt-mode');
+    var disaggregated = true, progress = 1;
+    var rng = Guide.seededRandom(1307);
+    var N = 18;
+    var baseDecode = 28;
+    var jitter = [];
+    for (var i = 0; i < N; i++) jitter.push(0.85 + 0.3 * rng());
+    var prefillEvery = 4;
+    var prefillMs = 170, xferMs = 9;
+    var setup = Guide.setupCanvas(canvas, 640, 360, function (W, H) { draw(W, H); });
+
+    function itls() {
+      var out = [];
+      for (var i = 0; i < N; i++) {
+        var dec = baseDecode * jitter[i];
+        if (disaggregated) out.push(dec + (i % prefillEvery === 0 ? xferMs : 0));
+        else out.push(dec + (i % prefillEvery === 0 ? prefillMs : 0));
+      }
+      return out;
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var vals = itls();
+      var maxV = Math.max.apply(null, vals) * 1.1;
+      var padL = 44, padR = 12, padT = 26, padB = 22;
+      var panelH = (H - padT - padB - 26) / 2;
+      var bw = (W - padL - padR) / N;
+      var reveal = Math.max(1, Math.round(N * progress));
+      function panel(title, y0, color, secondary, secondColor) {
+        ctx.fillStyle = c.text; ctx.font = 'bold 11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(title, padL, y0 - 5);
+        for (var i = 0; i < N; i++) {
+          var dec = baseDecode * jitter[i] * (panelH / maxV);
+          var extra = (i % prefillEvery === 0 ? secondary : 0) * (panelH / maxV);
+          var x = padL + i * bw;
+          if (i >= reveal) continue;
+          ctx.fillStyle = color;
+          ctx.fillRect(x + 1, y0 + panelH - dec, bw - 2, dec);
+          if (extra > 0) {
+            ctx.fillStyle = secondColor;
+            ctx.fillRect(x + 1, y0 + panelH - dec - extra, bw - 2, extra);
+          }
+        }
+        ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, y0 + panelH); ctx.lineTo(W - padR, y0 + panelH); ctx.stroke();
+      }
+      panel('Colocated — prefill stalls the decode batch', padT, c.accent400, prefillMs, c.accent2);
+      panel('Disaggregated — decode stays flat, transfer overlapped', padT + panelH + 26, c.accent, xferMs, c.accent700);
+      // axes
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('per-iteration time, ms (max ' + maxV.toFixed(0) + ')', padL, H - 4);
+      // now marker
+      var nx = padL + reveal * bw;
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 1.5;
+      if (ctx.setLineDash) ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(nx, padT - 12); ctx.lineTo(nx, H - padB); ctx.stroke();
+      if (ctx.setLineDash) ctx.setLineDash([]);
+    }
+    function render() {
+      var vals = itls();
+      var mean = vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+      var p99 = ServingSim.percentile(vals, 99);
+      readout.innerHTML =
+        '<span class="k">mode</span> <span class="hi">' + (disaggregated ? 'disaggregated' : 'colocated') + '</span><br>' +
+        '<span class="k">mean ITL</span> ' + mean.toFixed(0) + ' ms<br>' +
+        '<span class="k">p99 ITL</span> <span class="' + (p99 > 80 ? 'bad' : '') + '">' + p99.toFixed(0) + ' ms</span><br>' +
+        '<span class="k">decode jitter</span> ' + (100 * (p99 / mean - 1)).toFixed(0) + '% over mean';
+      draw(640, 360);
+    }
+    modeBtn.addEventListener('click', function () {
+      disaggregated = !disaggregated;
+      modeBtn.textContent = disaggregated ? 'Disaggregated' : 'Colocated';
+      modeBtn.className = disaggregated ? 'g-primary' : '';
+      render();
+    });
+    var loop = Guide.loop({
+      button: playBtn, interval: 55, playLabel: 'Play', pauseLabel: 'Pause',
+      onStep: function () {
+        progress += 0.035;
+        if (progress > 1) { progress = 1; loop.stop(); }
+        draw(640, 360);
+      }
+    });
+    render();
+  })();
+
+  // ---- Demo b: pool sizing ----
+  (function () {
+    var canvas = document.getElementById('pool-canvas');
+    var ctx = canvas.getContext('2d');
+    var rS = document.getElementById('pool-r'), nS = document.getElementById('pool-n'), splitS = document.getElementById('pool-split');
+    var readout = document.getElementById('pool-readout');
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 320, function (W, H) { if (ready) draw(W, H); });
+    var RP = 12000, RD = 800;
+
+    function ratio() { return Math.pow(10, parseFloat(rS.value)); }
+    function optimalSplit(r) { return 1 / (1 + 15 / r); } // 15 = RP/RD
+    function state() {
+      var r = ratio(), N = parseInt(nS.value, 10), split = parseInt(splitS.value, 10) / 100;
+      var opt = optimalSplit(r);
+      var a = r / RP, b = 1 / RD;
+      var idealNp = N * a / (a + b), idealNd = N * b / (a + b);
+      var Np = Math.max(0.001, split * N), Nd = Math.max(0.001, (1 - split) * N);
+      return { r: r, N: N, split: split, opt: opt, idealNp: idealNp, idealNd: idealNd, Np: Np, Nd: Nd,
+        uP: idealNp / Np, uD: idealNd / Nd };
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var s = state();
+      var padL = 90, padR = 24, padT = 24, barH = 30, gap = 40;
+      // allocation bar
+      var allocW = W - padL - padR;
+      ctx.font = '12px ' + c.font; ctx.textAlign = 'right'; ctx.fillStyle = c.text;
+      ctx.fillText('prefill GPUs', padL - 8, padT + 20);
+      ctx.fillText('decode GPUs', padL - 8, padT + 20 + gap);
+      ctx.fillStyle = c.accent400; ctx.fillRect(padL, padT, allocW * s.split, barH);
+      ctx.fillStyle = c.accent; ctx.fillRect(padL, padT + gap, allocW * (1 - s.split), barH);
+      ctx.fillStyle = c.text; ctx.textAlign = 'center'; ctx.font = '11px ' + c.mono;
+      if (s.split > 0.08) ctx.fillText(Math.round(s.split * s.N) + ' GPUs', padL + allocW * s.split / 2, padT + 20);
+      if (s.split < 0.92) ctx.fillText(Math.round((1 - s.split) * s.N) + ' GPUs', padL + allocW * s.split + allocW * (1 - s.split) / 2, padT + gap + 20);
+      // optimal marker
+      var ox = padL + allocW * s.opt;
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      if (ctx.setLineDash) ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(ox, padT - 6); ctx.lineTo(ox, padT + gap + barH + 6); ctx.stroke();
+      if (ctx.setLineDash) ctx.setLineDash([]);
+      ctx.fillStyle = c.accent2; ctx.textAlign = 'center'; ctx.font = '10px ' + c.font;
+      ctx.fillText('optimal ' + (100 * s.opt).toFixed(0) + '%', ox, padT - 10);
+      // utilisation gauges
+      var gy = padT + gap + barH + 46;
+      function gauge(label, util, y) {
+        ctx.fillStyle = c.text; ctx.textAlign = 'right'; ctx.font = '12px ' + c.font;
+        ctx.fillText(label, padL - 8, y + 11);
+        var gw = allocW;
+        ctx.fillStyle = c.divider; ctx.fillRect(padL, y, gw, 14);
+        var over = util > 1;
+        ctx.fillStyle = over ? c.accent2 : c.accent;
+        ctx.fillRect(padL, y, gw * Math.min(1.4, util), 14);
+        // 100% line
+        ctx.strokeStyle = c.text; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(padL + gw * (1 / 1.4), y - 3); ctx.lineTo(padL + gw * (1 / 1.4), y + 17); ctx.stroke();
+        ctx.fillStyle = c.text; ctx.textAlign = 'left'; ctx.font = '11px ' + c.mono;
+        ctx.fillText((100 * util).toFixed(0) + '%', padL + 6, y + 11);
+      }
+      gauge('prefill util', s.uP, gy);
+      gauge('decode util', s.uD, gy + 46);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText('100% = balanced allocation', W - padR, gy + 12);
+    }
+    function render() {
+      var s = state();
+      document.getElementById('pool-r-val').textContent = s.r.toFixed(s.r < 1 ? 2 : 1);
+      document.getElementById('pool-n-val').textContent = s.N;
+      document.getElementById('pool-split-val').textContent = Math.round(100 * s.split) + '%';
+      var prefillShort = Math.max(0, s.uP - 1), decodeShort = Math.max(0, s.uD - 1);
+      var queue = (prefillShort + decodeShort);
+      var advice;
+      if (s.split < s.opt - 0.03) advice = 'Prefill pool is the bottleneck — shift ' + Math.max(1, Math.round((s.opt - s.split) * s.N)) + ' GPUs from decode.';
+      else if (s.split > s.opt + 0.03) advice = 'Decode pool is the bottleneck — shift ' + Math.max(1, Math.round((s.split - s.opt) * s.N)) + ' GPUs to decode.';
+      else advice = 'Balanced: both pools hit 100% at the same time.';
+      readout.innerHTML =
+        '<span class="k">optimal prefill share</span> <span class="hi">' + (100 * s.opt).toFixed(1) + '%</span> (' + Math.round(s.idealNp) + ' / ' + s.N + ')<br>' +
+        '<span class="k">prefill util</span> ' + (100 * s.uP).toFixed(0) + '% &nbsp; <span class="k">decode util</span> ' + (100 * s.uD).toFixed(0) + '%<br>' +
+        '<span class="k">queue pressure</span> <span class="' + (queue > 0.3 ? 'bad' : '') + '">' + queue.toFixed(2) + '× pool</span><br>' +
+        '<span class="k">verdict:</span> ' + advice;
+      draw(640, 320);
+    }
+    var presets = [
+      { label: 'Chat 4:1', r: 4, n: 64 },
+      { label: 'Summarisation 20:1', r: 20, n: 64 },
+      { label: 'Reasoning 1:6', r: 1 / 6, n: 64 },
+      { label: 'DeepSeek 608:168', r: 608 / 168, n: 176 }
+    ];
+    var box = document.getElementById('pool-presets');
+    presets.forEach(function (p) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.textContent = p.label;
+      b.addEventListener('click', function () {
+        rS.value = Math.log(p.r) / Math.LN10;
+        nS.value = p.n;
+        splitS.value = Math.round(100 * optimalSplit(p.r));
+        render();
+      });
+      box.appendChild(b);
+    });
+    ready = true;
+    Guide.bindSliders([rS, nS, splitS], render);
+    render();
+  })();
+
+  // ---- Demo c: KV transfer budget ----
+  (function () {
+    var canvas = document.getElementById('xfer-canvas');
+    var ctx = canvas.getContext('2d');
+    var bwS = document.getElementById('xfer-bw'), schemeS = document.getElementById('xfer-scheme');
+    var overlapBtn = document.getElementById('xfer-overlap');
+    var readout = document.getElementById('xfer-readout');
+    var ready = false;
+    var setup = Guide.setupCanvas(canvas, 640, 340, function (W, H) { if (ready) draw(W, H); });
+    var BWS = [12.5e9, 25e9, 50e9, 100e9, 450e9];
+    var BWL = ['12.5 GB/s (100GbE)', '25 GB/s (200GbE)', '50 GB/s (400G IB)', '100 GB/s (800G)', '450 GB/s (NVLink)'];
+    var overlap = true;
+    var SETUP_MS = 3.0, DELTA = 0.04; // colocated prefill tax, ms per prompt token
+
+    function kv() { return kvBytesPerToken(parseInt(schemeS.value, 10)); }
+    function cross() {
+      var bw = BWS[parseInt(bwS.value, 10)];
+      var share = overlap ? 0.3 : 1;
+      var perTok = kv() / bw * 1000 * share; // ms per prompt token
+      var denom = DELTA - perTok;
+      return { bw: bw, share: share, perTok: perTok, minP: denom > 0 ? SETUP_MS / denom : Infinity };
+    }
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var x = cross();
+      var maxP = 5000;
+      var colo = [], dis = [];
+      for (var i = 0; i <= 80; i++) {
+        var P = Math.pow(10, -0.3 + (Math.log(maxP) / Math.LN10 + 0.3) * i / 80);
+        colo.push({ x: P, y: DELTA * P });
+        dis.push({ x: P, y: SETUP_MS + x.perTok * P });
+      }
+      var maxY = Math.max(200, DELTA * maxP, cross().minP === Infinity ? 0 : SETUP_MS + x.perTok * maxP);
+      var axes = Guide.drawLines(ctx, W, H,
+        [{ points: colo, color: c.accent2, width: 2.5 }, { points: dis, color: c.accent, width: 2.5 }],
+        [Math.pow(10, -0.3), maxP], [0, maxY * 1.05],
+        { xLabel: 'prompt length (tokens, log scale)', yLabel: 'cost per request (ms)', padL: 52, padB: 34 });
+      // shade region where disaggregation wins
+      var mp = x.minP;
+      if (isFinite(mp) && mp < maxP) {
+        var mx = axes.px(Math.max(Math.pow(10, -0.3), mp));
+        ctx.fillStyle = 'rgba(43,95,255,0.08)';
+        ctx.fillRect(mx, axes.padT, W - 8 - mx, axes.plotH);
+        ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5;
+        if (ctx.setLineDash) ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(mx, axes.padT); ctx.lineTo(mx, axes.padT + axes.plotH); ctx.stroke();
+        if (ctx.setLineDash) ctx.setLineDash([]);
+        ctx.fillStyle = c.accent700; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText('disaggregation pays →', mx + 5, axes.padT + 14);
+      }
+      // legend
+      ctx.textAlign = 'left'; ctx.font = '11px ' + c.font;
+      ctx.fillStyle = c.accent2; ctx.fillText('■ colocated prefill tax', axes.padL + 4, axes.padT + 4);
+      ctx.fillStyle = c.accent; ctx.fillText('■ setup + KV transfer', axes.padL + 174, axes.padT + 4);
+      if (isFinite(mp)) {
+        var my = axes.py(SETUP_MS + x.perTok * mp);
+        ctx.fillStyle = c.text;
+        ctx.beginPath(); ctx.arc(axes.px(mp), my, 5, 0, 2 * Math.PI); ctx.fill();
+        ctx.fillText('break-even ' + Math.round(mp) + ' tokens', axes.px(mp) + 8, my - 6);
+      }
+    }
+    function render() {
+      var x = cross();
+      var promptTokens = 4000;
+      var bytes = kv() * promptTokens;
+      var transferMs = bytes / x.bw * 1000 * (overlap ? x.share : 1);
+      document.getElementById('xfer-bw-val').textContent = BWL[parseInt(bwS.value, 10)];
+      document.getElementById('xfer-scheme-val').textContent = (parseInt(schemeS.value, 10) === 1 ? 'MLA 69 KB/tok' : 'GQA 320 KB/tok');
+      readout.innerHTML =
+        '<span class="k">4,000-token cache</span> ' + Guide.fmtBytes(bytes) + '<br>' +
+        '<span class="k">transfer @ ' + BWL[parseInt(bwS.value, 10)] + '</span> ' + Guide.fmtMs(transferMs) + '<br>' +
+        '<span class="k">overlap</span> ' + (overlap ? 'on (30% effective)' : 'off') + '<br>' +
+        '<span class="k">minimum prompt where it pays</span> <span class="hi">' + (isFinite(x.minP) ? Math.round(x.minP) + ' tokens' : 'never — transfer exceeds the prefill tax') + '</span>';
+      overlapBtn.className = overlap ? 'g-primary' : '';
+      draw(640, 340);
+    }
+    overlapBtn.addEventListener('click', function () { overlap = !overlap; render(); });
+    ready = true;
+    Guide.bindSliders([bwS, schemeS], render);
+    render();
+  })();
+
+  // ---- Demo d: DeepSeek deployment scaled ----
+  (function () {
+    var canvas = document.getElementById('ds-canvas');
+    var ctx = canvas.getContext('2d');
+    var fracS = document.getElementById('ds-frac');
+    var readout = document.getElementById('ds-readout');
+    var setup = Guide.setupCanvas(canvas, 640, 300, function (W, H) { draw(W, H); });
+    function draw(W, H) {
+      ctx.clearRect(0, 0, W, H);
+      var frac = Math.pow(10, parseFloat(fracS.value));
+      var d = ds();
+      var yourIn = d.inputTokensPerDayB * frac, yourOut = d.outputTokensPerDayB * frac;
+      var prefillUnits = Math.max(1, Math.ceil(yourIn / d.inputTokensPerDayB));
+      var decodeUnits = Math.max(1, Math.ceil(yourOut / d.outputTokensPerDayB));
+      // capacity per unit is the disclosed daily total
+      ctx.font = '11px ' + c.font;
+      function unitRow(label, units, perUnit, color, y) {
+        ctx.fillStyle = c.text; ctx.textAlign = 'left';
+        ctx.fillText(label, 10, y - 6);
+        for (var i = 0; i < units; i++) {
+          var x = 10 + i * 34;
+          if (x > W - 40) break;
+          ctx.fillStyle = i === units - 1 && (units > 1) ? c.accent : color;
+          ctx.fillRect(x, y, 28, 28);
+          ctx.fillStyle = '#fff'; ctx.font = '10px ' + c.mono; ctx.textAlign = 'center';
+          ctx.fillText('32', x + 14, y + 18);
+        }
+      }
+      unitRow('prefill units (32 GPUs each)', prefillUnits, 0, c.accent400, 40);
+      unitRow('decode units (144 GPUs each)', decodeUnits, 0, c.accent, 120);
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('one unit ≈ ' + d.inputTokensPerDayB + 'B prefill tok/day, ' + d.outputTokensPerDayB + 'B decode tok/day', 10, 210);
+      ctx.fillText('total GPUs: ' + (prefillUnits * 32 + decodeUnits * 144) + '   ·   ~' + ((prefillUnits * 32 + decodeUnits * 144) * 0.7).toFixed(0) + ' kW', 10, 232);
+      // fraction bar
+      ctx.fillStyle = c.divider; ctx.fillRect(10, 258, W - 40, 12);
+      ctx.fillStyle = c.accent; ctx.fillRect(10, 258, (W - 40) * Math.max(0.002, frac), 12);
+      ctx.fillStyle = c.text; ctx.textAlign = 'left'; ctx.font = '10px ' + c.font;
+      ctx.fillText('your traffic: ' + (100 * frac).toFixed(frac < 0.01 ? 3 : 1) + '% of 608B in / 168B out per day', 10, 288);
+    }
+    function render() {
+      var frac = Math.pow(10, parseFloat(fracS.value));
+      var d = ds();
+      var yourIn = d.inputTokensPerDayB * frac, yourOut = d.outputTokensPerDayB * frac;
+      var prefillUnits = Math.max(1, Math.ceil(yourIn / d.inputTokensPerDayB));
+      var decodeUnits = Math.max(1, Math.ceil(yourOut / d.outputTokensPerDayB));
+      var gpus = prefillUnits * 32 + decodeUnits * 144;
+      document.getElementById('ds-frac-val').textContent = (100 * frac).toFixed(frac < 0.01 ? 3 : 1) + '%';
+      readout.innerHTML =
+        '<span class="k">your tokens/day</span> ' + Guide.fmtNum(yourIn, 1) + 'B in / ' + Guide.fmtNum(yourOut, 1) + 'B out<br>' +
+        '<span class="k">units</span> ' + prefillUnits + ' prefill + ' + decodeUnits + ' decode<br>' +
+        '<span class="k">GPUs</span> <span class="hi">' + gpus + '</span> (' + (prefillUnits * 32) + ' prefill / ' + (decodeUnits * 144) + ' decode)<br>' +
+        '<span class="k">granularity</span> ' + (gpus <= 176 && frac < 0.9 ? 'one full deployment unit — you cannot buy 10% of one' : 'multiple units') + '<br>' +
+        '<span class="k">power</span> ~' + ((gpus * 0.7).toFixed(0)) + ' kW at 700 W/GPU';
+      draw(640, 300);
+    }
+    Guide.bindSliders([fracS], render);
+    render();
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

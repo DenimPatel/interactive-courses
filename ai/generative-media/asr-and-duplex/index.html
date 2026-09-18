@@ -1,0 +1,740 @@
+---
+title: "Speech to text, and answering out loud"
+description: "CTC to RNN-T to Whisper, why bidirectional attention makes streaming hard and the two-pass fix, then voice activity, barge-in and the realtime duplex budget."
+permalink: "/ai/generative-media/asr-and-duplex/"
+section: "ai"
+series: "generative_media"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-plot-stack { display: flex; flex-direction: column; gap: 12px; }
+  .g-mini { font-size: 11.5px; opacity: 0.65; margin-top: 6px; }
+  .g-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  .g-field input[type="checkbox"] { vertical-align: middle; margin-right: 6px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.generative_media %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Generative Media</span>
+    <h1>Speech to text, and answering out loud</h1>
+    <p>Recognition is synthesis run backwards, and it inherits the same alignment problem with one extra constraint: it has to run while the user is still talking. The field solved that in two jumps &mdash; CTC showed that a frame classifier could learn an alignment it was never given, and RNN-T turned recognition into a streaming transducer. Then Whisper raised accuracy with a fixed thirty-second window attended in both directions, which is precisely the design that refuses to stream. This part follows that arc and lands on the thing a user actually feels: the few hundred milliseconds between the end of their sentence and the first sound of the reply.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="ctc-rnnt">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>CTC and RNN-T</h2></div>
+    <p class="g-eyebrow">Frame-synchronous models with an alignment you collapse</p>
+    <p>A recogniser reads a sequence of audio frames and must produce a shorter sequence of letters, and nobody tells it which frames belong to which letter. CTC handles that by adding a <em>blank</em> symbol to the vocabulary. The network produces one distribution per frame; a blank means "nothing is being said here", and the training objective sums over every monotonic path that collapses to the correct transcript, so the alignment is marginalised out rather than supervised. At inference you take the argmax per frame, merge runs of the same symbol, and drop the blanks. The heatmap below is exactly that posterior picture: a bright spike wherever a symbol is being spoken, a blank row for the gaps.</p>
+    <p>The catch is that CTC assumes the frames are conditionally independent given the transcript, so it has no internal language model and no memory of what it just emitted. RNN-T fixes that with a <em>predictor</em> &mdash; a small language model over the tokens emitted so far &mdash; whose state is combined with each encoder frame by a <em>joint network</em>. At every cell $(t, u)$ the joint network predicts either a blank, which advances the time index and emits nothing, or the next token, which advances the predictor instead. That is a transducer, and it is naturally streaming: tokens can be emitted as audio arrives, without waiting for the whole utterance and without CTC's independence assumption.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="asr-ctc-canvas" width="660" height="250"></canvas>
+        <p class="g-canvas-hint">Per-frame posteriors drawn with <code>Guide.drawHeatmap</code>. The top row is the blank symbol; the bright diagonal band is the alignment CTC discovers on its own.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Symbols <span class="val">8</span></label><input type="range" id="asr-ctc-tokens" min="4" max="12" step="1" value="8"></div>
+        <div class="g-field"><label>Frames <span class="val">44</span></label><input type="range" id="asr-ctc-frames" min="20" max="72" step="2" value="44"></div>
+        <div class="g-readout" id="asr-ctc-readout"></div>
+      </div>
+    </div>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="asr-rnnt-canvas" width="660" height="220"></canvas>
+        <p class="g-canvas-hint">The RNN-T lattice. Moving right is a blank (advance the encoder); moving up emits a token (advance the predictor). Every path is monotonic, so decoding can begin before the sentence ends.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Encoder frames <span class="val">7</span></label><input type="range" id="asr-rnnt-frames" min="4" max="10" step="1" value="7"></div>
+        <div class="g-readout" id="asr-rnnt-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll be able to</b> explain what the CTC blank buys and how the collapse rule works, describe what the RNN-T predictor adds, say why a Whisper-style encoder cannot stream and what a block-causal mask changes, and account for every millisecond of a full-duplex turn budget.</span></div>
+    <div class="g-toc">
+      <a href="#whisper">2 · Whisper and the streaming problem</a>
+      <a href="#two-pass">3 · The two-pass fix</a>
+      <a href="#duplex">4 · The realtime duplex budget</a>
+      <a href="#shows">5 · Where this shows up</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="whisper">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Whisper and the streaming problem</h2></div>
+    <p class="g-eyebrow">Strong offline, awkward live</p>
+    <p>Whisper replaced the frame classifier with an attention encoder-decoder trained on hundreds of thousands of hours of weakly labelled audio. Audio is resampled to 16 kHz, turned into a log-mel spectrogram, and then padded or cropped to a <em>fixed thirty-second window</em>. The encoder attends over all fifteen hundred frames at once, in both directions, and the decoder cross-attends to that representation while writing text. The fixed window and the bidirectional attention are what make the model robust and easy to train on a messy corpus; they are also exactly what make it non-streaming. A frame near the start of the window already knows about a frame near the end.</p>
+    <p>To run it online you have to decide how much context is available, and both extremes are bad. Wait for the full thirty seconds and the latency is thirty seconds. Cut the audio into chunks and decode each independently and the model loses context and mangles any word that straddles a boundary, which is a well-documented word-error-rate cliff. The middle ground is a mask. A <em>block-causal</em> mask lets each frame attend to every frame in its own block and all earlier blocks, but to nothing later, so a fixed look-ahead of one or two blocks buys back most of the accuracy at a bounded delay. The heatmap below is the two masks side by side: full bidirectional, where every frame sees every other, and block-causal, where the staircase of zeros is the future the model is not allowed to see.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="asr-window-canvas" width="660" height="300"></canvas>
+        <p class="g-canvas-hint">The fixed thirty-second window on top, and the encoder attention mask below. Rows are frames being encoded, columns are frames they attend to; the dark triangle in block-causal mode is the unavailable future.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Attention mask <span class="val">block-causal</span></label><input type="range" id="asr-win-mode" min="0" max="1" step="1" value="1"></div>
+        <div class="g-field"><label>Block size <span class="val">4</span> s</label><input type="range" id="asr-win-block" min="1" max="8" step="1" value="4"></div>
+        <div class="g-field"><label>Audio arrived <span class="val">20</span> s</label><input type="range" id="asr-win-arrive" min="5" max="30" step="1" value="20"></div>
+        <div class="g-readout" id="asr-window-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Re-encoding is the hidden cost.</b> A naive chunked Whisper re-runs the encoder on a fresh thirty-second window for every chunk, so the compute per second of audio is many times the offline figure. Caching the encoder state, or training with a block-causal mask in the first place, is what makes streaming affordable rather than merely possible.</span></div>
+  </section>
+
+  <section class="g-step" id="two-pass">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The two-pass fix</h2></div>
+    <p class="g-eyebrow">Cheap partials, then a rescoring pass</p>
+    <p>The standard answer is to stop pretending one pass can be both fast and accurate. U2 and U2++ train a single hybrid model with two decoders: a first pass that is <em>causal or chunk-based</em> and emits partial hypotheses with low latency, and a second pass whose attention decoder <em>re-decodes and rescores</em> those hypotheses using more right context. The streaming latency is a knob &mdash; the chunk size &mdash; and the final output approaches the non-streaming accuracy because the second pass gets to look ahead. The same idea appears in a transformer encoder as the block-causal mask from the previous step: attention restricted to the current block plus preceding blocks, so the model runs online with a fixed look-ahead instead of an unbounded one.</p>
+    <p>Note what is and is not being bought. A two-pass model does not remove the latency; it splits it into a small <em>partial</em> latency, which is what the interface shows while the user is still speaking, and a larger <em>finalisation</em> latency, by which time the text is as good as offline. Interleaving full-attention and causal layers is a third variant of the same trade: a few bidirectional layers recover some global context while the rest of the stack stays causal. In every version, context is the currency and latency is the price.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="asr-twopass-canvas" width="660" height="210"></canvas>
+        <p class="g-canvas-hint">Chunks of audio, the causal first pass that emits partials one chunk behind the speech, and the second pass that re-decodes each chunk once its look-ahead has arrived.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Chunk <span class="val">320</span> ms</label><input type="range" id="asr-two-chunk" min="100" max="800" step="20" value="320"></div>
+        <div class="g-field"><label>Look-ahead <span class="val">320</span> ms</label><input type="range" id="asr-two-delta" min="0" max="800" step="20" value="320"></div>
+        <div class="g-readout" id="asr-twopass-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Latency is a control, not a property.</b> The same weights serve a low-latency partial and a near-offline final transcript; the chunk size and the look-ahead decide which you get. That is why the two-pass design became the default in production recognisers.</span></div>
+  </section>
+
+  <section class="g-step" id="duplex">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The realtime duplex budget</h2></div>
+    <p class="g-eyebrow">Voice activity, barge-in, and the reply the user hears</p>
+    <p>A voice agent layers turn-taking on top of recognition. A voice-activity detector separates speech from silence, <em>endpointing</em> decides when a turn is over, and <em>barge-in</em> is the case where the user starts talking while the assistant is still speaking &mdash; which requires the agent to stop, listen and revise. In a cascade &mdash; voice activity, then recognition, then the language model, then synthesis &mdash; every stage is a separate service and the latency is the sum. The number the user actually feels is the gap between the end of their speech and the first sound of the reply, and in a well-built cascade the recogniser runs <em>concurrently</em> with the speech, so what remains in the gap is the network hop, the time to first token and the TTS first chunk.</p>
+    <p>The alternative is a native speech-to-speech model. Moshi models the user's audio and its own audio as two parallel streams inside one transformer and removes explicit speaker turns altogether, reporting a theoretical latency of about 160 ms and roughly 200 ms in practice. Qwen2.5-Omni keeps a thinker that writes text and a talker that emits speech tokens from the thinker's hidden states, and stream-decodes with a sliding-window decoder to cut the first-package delay. Both fold the text bottleneck away, at the cost of intermediate text you can no longer inspect and control. The simulator below makes the cascade arithmetic concrete: push the stages around, then flip the barge-in switch and watch a pending reply get cancelled.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="asr-turn-canvas" width="660" height="250"></canvas>
+        <p class="g-canvas-hint">A turn from <code>GenMedia.timeline.turn</code>: user speech, streaming recognition overlapping its end, the reply gap in its parts, and the assistant. The barge-in marker cancels a reply that has not started.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Speech <span class="val">2000</span> ms</label><input type="range" id="asr-speech" min="500" max="4000" step="100" value="2000"></div>
+        <div class="g-field"><label>ASR finalize <span class="val">120</span> ms</label><input type="range" id="asr-asr" min="20" max="500" step="10" value="120"></div>
+        <div class="g-field"><label>Network <span class="val">40</span> ms</label><input type="range" id="asr-net" min="5" max="200" step="5" value="40"></div>
+        <div class="g-field"><label>TTFT <span class="val">150</span> ms</label><input type="range" id="asr-ttft" min="30" max="600" step="10" value="150"></div>
+        <div class="g-field"><label>TTS first chunk <span class="val">60</span> ms</label><input type="range" id="asr-tts" min="10" max="300" step="10" value="60"></div>
+        <div class="g-field"><label><input type="checkbox" id="asr-barge"> Barge-in <span class="val">off</span></label></div>
+        <div class="g-readout" id="asr-turn-readout"></div>
+      </div>
+    </div>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="asr-budget-canvas" width="660" height="160"></canvas>
+        <p class="g-canvas-hint">The full cascade chain assembled with <code>GenMedia.timeline.budget</code> and drawn by <code>Guide.drawStacked</code>. The dashed line is the 300 ms figure a natural turn is allowed.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="asr-budget-readout"></div>
+        <p class="g-mini">A native duplex model does not remove these stages; it runs them jointly, so the recogniser's finalise time stops sitting in front of the reply.</p>
+      </div>
+    </div>
+    <div class="g-warn">⚠ <span><b>Two hundred to three hundred milliseconds is the whole budget.</b> Below about 200 ms a reply feels like a reflex; past roughly 300 ms listeners read it as hesitation, and past a second they start talking again. That is why barge-in handling is not a nice-to-have: an agent that cannot be interrupted will be interrupted anyway, badly.</span></div>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Recognition is the front half of every voice agent</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Serving</div>
+        <h3 style="margin:6px 0;">Realtime voice as a workload</h3>
+        <p style="margin-bottom:0;">A duplex conversation is a serving problem before it is a modelling one: streaming requests, tiny batches, a hard latency objective and a prefix cache that turns over every turn. The workload-page treatment of realtime voice is in <a href="{{ '/ai/llm-serving/workloads/' | relative_url }}">LLM Serving, Part 18</a>, and the numbers there are the same ones this page's budget bar is spending.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Sound · Synthesis</div>
+        <h3 style="margin:6px 0;">The answering half</h3>
+        <p style="margin-bottom:0;">Everything the reply spends after the first token is <a href="{{ '/ai/generative-media/tts/' | relative_url }}">text-to-speech</a>: the codec vocabulary, the autoregressive first chunk and the vocoder. Recognition and synthesis share the token vocabulary from the <a href="{{ '/ai/generative-media/audio-codecs/' | relative_url }}">neural codec</a>, which is why a native duplex model can run both in one sequence.</p>
+      </div>
+    </div>
+    <p>The frontier question is no longer whether recognition can be accurate, but whether the two halves of a conversation can be one model. Cascade systems are measurable, debuggable and easy to ship; native duplex models are faster and handle overlap, interruption and emotion that a turn-based pipeline simply throws away. Both are being deployed, and the part that follows is about the problem that arrives as soon as either one is good enough to fool a listener: telling generated speech from recorded speech, and attributing it.</p>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <p>The recognition literature is unusually well marked by a handful of papers. CTC makes the alignment marginalisable, RNN-T makes it a streaming transducer, Whisper makes attention the default and streaming the problem, U2 and U2++ supply the two-pass answer, and Moshi and Qwen2.5-Omni are the current argument that the whole pipeline should be one model.</p>
+    <p>Graves and coauthors introduce the blank symbol and the collapse rule; Graves follows with the transducer; Radford and coauthors scale the encoder-decoder; Zhang and Wu and coauthors unify streaming and non-streaming with a rescoring second pass; and Défossez and Xu and coauthors remove the turns entirely.</p>
+    <ul class="g-refs">
+      <li>Alex Graves, Santiago Fernández, Faustino Gomez and Jürgen Schmidhuber, <a href="https://dl.acm.org/doi/10.1145/1143844.1143891">"Connectionist Temporal Classification: Labelling Unsegmented Sequence Data with Recurrent Neural Networks"</a>, 2006 &mdash; the blank symbol and the alignment marginalised out.</li>
+      <li>Alex Graves, <a href="https://arxiv.org/abs/1211.3711">"Sequence Transduction with Recurrent Neural Networks"</a>, 2012 &mdash; the RNN-T, with a predictor feeding a joint network.</li>
+      <li>Alec Radford, Jong Wook Kim, Tao Xu and coauthors, <a href="https://arxiv.org/abs/2212.04356">"Robust Speech Recognition via Large-Scale Weak Supervision"</a>, 2022 &mdash; Whisper, the fixed thirty-second window and the encoder-decoder.</li>
+      <li>Binbin Zhang, Di Wu, Zhuoyuan Yao and coauthors, <a href="https://arxiv.org/abs/2012.05481">"Unified Streaming and Non-streaming Two-pass End-to-end Model for Speech Recognition"</a>, 2020 &mdash; U2, hybrid CTC and attention with a rescoring second pass.</li>
+      <li>Di Wu, Binbin Zhang, Chao Yang and coauthors, <a href="https://arxiv.org/abs/2106.05642">"U2++: Unified Two-pass Bidirectional End-to-end Model for Speech Recognition"</a>, 2021 &mdash; the bidirectional two-pass refinement.</li>
+      <li>Alexandre Défossez, Laurent Mazaré, Manu Orsini and coauthors, <a href="https://arxiv.org/abs/2410.00037">"Moshi: a speech-text foundation model for real-time dialogue"</a>, 2024 &mdash; full-duplex speech-to-speech with parallel user and model streams.</li>
+      <li>Jin Xu, Zhifang Guo, Jinzheng He and coauthors, <a href="https://arxiv.org/abs/2503.20215">"Qwen2.5-Omni Technical Report"</a>, 2025 &mdash; a thinker writing text and a talker emitting speech, stream-decoded.</li>
+    </ul>
+    <h3 style="margin:26px 0 6px;">Cheat sheet</h3>
+    <table class="g-cheat">
+      <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+      <tbody>
+        <tr><td>CTC</td><td>A frame classifier trained without alignment; the blank symbol absorbs the slack</td></tr>
+        <tr><td>Collapse rule</td><td>Merge runs of the same symbol, then drop blanks; a repeat needs a blank between</td></tr>
+        <tr><td>RNN-T</td><td>A transducer: a predictor over emitted tokens joined to each encoder frame</td></tr>
+        <tr><td>Blank (transducer)</td><td>No new token at this frame; advance time instead of the predictor</td></tr>
+        <tr><td>Log-mel</td><td>The 16 kHz spectrogram Whisper's encoder consumes</td></tr>
+        <tr><td>Thirty-second window</td><td>Whisper pads or crops every chunk to it; the irreducible offline latency</td></tr>
+        <tr><td>Bidirectional attention</td><td>Every frame sees every other frame; the reason Whisper is not causal</td></tr>
+        <tr><td>Block-causal mask</td><td>Attention to the current block and all earlier ones; a bounded look-ahead</td></tr>
+        <tr><td>Two-pass / U2</td><td>Causal first pass emits partials; a second pass rescores with right context</td></tr>
+        <tr><td>Chunk size</td><td>The streaming latency knob; partials land one chunk behind the speech</td></tr>
+        <tr><td>VAD</td><td>Voice activity detection; separates speech from silence</td></tr>
+        <tr><td>Endpointing</td><td>Deciding the turn is over, which is where most of the gap is spent</td></tr>
+        <tr><td>Barge-in</td><td>The user talks over the assistant; the agent must stop and listen</td></tr>
+        <tr><td>Cascade</td><td>VAD, ASR, LLM and TTS as separate stages, summed at the user</td></tr>
+        <tr><td>Native duplex</td><td>One model over both audio streams; Moshi and Qwen2.5-Omni</td></tr>
+        <tr><td>Felt gap</td><td>Speech end to first reply sound: network + TTFT + TTS first chunk</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}A recogniser good enough to transcribe anyone, and a synthesiser good enough to speak as anyone, together make voice the easiest modality to forge. The final part is about judging generated media and saying where it came from: evaluation, detection, watermarking and provenance.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.generative_media teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/genmedia-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/diffusion-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var GM = GenMedia;
+  var c = Guide.colors();
+
+  var ctcTokens = 8, ctcFrames = 44;
+  var rnntFrames = 7;
+  var winMode = 1, winBlock = 4, winArrive = 20;
+  var chunkMs = 320, deltaMs = 320;
+  var speechMs = 2000, asrMs = 120, netMs = 40, ttftMs = 150, ttsFirstMs = 60, bargeOn = false;
+
+  var CTC_W = 660, CTC_H = 250;
+  var RNN_W = 660, RNN_H = 220;
+  var WIN_W = 660, WIN_H = 300;
+  var TWO_W = 660, TWO_H = 210;
+  var TURN_W = 660, TURN_H = 250;
+  var BUD_W = 660, BUD_H = 160;
+
+  // ---- CTC spike matrix -----------------------------------------------------
+  function buildCTC(tokens, frames) {
+    var r = GM.rng(17);
+    var rows = tokens + 1, i, j;
+    var M = [];
+    for (i = 0; i < rows; i++) { M[i] = new Array(frames); for (j = 0; j < frames; j++) M[i][j] = 0.02; }
+    var speech = Math.max(tokens, Math.round(frames * 0.82));
+    var w = [], sum = 0;
+    for (i = 0; i < tokens; i++) { var v = 0.6 + r(); w.push(v); sum += v; }
+    var pos = 0, runs = [];
+    for (i = 0; i < tokens; i++) {
+      var len = Math.max(1, Math.round(speech * w[i] / sum));
+      var end = Math.min(frames, pos + len);
+      if (pos < frames) runs.push({ sym: i + 1, start: pos, end: end });
+      pos = end;
+      if (r() < 0.35 && pos + 2 <= frames) {
+        runs.push({ sym: i + 1, start: pos + 1, end: pos + 2 });
+        pos += 2;
+      }
+    }
+    var covered = new Array(frames);
+    for (j = 0; j < frames; j++) covered[j] = false;
+    for (var k = 0; k < runs.length; k++) {
+      var run = runs[k];
+      for (var t = run.start; t < run.end && t < frames; t++) {
+        M[run.sym][t] = 0.92;
+        covered[t] = true;
+      }
+    }
+    for (j = 0; j < frames; j++) M[0][j] = covered[j] ? 0.06 : 0.9;
+    return { M: M, runs: runs, covered: covered };
+  }
+
+  function drawCTC() {
+    if (!ctcSetup) return;
+    var ctx = ctcSetup.ctx;
+    var res = buildCTC(ctcTokens, ctcFrames);
+    var rowLabels = ['blank'], colLabels = [];
+    for (var i = 1; i <= ctcTokens; i++) rowLabels.push(String.fromCharCode(96 + i));
+    var step = Math.max(1, Math.ceil(ctcFrames / 8));
+    for (var t = 0; t < ctcFrames; t++) colLabels.push(t % step === 0 ? (t * 20) + ' ms' : '');
+    Guide.drawHeatmap(ctx, CTC_W, CTC_H, res.M, {
+      rowLabels: rowLabels, colLabels: colLabels, padL: 46, padB: 26,
+      colorLow: [244, 246, 252], colorHigh: [43, 95, 255]
+    });
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('CTC posteriors: ' + ctcTokens + ' symbols over ' + ctcFrames + ' frames', 4, 12);
+
+    var blank = 0, spoken = 0;
+    for (t = 0; t < ctcFrames; t++) { if (res.covered[t]) spoken++; else blank++; }
+    var repeats = 0;
+    for (i = 0; i + 1 < res.runs.length; i++) if (res.runs[i].sym === res.runs[i + 1].sym) repeats++;
+    var el = document.getElementById('asr-ctc-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">symbols</span> ' + ctcTokens + '</div>' +
+        '<div><span class="k">spoken frames</span> <span class="hi">' + spoken + '</span></div>' +
+        '<div><span class="k">blank frames</span> ' + blank + '</div>' +
+        '<div><span class="k">frames / symbol</span> ' + (ctcFrames / ctcTokens).toFixed(1) + '</div>' +
+        '<div><span class="k">repeats split by a blank</span> ' + repeats + '</div>' +
+        '<div class="g-mini">Collapse: merge runs of the same letter, then delete the blank row. Without the blank, a repeated letter is unrecoverable.</div>';
+    }
+  }
+
+  // ---- RNN-T lattice --------------------------------------------------------
+  function rnntPath(T, U) {
+    var r = GM.rng(23);
+    var pts = [{ t: 0, u: 0, emit: false }];
+    var t = 0, u = 0, guard = 0;
+    while ((t < T || u < U) && guard++ < 400) {
+      if (u < U && (t >= T || r() < 0.4)) { u++; pts.push({ t: t, u: u, emit: true }); }
+      else if (t < T) { t++; pts.push({ t: t, u: u, emit: false }); }
+      else break;
+    }
+    return pts;
+  }
+
+  function drawRNNT() {
+    if (!rnntSetup) return;
+    var ctx = rnntSetup.ctx;
+    ctx.clearRect(0, 0, RNN_W, RNN_H);
+    var T = rnntFrames, U = 4;
+    var padL = 62, padR = 34, padT = 40, padB = 44;
+    var plotW = RNN_W - padL - padR, plotH = RNN_H - padT - padB;
+    function X(t) { return padL + plotW * t / T; }
+    function Y(u) { return padT + plotH * (1 - u / U); }
+
+    for (var t = 0; t <= T; t++) for (var u = 0; u <= U; u++) {
+      ctx.beginPath(); ctx.arc(X(t), Y(u), 2.4, 0, 2 * Math.PI);
+      ctx.fillStyle = 'rgba(120,130,160,0.5)'; ctx.fill();
+    }
+    var pts = rnntPath(T, U);
+    for (var i = 0; i + 1 < pts.length; i++) {
+      var a = pts[i], b = pts[i + 1];
+      var up = b.u > a.u;
+      Guide.drawArrow(ctx, X(a.t), Y(a.u), X(b.t), Y(b.u), { color: up ? c.accent : c.accent400, width: 2, head: 6 });
+    }
+    var emitted = 0, blanks = 0;
+    for (i = 1; i < pts.length; i++) {
+      if (pts[i].emit) {
+        emitted++;
+        ctx.fillStyle = c.accent; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(String.fromCharCode(96 + pts[i].u), X(pts[i].t) + 5, Y(pts[i].u) + 4);
+      } else blanks++;
+    }
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('RNN-T lattice: right = blank (advance t), up = emit (advance u)', 4, 14);
+    ctx.textAlign = 'center';
+    ctx.fillText('encoder frames t', padL + plotW / 2, RNN_H - 8);
+    ctx.save();
+    ctx.translate(16, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('predictor u', 0, 0);
+    ctx.restore();
+    // legend
+    ctx.fillStyle = c.accent400; ctx.fillRect(padL, 22, 12, 6);
+    ctx.fillStyle = c.text; ctx.textAlign = 'left';
+    ctx.fillText('blank', padL + 17, 28);
+    ctx.fillStyle = c.accent; ctx.fillRect(padL + 78, 22, 12, 6);
+    ctx.fillStyle = c.text;
+    ctx.fillText('emit token', padL + 95, 28);
+
+    var el = document.getElementById('asr-rnnt-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">encoder frames</span> ' + T + '</div>' +
+        '<div><span class="k">tokens emitted</span> <span class="hi">' + emitted + '</span></div>' +
+        '<div><span class="k">blank steps</span> ' + blanks + '</div>' +
+        '<div class="g-mini">Because every path only moves right or up, a token can be committed before the utterance ends. Training sums over all such paths, as with CTC.</div>';
+    }
+  }
+
+  // ---- Whisper window and the mask -----------------------------------------
+  function drawWindow() {
+    if (!winSetup) return;
+    var ctx = winSetup.ctx;
+    var N = 30, i, j, M = [];
+    for (i = 0; i < N; i++) { M[i] = new Array(N); for (j = 0; j < N; j++) M[i][j] = 0; }
+    if (winMode === 0) {
+      for (i = 0; i < N; i++) for (j = 0; j < N; j++) M[i][j] = 1;
+    } else {
+      var B = winBlock;
+      for (i = 0; i < N; i++) {
+        var bEnd = Math.min(N - 1, (Math.floor(i / B) + 1) * B - 1);
+        for (j = 0; j < N; j++) M[i][j] = (j <= bEnd) ? 1 : 0;
+      }
+    }
+    var rowLabels = [], colLabels = [];
+    for (i = 0; i < N; i++) {
+      rowLabels.push(i % 5 === 0 ? (i + ' s') : '');
+      colLabels.push(i % 5 === 0 ? (i + ' s') : '');
+    }
+    Guide.drawHeatmap(ctx, WIN_W, WIN_H, M, {
+      min: 0, max: 1, rowLabels: rowLabels, colLabels: colLabels,
+      padL: 46, padT: 104, padB: 30, colorLow: [246, 247, 252], colorHigh: [43, 95, 255]
+    });
+
+    var barX = 46, barW = WIN_W - 46 - 6, barY = 42, barH = 32;
+    function SX(s) { return barX + barW * (s / 30); }
+    var cx = SX(winArrive);
+    ctx.fillStyle = 'rgba(214,0,108,0.18)';
+    ctx.fillRect(barX, barY, Math.max(0, cx - barX), barH);
+    ctx.fillStyle = 'rgba(43,95,255,0.07)';
+    ctx.fillRect(cx, barY, Math.max(0, barX + barW - cx), barH);
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
+    for (var s = 0; s <= 30; s += 5) {
+      ctx.beginPath(); ctx.moveTo(SX(s), barY + barH); ctx.lineTo(SX(s), barY + barH + 5); ctx.stroke();
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(s + 's', SX(s), barY - 3);
+    }
+    ctx.save();
+    ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.6; ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(cx, barY - 6); ctx.lineTo(cx, barY + barH + 6); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('audio so far', barX + 6, barY + barH * 0.68);
+    ctx.textAlign = 'right';
+    ctx.fillText('unseen future', barX + barW - 6, barY + barH * 0.68);
+    ctx.textAlign = 'left';
+    ctx.fillText('fixed 30 s window', 4, 14);
+
+    var el = document.getElementById('asr-window-readout');
+    if (el) {
+      var wait = 30 - winArrive;
+      el.innerHTML =
+        '<div><span class="k">window</span> 30 s fixed</div>' +
+        '<div><span class="k">audio arrived</span> ' + winArrive + ' s</div>' +
+        '<div><span class="k">window complete in</span> <span class="' + (wait > 5 ? 'bad' : 'hi') + '">' + wait + ' s</span></div>' +
+        '<div><span class="k">mask</span> ' + (winMode === 0 ? 'full bidirectional' : 'block-causal, ' + winBlock + ' s blocks') + '</div>' +
+        '<div class="g-mini">' + (winMode === 0
+          ? 'Every frame attends to every other, including the future: accurate but non-streaming.'
+          : 'Each frame sees its block and all earlier blocks. A one-block look-ahead recovers most of the accuracy at a bounded delay.') + '</div>';
+    }
+  }
+
+  // ---- two-pass streaming diagram ------------------------------------------
+  function drawTwoPass() {
+    if (!twoSetup) return;
+    var ctx = twoSetup.ctx;
+    ctx.clearRect(0, 0, TWO_W, TWO_H);
+    var padL = 112, padR = 20, padT = 40, padB = 34;
+    var plotW = TWO_W - padL - padR, totalMs = 2400;
+    function X(ms) { return padL + plotW * Math.max(0, Math.min(totalMs, ms)) / totalMs; }
+    var rowH = 24, rgap = 16, top = padT;
+    function rowY(i) { return top + i * (rowH + rgap); }
+    var labels = ['audio chunks', 'pass 1 · causal', 'pass 2 · look-ahead'];
+
+    ctx.fillStyle = 'rgba(43,95,255,0.13)';
+    ctx.fillRect(X(0), rowY(0), X(totalMs) - X(0), rowH);
+    ctx.strokeStyle = c.accent400; ctx.lineWidth = 1;
+    ctx.strokeRect(X(0) + 0.5, rowY(0) + 0.5, X(totalMs) - X(0) - 1, rowH - 1);
+
+    for (var start = 0; start < totalMs; start += chunkMs) {
+      var end = Math.min(totalMs, start + chunkMs);
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(X(start), rowY(0)); ctx.lineTo(X(start), rowY(0) + rowH); ctx.stroke();
+
+      ctx.fillStyle = c.accent400;
+      ctx.fillRect(X(start), rowY(1), Math.max(1, X(end) - X(start)), rowH);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      if (X(end) - X(start) > 30) ctx.fillText('partial', (X(start) + X(end)) / 2, rowY(1) + rowH * 0.68);
+
+      var d1 = Math.min(totalMs, end + deltaMs);
+      ctx.fillStyle = c.accent;
+      ctx.fillRect(X(end), rowY(2), Math.max(1, X(d1) - X(end)), rowH);
+      if (X(d1) - X(end) > 34) {
+        ctx.fillStyle = '#fff';
+        ctx.fillText('re-decode', (X(end) + X(d1)) / 2, rowY(2) + rowH * 0.68);
+      }
+      ctx.save();
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(X(d1), rowY(2)); ctx.lineTo(X(d1), rowY(2) + rowH); ctx.stroke();
+      ctx.restore();
+    }
+    for (var i = 0; i < labels.length; i++) {
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(labels[i], padL - 8, rowY(i) + rowH * 0.68);
+    }
+    ctx.textAlign = 'left';
+    ctx.fillText('chunk boundaries and the look-ahead shift', 4, 16);
+    ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    for (var m = 0; m <= totalMs; m += 400) {
+      ctx.fillText(m + ' ms', X(m), rowY(2) + rowH + 16);
+    }
+
+    var el = document.getElementById('asr-twopass-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">chunk</span> ' + chunkMs + ' ms</div>' +
+        '<div><span class="k">look-ahead</span> ' + deltaMs + ' ms</div>' +
+        '<div><span class="k">partial latency</span> ' + chunkMs + ' ms</div>' +
+        '<div><span class="k">final latency</span> <span class="hi">' + (chunkMs + deltaMs) + ' ms</span></div>' +
+        '<div class="g-mini">The first pass commits a partial one chunk behind the audio; the second pass waits for the look-ahead and then matches offline accuracy.</div>';
+    }
+  }
+
+  function turnModel() {
+    return GM.timeline.turn({
+      speechMs: speechMs, asrMs: asrMs, netMs: netMs, ttftMs: ttftMs,
+      ttsFirstMs: ttsFirstMs, bargeInMs: bargeOn ? speechMs + 90 : null
+    });
+  }
+
+  // ---- duplex turn gantt ----------------------------------------------------
+  function drawTurn() {
+    if (!turnSetup) return;
+    var ctx = turnSetup.ctx;
+    ctx.clearRect(0, 0, TURN_W, TURN_H);
+    var t = turnModel();
+    var totalMs = Math.max(t.replyStart + 1400, 2600);
+    var padL = 108, padR = 18, padT = 34, padB = 40;
+    var plotW = TURN_W - padL - padR;
+    function X(ms) { return padL + plotW * Math.max(0, Math.min(totalMs, ms)) / totalMs; }
+    var rowH = 24, rgap = 14, top = padT;
+    function rowY(i) { return top + i * (rowH + rgap); }
+    var labels = ['user speech', 'streaming ASR', 'reply gap', 'assistant'];
+
+    for (var m = 0; m <= totalMs; m += 500) {
+      ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(X(m), top - 8); ctx.lineTo(X(m), rowY(3) + rowH + 6); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(m + ' ms', X(m), rowY(3) + rowH + 20);
+    }
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, top - 8); ctx.lineTo(padL, rowY(3) + rowH + 6); ctx.stroke();
+
+    ctx.fillStyle = c.accent400;
+    ctx.fillRect(X(0), rowY(0), Math.max(1, X(speechMs) - X(0)), rowH);
+
+    var asrStart = Math.max(0, speechMs - asrMs);
+    ctx.fillStyle = 'rgba(214,0,108,0.55)';
+    ctx.fillRect(X(asrStart), rowY(1), Math.max(1, X(speechMs) - X(asrStart)), rowH);
+
+    var b = GM.timeline.budget([
+      { name: 'network', ms: netMs, color: c.accent2 },
+      { name: 'time to first token', ms: ttftMs, color: c.accent700 },
+      { name: 'TTS first chunk', ms: ttsFirstMs, color: c.accent }
+    ]);
+    var at = speechMs;
+    for (var k = 0; k < b.segments.length; k++) {
+      var seg = b.segments[k];
+      ctx.fillStyle = seg.color;
+      ctx.fillRect(X(at), rowY(2), Math.max(1, X(at + seg.ms) - X(at)), rowH);
+      at += seg.ms;
+    }
+
+    var replyEnd = t.replyStart + 1400;
+    if (t.interrupted) {
+      ctx.fillStyle = 'rgba(200,60,60,0.22)';
+      ctx.fillRect(X(t.replyStart), rowY(3), Math.max(1, X(replyEnd) - X(t.replyStart)), rowH);
+      ctx.fillStyle = '#c83232'; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('reply cancelled', X(t.replyStart) + 6, rowY(3) + rowH * 0.68);
+    } else {
+      ctx.fillStyle = c.accent;
+      ctx.fillRect(X(t.replyStart), rowY(3), Math.max(1, X(replyEnd) - X(t.replyStart)), rowH);
+    }
+
+    if (bargeOn) {
+      var bx = X(speechMs + 90);
+      ctx.save();
+      ctx.strokeStyle = '#c83232'; ctx.lineWidth = 1.8; ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(bx, top - 8); ctx.lineTo(bx, rowY(3) + rowH + 6); ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = '#c83232'; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('barge-in', bx + 4, top - 12);
+    }
+
+    for (var i = 0; i < labels.length; i++) {
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(labels[i], padL - 8, rowY(i) + rowH * 0.68);
+    }
+    ctx.textAlign = 'left';
+    ctx.fillText('one turn, from speech to first reply sound', 4, 16);
+
+    var el = document.getElementById('asr-turn-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">user speaks</span> ' + speechMs + ' ms</div>' +
+        '<div><span class="k">ASR finalize</span> ' + asrMs + ' ms (concurrent)</div>' +
+        '<div><span class="k">gap to reply</span> <span class="' + (t.gapMs > 300 ? 'bad' : 'hi') + '">' + Guide.fmtMs(t.gapMs) + '</span></div>' +
+        '<div><span class="k">reply starts at</span> ' + t.replyStart + ' ms</div>' +
+        '<div><span class="k">barge-in</span> ' + (bargeOn ? (t.interrupted ? 'cancels the pending reply' : 'too late to cancel') : 'off') + '</div>' +
+        '<div class="g-mini">The felt gap is network + TTFT + TTS first chunk. Streaming recognition overlaps the speech, so it is not added on top.</div>';
+    }
+  }
+
+  // ---- cascade budget bar ---------------------------------------------------
+  function drawBudget() {
+    if (!budSetup) return;
+    var ctx = budSetup.ctx;
+    var b = GM.timeline.budget([
+      { name: 'ASR', ms: asrMs, color: c.accent400 },
+      { name: 'network', ms: netMs, color: c.accent2 },
+      { name: 'TTFT', ms: ttftMs, color: c.accent700 },
+      { name: 'TTS first', ms: ttsFirstMs, color: c.accent }
+    ]);
+    var scaleMax = Math.max(400, Math.ceil(b.total / 100) * 100);
+    var rows = [{ label: 'cascade', segments: b.segments.map(function (s) { return { value: s.ms, color: s.color, name: s.name }; }) }];
+    var geo = Guide.drawStacked(ctx, BUD_W, BUD_H, rows, { padL: 84, padT: 26, padB: 60, maxTotal: scaleMax });
+    var x300 = geo.padL + geo.scale * 300;
+    ctx.save();
+    ctx.strokeStyle = c.text; ctx.lineWidth = 1.4; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(x300, geo.padT - 6); ctx.lineTo(x300, geo.padT + geo.barH + 6); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right';
+    ctx.fillText('300 ms target', x300 - 4, geo.padT - 10);
+
+    var lx = geo.padL;
+    for (var i = 0; i < b.segments.length; i++) {
+      var s = b.segments[i];
+      ctx.fillStyle = s.color; ctx.fillRect(lx, geo.padT + geo.barH + 14, 10, 10);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      var label = s.name + ' ' + s.ms + 'ms';
+      ctx.fillText(label, lx + 14, geo.padT + geo.barH + 23);
+      lx += 20 + ctx.measureText(label).width + 12;
+    }
+
+    var felt = netMs + ttftMs + ttsFirstMs;
+    var el = document.getElementById('asr-budget-readout');
+    if (el) {
+      el.innerHTML =
+        '<div><span class="k">cascade chain</span> ' + Guide.fmtMs(b.total) + '</div>' +
+        '<div><span class="k">felt gap (no ASR)</span> <span class="' + (felt > 300 ? 'bad' : 'hi') + '">' + Guide.fmtMs(felt) + '</span></div>' +
+        '<div><span class="k">verdict</span> ' + (felt > 300 ? 'hesitant' : 'reflex-like') + '</div>' +
+        '<div class="g-mini">Total cascade work grows with ASR, but only the stages after the user stops speaking land in the felt gap.</div>';
+    }
+  }
+
+  var ctcSetup = Guide.setupCanvas(document.getElementById('asr-ctc-canvas'), CTC_W, CTC_H, function () { drawCTC(); });
+  var rnntSetup = Guide.setupCanvas(document.getElementById('asr-rnnt-canvas'), RNN_W, RNN_H, function () { drawRNNT(); });
+  var winSetup = Guide.setupCanvas(document.getElementById('asr-window-canvas'), WIN_W, WIN_H, function () { drawWindow(); });
+  var twoSetup = Guide.setupCanvas(document.getElementById('asr-twopass-canvas'), TWO_W, TWO_H, function () { drawTwoPass(); });
+  var turnSetup = Guide.setupCanvas(document.getElementById('asr-turn-canvas'), TURN_W, TURN_H, function () { drawTurn(); });
+  var budSetup = Guide.setupCanvas(document.getElementById('asr-budget-canvas'), BUD_W, BUD_H, function () { drawBudget(); });
+
+  function redraw() { drawCTC(); drawRNNT(); drawWindow(); drawTwoPass(); drawTurn(); drawBudget(); }
+
+  Guide.bindSliders(document.querySelectorAll('#asr-ctc-tokens'), function (el) {
+    ctcTokens = parseInt(el.value, 10);
+    drawCTC();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-ctc-frames'), function (el) {
+    ctcFrames = parseInt(el.value, 10);
+    drawCTC();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-rnnt-frames'), function (el) {
+    rnntFrames = parseInt(el.value, 10);
+    drawRNNT();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-win-mode'), function (el) {
+    winMode = parseInt(el.value, 10);
+    var p = el.parentElement; if (p) { var lab = p.querySelector('.val'); if (lab) lab.textContent = winMode === 0 ? 'bidirectional' : 'block-causal'; }
+    drawWindow();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-win-block'), function (el) {
+    winBlock = parseInt(el.value, 10);
+    drawWindow();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-win-arrive'), function (el) {
+    winArrive = parseInt(el.value, 10);
+    drawWindow();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-two-chunk'), function (el) {
+    chunkMs = parseInt(el.value, 10);
+    drawTwoPass();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-two-delta'), function (el) {
+    deltaMs = parseInt(el.value, 10);
+    drawTwoPass();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-speech'), function (el) {
+    speechMs = parseInt(el.value, 10);
+    drawTurn();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-asr'), function (el) {
+    asrMs = parseInt(el.value, 10);
+    drawTurn(); drawBudget();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-net'), function (el) {
+    netMs = parseInt(el.value, 10);
+    drawTurn(); drawBudget();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-ttft'), function (el) {
+    ttftMs = parseInt(el.value, 10);
+    drawTurn(); drawBudget();
+  });
+  Guide.bindSliders(document.querySelectorAll('#asr-tts'), function (el) {
+    ttsFirstMs = parseInt(el.value, 10);
+    drawTurn(); drawBudget();
+  });
+
+  var bargeEl = document.getElementById('asr-barge');
+  if (bargeEl) {
+    bargeEl.addEventListener('change', function () {
+      bargeOn = bargeEl.checked;
+      var p = bargeEl.parentElement; if (p) { var lab = p.querySelector('.val'); if (lab) lab.textContent = bargeOn ? 'on' : 'off'; }
+      drawTurn();
+    });
+  }
+
+  redraw();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'asr-ctc-blank',
+      kind: 'choice',
+      prompt: 'What does the CTC blank symbol let the network do?',
+      options: [
+        { label: 'Emit a label sequence shorter than the frame sequence without ever being told the alignment.', correct: true },
+        { label: 'Skip the encoder entirely and predict letters from raw samples.', correct: false },
+        { label: 'Force attention to be strictly diagonal at inference time.', correct: false }
+      ],
+      explanation: 'Blank absorbs the frames where no new symbol is being spoken, so any transcript can be matched to any number of frames by many monotonic paths. The loss marginalises over those paths; at inference you merge repeats and drop blanks.'
+    },
+    {
+      id: 'asr-whisper-stream',
+      kind: 'choice',
+      prompt: 'Why is a Whisper-style encoder hard to run in a streaming setting?',
+      options: [
+        { label: 'The encoder attends over a fixed 30 s window in both directions, so early frames already see the future.', correct: true },
+        { label: 'It cannot process 16 kHz audio without downsampling to 8 kHz first.', correct: false },
+        { label: 'Its decoder is non-autoregressive and needs the whole transcript up front.', correct: false }
+      ],
+      explanation: 'Bidirectional attention over a padded fixed window is what makes the model accurate and what makes it non-causal. Streaming needs a mask (block-causal or chunked) or a second pass that adds right context later.'
+    },
+    {
+      id: 'asr-two-pass-latency',
+      kind: 'numeric',
+      prompt: 'A two-pass streaming recogniser uses 320 ms chunks and a 320 ms look-ahead before it finalises the text. What is the finalisation latency, in milliseconds?',
+      answer: 640,
+      tolerance: 0.5,
+      explanation: 'The first pass commits a partial one chunk behind the audio, and the second pass waits for the look-ahead to arrive, so finalisation lands at chunk + look-ahead = 320 + 320 = 640 ms.'
+    },
+    {
+      id: 'asr-gap',
+      kind: 'numeric',
+      prompt: 'In a cascade a reply is preceded by a 40 ms network hop, 150 ms to first token and a 60 ms TTS first chunk, with the recogniser running concurrently with the speech. What is the gap the user feels, in milliseconds?',
+      answer: 250,
+      tolerance: 0.5,
+      explanation: 'Streaming recognition overlaps the user\'s speech, so it is not added on top of the gap: 40 + 150 + 60 = 250 ms, inside the 200-300 ms figure a natural turn is allowed.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,805 @@
+---
+title: "LLM Serving, Interactively — Part 10: Quantization and numerics"
+description: "Formats from FP16 to MXFP4, activation outliers, why the serving win is bandwidth rather than FLOPs, and how to measure the damage."
+permalink: "/ai/llm-serving/quantization/"
+section: "ai"
+series: "llm_serving"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .qz-bits { display: flex; height: 34px; border-radius: var(--radius-sm); overflow: hidden; margin: 6px 0 2px; }
+  .qz-bits > div {
+    display: flex; align-items: center; justify-content: center; min-width: 0;
+    font-family: var(--font-mono); font-size: 11px; color: #fff; white-space: nowrap; overflow: hidden;
+  }
+  .qz-bits .b-sign { background: var(--color-neutral-600); }
+  .qz-bits .b-exp { background: var(--color-accent); }
+  .qz-bits .b-man { background: var(--color-accent-2); }
+  .qz-bl { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; opacity: 0.75; margin: 2px 0 12px; }
+  .qz-bl .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .qz-legend { font-size: 11.5px; line-height: 1.6; opacity: 0.8; }
+  .qz-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.llm_serving %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Part 10 of 20</span>
+    <h1>Quantization and numerics</h1>
+    <p>Every bit you drop is memory bandwidth you do not pay for on every token — and a small numerical error you may or may not notice. This part starts at the bit pattern, shows what an activation outlier does to it, and ends with a decision table you can put in a runbook.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="formats">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>A format is just a bit budget</h2></div>
+    <p class="g-eyebrow">Sign, exponent, mantissa</p>
+    <p><a href="{{ '/ai/llm-training/inference/' | relative_url }}">The training guide's quantization demo</a> established the basic size-versus-error trade by rounding a synthetic weight distribution at 16, 8 and 4 bits. That is the right first intuition and we will not repeat it. The serving question is narrower and harder: given 16, 8 or 4 bits, <em>how are they spent</em>, and where does the scale that maps them back to real numbers live? A format is a fixed contract — so many bits of sign, so many of exponent, so many of mantissa — and every downstream number (bytes per token, concurrent sequences, tokens per second, and a small quality tax) is a consequence of that contract.</p>
+    <p>Pick a format and a probe value below. The strip shows how the bits are allocated, the number line shows which real values the format can actually represent near the probe, and the readout reports the round-trip error you would introduce by storing the probe in that format.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="qz-fmt-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Ticks are representable values in the window around the probe; the marker is the probe, the ring is the nearest representable value.</p>
+      </div>
+      <div class="g-controls">
+        <div id="qz-bits"></div>
+        <div class="qz-bl">
+          <span><span class="sw" style="background:var(--color-neutral-600)"></span>sign</span>
+          <span><span class="sw" style="background:var(--color-accent)"></span>exponent</span>
+          <span><span class="sw" style="background:var(--color-accent-2)"></span>mantissa / magnitude</span>
+        </div>
+        <div class="g-btnrow" id="qz-fmt-btns"></div>
+        <div class="g-field"><label>Probe value <span class="val">1.00</span></label><input type="range" id="qz-probe" min="0.25" max="4" step="0.05" value="1"></div>
+        <div class="g-readout" id="qz-fmt-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="sixteen">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Sixteen bits, eight bits, and where the scale lives</h2></div>
+    <p class="g-eyebrow">Width is only half the decision</p>
+    <p>FP16 and BF16 are both 16 bits and are not interchangeable. FP16 spends 5 bits on the exponent and 10 on the mantissa; BF16 spends 8 and 7. That gives BF16 the same exponent range as FP32 — roughly <span class="qz-legend">10<sup>±38</sup></span> — and FP16 more mantissa near 1.0. In practice BF16 is preferred for weights and activations because a wide exponent tolerates the occasional large value without saturating, and the 8-bit mantissa is plenty once you accept a relative step of about <span class="qz-legend">2<sup>-8</sup> ≈ 0.4%</span>.</p>
+    <p>FP8 comes in two shapes for two jobs. <strong>E4M3</strong> (4 exponent bits, 3 mantissa) keeps precision up to a maximum finite value of 448 and is the format Hopper and Blackwell tensor cores accelerate natively; DeepSeek-V3 trained and served in E4M3 with per-block scaling. <strong>E5M2</strong> trades two mantissa bits for a much larger range and is used where values can spike, classically in gradients. Neither is a drop-in for the 16-bit baseline: at 3 mantissa bits the relative step is <span class="qz-legend">2<sup>-3</sup> = 12.5%</span>, which is why FP8 only works with a scale.</p>
+    <p>And that is the part the bit-width conversation always skips. Quantization error is set by the <em>range</em> you pack into a fixed number of levels, and the range is chosen per <strong>scale</strong>. One scale per tensor means a single large value dictates the step for every other value. One scale per output channel is strictly better. One scale per group of 128 weights along the input dimension is better again, at the cost of storing more scales. The readout above uses a fixed per-tensor range; the next demo makes the choice explicit.</p>
+  </section>
+
+  <section class="g-step" id="outliers">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Outliers: the tensor you actually have to quantize</h2></div>
+    <p class="g-eyebrow">SmoothQuant and the migration of scale</p>
+    <p>Weights are well behaved: roughly Gaussian, similar magnitude across channels. Activations are not. A handful of input channels — often the same few across layers — carry values one to two orders of magnitude larger than the rest (the "massive activations" that make W8A8 harder than weight-only). Quantize activations per-tensor and one outlier channel sets a step so coarse that every ordinary channel is destroyed. The fix, from SmoothQuant, is an algebraic identity: you may multiply a column of the weights by a per-channel factor and divide the corresponding activation channel by the same factor without changing the product. Choose the factor to move the activation's dynamic range into the weights, which tolerate it.</p>
+    <p>The demo builds a seeded Gaussian weight matrix and an activation matrix with three deliberate outlier channels, then quantizes both under your chosen format and granularity. Slide alpha to move dynamic range out of the activations and into the weights: the activation profile flattens monotonically, but the output error has a shallow optimum in between — too little alpha leaves the outliers in the activations, while pushing all of it into the weights makes those weights harder to quantize. Production SmoothQuant sits near α = 0.5.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="qz-tensor-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Per-input-channel magnitude on a log₂ scale. Spikes are outliers; the accent line is after smoothing.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="qz-tensor-fmt"></div>
+        <div class="g-btnrow" id="qz-tensor-gran"></div>
+        <div class="g-field"><label>SmoothQuant alpha <span class="val">0.50</span></label><input type="range" id="qz-alpha" min="0" max="1" step="0.05" value="0.5"></div>
+        <div class="g-readout" id="qz-tensor-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="int4">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>INT4 weight-only: GPTQ and AWQ</h2></div>
+    <p class="g-eyebrow">The safest 4 bits</p>
+    <p>The most common production configuration is deliberately asymmetric: weights in 4 bits, activations left in FP16. This sidesteps the outlier problem entirely, because nothing about the activations changes — only the weight matrices are stored coarsely, and each is dequantized to FP16 immediately before the matmul. <strong>GPTQ</strong> does this with layer-wise second-order error compensation: it quantizes one column at a time and updates the remaining weights to cancel the error it just introduced, reaching 3–4 bits with negligible degradation and a reported ~3.25× end-to-end speedup on an A100. <strong>AWQ</strong> starts from the observation that about 1% of channels matter far more than the rest and protects them by scaling rather than by keeping them at higher precision, which is cheaper and tends to be the safer default for instruction-tuned models. Group size matters more than the algorithm in practice: 128 is standard, and going below 64 buys little quality for a lot of scale overhead.</p>
+    <p>The catch is the one section 7 makes visual: weights in 4 bits shrink the bytes you read, but the tensor cores still run the matmul at FP16 precision unless the activations are quantized too. At batch size 1, where decode is purely memory-bound, that is almost a pure win. At high batch, where the step becomes compute-bound, it is worth nothing.</p>
+  </section>
+
+  <section class="g-step" id="block">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Block formats: MXFP4 and NVFP4</h2></div>
+    <p class="g-eyebrow">Shared exponents instead of shared scales</p>
+    <p>There is a third way to spend the scale bits. Instead of a floating-point scale per block, <strong>microscaling (MX)</strong> formats store a single power-of-two exponent shared by a block of values, and each value is a small set of mantissa bits — for MXFP4, an E2M1 element with representable magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6}. The block size is fixed at 32 and the exponent is shared by all 32 values, so the format is <em>dequantize-friendly</em>: hardware can reconstruct the block cheaply, and there is no per-tensor range to blow up. <strong>NVFP4</strong> is NVIDIA's Blackwell variant, adding a per-block FP8 scale on top of the per-value E2M1 (a two-level scaling scheme, block 16) so a block's values need not be exact powers of two. gpt-oss-120b ships its weights in MXFP4; Blackwell adds native FP4 tensor cores, which is why B200 advertises ~9,000 dense FP4 TFLOP/s (the H100 column in the numbers table has no FP4 row at all).</p>
+    <p>Block formats move the quality question from "how many bits" to "how many bits, and which layers stay wide". Community evaluations consistently find that the damage concentrates in attention projections, router weights and embeddings, and that keeping those at BF16 while the feed-forward blocks go to 4 bits is worth more than any choice of 4-bit algorithm.</p>
+  </section>
+
+  <section class="g-step" id="kvquant">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>KV-cache quantization is a separate decision</h2></div>
+    <p class="g-eyebrow">A second, larger tensor</p>
+    <p>Weights are static and read once per token; the KV cache is written once and then re-read on every single decode step, and it grows with context and concurrency. It is a different tensor with a different access pattern and it deserves its own format decision — you can ship FP8 weights and FP16 KV, or BF16 weights and INT8 KV, independently. The lever is enormous because KV bytes are what cap how many sequences fit in a fixed memory pool. Following <a href="{{ '/ai/llm-serving/kv-cache/' | relative_url }}">Part 4</a>, a Llama-3.1-70B-class model with GQA caches 327,680 bytes per token at FP16 — 0.33 MB per token, before any batching. Halving the element width doubles the number of concurrent long-context sequences at the same memory budget.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="qz-kv-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">Maximum resident sequences at the chosen context length, for a fixed KV memory budget.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow" id="qz-kv-model"></div>
+        <div class="g-field"><label>Context length <span class="val">8192</span></label><input type="range" id="qz-kv-tokens" min="1024" max="32768" step="1024" value="8192"></div>
+        <div class="g-field"><label>KV memory budget <span class="val">80</span></label><input type="range" id="qz-kv-budget" min="10" max="320" step="10" value="80"></div>
+        <div class="g-readout" id="qz-kv-readout"></div>
+      </div>
+    </div>
+    <p>KV quantization is harder to get right than weight quantization, because the cache is per-request and every error is re-read thousands of times. Per-channel keys and per-token values are the common pattern, and most engines keep the first and last few layers, or the attention sinks, at higher precision. Treat it as a knob to test against your own evaluation, not a free 2×.</p>
+  </section>
+
+  <section class="g-step" id="bandwidth">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>The win is bandwidth, not FLOPs</h2></div>
+    <p class="g-eyebrow">Why the speedup evaporates at batch</p>
+    <p>This is the counter-intuitive result worth internalizing. Quantization shrinks the number of <em>bytes</em> a decode step must read. It does not, by itself, reduce the number of <em>FLOPs</em> the matmul performs: a 4-bit weight is dequantized to FP16 before the multiply, so the tensor core still does FP16 work unless the activation is quantized too. At batch size 1 every decode step is memory-bound (arithmetic intensity around 1–2 FLOPs/byte) and the step time is almost exactly bytes over bandwidth — so 4-bit weights look like a 4× win. As batch grows, the same weight read is amortized over more tokens and the step becomes compute-bound; the int4 kernel must still do all the FP16 FLOPs and the speedup collapses toward 1×. The fix is asymmetric again: quantize the <em>activations</em> too (W4A8, 4-bit weights with FP8 activations) so the matmul runs on the FP8 tensor cores, which keeps roughly a 2× even in the compute-bound regime. The plot below uses the shared step-time model: x-axis is batch, y-axis is speedup over the FP16 baseline at the same batch.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="qz-speed-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Solid marks show the selected batch on each curve; the dashed line is parity with BF16.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Batch size <span class="val">1</span></label><input type="range" id="qz-speed-batch" min="1" max="1000" step="1" value="1"></div>
+        <div class="qz-legend" id="qz-speed-legend"></div>
+        <div class="g-readout" id="qz-speed-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="qz-speed-source"></p>
+  </section>
+
+  <section class="g-step" id="damage">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Calibration and measuring the damage</h2></div>
+    <p class="g-eyebrow">The accuracy bill</p>
+    <p>Per-channel and per-group scaling need to know the range of each channel, and for activations you cannot know it without running data through the model. That is <strong>calibration</strong>: a few hundred sequences, ideally drawn from the same distribution as production traffic, run through the model to record activation ranges. It is why "post-training quantization" is not actually post-training — the ranges are data-dependent, and a model quantized on English Wikipedia will behave differently on code or on a low-resource language. Calibration set size and composition are as much a hyperparameter as group size.</p>
+    <p>The table and bars below are the accuracy bill as reported in the primary papers. Read the deltas as orders of magnitude, not commitments.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="qz-acc-canvas" width="640" height="260"></canvas>
+      </div>
+      <div class="g-controls">
+        <div class="g-readout" id="qz-acc-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>Every delta below is model and task dependent.</b> A 1–3% average can hide a 20% collapse on a specific reasoning or code benchmark, and weight-only INT4 is usually far more benign than INT4 activations. Quantization must be evaluated on your own task suite and your own traffic; the numbers here are priors, not guarantees.</span></div>
+    <div style="overflow-x:auto;">
+      <table class="g-cheat" id="qz-acc-table">
+        <thead><tr><th>Format</th><th>Bits</th><th>Typical delta</th><th>What it is for</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="g-source" id="qz-acc-source"></p>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">✓</span><h2>Cheat sheet: the decision table</h2></div>
+    <p class="g-eyebrow">Pick a format</p>
+    <div style="overflow-x:auto;">
+      <table class="g-cheat">
+        <thead><tr><th>Situation</th><th>Start with</th><th>Watch out for</th></tr></thead>
+        <tbody>
+          <tr><td>You want the safest large win, single-stream latency matters</td><td>INT4 weight-only (AWQ), group 128, activations FP16</td><td>Gains fade above batch ~128; measure at your real batch, not at batch 1</td></tr>
+          <tr><td>You serve high batch and want throughput, not just latency</td><td>W4A8, or FP8 E4M3 per-block on native hardware</td><td>Needs activation calibration and outlier handling</td></tr>
+          <tr><td>You are on Hopper/Blackwell and want near-BF16 quality</td><td>FP8 E4M3 with per-block (128×128) scales</td><td>Keep the router, embeddings and attention output projections wide if quality moves</td></tr>
+          <tr><td>You need maximum memory saving and have a task suite to test against</td><td>MXFP4 / NVFP4 block formats</td><td>Sensitive layers dominate the damage; block size and per-layer precision matter more than the algorithm</td></tr>
+          <tr><td>Concurrency is capped by the KV cache, not by weights</td><td>INT8 or FP8 KV, keeping sinks and boundary layers at FP16</td><td>Every error is re-read thousands of times — evaluate, do not assume</td></tr>
+          <tr><td>You have no evaluation harness yet</td><td>Do not quantize below BF16</td><td>The accuracy bill is unmeasurable until you can measure it</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">📚</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">References</p>
+    <ul class="g-refs">
+      <li>Frantar et al., <a href="https://arxiv.org/abs/2210.17323">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a>, ICLR 2023.</li>
+      <li>Lin et al., <a href="https://arxiv.org/abs/2306.00978">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a>, MLSys 2024.</li>
+      <li>Xiao et al., <a href="https://arxiv.org/abs/2211.10438">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a>, ICML 2023.</li>
+      <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a>, 2024 — FP8 E4M3 training and inference at scale.</li>
+      <li>NVIDIA, <a href="https://developer.nvidia.com/blog/nvfp4-explained-nvidias-4-bit-floating-point-format-for-high-performance-ai-compute/">NVFP4 explained</a>, 2025 — microscopic 4-bit block formats and Blackwell FP4 tensor cores.</li>
+      <li>Rouhani et al., <a href="https://arxiv.org/abs/2310.10537">Microscaling Data Formats for Deep Learning</a>, 2023 — the MX specification.</li>
+    </ul>
+  </section>
+
+</main>
+
+{% capture next_teaser %}You have made each token cheaper to produce. Next: produce fewer steps of it.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.llm_serving teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/serving-sim.js' | relative_url }}"></script>
+<script>window.NUMBERS_URL = "{{ '/assets/data/llm-serving-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var G = window.Guide;
+  var c = G.colors();
+
+  function log2(x) { return Math.log(Math.max(1e-12, x)) / Math.LN2; }
+
+  // ============================================================
+  // 1. Format inspector
+  // ============================================================
+  (function () {
+    var FORMATS = [
+      { id: 'fp32', label: 'FP32', kind: 'float', e: 8, m: 23, maxExp: 254, color: '#7a5c9e' },
+      { id: 'fp16', label: 'FP16', kind: 'float', e: 5, m: 10, maxExp: 30, color: '#5f8a3a' },
+      { id: 'bf16', label: 'BF16', kind: 'float', e: 8, m: 7, maxExp: 254, color: '#c9a227' },
+      { id: 'fp8e4m3', label: 'FP8 E4M3', kind: 'float', e: 4, m: 3, maxExp: 15, color: '#2b5fff' },
+      { id: 'fp8e5m2', label: 'FP8 E5M2', kind: 'float', e: 5, m: 2, maxExp: 30, color: '#93aefe' },
+      { id: 'int8', label: 'INT8', kind: 'int', bits: 8, color: '#b0552d' },
+      { id: 'int4', label: 'INT4', kind: 'int', bits: 4, color: '#d6006c' }
+    ];
+    var current = FORMATS[1];
+    var ctx = null;
+    var cv = document.getElementById('qz-fmt-canvas');
+    var view = G.setupCanvas(cv, 640, 300, function () { draw(); });
+    ctx = view.ctx;
+    var probe = 1.0;
+
+    function maxFinite(f) {
+      if (f.kind === 'int') return 8;
+      var bias = Math.pow(2, f.e - 1) - 1;
+      return (2 - Math.pow(2, -f.m)) * Math.pow(2, f.maxExp - bias);
+    }
+    function stepAt(f, x) {
+      if (f.kind === 'int') return 8 / (Math.pow(2, f.bits - 1) - 1);
+      return Math.pow(2, Math.floor(log2(x)) - f.m);
+    }
+    function quantize(f, x) {
+      var s = stepAt(f, x);
+      if (x <= 0) return 0;
+      return Math.round(x / s) * s;
+    }
+    function representables(f, lo, hi) {
+      var out = [];
+      if (f.kind === 'int') {
+        var step = stepAt(f, 1);
+        var k0 = Math.ceil(lo / step), k1 = Math.floor(hi / step);
+        for (var k = k0; k <= k1 && out.length < 8000; k++) out.push(k * step);
+        return out.length >= 8000 ? null : out;
+      }
+      for (var E = Math.floor(log2(lo)); E <= Math.ceil(log2(hi)); E++) {
+        var st = Math.pow(2, E - f.m);
+        var base = Math.pow(2, E);
+        var n0 = Math.ceil((lo - base) / st), n1 = Math.floor((hi - base) / st);
+        if (n1 - n0 + 1 > 8000) return null;
+        for (var n = n0; n <= n1; n++) out.push(base + n * st);
+      }
+      return out;
+    }
+    function drawBits() {
+      var host = document.getElementById('qz-bits');
+      var f = current;
+      var segs;
+      if (f.kind === 'int') {
+        segs = [{ cls: 'b-sign', w: 1, t: 'S' }, { cls: 'b-man', w: f.bits - 1, t: (f.bits - 1) + ' value bits' }];
+      } else {
+        segs = [{ cls: 'b-sign', w: 1, t: 'S' }, { cls: 'b-exp', w: f.e, t: f.e + ' exp' }, { cls: 'b-man', w: f.m, t: f.m + ' mant' }];
+      }
+      host.innerHTML = segs.map(function (s) {
+        return '<div class="' + s.cls + '" style="flex:' + s.w + ' 1 0">' + s.t + '</div>';
+      }).join('');
+    }
+    function draw() {
+      if (!ctx) return;
+      var f = current, W = 640, H = 300;
+      ctx.clearRect(0, 0, W, H);
+      var padL = 30, padR = 30, axisY = H - 74;
+      var lo = probe * 0.55, hi = probe * 1.6;
+      function X(v) { return padL + (W - padL - padR) * (v - lo) / (hi - lo); }
+      ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, axisY); ctx.lineTo(W - padR, axisY); ctx.stroke();
+      var reps = representables(f, lo, hi);
+      if (reps === null) {
+        ctx.fillStyle = f.color; ctx.globalAlpha = 0.22;
+        ctx.fillRect(padL, axisY - 16, W - padL - padR, 16);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('too many representable values to draw — effectively continuous', W / 2, axisY - 24);
+      } else {
+        ctx.strokeStyle = f.color; ctx.globalAlpha = 0.65;
+        ctx.beginPath();
+        reps.forEach(function (v) {
+          var x = X(v); ctx.moveTo(x, axisY - 16); ctx.lineTo(x, axisY);
+        });
+        ctx.stroke(); ctx.globalAlpha = 1;
+      }
+      // probe + nearest representable
+      var q = quantize(f, probe);
+      var px = X(probe), qx = X(q);
+      ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(px, axisY - 54); ctx.lineTo(px, axisY + 16); ctx.stroke();
+      ctx.fillStyle = c.accent2; ctx.textAlign = 'center'; ctx.font = '600 11px ' + c.font;
+      ctx.fillText('probe ' + probe.toFixed(2), px, axisY - 60);
+      ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(qx, axisY + 30, 5, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = c.accent700; ctx.fillText('← nearest', Math.min(W - padR - 40, qx + 44), axisY + 34);
+      // axis ticks
+      ctx.strokeStyle = c.divider; ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      for (var i = 0; i <= 4; i++) {
+        var v = lo + (hi - lo) * i / 4, x = X(v);
+        ctx.beginPath(); ctx.moveTo(x, axisY); ctx.lineTo(x, axisY + 6); ctx.stroke();
+        ctx.fillText(v.toFixed(2), x, axisY + 20);
+      }
+      ctx.textAlign = 'left'; ctx.fillStyle = c.text; ctx.font = '11px ' + c.font;
+      ctx.fillText(f.label + ' — representable values near the probe', padL, 22);
+    }
+    var btns = document.getElementById('qz-fmt-btns');
+    FORMATS.forEach(function (f) {
+      var b = document.createElement('button');
+      b.textContent = f.label;
+      b.addEventListener('click', function () {
+        current = f;
+        Array.prototype.forEach.call(btns.children, function (x) { x.className = ''; });
+        b.className = 'active';
+        drawBits(); draw(); updateReadout();
+      });
+      btns.appendChild(b);
+    });
+    btns.children[1].className = 'active';
+    function updateReadout() {
+      var f = current;
+      var step = stepAt(f, probe);
+      var q = quantize(f, probe);
+      var rel = Math.abs(q - probe) / probe;
+      var mf = maxFinite(f);
+      var bits = f.kind === 'int' ? f.bits : 1 + f.e + f.m;
+      var prec = f.kind === 'int' ? (f.bits - 1) + ' magnitude bits' : f.m + ' mantissa bits';
+      var decades;
+      if (f.kind === 'int') {
+        decades = 'set by the scale';
+      } else {
+        var bias = Math.pow(2, f.e - 1) - 1;
+        var minNormal = Math.pow(2, 1 - bias);
+        decades = '≈ ' + (Math.log10(mf) - Math.log10(minNormal)).toFixed(1) + ' decades (normals)';
+      }
+      document.getElementById('qz-fmt-readout').innerHTML =
+        '<span class="k">bits:</span> ' + bits + ' · ' + prec + '<br>' +
+        '<span class="k">step at probe:</span> ' + step.toExponential(2) + '<br>' +
+        '<span class="k">round-trip error:</span> <span class="hi">' + (rel * 100).toFixed(2) + '%</span><br>' +
+        '<span class="k">max finite:</span> ' + (f.kind === 'int' ? mf.toFixed(1) + ' (per-tensor range)' : mf.toExponential(2)) + '<br>' +
+        '<span class="k">dynamic range:</span> ' + decades;
+    }
+    G.bindSliders(document.querySelectorAll('#qz-probe'), function (el) { probe = parseFloat(el.value); draw(); updateReadout(); });
+    drawBits(); draw(); updateReadout();
+  })();
+
+  // ============================================================
+  // 3. Tensor quantizer + SmoothQuant
+  // ============================================================
+  (function () {
+    var IN = 256, OUT = 32, TOK = 64;
+    var OUTLIERS = [7, 61, 180];
+    var formats = {
+      int8: { label: 'INT8', fmt: 'int', bits: 8 },
+      int4: { label: 'INT4', fmt: 'int', bits: 4 },
+      fp8: { label: 'FP8 E4M3', fmt: 'fp8' },
+      mxfp4: { label: 'MXFP4', fmt: 'mxfp4' }
+    };
+    var grans = { tensor: 'per-tensor', channel: 'per-channel', group128: 'group-128' };
+    var fmtKey = 'int4', granKey = 'channel', alpha = 0.5;
+
+    var r = G.seededRandom(20240910);
+    function gauss() {
+      var u = 0, v = 0;
+      while (u === 0) u = r();
+      while (v === 0) v = r();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    var W = [], X = [];
+    var o, j, t;
+    for (o = 0; o < OUT; o++) { W[o] = []; for (j = 0; j < IN; j++) W[o][j] = gauss() * 0.09; }
+    for (t = 0; t < TOK; t++) {
+      X[t] = [];
+      for (j = 0; j < IN; j++) {
+        var v = gauss() * 0.6;
+        if (OUTLIERS.indexOf(j) >= 0) v *= 55 + gauss() * 6;
+        X[t][j] = v;
+      }
+    }
+
+    function smooth(a) {
+      var Ws = [], Xs = [];
+      for (o = 0; o < OUT; o++) Ws[o] = W[o].slice();
+      for (t = 0; t < TOK; t++) Xs[t] = X[t].slice();
+      for (j = 0; j < IN; j++) {
+        var ax = 1e-6, aw = 1e-6;
+        for (t = 0; t < TOK; t++) ax = Math.max(ax, Math.abs(X[t][j]));
+        for (o = 0; o < OUT; o++) aw = Math.max(aw, Math.abs(W[o][j]));
+        var s = Math.pow(ax, a) / Math.pow(aw, 1 - a);
+        s = Math.max(1e-4, Math.min(1e4, s));
+        for (t = 0; t < TOK; t++) Xs[t][j] = X[t][j] / s;
+        for (o = 0; o < OUT; o++) Ws[o][j] = W[o][j] * s;
+      }
+      return { W: Ws, X: Xs };
+    }
+
+    var E4M3_MAX = 448;
+    var E2M1 = [-6, -4, -3, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 6];
+    function quantBlock(vals, cfg) {
+      var i, n = vals.length, amax = 0;
+      for (i = 0; i < n; i++) amax = Math.max(amax, Math.abs(vals[i]));
+      var out = new Array(n);
+      if (cfg.fmt === 'int') {
+        var levels = Math.pow(2, cfg.bits - 1) - 1;
+        var s = amax / Math.max(1e-9, levels);
+        if (s === 0) { for (i = 0; i < n; i++) out[i] = 0; return out; }
+        for (i = 0; i < n; i++) {
+          var q = Math.round(vals[i] / s) * s;
+          out[i] = Math.max(-amax, Math.min(amax, q));
+        }
+      } else if (cfg.fmt === 'fp8') {
+        var scale = amax / E4M3_MAX;
+        if (scale === 0) { for (i = 0; i < n; i++) out[i] = 0; return out; }
+        for (i = 0; i < n; i++) {
+          var x = vals[i] / scale;
+          var step = Math.pow(2, Math.floor(log2(Math.abs(x) || 1e-9)) - 3);
+          var qq = Math.round(x / step) * step;
+          qq = Math.max(-E4M3_MAX, Math.min(E4M3_MAX, qq));
+          out[i] = qq * scale;
+        }
+      } else {
+        var e = Math.max(-30, Math.floor(log2(Math.max(1e-9, amax) / 6)));
+        var p = Math.pow(2, e);
+        for (i = 0; i < n; i++) {
+          var xx = vals[i] / p, best = 0, bd = Infinity;
+          for (var l = 0; l < E2M1.length; l++) {
+            var d = Math.abs(xx - E2M1[l]);
+            if (d < bd) { bd = d; best = E2M1[l]; }
+          }
+          out[i] = best * p;
+        }
+      }
+      return out;
+    }
+    function quantMatrix(M, rows, cols, cfg, mode) {
+      var Q = [], i, j2, k;
+      for (i = 0; i < rows; i++) Q[i] = new Array(cols);
+      if (cfg.gran === 'tensor') {
+        var flat = [];
+        for (i = 0; i < rows; i++) for (j2 = 0; j2 < cols; j2++) flat.push(M[i][j2]);
+        var qf = quantBlock(flat, cfg), idx = 0;
+        for (i = 0; i < rows; i++) for (j2 = 0; j2 < cols; j2++) Q[i][j2] = qf[idx++];
+        return Q;
+      }
+      if (cfg.gran === 'channel' && mode === 'row') {
+        for (i = 0; i < rows; i++) Q[i] = quantBlock(M[i], cfg);
+        return Q;
+      }
+      if (cfg.gran === 'channel' && mode === 'col') {
+        for (j2 = 0; j2 < cols; j2++) {
+          var col = [];
+          for (i = 0; i < rows; i++) col.push(M[i][j2]);
+          var qc = quantBlock(col, cfg);
+          for (i = 0; i < rows; i++) Q[i][j2] = qc[i];
+        }
+        return Q;
+      }
+      // group-128 along the column (input) dimension
+      for (j2 = 0; j2 < cols; j2 += 128) {
+        var w = Math.min(128, cols - j2);
+        if (mode === 'row') {
+          for (i = 0; i < rows; i++) {
+            var qr = quantBlock(M[i].slice(j2, j2 + w), cfg);
+            for (k = 0; k < w; k++) Q[i][j2 + k] = qr[k];
+          }
+        } else {
+          for (i = 0; i < rows; i++) {
+            var piece = [], arr = [];
+            for (k = 0; k < w; k++) piece.push(M[i][j2 + k]);
+            arr = quantBlock(piece, cfg);
+            for (k = 0; k < w; k++) Q[i][j2 + k] = arr[k];
+          }
+        }
+      }
+      return Q;
+    }
+    function matmul(A, B, aRows, aCols, bRows) {
+      var Y = [], a, b, k;
+      for (a = 0; a < aRows; a++) {
+        Y[a] = new Array(bRows);
+        for (b = 0; b < bRows; b++) {
+          var s = 0;
+          for (k = 0; k < aCols; k++) s += A[a][k] * B[b][k];
+          Y[a][b] = s;
+        }
+      }
+      return Y;
+    }
+    function relFro(Y, Yq) {
+      var num = 0, den = 0;
+      for (var a = 0; a < Y.length; a++) for (var b = 0; b < Y[a].length; b++) {
+        var d = Y[a][b] - Yq[a][b]; num += d * d; den += Y[a][b] * Y[a][b];
+      }
+      return Math.sqrt(num / Math.max(1e-30, den));
+    }
+
+    var ctx = null;
+    var cv = document.getElementById('qz-tensor-canvas');
+    var view = G.setupCanvas(cv, 640, 300, function () { draw(); });
+    ctx = view.ctx;
+    var cache = null;
+
+    function channelMax(M, rows, cols, col) {
+      var m = 0;
+      for (var i = 0; i < rows; i++) m = Math.max(m, Math.abs(M[i][col]));
+      return Math.max(1e-6, m);
+    }
+    function draw() {
+      if (!ctx || !cache) return;
+      var Wc = 640, Hc = 300;
+      var xs = [], ysB = [], ysA = [];
+      for (var j2 = 0; j2 < IN; j2++) {
+        xs.push(j2);
+        ysB.push(log2(channelMax(X, TOK, IN, j2)));
+        ysA.push(log2(channelMax(cache.X, TOK, IN, j2)));
+      }
+      var all = ysB.concat(ysA);
+      var lo = Math.floor(Math.min.apply(null, all)) - 0.5;
+      var hi = Math.ceil(Math.max.apply(null, all)) + 0.5;
+      var ptsB = xs.map(function (x, i) { return { x: x, y: ysB[i] }; });
+      var ptsA = xs.map(function (x, i) { return { x: x, y: ysA[i] }; });
+      var axes = G.drawLines(ctx, Wc, Hc, [
+        { points: ptsB, color: c.accent2, width: 1.5 },
+        { points: ptsA, color: c.accent, width: 2 }
+      ], [0, IN - 1], [lo, hi], { xLabel: 'input channel / feature', yLabel: 'log₂ max |activation|' });
+      ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillStyle = c.text;
+      for (var g = Math.ceil(lo); g <= hi; g += 2) {
+        var yy = axes.py(g);
+        ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35;
+        ctx.beginPath(); ctx.moveTo(axes.padL, yy); ctx.lineTo(axes.padL + axes.plotW, yy); ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.text;
+        ctx.fillText('2' + sup(g), 6, yy + 3);
+      }
+      ctx.fillStyle = c.accent2; ctx.font = '11px ' + c.font;
+      ctx.fillText('■ before smoothing', axes.padL + 8, 16);
+      ctx.fillStyle = c.accent;
+      ctx.fillText('■ after smoothing', axes.padL + 150, 16);
+    }
+    function sup(n) {
+      var m = { '-': '⁻', '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹' };
+      return String(n).split('').map(function (ch) { return m[ch] || ch; }).join('');
+    }
+    function render() {
+      cache = smooth(alpha);
+      var cfg = { fmt: formats[fmtKey].fmt, bits: formats[fmtKey].bits, gran: granKey };
+      var Wq = quantMatrix(cache.W, OUT, IN, cfg, 'row');
+      var Xq = quantMatrix(cache.X, TOK, IN, cfg, 'col');
+      var Y = matmul(cache.X, cache.W, TOK, IN, OUT);
+      var Yq = matmul(Xq, Wq, TOK, IN, OUT);
+      var err = relFro(Y, Yq);
+      // dynamic range of activation channels
+      var mx = 0, mn = Infinity;
+      for (var j2 = 0; j2 < IN; j2++) { var m = channelMax(cache.X, TOK, IN, j2); mx = Math.max(mx, m); mn = Math.min(mn, m); }
+      var spread = log2(mx / mn);
+      var bytesW = OUT * IN * (formats[fmtKey].fmt === 'int' ? formats[fmtKey].bits : (formats[fmtKey].fmt === 'fp8' ? 8 : 4)) / 8;
+      document.getElementById('qz-tensor-readout').innerHTML =
+        '<span class="k">' + formats[fmtKey].label + ' · ' + grans[granKey] + ' · α=' + alpha.toFixed(2) + '</span><br>' +
+        '<span class="k">activation dynamic range:</span> ' + spread.toFixed(1) + ' bits (max/min channel)<br>' +
+        '<span class="k">output error ‖ΔY‖/‖Y‖:</span> <span class="' + (err > 0.05 ? 'bad' : 'hi') + '">' + (err * 100).toFixed(2) + '%</span><br>' +
+        '<span class="k">weights:</span> ' + G.fmtBytes(bytesW) + ' vs ' + G.fmtBytes(OUT * IN * 2) + ' at FP16';
+      draw();
+    }
+    function buttonRow(hostId, keys, labels, get, set) {
+      var host = document.getElementById(hostId);
+      keys.forEach(function (k) {
+        var b = document.createElement('button');
+        b.textContent = labels[k];
+        b.addEventListener('click', function () {
+          set(k);
+          Array.prototype.forEach.call(host.children, function (x) { x.className = ''; });
+          b.className = 'active';
+          render();
+        });
+        host.appendChild(b);
+      });
+      host.children[keys.indexOf(get())].className = 'active';
+    }
+    buttonRow('qz-tensor-fmt', Object.keys(formats), { int8: 'INT8', int4: 'INT4', fp8: 'FP8 E4M3', mxfp4: 'MXFP4' }, function () { return fmtKey; }, function (k) { fmtKey = k; });
+    buttonRow('qz-tensor-gran', Object.keys(grans), grans, function () { return granKey; }, function (k) { granKey = k; });
+    G.bindSliders(document.querySelectorAll('#qz-alpha'), function (el) { alpha = parseFloat(el.value); render(); });
+    render();
+  })();
+
+  // ============================================================
+  // 6. KV quantization -> concurrency
+  // ============================================================
+  (function () {
+    var MODELS = {
+      gqa: {
+        label: 'Llama-3.1-70B (GQA)',
+        perTok: function (be) {
+          return window.ServingSim.kvBytes({ layers: 80, kvHeads: 8, headDim: 128, tokens: 1, bytesPerElem: be, batch: 1 });
+        }
+      },
+      mla: {
+        label: 'DeepSeek-V3 (MLA)',
+        perTok: function (be) {
+          // ServingSim.kvBytes counts separate K and V; DeepSeek caches one 576-element
+          // latent per layer, so the per-token figure is half its two-tensor total.
+          return window.ServingSim.kvBytes({ layers: 61, mla: true, latentDim: 576, tokens: 1, bytesPerElem: be, batch: 1 }) / 2;
+        }
+      }
+    };
+    var modelKey = 'gqa', tokens = 8192, budgetGB = 80;
+    var ctx = null;
+    var cv = document.getElementById('qz-kv-canvas');
+    var view = G.setupCanvas(cv, 640, 300, function () { draw(); });
+    ctx = view.ctx;
+    var dtypes = [
+      { label: 'KV FP16', be: 2, color: c.accent700 },
+      { label: 'KV FP8', be: 1, color: c.accent },
+      { label: 'KV INT4', be: 0.5, color: c.accent2 }
+    ];
+    function draw() {
+      if (!ctx) return;
+      var per = MODELS[modelKey].perTok(2);
+      var data = dtypes.map(function (d, i) {
+        var perSeq = per * (d.be / 2) * tokens;
+        var count = (budgetGB * 1e9) / perSeq;
+        return { label: d.label, value: count, valueLabel: Math.floor(count) + ' seqs', color: d.color };
+      });
+      G.drawBars(ctx, 640, 300, data, { maxV: Math.max(1, data[0].value) * 1.05, padL: 90 });
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText(MODELS[modelKey].label + ' · ' + tokens + ' tokens · ' + budgetGB + ' GB KV pool', 90, 16);
+      var perSeq16 = G.fmtBytes(per * tokens);
+      document.getElementById('qz-kv-readout').innerHTML =
+        '<span class="k">KV per sequence at FP16:</span> <span class="hi">' + perSeq16 + '</span><br>' +
+        '<span class="k">bytes/token:</span> ' + G.fmtBytes(per) + ' (FP16) → ' + G.fmtBytes(per / 2) + ' (FP8) → ' + G.fmtBytes(per / 4) + ' (INT4)<br>' +
+        '<span class="k">concurrent sequences:</span> ' + Math.floor(data[0].value) + ' / ' + Math.floor(data[1].value) + ' / ' + Math.floor(data[2].value) + '<br>' +
+        '<span class="k">extra concurrency from FP8 KV:</span> <span class="hi">' + (data[1].value / Math.max(1e-9, data[0].value)).toFixed(1) + '×</span>' +
+        ' <span class="k">(per-seq cost ' + perSeq16 + ' at this length)</span>';
+    }
+    var host = document.getElementById('qz-kv-model');
+    Object.keys(MODELS).forEach(function (k) {
+      var b = document.createElement('button');
+      b.textContent = MODELS[k].label;
+      b.addEventListener('click', function () {
+        modelKey = k;
+        Array.prototype.forEach.call(host.children, function (x) { x.className = ''; });
+        b.className = 'active'; draw();
+      });
+      host.appendChild(b);
+    });
+    host.children[0].className = 'active';
+    G.bindSliders(document.querySelectorAll('#qz-kv-tokens'), function (el) { tokens = parseInt(el.value, 10); draw(); });
+    G.bindSliders(document.querySelectorAll('#qz-kv-budget'), function (el) { budgetGB = parseFloat(el.value); draw(); });
+    draw();
+  })();
+
+  // ============================================================
+  // 7. Speed-up predictor
+  // ============================================================
+  (function () {
+    var PARAMS = 8, BW = 3.35, PEAK_FP16 = 989, PEAK_FP8 = 1979;
+    var VARIANTS = [
+      { key: 'w4a16', label: 'INT4 W4A16', bpp: 0.5, peak: PEAK_FP16, color: c.accent2 },
+      { key: 'w4a8', label: 'W4A8', bpp: 0.5, peak: PEAK_FP8, color: c.accent },
+      { key: 'w8a8', label: 'INT8 W8A8', bpp: 1.0, peak: PEAK_FP8, color: c.accent400 }
+    ];
+    function step(batch, bpp, peak) {
+      return window.ServingSim.stepTime({
+        paramsB: PARAMS, bytesPerParam: bpp, batch: batch,
+        bwTBs: BW, peakTFLOPs: peak, flops: 2 * PARAMS * 1e9 * batch, kvBytes: 0
+      });
+    }
+    function speedup(batch, v) {
+      var base = step(batch, 2, PEAK_FP16);
+      return base.totalMs / step(batch, v.bpp, v.peak).totalMs;
+    }
+    var selected = 1;
+    var ctx = null;
+    var cv = document.getElementById('qz-speed-canvas');
+    var view = G.setupCanvas(cv, 640, 320, function () { draw(); });
+    ctx = view.ctx;
+    var N = 60;
+    var xs = [], batches = [];
+    for (var i = 0; i <= N; i++) {
+      var b = Math.pow(10, 3 * i / N); // 1 .. 1000
+      batches.push(b);
+      xs.push(Math.log10(b));
+    }
+    var axesCache = null;
+    function draw() {
+      if (!ctx) return;
+      var series = VARIANTS.map(function (v) {
+        return { points: batches.map(function (b, k) { return { x: xs[k], y: speedup(b, v) }; }), color: v.color, width: 2 };
+      });
+      var axes = G.drawLines(ctx, 640, 320, series, [0, 3], [0, 4.5], { xLabel: 'log₁₀ batch size', yLabel: 'speedup vs BF16 step' });
+      axesCache = axes;
+      // parity line
+      ctx.strokeStyle = c.divider; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+      var y1 = axes.py(1);
+      ctx.beginPath(); ctx.moveTo(axes.padL, y1); ctx.lineTo(axes.padL + axes.plotW, y1); ctx.stroke();
+      ctx.setLineDash([]);
+      // selected batch markers
+      VARIANTS.forEach(function (v) {
+        var X = axes.px(Math.log10(selected)), Y = axes.py(Math.min(4.5, speedup(selected, v)));
+        ctx.fillStyle = v.color; ctx.beginPath(); ctx.arc(X, Y, 4.5, 0, Math.PI * 2); ctx.fill();
+      });
+      // x ticks
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+      [1, 8, 64, 512].forEach(function (b) {
+        ctx.fillText(String(b), axes.px(Math.log10(b)), 320 - 8);
+      });
+      // legend
+      ctx.textAlign = 'left'; ctx.font = '11px ' + c.font;
+      VARIANTS.forEach(function (v, k) {
+        ctx.fillStyle = v.color;
+        ctx.fillText('■ ' + v.label, axes.padL + 8 + k * 118, 16);
+      });
+    }
+    function updateReadout() {
+      var base = step(selected, 2, PEAK_FP16);
+      var lines = VARIANTS.map(function (v) {
+        var st = step(selected, v.bpp, v.peak);
+        return '<span class="k">' + v.label + ':</span> <span class="hi">' + speedup(selected, v).toFixed(2) + '×</span> ' +
+          '<span class="k">(' + st.bound + '-bound, ' + G.fmtMs(st.totalMs) + '/step)</span>';
+      });
+      document.getElementById('qz-speed-readout').innerHTML =
+        '<span class="k">batch ' + selected + ' · BF16 step ' + G.fmtMs(base.totalMs) + ' (' + base.bound + '-bound)</span><br>' +
+        lines.join('<br>');
+    }
+    G.bindSliders(document.querySelectorAll('#qz-speed-batch'), function (el) {
+      selected = parseInt(el.value, 10);
+      draw(); updateReadout();
+    });
+    document.getElementById('qz-speed-legend').innerHTML =
+      '<span><span class="sw" style="background:' + c.accent2 + '"></span>INT4 W4A16 — big at B=1, gone at high batch</span><br>' +
+      '<span><span class="sw" style="background:' + c.accent + '"></span>W4A8 — activations in FP8 keep the compute-bound win</span><br>' +
+      '<span><span class="sw" style="background:' + c.accent400 + '"></span>INT8 W8A8 — half the bytes, half the compute</span>';
+    document.getElementById('qz-speed-source').textContent = 'Step-time model: ' + PARAMS + 'B parameters, H100-class bandwidth ' + BW + ' TB/s, BF16 peak ' + PEAK_FP16 + ' / FP8 peak ' + PEAK_FP8 + ' TFLOP/s (the FP16 peak equals the numbers table\'s dense H100 BF16 figure). Dequantization overhead and KV bytes are excluded so the bytes-versus-FLOPs effect is isolated.';
+    draw(); updateReadout();
+  })();
+
+  // ============================================================
+  // 8. Accuracy bill (from the numbers JSON)
+  // ============================================================
+  (function () {
+    var FALLBACK = {
+      quantization: {
+        source: "GPTQ (Frantar et al., ICLR 2023, arXiv:2210.17323); AWQ (Lin et al., MLSys 2024, arXiv:2306.00978); FP8 E4M3 (DeepSeek-V3 Technical Report, arXiv:2412.19437); NVFP4/MXFP4 (openai/gpt-oss-120b config.json; NVIDIA Blackwell architecture). Accuracy deltas are typical reported ranges, not guarantees.",
+        items: [
+          { format: 'BF16', bits: 16, bytesPerParam: 2.0, accuracyDelta: '0 (reference)', eval: 'Baseline for all comparisons' },
+          { format: 'FP16', bits: 16, bytesPerParam: 2.0, accuracyDelta: '~0 vs BF16', eval: 'Baseline' },
+          { format: 'FP8 (E4M3)', bits: 8, bytesPerParam: 1.0, accuracyDelta: '~0 to 0.5%', eval: 'MMLU/GSM8K near-BF16 parity' },
+          { format: 'INT8 W8A8', bits: 8, bytesPerParam: 1.0, accuracyDelta: '~0.5-1%', eval: 'Near-lossless with SmoothQuant-style scaling' },
+          { format: 'INT4 weight-only (GPTQ/AWQ)', bits: 4, bytesPerParam: 0.5, accuracyDelta: '~1-3% (task-dependent)', eval: 'Perplexity and MMLU within a few points' },
+          { format: 'MXFP4 / NVFP4', bits: 4, bytesPerParam: 0.5, accuracyDelta: 'Measurable but often small with block scales', eval: 'Microscaling block formats (gpt-oss-120b, Blackwell)' }
+        ]
+      }
+    };
+    var accCtx = null;
+    var accView = G.setupCanvas(document.getElementById('qz-acc-canvas'), 640, 260, function () { if (accCtx) drawAccBars(); });
+    accCtx = accView.ctx;
+    var accItems = FALLBACK.quantization.items;
+    function drawAccBars() {
+      var dataB = accItems.map(function (it, i) {
+        return { label: it.format, value: it.bytesPerParam, valueLabel: it.bytesPerParam.toFixed(2) + ' B/param', color: i === 0 ? c.accent700 : (it.bytesPerParam <= 0.5 ? c.accent2 : c.accent) };
+      });
+      G.drawBars(accCtx, 640, 260, dataB, { maxV: 2, padL: 170 });
+    }
+    function render(data) {
+      var items = (data && data.quantization && data.quantization.items) || FALLBACK.quantization.items;
+      var source = (data && data.quantization && data.quantization.source) || FALLBACK.quantization.source;
+      accItems = items;
+      var tbody = document.querySelector('#qz-acc-table tbody');
+      tbody.innerHTML = items.map(function (it) {
+        return '<tr><td><b>' + it.format + '</b></td><td>' + it.bits + '</td><td>' + it.accuracyDelta + '</td><td>' + (it.eval || it.note || '') + '</td></tr>';
+      }).join('');
+      drawAccBars();
+      document.getElementById('qz-acc-readout').innerHTML =
+        '<span class="k">Formats compared:</span> ' + items.length + '<br>' +
+        '<span class="k">Smallest / largest weight footprint:</span> ' +
+        Math.min.apply(null, items.map(function (i) { return i.bytesPerParam; })).toFixed(2) + ' – ' +
+        Math.max.apply(null, items.map(function (i) { return i.bytesPerParam; })).toFixed(2) + ' bytes/param<br>' +
+        '<span class="k">Rule of thumb:</span> weight-only 4-bit is safe; activation 4-bit and KV 4-bit are not, without evaluation.';
+      document.getElementById('qz-acc-source').textContent = source;
+    }
+    render(FALLBACK);
+    fetch(window.NUMBERS_URL).then(function (r) { return r.json(); }).then(render).catch(function () { render(FALLBACK); });
+  })();
+
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,564 @@
+---
+title: "Agents in Action, Interactively — Part 9: Datasets, deterministic checks and CI"
+description: "Golden sets, coverage matrices, held-out test sets, code checks before judges, regression gating and significance."
+permalink: "/ai/agents-in-action/datasets-and-ci/"
+section: "ai"
+series: "agents_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.agents_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Agents in Action</span>
+    <h1>Datasets, deterministic checks and CI</h1>
+    <p>The taxonomy gave you the failure modes; this part turns them into infrastructure. A <strong>golden set</strong> you trust, a <strong>held-out set</strong> you must not tune against, a <strong>coverage matrix</strong> that shows the blind spots, a preference for <strong>deterministic checks</strong> over judges, and a <strong>regression gate</strong> that treats a prompt change as a deploy. The uncomfortable parts are the last two: a two-point move on twenty cases is noise, and a gate that cannot tell noise from a regression gets turned off within a month.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="golden">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Golden sets, held-out sets and coverage</h2></div>
+    <p class="g-eyebrow">A small set you trust, a set you must not tune against, and a map of the gaps</p>
+    <p>A <strong>golden set</strong> is small, high-signal and human-labelled: a few dozen cases you have personally read and would defend. It is the thing you iterate against, and its value is that you trust every row. A <strong>held-out test set</strong> is separate and larger, and the one rule is that you never tune against it. You will overfit prompts exactly the way models overfit weights — a phrase that fixes case 7 and breaks case 19 — and the held-out set is the only instrument that tells you the difference between learning the task and memorising your examples.</p>
+    <p>Neither is enough without a <strong>coverage matrix</strong>: input dimensions down one axis, cases along the other, and a count in each cell. The empty cells are the answer. A suite can be large, green and blind at the same time — covering short factual lookups exhaustively while never testing a multi-hop question, a typo, a no-answer case, or an adversarial input. Below, the heatmap is that matrix; the red cells are blind spots. Add cases and watch the gaps move rather than disappear.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dc-cov-canvas" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">Rows: input dimensions. Columns: cases. Dark = covered, white = a blind spot, outlined red where the suite has never looked.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Cases in the suite <span class="val">8</span></label><input type="range" id="dc-cols" min="4" max="12" step="1" value="8"></div>
+        <div class="g-btnrow">
+          <button id="dc-blind" class="g-primary">Highlight blind spots</button>
+        </div>
+        <div class="g-readout" id="dc-cov-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The durable idea:</b> a dataset is a <b>statement about coverage</b>, not a pile of rows. Its size is the least interesting thing about it; the dimensions it exercises, and the ones it does not, are the whole point.</span></div>
+  </section>
+
+  <section class="g-step" id="overfit">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Overfitting the golden set</h2></div>
+    <p class="g-eyebrow">Train rises, held-out peaks and falls</p>
+    <p>Iterating on a prompt against a small golden set feels like progress, because the golden-set number goes up every time. The problem is that it goes up for two different reasons and the metric cannot distinguish them: you are fixing real failures, and you are also fitting the specific phrasing of the cases you happen to have. The first generalises. The second is memorisation, and it shows up as a widening gap between the set you tune on and the set you do not.</p>
+    <p>The curves below are the shape you should expect. Train climbs monotonically with each iteration. Held-out climbs too — until the prompt starts encoding details of the golden set rather than the task — and then it rolls over and declines. The peak is the honest end of useful iteration; everything to the right of it makes the golden set look better and the product worse.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dc-overfit-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The dashed held-out curve peaks and falls while the train curve keeps rising. The gap is the overfitting.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Prompt iteration <span class="val">12</span></label><input type="range" id="dc-iter" min="1" max="12" step="1" value="12"></div>
+        <div class="g-readout" id="dc-overfit-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="dc-evals-source"></p>
+    <div class="g-warn">⚠️ <span><b>You overfit prompts too.</b> Tuning against the held-out set converts it into a second golden set and you lose the only clean instrument you had. Freeze it, look at it rarely, and when you do look, accept that a peak on it means the search is over.</span></div>
+  </section>
+
+  <section class="g-step" id="checks">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Code checks before judges</h2></div>
+    <p class="g-eyebrow">Deterministic where you can, a judge only where you must</p>
+    <p>Given a case, the question is not "how do I grade this" but "what is the cheapest thing that distinguishes pass from fail?". For a large share of agent failures the answer is a code check: does the output parse against the schema, does every citation resolve to a document that contains the claim, is the required tool argument present, did the same call repeat, is the expected field present with the right value. A code check is instant, free, perfectly repeatable, and it fails loudly. A model judge is none of those things — it costs money per case, its verdict drifts run to run, and it carries the position and verbosity biases you would spend Part 10 fighting.</p>
+    <p>So the default ordering is code first, judge last. Reach for the judge only where the criterion is genuinely irreducibly subjective — "is this retrieved document relevant to the question" — and even then, prefer to decompose it into checkable sub-questions. The panels below compare the two on the same cases: accuracy, cost, and run-to-run spread.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dc-check-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Three panels, two graders: a deterministic check and a model judge. Note which one is flat across reruns.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Cases in the set <span class="val">120</span></label><input type="range" id="dc-cases" min="20" max="500" step="20" value="120"></div>
+        <div class="g-btnrow">
+          <button id="dc-judge-seed">Rerun the judge</button>
+        </div>
+        <div class="g-readout" id="dc-check-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="dc-cost-source"></p>
+  </section>
+
+  <section class="g-step" id="gate">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Regression gating, significance and the CI bill</h2></div>
+    <p class="g-eyebrow">A prompt change is a deploy</p>
+    <p>The last step is the gate. A prompt change, a model version bump, a retriever tweak — each is a deploy, and each should have to pass the suite before it ships. But a gate is only useful if it can tell a regression from noise, and that is a sample-size question, not a taste question. A two-point drop measured on twenty cases is indistinguishable from a two-point drop measured on zero cases; the confidence interval around the delta is wider than the delta. Compute the interval, and let the gate block only when the interval excludes zero.</p>
+    <p>The demo makes the arithmetic visible. The pale band is where a <em>second measurement of the unchanged system</em> would land; the point is the candidate, with its own interval. Move the case count and the band narrows. Move the delta and it takes a real change to escape. The readout also prices the eval run itself, because the honest answer to "why not 10,000 cases" is usually the bill.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="dc-gate-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">The band is noise around the baseline. The candidate is significant only when its interval clears the band entirely.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Cases in the eval set <span class="val">100</span></label><input type="range" id="dc-n" min="20" max="1000" step="20" value="100"></div>
+        <div class="g-field"><label>Candidate delta <span class="val">-4</span> pts</label><input type="range" id="dc-delta" min="-8" max="8" step="1" value="-4"></div>
+        <div class="g-readout" id="dc-gate-readout"></div>
+      </div>
+    </div>
+    <p class="g-source" id="dc-pricing-source"></p>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer that shapes the build</th></tr></thead>
+      <tbody>
+        <tr><td>What is a golden set?</td><td>A small, high-signal, human-labelled set you trust and iterate against.</td></tr>
+        <tr><td>What is a held-out set for?</td><td>The instrument you do not tune against, so you can tell learning from memorising.</td></tr>
+        <tr><td>What does a coverage matrix show?</td><td>Input dimensions against cases. The empty cells are the finding.</td></tr>
+        <tr><td>What check should a case use?</td><td>Code first: parse, citation resolves, argument present, call did not repeat. A judge only for irreducibly subjective criteria.</td></tr>
+        <tr><td>Why prefer code over a judge?</td><td>It is instant, free, perfectly repeatable, and has no position or verbosity bias.</td></tr>
+        <tr><td>What is a prompt change?</td><td>A deploy. It goes through the suite and the gate like any other change.</td></tr>
+        <tr><td>When is a delta a regression?</td><td>When its confidence interval excludes zero. Otherwise it is noise.</td></tr>
+        <tr><td>Is a 2-point drop on 20 cases real?</td><td>No. The interval around it is far wider than 2 points.</td></tr>
+        <tr><td>What limits the case count?</td><td>Usually the bill for running the suite, not the availability of examples.</td></tr>
+        <tr><td>What does the gate protect?</td><td>The held-out number, and therefore the product — from a fix that only improves the golden set.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>OpenAI, <a href="https://www.openai.com/simple-evals/">"Simple Evals" and SWE-bench Verified</a>, 2024-08 — a 500-instance, human-validated subset, with the repository's tests as the deterministic check.</li>
+      <li>Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024 — deterministic grading from real test suites, and its scaffold dependence.</li>
+      <li>Yao et al., <a href="https://arxiv.org/abs/2406.12045">"τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"</a>, 2024 — pass^k, and why one attempt is not a measurement.</li>
+      <li>Liang et al., <a href="https://arxiv.org/abs/2211.09110">"Holistic Evaluation of Language Models (HELM)"</a>, 2022 — reporting distributions with intervals, not a single headline number.</li>
+      <li>Zheng et al., <a href="https://arxiv.org/abs/2306.05685">"Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"</a>, 2023 — the position, verbosity and self-enhancement biases a code check never has.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">"Effective context engineering for AI agents"</a>, 29 September 2025 — why the eval loop, not the prompt, is the thing you keep improving.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}Code checks cover what you can state exactly. The rest needs a grader — and a grader is a model with biases you now have to measure. Next: the LLM judge, its failure modes and how to calibrate one.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.agents_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    evals: {
+      source: "SWE-bench (Jimenez et al., arXiv:2310.06770, ICLR 2024) and SWE-bench Verified (OpenAI, 2024-08, a 500-instance human-validated subset); τ-bench (Yao et al., arXiv:2406.12045, 2024) with pass^k; HELM (Liang et al., arXiv:2211.09110, 2022) for multi-metric reporting. Public scores are contaminated by training-data leakage, scaffolding differences and harness version drift. Offline fallback constants.",
+      passKFormula: "pass^k = fraction of tasks solved on all k independent attempts.",
+      benchmarks: [
+        { name: "SWE-bench Verified", measures: "resolving real GitHub issues in a repo", caveat: "scaffold- and harness-dependent" },
+        { name: "τ²-bench", measures: "tool-agent-user dialogue with a verifiable database end state", caveat: "scores move with the user simulator" }
+      ]
+    },
+    cost_latency: {
+      source: "The agent-loop cost is arithmetic: each turn resends the whole prior context, so N turns with a growing history cost O(N^2) input tokens before caching. Cache discounts are vendor-specific. Offline fallback constants.",
+      cacheLayers: ["provider prefix cache", "application result cache", "semantic cache (correctness risk)"]
+    },
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD, standard, non-batch). These rot fast and are labelled historical reference points, not current quotes. Offline fallback constants.",
+      as_of: "2025-02",
+      items: [
+        { model: "GPT-4o", inputPerMUSD: 2.5, outputPerMUSD: 10.0, cachedInputPerMUSD: 1.25 },
+        { model: "Claude 3.5 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 }
+      ],
+      outputInputRatio: "Output is the expensive side at every vendor in this table."
+    }
+  };
+
+  var PRICES = { inputPerM: 3, outputPerM: 15, cachedPerM: 0.3 };
+  // One judge check: a few thousand tokens in, a short verdict out.
+  var JUDGE_COST = AppSim.costModel({ inputTokens: 1200, outputTokens: 80, prices: PRICES }).total;
+
+  // ------------------------------------------------------------------
+  // Demo A — the coverage matrix
+  // ------------------------------------------------------------------
+  var DIMS = ['short factual lookup', 'long, multi-clause query', 'typo or misspelling', 'multi-hop question', 'no-answer in corpus', 'adversarial input'];
+  var V = { showBlind: true };
+  var setupV = Guide.setupCanvas(el('dc-cov-canvas'), 640, 380, drawV);
+  function matrixFor(cols) {
+    var r = AppSim.rng(88);
+    var M = [];
+    for (var i = 0; i < DIMS.length; i++) {
+      var row = [];
+      for (var j = 0; j < cols; j++) {
+        var base = Math.floor(r() * 4);
+        if (i >= 4 && j < 5) base = 0;
+        if (i === 0 && j >= cols - 2 && cols > 6) base = 0;
+        if (i === 2 && j % 5 === 3) base = 0;
+        row.push(Math.max(0, Math.min(3, base)));
+      }
+      M.push(row);
+    }
+    return M;
+  }
+  function drawV() {
+    if (!setupV) return;
+    var ctx = setupV.ctx, W = 640, H = 380;
+    var cols = parseInt(el('dc-cols').value, 10);
+    if (!isFinite(cols)) cols = 8;
+    var M = matrixFor(cols);
+    var labels = [];
+    for (var j = 0; j < cols; j++) labels.push('c' + (j + 1));
+    var geo = Guide.drawHeatmap(ctx, W, H, M, {
+      rowLabels: DIMS, colLabels: labels, min: 0, max: 3,
+      padL: 150, padT: 42, padB: 32, fontSize: 10,
+      colorLow: [246, 248, 251], colorHigh: [43, 95, 255]
+    });
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('coverage matrix — cases against input dimensions', 16, 18);
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font;
+    ctx.fillText('cell value = labelled examples of that dimension the case covers · white = never exercised', 16, 32);
+
+    var blind = [], rowBlind = DIMS.map(function () { return 0; });
+    for (var i = 0; i < M.length; i++) {
+      for (var q = 0; q < cols; q++) {
+        if (M[i][q] === 0) {
+          blind.push({ r: i, c: q });
+          rowBlind[i]++;
+        }
+      }
+    }
+    if (V.showBlind) {
+      blind.forEach(function (b) {
+        var x = geo.padL + b.c * geo.cellW, y = geo.padT + b.r * geo.cellH;
+        ctx.strokeStyle = c.accent2; ctx.lineWidth = 2;
+        ctx.strokeRect(x + 1.5, y + 1.5, geo.cellW - 3, geo.cellH - 3);
+        ctx.fillStyle = c.accent2; ctx.font = '13px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillText('+', x + geo.cellW / 2, y + geo.cellH / 2 + 5);
+      });
+    }
+    var worst = 0;
+    rowBlind.forEach(function (n, i) { if (n > rowBlind[worst]) worst = i; });
+    var firstBlind = blind.filter(function (b) { return b.r === worst; })[0];
+    if (firstBlind) {
+      var fx = geo.padL + firstBlind.c * geo.cellW + geo.cellW / 2;
+      var fy = geo.padT + firstBlind.r * geo.cellH + geo.cellH - 6;
+      Guide.drawArrow(ctx, fx, fy + 14, fx + 54, fy + 14, { color: c.accent2, width: 1.6, head: 8 });
+      ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+      ctx.fillText('add cases here', Math.min(fx + 58, 520), fy + 18);
+    }
+
+    var cells = DIMS.length * cols;
+    var covered = cells - blind.length;
+    el('dc-cov-readout').innerHTML =
+      '<div><span class="k">suite</span> ' + cols + ' cases × ' + DIMS.length + ' dimensions = ' + cells + ' cells' +
+      ' &nbsp; <span class="k">blind spots</span> <span class="' + (blind.length ? 'bad' : 'hi') + '">' + blind.length + '</span></div>' +
+      '<div><span class="k">coverage</span> <span class="hi">' + (covered / cells * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">worst dimension</span> ' + DIMS[worst] + ' (' + rowBlind[worst] + ' blind)</div>' +
+      '<div class="k">' + (blind.length
+        ? 'the suite is large and green and blind in ' + blind.length + ' places; add cases until the worst dimension stops being the worst'
+        : 'no blind spots at this size — the interesting question now is whether the cases themselves are good') + '</div>';
+  }
+  Guide.bindSliders([el('dc-cols')], drawV);
+  el('dc-blind').addEventListener('click', function () {
+    V.showBlind = !V.showBlind;
+    this.className = V.showBlind ? 'g-primary' : '';
+    this.textContent = V.showBlind ? 'Highlight blind spots' : 'Blind spots hidden';
+    drawV();
+  });
+
+  // ------------------------------------------------------------------
+  // Demo B — overfitting the golden set
+  // ------------------------------------------------------------------
+  var setupO = Guide.setupCanvas(el('dc-overfit-canvas'), 640, 340, drawO);
+  function trainAt(i) { return 0.60 + 0.030 * i; }
+  function heldAt(i) { return 0.60 + 0.05 * i - 0.0045 * i * i; }
+  function peakIter() {
+    var best = 1;
+    for (var i = 2; i <= 12; i++) if (heldAt(i) > heldAt(best)) best = i;
+    return best;
+  }
+  function drawO() {
+    if (!setupO) return;
+    var ctx = setupO.ctx, W = 640, H = 340;
+    var it = parseInt(el('dc-iter').value, 10);
+    if (!isFinite(it)) it = 12;
+    var tPts = [], hPts = [], tDots = [], hDots = [];
+    for (var i = 1; i <= 12; i++) {
+      tPts.push({ x: i, y: trainAt(i) });
+      hPts.push({ x: i, y: Math.max(0.2, heldAt(i)) });
+      tDots.push({ x: i, y: trainAt(i) + AppSim.gaussian(AppSim.rng(300 + i * 11)) * 0.008 });
+      hDots.push({ x: i, y: Math.max(0.2, heldAt(i) + AppSim.gaussian(AppSim.rng(800 + i * 13)) * 0.010) });
+    }
+    var geo = Guide.drawLines(ctx, W, H,
+      [{ points: tPts, color: c.accent }, { points: hPts, color: c.accent2, dashed: true }],
+      [1, 12], [0.4, 1.0], { xLabel: 'prompt iteration', yLabel: 'pass rate', padL: 56, padB: 34 });
+    // seeded observations
+    [tDots, hDots].forEach(function (dots, di) {
+      ctx.fillStyle = di === 0 ? c.accent : c.accent2; ctx.globalAlpha = 0.45;
+      dots.forEach(function (p) { ctx.beginPath(); ctx.arc(geo.px(p.x), geo.py(p.y), 1.7, 0, 2 * Math.PI); ctx.fill(); });
+      ctx.globalAlpha = 1;
+    });
+    var pk = peakIter();
+    ctx.fillStyle = c.accent2;
+    ctx.beginPath(); ctx.arc(geo.px(pk), geo.py(heldAt(pk)), 4.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.accent2; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('held-out peak at iteration ' + pk, geo.px(pk) + 8, geo.py(heldAt(pk)) - 8);
+    var mx = geo.px(it);
+    ctx.strokeStyle = c.text; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(mx, geo.padT); ctx.lineTo(mx, geo.padT + geo.plotH); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = c.accent; ctx.font = '10px ' + c.font;
+    ctx.fillText('golden set (train)', geo.padL + 8, geo.padT + 14);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('held-out', geo.padL + 120, geo.padT + 14);
+
+    var train = trainAt(it), held = Math.max(0.2, heldAt(it)), gap = train - held;
+    el('dc-overfit-readout').innerHTML =
+      '<div><span class="k">iteration</span> <span class="hi">' + it + '</span>' +
+      ' &nbsp; <span class="k">golden set</span> <span class="hi">' + (train * 100).toFixed(0) + '%</span>' +
+      ' &nbsp; <span class="k">held-out</span> ' + (held * 100).toFixed(0) + '%</div>' +
+      '<div><span class="k">gap</span> <span class="' + (gap > 0.12 ? 'bad' : 'hi') + '">' + (gap * 100).toFixed(0) + ' points</span>' +
+      ' &nbsp; <span class="k">held-out peaks at iteration</span> ' + pk + '</div>' +
+      '<div class="k">' + (it <= pk
+        ? 'still on the rising side for both — iteration is buying generalisable improvement here'
+        : 'past the peak: the golden-set curve is still climbing and the held-out curve is falling, so the extra iterations are fitting the cases rather than the task') + '</div>';
+  }
+  Guide.bindSliders([el('dc-iter')], drawO);
+
+  // ------------------------------------------------------------------
+  // Demo C — code check versus judge
+  // ------------------------------------------------------------------
+  var X = { judgeSeed: 3 };
+  var setupX = Guide.setupCanvas(el('dc-check-canvas'), 640, 340, drawX);
+  function judgeAccuracy() { return Math.max(0.5, Math.min(0.99, 0.88 + AppSim.gaussian(AppSim.rng(X.judgeSeed)) * 0.030)); }
+  var CODE_ACC = 0.94;
+  function twoBarPanel(ctx, x0, y0, w, h, title, codeVal, judgeVal, fmt, lowerBetter) {
+    var baseY = y0 + h - 18, maxV = Math.max(codeVal, judgeVal) || 1;
+    ctx.fillStyle = c.text; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText(title, x0, y0 - 2);
+    var bw = w / 2 - 12;
+    [{ v: codeVal, label: 'code check', color: c.accent700 }, { v: judgeVal, label: 'LLM judge', color: c.accent2 }].forEach(function (b, i) {
+      var bx = x0 + i * (bw + 18);
+      var bh = Math.max(2, (baseY - y0 - 14) * (b.v / maxV));
+      ctx.fillStyle = b.color; ctx.fillRect(bx, baseY - bh, bw, bh);
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(fmt(b.v), bx + bw / 2, baseY - bh - 4);
+      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillText(b.label, bx + bw / 2, baseY + 14);
+    });
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, baseY); ctx.lineTo(x0 + w, baseY); ctx.stroke();
+  }
+  function drawX() {
+    if (!setupX) return;
+    var ctx = setupX.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var cases = parseInt(el('dc-cases').value, 10);
+    if (!isFinite(cases)) cases = 120;
+    var jAcc = judgeAccuracy();
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('the same ' + cases + ' cases, graded two ways — rerun the judge to see which one moves', 16, 18);
+    var panelW = 194, gap = 20, x0 = 16, py0 = 54, ph = 200;
+    twoBarPanel(ctx, x0, py0, panelW, ph, 'accuracy', CODE_ACC, jAcc, function (v) { return (v * 100).toFixed(0) + '%'; });
+    twoBarPanel(ctx, x0 + (panelW + gap), py0, panelW, ph, 'cost per 1,000 checks', 0.02, JUDGE_COST * 1000, function (v) { return v >= 1 ? '$' + v.toFixed(0) : '$' + v.toFixed(2); });
+    twoBarPanel(ctx, x0 + 2 * (panelW + gap), py0, panelW, ph, 'run-to-run spread (std)', 0, 2.4, function (v) { return v ? '±' + v.toFixed(1) + ' pts' : '0 · deterministic'; });
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('a parse check is a function: same input, same verdict, every run.', 16, 292);
+    ctx.fillText('a judge is a sample: same input, a slightly different verdict each time.', 16, 308);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('prefer the check unless the criterion is irreducibly subjective.', 16, 324);
+
+    el('dc-check-readout').innerHTML =
+      '<div><span class="k">accuracy</span> code <span class="hi">' + (CODE_ACC * 100).toFixed(0) + '%</span>' +
+      ' vs judge <span class="hi">' + (jAcc * 100).toFixed(1) + '%</span>' +
+      ' &nbsp; <span class="k">judge seed</span> ' + X.judgeSeed + '</div>' +
+      '<div><span class="k">cost per 1,000 checks</span> code ~$0.02 vs judge $' + (JUDGE_COST * 1000).toFixed(2) +
+      ' &nbsp; <span class="k">for ' + cases + ' cases</span> code $' + (cases * 0.00002).toFixed(4) + ' vs judge $' + (cases * JUDGE_COST).toFixed(2) + '</div>' +
+      '<div><span class="k">stability</span> code ±0.0 pts · judge ±~2.4 pts across reruns</div>' +
+      '<div class="k">a code check is cheaper and more stable even when it is slightly less accurate — and for most agent failures it is also more accurate</div>';
+  }
+  Guide.bindSliders([el('dc-cases')], drawX);
+  el('dc-judge-seed').addEventListener('click', function () { X.judgeSeed += 1; drawX(); });
+
+  // ------------------------------------------------------------------
+  // Demo D — the regression gate
+  // ------------------------------------------------------------------
+  var G = { n: el('dc-n'), delta: el('dc-delta') };
+  var setupG = Guide.setupCanvas(el('dc-gate-canvas'), 640, 340, drawG);
+  var P0 = 0.75, Z = 1.96;
+  function drawG() {
+    if (!setupG) return;
+    var ctx = setupG.ctx, W = 640, H = 340;
+    ctx.clearRect(0, 0, W, H);
+    var n = parseInt(G.n.value, 10);
+    if (!isFinite(n)) n = 100;
+    var deltaPts = parseInt(G.delta.value, 10);
+    if (!isFinite(deltaPts)) deltaPts = -4;
+    var p0 = P0, p1 = Math.max(0.01, Math.min(0.99, p0 + deltaPts / 100));
+    var delta = p1 - p0;
+    var seSingle = Math.sqrt(p0 * (1 - p0) / n);
+    var seDiff = Math.sqrt(p0 * (1 - p0) / n + p1 * (1 - p1) / n);
+    var half = Z * seDiff;
+    var lo = delta - half, hi = delta + half;
+    var significant = lo > 0 || hi < 0;
+    var mde = Z * Math.sqrt(2 * p0 * (1 - p0) / n);
+
+    var x0 = 60, x1 = 600, yAxis = 190;
+    var lo0 = 0.55, hi0 = 0.95;
+    function X(p) { return x0 + (x1 - x0) * (p - lo0) / (hi0 - lo0); }
+    ctx.fillStyle = c.text; ctx.font = '600 11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('pass rate with a 95% interval, at ' + n + ' cases', 16, 18);
+    // noise band around the baseline
+    var bandLo = X(p0 - Z * seSingle), bandHi = X(p0 + Z * seSingle);
+    ctx.fillStyle = 'rgba(43,95,255,0.10)';
+    ctx.fillRect(bandLo, 50, bandHi - bandLo, 120);
+    ctx.strokeStyle = 'rgba(43,95,255,0.45)'; ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+    ctx.strokeRect(bandLo, 50, bandHi - bandLo, 120); ctx.setLineDash([]);
+    // axis
+    ctx.strokeStyle = c.divider; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, yAxis); ctx.lineTo(x1, yAxis); ctx.stroke();
+    for (var t = 0.55; t <= 0.951; t += 0.05) {
+      ctx.fillStyle = c.text; ctx.font = '9px ' + c.font; ctx.textAlign = 'center';
+      ctx.fillText(t.toFixed(2), X(t), yAxis + 14);
+    }
+    // baseline
+    ctx.strokeStyle = c.accent700; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(X(p0), 50); ctx.lineTo(X(p0), yAxis); ctx.stroke();
+    ctx.fillStyle = c.accent700; ctx.font = '10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('baseline ' + (p0 * 100).toFixed(0) + '%', X(p0), 44);
+    // candidate with interval
+    ctx.strokeStyle = significant ? c.accent2 : '#7a5c9e'; ctx.lineWidth = 2.4;
+    var cxp = X(p1);
+    ctx.beginPath(); ctx.moveTo(cxp, 84); ctx.lineTo(cxp, 156); ctx.stroke();
+    var capLo = X(Math.max(lo0, p1 - half)), capHi = X(Math.min(hi0, p1 + half));
+    ctx.beginPath(); ctx.moveTo(capLo, 90); ctx.lineTo(capHi, 90); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(capLo, 150); ctx.lineTo(capHi, 150); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(capLo, 86); ctx.lineTo(capLo, 94); ctx.moveTo(capHi, 86); ctx.lineTo(capHi, 94); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(capLo, 146); ctx.lineTo(capLo, 154); ctx.moveTo(capHi, 146); ctx.lineTo(capHi, 154); ctx.stroke();
+    ctx.fillStyle = significant ? c.accent2 : '#7a5c9e'; ctx.font = '600 10px ' + c.font; ctx.textAlign = 'center';
+    ctx.fillText('candidate ' + (p1 * 100).toFixed(1) + '%', cxp, 72);
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillText('pale band = where a second measurement of the unchanged system would land', 16, 244);
+    ctx.fillStyle = significant ? c.accent2 : c.accent700;
+    ctx.fillText(significant
+      ? 'the candidate interval clears the baseline column: this is a real ' + (delta < 0 ? 'regression' : 'improvement') + '.'
+      : 'the candidate interval overlaps the baseline: this is noise, not a ' + (delta < 0 ? 'regression' : 'improvement') + '.', 16, 262);
+    ctx.fillStyle = c.text;
+    ctx.fillText('single-rate 95% half-width at this n: ±' + (seSingle * Z * 100).toFixed(1) + ' points' +
+      '  ·  minimum detectable delta: ±' + (mde * 100).toFixed(1) + ' points', 16, 284);
+    ctx.fillStyle = c.accent700;
+    ctx.fillText('suite cost: ' + n + ' cases × $' + JUDGE_COST.toFixed(4) + ' = $' + (n * JUDGE_COST).toFixed(2) +
+      ' per run · $' + (100 * n * JUDGE_COST).toFixed(2) + ' per 100 runs', 16, 306);
+
+    el('dc-gate-readout').innerHTML =
+      '<div><span class="k">delta</span> <span class="' + (significant ? 'bad' : 'hi') + '">' + (delta * 100).toFixed(1) + ' pts</span>' +
+      ' &nbsp; <span class="k">95% CI</span> [' + (lo * 100).toFixed(1) + ', ' + (hi * 100).toFixed(1) + '] pts' +
+      ' &nbsp; <span class="k">verdict</span> ' + (significant ? (delta < 0 ? 'regression — block' : 'improvement — ship') : 'indistinguishable from noise') + '</div>' +
+      '<div><span class="k">n</span> ' + n + ' cases &nbsp; <span class="k">single-rate half-width</span> ±' + (seSingle * Z * 100).toFixed(1) + ' pts' +
+      ' &nbsp; <span class="k">minimum detectable delta</span> ±' + (mde * 100).toFixed(1) + ' pts</div>' +
+      '<div><span class="k">CI run cost</span> $' + (n * JUDGE_COST).toFixed(2) + ' per run at $' + JUDGE_COST.toFixed(4) + ' per judged case' +
+      ' <span class="k">(deterministic checks are effectively free)</span></div>' +
+      '<div class="k">' + (significant
+        ? 'the interval excludes zero, so the gate should block (or promote) on this evidence'
+        : 'widen the set or shrink the claim: at this n a ' + Math.abs(deltaPts) + '-point move is inside the noise band') + '</div>';
+  }
+  Guide.bindSliders([G.n, G.delta], drawG);
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    el('dc-evals-source').textContent = (data && data.evals && data.evals.source) || FALLBACK.evals.source;
+    el('dc-cost-source').textContent = (data && data.cost_latency && data.cost_latency.source) || FALLBACK.cost_latency.source;
+    el('dc-pricing-source').textContent = (data && data.pricing && data.pricing.source) || FALLBACK.pricing.source;
+    drawV(); drawO(); drawX(); drawG();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawV(); drawO(); drawX(); drawG();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'datasets-and-ci-golden',
+      kind: 'choice',
+      prompt: 'What is the difference between the golden set and the held-out test set?',
+      options: [
+        { label: 'You iterate against the golden set; you must not tune against the held-out set, so it can tell learning from memorising.', correct: true },
+        { label: 'The golden set is larger and the held-out set is smaller.', correct: false },
+        { label: 'The golden set is for judges and the held-out set is for code checks.', correct: false },
+        { label: 'They are the same thing under two names.', correct: false }
+      ],
+      explanation: 'The value of the held-out set is that it is uncontaminated. Tuning a prompt against it converts it into a second golden set and you lose the only instrument that detects overfitting.'
+    },
+    {
+      id: 'datasets-and-ci-checks',
+      kind: 'choice',
+      prompt: 'When should a case use a deterministic code check rather than an LLM judge?',
+      options: [
+        { label: 'Whenever the pass criterion can be stated exactly — parse, citation resolves, argument present, call did not repeat.', correct: true },
+        { label: 'Only when the code check is more accurate than the judge.', correct: false },
+        { label: 'Never; judges are always the better grader.', correct: false },
+        { label: 'Only for structured-output cases.', correct: false }
+      ],
+      explanation: 'A code check is instant, free, perfectly repeatable and unbiased. The judge is for criteria that are irreducibly subjective. The default ordering is code first, judge last.'
+    },
+    {
+      id: 'datasets-and-ci-significance',
+      kind: 'numeric',
+      prompt: 'For a single pass rate of 0.75 measured on 100 cases, what is the 95% confidence-interval half-width, in percentage points?',
+      answer: 8.5,
+      unit: "percentage points",
+      tolerance: 0.5,
+      explanation: 'The standard error is sqrt(0.75 × 0.25 / 100) ≈ 0.0433, and 1.96 × 0.0433 ≈ 0.0849 — about 8.5 points. At twenty cases it is nearly twice that, which is why a two-point move on twenty cases is not evidence of anything.'
+    },
+    {
+      id: 'datasets-and-ci-gate',
+      kind: 'choice',
+      prompt: 'Why treat a prompt change as a deploy that must pass a regression gate?',
+      options: [
+        { label: 'It can silently break cases the golden set happens to miss, and the held-out number is the product.', correct: true },
+        { label: 'Because prompts are versioned in git.', correct: false },
+        { label: 'Because a prompt change always changes the model weights.', correct: false },
+        { label: 'Because the provider requires it.', correct: false }
+      ],
+      explanation: 'A fix aimed at one case routinely breaks another. The gate blocks only when a delta is real — its confidence interval excludes zero — so it catches regressions without crying wolf at noise.'
+    },
+    {
+      id: 'datasets-and-ci-coverage',
+      kind: 'choice',
+      prompt: 'What does a coverage matrix add that a pass rate does not?',
+      options: [
+        { label: 'It shows which input dimensions the suite never exercises — the blind spots behind a green number.', correct: true },
+        { label: 'It makes the pass rate more accurate.', correct: false },
+        { label: 'It replaces the need for a held-out set.', correct: false },
+        { label: 'It measures latency per case.', correct: false }
+      ],
+      explanation: 'A suite can be large, green and blind. Plotting dimensions against cases exposes the empty cells, and those cells are where the next failure will come from.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

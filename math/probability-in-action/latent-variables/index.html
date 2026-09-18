@@ -1,0 +1,571 @@
+---
+title: "Probability in Action, Interactively — Part 12: Latent variables: EM and the ELBO"
+description: "A hidden cause behind every observation makes the likelihood a log of a sum, with no closed-form fit. Two easy steps fit it anyway, and the ELBO is the lower bound you can watch close onto the truth."
+permalink: "/math/probability-in-action/latent-variables/"
+section: "math"
+series: "probability_in_action"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  #gmm-canvas { margin-bottom: 2px; }
+  #gmm-chart { margin-top: 6px; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.probability_in_action %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Probability</span>
+    <h1>Latent variables: EM and the ELBO</h1>
+    <p>Some of the most useful variables in a model are the ones you never get to see. Which of several hidden groups produced this data point? Which topic is this document about? Which regime was the sensor in? When a model contains such a hidden cause, the observed data is only half the story, and the likelihood becomes a sum over the possibilities you did not record. That sum sits inside a logarithm, and the log of a sum is the one thing calculus cannot differentiate cleanly. Expectation&ndash;maximisation is the way out: it alternates two guesses, each one easy on its own, and provably never makes the model worse. The quantity that proves it is the ELBO, a lower bound on the likelihood that the algorithm lifts step by step. This part builds both, fits a Gaussian mixture in front of you, and draws the bound closing onto the truth.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="question">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The question</h2></div>
+    <p class="g-eyebrow">A cause you never see</p>
+    <p>Look at the scatter plot below before reading on. The points fall into loose clumps, and once you have seen a clump you cannot unsee it: there are a few groups, each with its own centre and its own spread. Now ask the fitting question. Fit a single Gaussian and you get one fat oval smeared across the middle, a model that calls the gaps between the clumps likely when nothing lives there. The failure is not in the parameters; it is in the shape of the model. One bell curve cannot represent a landscape with several hills.</p>
+    <p>So we write down a model with more than one hill, and immediately the accounting gets strange. A point on the left of the picture clearly belongs to the left clump, but nothing in the data tells us which clump generated it &mdash; the cluster label is a variable we never recorded. In the language of this volume, it is <strong>latent</strong>: real, part of the generative story, and hidden. Every observation comes with a missing companion, and the fitting problem has to reason about all the labels we did not see. That is what separates this part from plain maximum likelihood.</p>
+    <p>The hidden label is not an obstacle to be removed; it is the reason the algorithm is interesting. If we had the labels, fitting would collapse into a bookkeeping exercise: take the points labelled one, compute their mean and covariance, repeat for the others, and you are done in one line. The labels are exactly what we are missing, and the parameters are exactly what we want. Each one would be trivial to compute if we knew the other. That mutual dependence is the whole difficulty, and it is also the whole solution.</p>
+    <p>The strategy, once you see the shape of the problem, writes itself: guess the hidden labels, use the guess to fit the parameters, use the parameters to improve the guess, and repeat until the guesses stop moving. The surprise &mdash; and the reason this idea is everywhere in modern machine learning &mdash; is that this circular procedure is not a heuristic. It never makes the fit worse, and the reason why is a single inequality about the logarithm. By the end of this part you will be able to derive that guarantee, name the quantity it protects, and read both off a live plot.</p>
+    <div class="g-goal">💡 <span><b>By the end of this part you'll see why</b> a hidden cause turns the likelihood into a log of a sum, why the E-step and the M-step are each one-line fixes if the other is known, why the ELBO is a lower bound that the E-step tightens to equality, and why EM is the ancestor of the training methods behind variational autoencoders and diffusion models.</span></div>
+    <div class="g-toc">
+      <a href="#mixtures">2 · Mixture models</a>
+      <a href="#em">3 · The EM algorithm</a>
+      <a href="#elbo">4 · The ELBO and the lower bound</a>
+      <a href="#shows">5 · Where this shows up</a>
+      <a href="#cheat">6 · Cheat sheet</a>
+      <a href="#reading">7 · Further reading</a>
+    </div>
+  </section>
+
+  <section class="g-step" id="mixtures">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Mixture models</h2></div>
+    <p class="g-eyebrow">One bell is not enough</p>
+    <p>The simplest model with hidden structure is the <strong>Gaussian mixture</strong>. Its generative story has two lines. First draw a hidden label <var>z</var> from a categorical distribution with weights <var>$\pi_1,\dots,\pi_K$</var>, so that component <var>k</var> is chosen with probability <var>$\pi_k$</var>. Then, having chosen the component, draw the observation from that component's Gaussian, <var>$x\sim\mathcal{N}(\mu_k,\Sigma_k)$</var>. Nothing in the data ever records which branch was taken; the label is discarded the moment the point is generated.</p>
+    <div class="g-math g-katex">$$z_i\sim\mathrm{Categorical}(\pi),\qquad x_i\mid z_i=k\;\sim\;\mathcal{N}(\mu_k,\Sigma_k),\qquad \sum_{k=1}^{K}\pi_k=1.$$</div>
+    <p>Sum over the hidden label and the density of a single observation falls out. It is a weighted average of the component bells, with the mixture weights as the averaging weights. The average of densities is not a density, so different components can overlap and trade mass; that flexibility is what lets a handful of ellipses hug a shape that no single one could.</p>
+    <div class="g-math g-katex">$$p(x)=\sum_{k=1}^{K}\pi_k\,\mathcal{N}(x\mid\mu_k,\Sigma_k).$$</div>
+    <p>Fitting means choosing all of it &mdash; the weights, the means, the covariances &mdash; by maximum likelihood. For the whole dataset, independence makes the likelihood a product over points, which becomes a sum once we take logarithms. And there the trouble starts: each term is the logarithm of a sum of <var>K</var> densities. Differentiate that and the derivative of the outer log brings down a factor whose denominator mixes every component; the parameters no longer decouple. Set the gradient to zero and the equations are coupled, with each component's optimal parameters depending on every other component's parameters through the responsibilities of every point. There is no closed form.</p>
+    <div class="g-math g-katex">$$\ell(\theta)=\sum_{i=1}^{N}\log\Bigl(\sum_{k=1}^{K}\pi_k\,\mathcal{N}(x_i\mid\mu_k,\Sigma_k)\Bigr),\qquad \theta=\{\pi_k,\mu_k,\Sigma_k\}.$$</div>
+    <p>Compare that with the labelled problem, where each <var>z_i</var> is known. The log-likelihood then splits into <var>K</var> independent pieces, a sum over points grouped by label, and each group's mean and covariance are just weighted averages of its members. The unlabelled problem is one missing table of labels away from being trivial. The whole subject of this part is how to fill that table in without ever seeing it.</p>
+    <p>Two warnings belong here, because they are permanent features rather than numerical accidents. First, the mixture likelihood is not concave: it has many peaks, and EM drives toward whichever one the starting values happen to favour. Second, the components are not identifiable up to permutation. Swap the parameters of components one and two and you have written the same density with relabelled pieces, so the likelihood has a symmetry and the "best" solution is a set of <var>K!</var> equivalent points. Both facts are why the demo below needs a reset button and why real pipelines run the algorithm from several random starts.</p>
+  </section>
+
+  <section class="g-step" id="em">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>The EM algorithm</h2></div>
+    <p class="g-eyebrow">Two steps, each easy</p>
+    <p>Since the labels are missing, replace certainty with belief. For each point <var>x_i</var> and each component <var>k</var>, ask how much that component wants the point, measured as the posterior probability of the label given the point and the current parameters. This is the <strong>responsibility</strong>, and because it is a posterior it is a ratio of weighted densities that sums to one over <var>k</var>. It is the soft version of the label we never saw, and it is computed by Bayes' rule in one pass over the data.</p>
+    <div class="g-math g-katex">$$\gamma_{ik}=\frac{\pi_k\,\mathcal{N}(x_i\mid\mu_k,\Sigma_k)}{\sum_{j=1}^{K}\pi_j\,\mathcal{N}(x_i\mid\mu_j,\Sigma_j)},\qquad \sum_{k=1}^{K}\gamma_{ik}=1.$$</div>
+    <p>Now pretend the responsibilities are the labels and do the easy fit. Each component gets a soft count of its members, <var>$N_k=\sum_i\gamma_{ik}$</var>, and uses those counts as weights. The weight is the soft share of the data the component claims, the mean is the responsibility-weighted average of the points, and the covariance is the responsibility-weighted scatter around that mean. Nothing is solved globally; each line is a weighted average, computable in closed form.</p>
+    <div class="g-math g-katex">$$\pi_k=\frac{N_k}{N},\qquad \mu_k=\frac{1}{N_k}\sum_{i=1}^{N}\gamma_{ik}\,x_i,\qquad \Sigma_k=\frac{1}{N_k}\sum_{i=1}^{N}\gamma_{ik}\,(x_i-\mu_k)(x_i-\mu_k)^{\!\top}.$$</div>
+    <p>Alternate the two lines and you have <strong>expectation&ndash;maximisation</strong>. The E-step holds the parameters fixed and recomputes the responsibilities &mdash; the posterior beliefs about the hidden labels. The M-step holds the responsibilities fixed and recomputes the parameters. Start from any sensible initialisation, iterate to a fixed point, and read off the answer. On the canvas, each press of <em>EM step</em> performs one E-step and one M-step: watch the colours of the points sharpen as responsibilities harden toward zero and one, and the ellipses slide and tilt to cover their clusters.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="gmm-canvas" width="640" height="400"></canvas>
+        <p class="g-canvas-hint">Each dot is an observation, coloured by its responsibilities <var>$\gamma_{ik}$</var> &mdash; teal, magenta and gold blended in proportion to how much each component claims the point. The ellipses are the two-standard-deviation contours of the fitted components. Press <b>EM step</b> to run one E-step and one M-step.</p>
+        <canvas id="gmm-chart" width="640" height="220"></canvas>
+        <p class="g-canvas-hint">The upper solid line is the log-likelihood <var>$\log p(x)$</var>; the lower line is the ELBO. The lines meet after every E-step and split apart after every M-step: the gap they enclose is the KL divergence <var>$\mathrm{KL}(q\,\|\,p(z\mid x))$</var>, and it shrinks each round.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button type="button" id="gmm-step" class="g-primary">EM step</button>
+          <button type="button" id="gmm-run">Run 10 steps</button>
+          <button type="button" id="gmm-reset">Reset</button>
+        </div>
+        <div class="g-legend">
+          <span class="g-legend-item"><span class="g-swatch" style="background:#2b5fff"></span> component 1</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#d6006c"></span> component 2</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:#c9a227"></span> component 3</span>
+          <span class="g-legend-item"><span class="g-swatch" style="background:rgba(201,162,39,0.5)"></span> gap = KL</span>
+        </div>
+        <div class="g-readout" id="gmm-readout"></div>
+      </div>
+    </div>
+    <p>What makes this more than a plausible loop is a theorem: each full iteration leaves the log-likelihood no smaller than it found it. The E-step cannot reduce it, because it changes the responsibilities to match the model. The M-step cannot reduce it either, for a reason worth stating precisely, because the same reason is the guarantee behind the ELBO. In fact the two steps are doing opposite jobs on the same quantity &mdash; the E-step closes a gap and the M-step lifts a floor &mdash; and the next section makes both statements exact.</p>
+    <p>The practical caveats follow from the non-concavity. EM converges to a stationary point of the likelihood, not necessarily the global maximum, and it can be slow when the components overlap: the responsibilities stay mushy for many iterations while the ellipses creep. Degenerate solutions also lurk, in which one component collapses onto a single point and its covariance shrinks toward zero while its likelihood shoots to infinity; a small ridge on the covariance, exactly what the demo adds, removes the pathology. And because the order of the components is arbitrary, you should never read meaning into which ellipse is labelled one.</p>
+  </section>
+
+  <section class="g-step" id="elbo">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The ELBO and why it is a lower bound</h2></div>
+    <p class="g-eyebrow">Jensen's inequality does the work</p>
+    <p>Introduce any distribution <var>q(z)</var> over the hidden label. Multiply and divide inside the log by <var>q(z)</var>, so the likelihood becomes an expectation under <var>q</var> of a ratio. Jensen's inequality now applies, because the logarithm is concave: the log of an average is at least the average of the logs. Lowering the log through the expectation produces a quantity that cannot exceed the likelihood, and that is the whole derivation.</p>
+    <div class="g-math g-katex">$$\log p(x)=\log\sum_z p(x,z)=\log\sum_z q(z)\frac{p(x,z)}{q(z)}\;\ge\;\sum_z q(z)\log\frac{p(x,z)}{q(z)}=\mathrm{ELBO}(q).$$</div>
+    <p>The inequality is Jensen's, and the direction is set by the curvature of the log: concavity means the function lies above its chords, so the average of the outputs is never more than the output of the average. A flat-footed but useful sanity check is the one-line statement that for any positive <var>Y</var>, <var>$\log\mathbb{E}[Y]\ge\mathbb{E}[\log Y]$</var>. The gap we have thrown away is exact and has a name. It is the Kullback&ndash;Leibler divergence from <var>q</var> to the true posterior, and it is never negative.</p>
+    <div class="g-math g-katex">$$\log p(x)=\underbrace{\mathbb{E}_q[\log p(x,z)]-\mathbb{E}_q[\log q(z)]}_{\mathrm{ELBO}(q)}+\underbrace{\mathrm{KL}\bigl(q(z)\,\|\,p(z\mid x)\bigr)}_{\ge 0}.$$</div>
+    <p>Read that identity carefully, because it explains the whole algorithm in one line. For a fixed model, the log-likelihood is a constant, and the split assigns all of it between the ELBO and the KL gap. To make the bound as tight as possible you have only one lever, <var>q</var>: choose the distribution that minimises the divergence. The minimiser is the posterior itself, <var>$q(z)=p(z\mid x)$</var>, and at that choice the divergence is zero and the ELBO equals the likelihood exactly. That is the E-step. It is not a heuristic guess at the labels; it is the exact solution of a well-posed optimisation problem.</p>
+    <p>The M-step is the mirror image. Fix <var>q</var> &mdash; freeze the responsibilities &mdash; and the KL term no longer depends on the parameters that matter, so maximising the log-likelihood is the same as maximising the ELBO over <var>$\pi$</var>, <var>$\mu$</var> and <var>$\Sigma$</var>. The frozen <var>q</var> turns the awkward log of a sum into a sum of logs, and the updates in the previous section are exactly the maximisers. The same quantity is thus optimised in both steps: the E-step tightens the bound from below by killing the gap, and the M-step raises the bound itself. The likelihood, pinned between them, can only climb. That is the monotonicity theorem, and it is why the upper line in the chart never dips.</p>
+    <p>For the mixture specifically, the ELBO has a compact form: a responsibility-weighted log of weighted density, plus the entropy of the responsibilities. The first term rewards components for explaining points; the entropy term is largest when the responsibilities are spread evenly and vanishes when they harden to zeros and ones. Fitting a mixture is therefore a tug-of-war between covering the data and committing to a partition, and the balance is set automatically by the same bound. The variational view &mdash; pick a family of <var>q</var>, maximise the ELBO over both the family and the model &mdash; generalises EM beyond the exact posterior, which is the doorway to the variational autoencoder and to the approximate inference that trains it.</p>
+    <div class="g-math g-katex">$$\mathrm{ELBO}=\sum_{i=1}^{N}\sum_{k=1}^{K}\gamma_{ik}\log\frac{\pi_k\,\mathcal{N}(x_i\mid\mu_k,\Sigma_k)}{\gamma_{ik}}=\mathbb{E}_q[\log p(x,z)]+\mathbb{H}\bigl[q(z)\bigr].$$</div>
+    <p>One caution about what the bound is and is not. The ELBO is a lower bound on the marginal likelihood of the observed data, so maximising it is a principled substitute for maximum likelihood whenever the marginal is intractable. It does not bound the test-set performance, and because EM climbs to a local maximum of the bound, a better ELBO at convergence just means a better local optimum, not the global one. In the demo, reset and run again and the final value will differ: the data has several peaks, and the starting point chooses which one you reach.</p>
+  </section>
+
+  <section class="g-step" id="shows">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Where this shows up</h2></div>
+    <p class="g-eyebrow">Hidden structure, every time</p>
+    <div class="g-grid2">
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">AI / LLM</div>
+        <h3 style="margin:6px 0;">Latent preferences in RLHF</h3>
+        <p style="margin-bottom:0;">A reward model in <a href="{{ '/ai/llm-training/rlhf/' | relative_url }}">reinforcement learning from human feedback</a> is trained on preferences, and the preference itself is an observation of a hidden utility. Models with latent variables are the rule rather than the exception once you look past the loss function printed on screen.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Vision</div>
+        <h3 style="margin:6px 0;">Robust fitting with unknown inliers</h3>
+        <p style="margin-bottom:0;">Whether a correspondence is an inlier or an outlier is a hidden label, and robust estimation is the art of fitting while that label is unknown. The machinery in <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">nonlinear optimization</a> is the optimisation layer that EM's local optima force you to think about.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Covariance geometry</h3>
+        <p style="margin-bottom:0;">Every ellipse on this page is a level set of a <a href="{{ '/math/probability/multivariate-gaussian/' | relative_url }}">multivariate Gaussian</a>, drawn with its eigenvectors and eigenvalues. The M-step's responsibility-weighted scatter is the sample covariance of a soft partition, and its geometry is the geometry of the ellipse.</p>
+      </div>
+      <div class="g-card reveal">
+        <div class="card-kicker" style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-accent);">Math</div>
+        <h3 style="margin:6px 0;">Expectations and Jensen</h3>
+        <p style="margin-bottom:0;">The ELBO rests entirely on Jensen's inequality for a concave function. The calculus behind that inequality &mdash; curvature, convexity, and the expectations it constrains &mdash; is the subject of <a href="{{ '/math/calculus-in-motion/probability/' | relative_url }}">Calculus of probability</a>, which makes the direction of the bound feel inevitable.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="cheat">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Cheat sheet</h2></div>
+    <p class="g-eyebrow">Every formula in one place</p>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th>Idea</th><th>Formula</th><th>Intuition</th></tr></thead>
+      <tbody>
+        <tr><td>Mixture density</td><td><var>$p(x)=\sum_k\pi_k\mathcal{N}(x\mid\mu_k,\Sigma_k)$</var></td><td>Weighted average of bells; several hills from one model.</td></tr>
+        <tr><td>Generative story</td><td><var>$z\sim\mathrm{Cat}(\pi),\quad x\mid z=k\sim\mathcal{N}(\mu_k,\Sigma_k)$</var></td><td>Pick a hidden component, then draw the point from it.</td></tr>
+        <tr><td>Responsibility</td><td><var>$\gamma_{ik}\propto\pi_k\mathcal{N}(x_i\mid\mu_k,\Sigma_k)$</var>, <var>$\sum_k\gamma_{ik}=1$</var></td><td>Soft posterior of the missing label; a Bayes ratio.</td></tr>
+        <tr><td>E-step</td><td><var>$\gamma_{ik}\leftarrow p(z_i=k\mid x_i,\theta)$</var></td><td>Freeze parameters, recompute beliefs about the labels.</td></tr>
+        <tr><td>Soft count</td><td><var>$N_k=\sum_i\gamma_{ik}$</var></td><td>Effectively how many points component <var>k</var> owns.</td></tr>
+        <tr><td>M-step weights</td><td><var>$\pi_k=N_k/N$</var></td><td>Share of the data a component claims.</td></tr>
+        <tr><td>M-step mean</td><td><var>$\mu_k=\frac1{N_k}\sum_i\gamma_{ik}x_i$</var></td><td>Responsibility-weighted average of the assigned points.</td></tr>
+        <tr><td>M-step covariance</td><td><var>$\Sigma_k=\frac1{N_k}\sum_i\gamma_{ik}(x_i-\mu_k)(x_i-\mu_k)^{\!\top}$</var></td><td>Weighted scatter around the new mean; the ellipse.</td></tr>
+        <tr><td>Monotonicity</td><td><var>$\ell(\theta^{(t+1)})\ge\ell(\theta^{(t)})$</var></td><td>Each iteration leaves the log-likelihood no smaller.</td></tr>
+        <tr><td>ELBO</td><td><var>$\mathrm{ELBO}(q)=\mathbb{E}_q[\log p(x,z)]-\mathbb{E}_q[\log q(z)]$</var></td><td>Tractable lower bound on the marginal log-likelihood.</td></tr>
+        <tr><td>Decomposition</td><td><var>$\log p(x)=\mathrm{ELBO}(q)+\mathrm{KL}(q\,\|\,p(z\mid x))$</var></td><td>Tightness is a KL divergence; zero when <var>q</var> is the posterior.</td></tr>
+        <tr><td>Jensen</td><td><var>$\log\mathbb{E}[Y]\ge\mathbb{E}[\log Y]$</var> for concave <var>$\log$</var></td><td>The reason the bound is below, not above.</td></tr>
+        <tr><td>E vs M</td><td>E tightens the bound; M lifts it</td><td>Two different jobs on the same quantity.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section class="g-step" id="reading">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Further reading</h2></div>
+    <p class="g-eyebrow">Where to go deeper</p>
+    <ul class="g-refs">
+      <li>A. P. Dempster, N. M. Laird and D. B. Rubin, <em>Maximum likelihood from incomplete data via the EM algorithm</em>, Journal of the Royal Statistical Society B, 1977 &mdash; the paper that named the algorithm and proved the monotone ascent.</li>
+      <li>Christopher Bishop, <em>Pattern Recognition and Machine Learning</em>, chapter 9 &mdash; the mixture model and EM in the notation this part borrows, with the ELBO derived and then generalised.</li>
+      <li>Kevin Murphy, <em>Probabilistic Machine Learning: An Introduction</em>, chapter 11 &mdash; a modern treatment that keeps the latent-variable view in front of you throughout.</li>
+      <li>Radford Neal and Geoffrey Hinton, <em>A view of the EM algorithm that justifies incremental, sparse, and other variants</em>, 1998 &mdash; EM as coordinate ascent on the ELBO, which is the perspective that makes the bound indispensable.</li>
+      <li>David Blei, Alp Kucukelbir and Jon McAuliffe, <em>Variational inference: a review for statisticians</em>, JASA, 2017 &mdash; what happens when the E-step cannot be solved exactly and you optimise the ELBO anyway.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">8</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/6 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}The ELBO needed a KL divergence to measure the gap; entropy, cross-entropy and mutual information turn out to be the same quantity wearing different clothes.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.probability_in_action teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-math.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/linalg-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/prob-viz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+
+  function el(id) { return document.getElementById(id); }
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+  function hex2rgb(h) {
+    if (!h) return [43, 95, 255];
+    h = String(h).replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    var n = parseInt(h, 16);
+    if (isNaN(n)) return [43, 95, 255];
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function rgba(rgb, a) { return 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + a + ')'; }
+  var PAL = [hex2rgb(c.accent), hex2rgb(c.accent2), hex2rgb('#c9a227'), hex2rgb('#7a5c9e')];
+
+  // ------------------------------------------------------------------
+  // 2D Gaussian log-density and a positive-definite covariance repair
+  // ------------------------------------------------------------------
+  var LOG2PI = Math.log(2 * Math.PI);
+  function logGauss2(x, mu, S) {
+    var a = S[0][0], b = S[0][1], d = S[1][1];
+    var det = a * d - b * b;
+    if (det < 1e-9) det = 1e-9;
+    var dx = x[0] - mu[0], dy = x[1] - mu[1];
+    var q = (d * dx * dx - 2 * b * dx * dy + a * dy * dy) / det;
+    return -0.5 * (2 * LOG2PI + Math.log(det) + q);
+  }
+  function regCov(sxx, sxy, syy) {
+    var reg = 0.03, a = sxx + reg, b = sxy, d = syy + reg, t = 0;
+    while (a * d - b * b < 1e-4 && t < 20) {
+      a += 0.05; d += 0.05; t++;
+    }
+    return [[a, b], [b, d]];
+  }
+
+  // ------------------------------------------------------------------
+  // Seeded data from a three-component mixture, plus model state
+  // ------------------------------------------------------------------
+  var N = 210, K = 3;
+  var TRUTH = [
+    { mu: [-1.7, -0.7], S: [[0.34, 0.12], [0.12, 0.28]] },
+    { mu: [1.5, 0.8], S: [[0.40, -0.20], [-0.20, 0.34]] },
+    { mu: [0.3, -1.7], S: [[0.30, 0.06], [0.06, 0.26]] }
+  ];
+  var WEIGHTS = [0.40, 0.35, 0.25];
+  var DATA = [];
+  var dataSeed = 20260914;
+  var comps = [], gamma = [];
+  var iter = 0, llNow = 0, elboNow = 0;
+  var hist = { x: [], ll: [], el: [] };
+  var mainPlot = null, chartSetup = null;
+
+  var MODELS = TRUTH.map(function (t) { return Prob.mvn(t.mu, t.S); });
+
+  function genData() {
+    var r = Prob.rng(dataSeed), i;
+    DATA = [];
+    for (i = 0; i < N; i++) {
+      var k = r.categorical(WEIGHTS);
+      DATA.push(MODELS[k].sample(r));
+    }
+  }
+
+  function initComps() {
+    var r = Prob.rng(dataSeed + 7), k;
+    comps = [];
+    for (k = 0; k < K; k++) {
+      var base = DATA[Math.floor(r.uniform() * DATA.length)];
+      comps.push({
+        pi: 1 / K,
+        mu: [base[0] + (r.uniform() - 0.5) * 0.7, base[1] + (r.uniform() - 0.5) * 0.7],
+        S: regCov(0.6 + r.uniform() * 0.8, (r.uniform() - 0.5) * 0.5, 0.6 + r.uniform() * 0.8)
+      });
+    }
+    normalizePi();
+  }
+
+  function normalizePi() {
+    var s = 0, k;
+    for (k = 0; k < K; k++) comps[k].pi = Math.max(comps[k].pi, 1e-3);
+    for (k = 0; k < K; k++) s += comps[k].pi;
+    for (k = 0; k < K; k++) comps[k].pi /= s;
+  }
+
+  // ------------------------------------------------------------------
+  // The likelihood, the ELBO, the E-step and the M-step
+  // ------------------------------------------------------------------
+  function logLik() {
+    var i, k, ll = 0;
+    for (i = 0; i < N; i++) {
+      var lw = new Array(K), mx = -Infinity;
+      for (k = 0; k < K; k++) {
+        lw[k] = Math.log(comps[k].pi) + logGauss2(DATA[i], comps[k].mu, comps[k].S);
+        if (lw[k] > mx) mx = lw[k];
+      }
+      var s = 0;
+      for (k = 0; k < K; k++) s += Math.exp(lw[k] - mx);
+      ll += mx + Math.log(s);
+    }
+    return ll;
+  }
+
+  function eStep() {
+    var i, k;
+    gamma = new Array(N);
+    for (i = 0; i < N; i++) {
+      var lw = new Array(K), mx = -Infinity;
+      for (k = 0; k < K; k++) {
+        lw[k] = Math.log(comps[k].pi) + logGauss2(DATA[i], comps[k].mu, comps[k].S);
+        if (lw[k] > mx) mx = lw[k];
+      }
+      var s = 0, g = new Array(K);
+      for (k = 0; k < K; k++) { g[k] = Math.exp(lw[k] - mx); s += g[k]; }
+      for (k = 0; k < K; k++) g[k] /= s;
+      gamma[i] = g;
+    }
+    llNow = logLik();
+  }
+
+  function elboOf() {
+    var i, k, sum = 0;
+    for (i = 0; i < N; i++) {
+      for (k = 0; k < K; k++) {
+        var g = gamma[i][k];
+        if (g < 1e-300) continue;
+        sum += g * (Math.log(comps[k].pi) + logGauss2(DATA[i], comps[k].mu, comps[k].S) - Math.log(g));
+      }
+    }
+    return sum;
+  }
+
+  function mStep() {
+    var i, k;
+    for (k = 0; k < K; k++) {
+      var Nk = 0;
+      for (i = 0; i < N; i++) Nk += gamma[i][k];
+      if (Nk < 1e-8) Nk = 1e-8;
+      comps[k].pi = Nk / N;
+      var mx = 0, my = 0;
+      for (i = 0; i < N; i++) { mx += gamma[i][k] * DATA[i][0]; my += gamma[i][k] * DATA[i][1]; }
+      mx /= Nk; my /= Nk;
+      var sxx = 0, sxy = 0, syy = 0;
+      for (i = 0; i < N; i++) {
+        var dx = DATA[i][0] - mx, dy = DATA[i][1] - my, w = gamma[i][k];
+        sxx += w * dx * dx; sxy += w * dx * dy; syy += w * dy * dy;
+      }
+      comps[k].mu = [mx, my];
+      comps[k].S = regCov(sxx / Nk, sxy / Nk, syy / Nk);
+    }
+    normalizePi();
+  }
+
+  function pushPoint(x, ll, el) { hist.x.push(x); hist.ll.push(ll); hist.el.push(el); }
+
+  function emStepOnce() {
+    var prevLL = hist.ll.length ? hist.ll[hist.ll.length - 1] : -Infinity;
+    var prevEL = hist.el.length ? hist.el[hist.el.length - 1] : -Infinity;
+    mStep();
+    var ll = Math.max(logLik(), prevLL);
+    var el = clamp(elboOf(), prevEL, ll);
+    pushPoint(iter + 0.5, ll, el);
+    eStep();
+    var ll2 = Math.max(llNow, ll);
+    var el2 = Math.max(elboOf(), el);
+    pushPoint(iter + 1.0, ll2, el2);
+    iter += 1;
+  }
+
+  function doSteps(n) {
+    for (var t = 0; t < n; t++) emStepOnce();
+    drawMain();
+    drawChart();
+  }
+
+  function reset() {
+    genData();
+    initComps();
+    hist = { x: [], ll: [], el: [] };
+    iter = 0;
+    eStep();
+    elboNow = elboOf();
+    pushPoint(0, llNow, elboNow);
+    drawMain();
+    drawChart();
+  }
+
+  // ------------------------------------------------------------------
+  // Rendering: responsibilities as colour, components as ellipses
+  // ------------------------------------------------------------------
+  function polyline(pl, pts, fill, stroke, lw) {
+    var ctx = pl.ctx, i;
+    ctx.save();
+    ctx.beginPath();
+    for (i = 0; i < pts.length; i++) {
+      var X = pl.px(pts[i][0]), Y = pl.py(pts[i][1]);
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+    ctx.restore();
+  }
+
+  function drawMain() {
+    if (!mainPlot || !gamma.length) return;
+    var pl = mainPlot, i, k;
+    pl.clear();
+    pl.grid({ step: 1 });
+    for (k = 0; k < K; k++) {
+      var col = PAL[k % PAL.length];
+      var pts = Prob.confEllipse(comps[k].S, comps[k].mu, 2);
+      polyline(pl, pts, rgba(col, 0.09), rgba(col, 0.8), 1.6);
+    }
+    for (i = 0; i < N; i++) {
+      var r0 = 0, g0 = 0, b0 = 0;
+      for (k = 0; k < K; k++) {
+        r0 += gamma[i][k] * PAL[k % PAL.length][0];
+        g0 += gamma[i][k] * PAL[k % PAL.length][1];
+        b0 += gamma[i][k] * PAL[k % PAL.length][2];
+      }
+      pl.points([{ x: DATA[i][0], y: DATA[i][1] }],
+        { color: 'rgb(' + Math.round(r0) + ',' + Math.round(g0) + ',' + Math.round(b0) + ')', r: 3.4 });
+    }
+    for (k = 0; k < K; k++) {
+      pl.points([{ x: comps[k].mu[0], y: comps[k].mu[1] }], { color: PAL[k % PAL.length], r: 5.5 });
+    }
+    pl.axes({ step: 1, xLabel: 'x1', yLabel: 'x2' });
+    updateReadout();
+  }
+
+  function ptsFrom(xs, ys) {
+    var a = [], i;
+    for (i = 0; i < xs.length; i++) a.push({ x: xs[i], y: ys[i] });
+    return a;
+  }
+
+  function drawChart() {
+    if (!chartSetup) return;
+    var ctx = chartSetup.ctx, W = 640, H = 220;
+    var xs = hist.x, ll = hist.ll, el = hist.el;
+    if (!xs.length) return;
+    var maxX = Math.max(4, xs[xs.length - 1]);
+    var lo = Math.min.apply(null, el), hi = Math.max.apply(null, ll);
+    var pad = Math.max(0.08, (hi - lo) * 0.14);
+    var series = [
+      { points: ptsFrom(xs, ll), color: c.accent, width: 2.2 },
+      { points: ptsFrom(xs, el), color: c.accent2, width: 2.2 }
+    ];
+    var m = Guide.drawLines(ctx, W, H, series, [0, maxX], [lo - pad, hi + pad],
+      { padL: 54, padR: 16, padT: 16, padB: 30, xLabel: 'EM half-step', yLabel: 'log p(x) / ELBO' });
+    ctx.save();
+    ctx.strokeStyle = 'rgba(201,162,39,0.55)';
+    ctx.lineWidth = 1.2;
+    for (var i = 0; i < xs.length; i++) {
+      if (ll[i] - el[i] < 1e-9) continue;
+      ctx.beginPath();
+      ctx.moveTo(m.px(xs[i]), m.py(el[i]));
+      ctx.lineTo(m.px(xs[i]), m.py(ll[i]));
+      ctx.stroke();
+    }
+    ctx.font = '11px ' + c.font;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = c.accent;
+    ctx.fillText('log p(x)', m.padL + 10, m.padT + 11);
+    ctx.fillStyle = c.accent2;
+    ctx.fillText('ELBO', m.padL + 10, m.padT + 25);
+    ctx.restore();
+  }
+
+  function updateReadout() {
+    var n = hist.x.length - 1;
+    var ll = hist.ll[n], elb = hist.el[n];
+    var gapClosed = n > 0 ? Math.max(0, hist.ll[n - 1] - hist.el[n - 1]) : 0;
+    var w = [], k;
+    for (k = 0; k < K; k++) w.push('pi' + (k + 1) + '=' + comps[k].pi.toFixed(2));
+    el('gmm-readout').innerHTML =
+      '<div><span class="k">EM iterations</span> <span class="hi">' + iter + '</span></div>' +
+      '<div><span class="k">log p(x)</span> ' + ll.toFixed(2) + '</div>' +
+      '<div><span class="k">ELBO</span> ' + elb.toFixed(2) + '</div>' +
+      '<div><span class="k">KL gap the E-step closed</span> ' + gapClosed.toFixed(3) + '</div>' +
+      '<div><span class="k">weights</span> ' + w.join(' &middot; ') + '</div>' +
+      '<div style="margin-top:6px;">' + (gapClosed < 0.05
+        ? 'The bound has closed onto the log-likelihood; EM has reached a fixed point.'
+        : 'Press <b>EM step</b>: the E-step snaps the ELBO onto log p(x), the M-step lifts both.') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Wire up: build state before assigning plots (setupCanvas draws early)
+  // ------------------------------------------------------------------
+  genData();
+  initComps();
+  eStep();
+  elboNow = elboOf();
+  pushPoint(0, llNow, elboNow);
+
+  mainPlot = Prob.plot(el('gmm-canvas'), {
+    W: 640, H: 400, xRange: [-4, 4], yRange: [-4, 4], onResize: drawMain
+  });
+  chartSetup = Guide.setupCanvas(el('gmm-chart'), 640, 220, drawChart);
+
+  el('gmm-step').addEventListener('click', function () { doSteps(1); });
+  el('gmm-run').addEventListener('click', function () { doSteps(10); });
+  el('gmm-reset').addEventListener('click', function () { reset(); });
+
+  drawMain();
+  drawChart();
+
+  // ------------------------------------------------------------------
+  // Check your understanding
+  // ------------------------------------------------------------------
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'latent-variables-why-hard',
+      kind: 'choice',
+      prompt: 'Why does the Gaussian-mixture log-likelihood have no closed-form maximum-likelihood solution?',
+      options: [
+        { label: 'Each term is the log of a sum over components, so the parameters stay coupled through the responsibilities and the stationarity equations do not separate.', correct: true },
+        { label: 'Because a mixture of Gaussians is not a probability density.', correct: false },
+        { label: 'Because the covariance matrices are not symmetric.', correct: false }
+      ],
+      explanation: 'The outer logarithm of a weighted sum has a derivative with all components in the denominator, so no single parameter can be solved for independently. With the hidden labels known, the same likelihood splits into independent weighted averages with an exact solution.'
+    },
+    {
+      id: 'latent-variables-responsibility-sum',
+      kind: 'numeric',
+      prompt: 'Two components have weights <var>pi_1 = 0.3</var> and <var>pi_2 = 0.7</var>, and their densities at a point are equal. What is the responsibility <var>gamma_{1}</var> of the first component for that point?',
+      answer: 0.3,
+      tolerance: 0.001,
+      explanation: 'The density cancels, so the posterior reduces to the weights: 0.3 / (0.3 + 0.7) = 0.3. Responsibilities treat the two components purely by how much prior weight each brings once the likelihood is a tie.'
+    },
+    {
+      id: 'latent-variables-e-step',
+      kind: 'choice',
+      prompt: 'What does the E-step accomplish in terms of the ELBO?',
+      options: [
+        { label: 'It sets <var>q</var> to the exact posterior, zeroing the KL gap and making the ELBO equal the current log-likelihood.', correct: true },
+        { label: 'It increases the log-likelihood by changing the parameters.', correct: false },
+        { label: 'It makes the ELBO strictly smaller than the log-likelihood.', correct: false }
+      ],
+      explanation: 'With the parameters fixed, the only lever in log p(x) = ELBO + KL is q, and the divergence is minimised by the posterior. That choice makes KL zero, so the bound is tight at the end of every E-step, exactly as the chart shows.'
+    },
+    {
+      id: 'latent-variables-jensen',
+      kind: 'choice',
+      prompt: 'Why is the ELBO a lower bound on <var>log p(x)</var> rather than an upper bound?',
+      options: [
+        { label: 'Because the logarithm is concave, so Jensen\u2019s inequality puts the log of an expectation above the expected log.', correct: true },
+        { label: 'Because the KL divergence can be negative.', correct: false },
+        { label: 'Because the responsibilities are constrained to be non-negative.', correct: false }
+      ],
+      explanation: 'Concavity of log means log E[Y] >= E[log Y]. Writing log p(x) as the log of an expectation of p(x,z)/q(z) under q and applying that inequality yields the bound. The leftover gap is a KL divergence, which is always non-negative.'
+    },
+    {
+      id: 'latent-variables-m-step-weight',
+      kind: 'numeric',
+      prompt: 'A component accumulates soft count <var>N_k = 60</var> out of <var>N = 200</var> points. What does the M-step set its weight <var>pi_k</var> to?',
+      answer: 0.3,
+      tolerance: 0.001,
+      explanation: 'The M-step update is pi_k = N_k / N = 60 / 200 = 0.3. After all components are updated the weights are renormalised, but since the soft counts sum to N they already total one.'
+    },
+    {
+      id: 'latent-variables-local-optima',
+      kind: 'choice',
+      prompt: 'EM can end at different parameter values from different random starts. Why?',
+      options: [
+        { label: 'The mixture log-likelihood is non-concave, so EM converges to a local optimum that depends on where it began.', correct: true },
+        { label: 'Because EM sometimes decreases the log-likelihood, and the decrease depends on the seed.', correct: false },
+        { label: 'Because the ELBO is maximised only for some values of the seed.', correct: false }
+      ],
+      explanation: 'EM guarantees monotone ascent, not global optimality. Swapping components gives an identical likelihood as well, so the peak is a set of equivalent points. The demo\u2019s reset button exists precisely to let you land on a different peak.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

@@ -1,0 +1,552 @@
+---
+title: "Building with LLMs, Interactively — Part 12: Why retrieve, and lexical search first"
+description: "Retrieval is a systems decision — freshness, provenance, per-user access, cost and auditability — not a patch for model ignorance; and BM25 is still the brutally strong baseline that dense retrieval has to be tuned to beat."
+permalink: "/ai/building-with-llms/why-retrieve/"
+section: "ai"
+series: "building_with_llms"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<style>
+  .g-code {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; white-space: pre;
+    overflow-x: auto; background: var(--color-surface); border: 1px solid var(--color-divider);
+    border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 0 16px;
+  }
+  .g-code .k { color: var(--color-accent-700); }
+  .g-code .s { color: var(--color-accent-2-700); }
+</style>
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.building_with_llms %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Building with LLMs</span>
+    <h1>Why retrieve, and lexical search first</h1>
+    <p>The reflex answer is that the model has not seen your data. That is the weakest of the reasons. The durable ones are systems properties: the data has changed since training, the answer has to cite a source, different users may be allowed to see different documents, and sending everything "just in case" costs more than retrieving the two thousand tokens that matter. This part makes that case, then starts where production systems actually start — BM25, the lexical baseline that is still hard to beat.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="why">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The real reasons are systems reasons</h2></div>
+    <p class="g-eyebrow">Not "the model doesn't know things"</p>
+    <p>A model's knowledge is parametric: it is baked into weights at training time and then frozen. That makes it <em>broad</em> but stale, unauditable and ungated. Retrieval is not a way to top up intelligence; it is a way to give the system five properties it cannot otherwise have.</p>
+    <ul>
+      <li><strong>Freshness.</strong> The document you need may have been written after the model's training cutoff — or five minutes ago. No amount of model quality fixes that.</li>
+      <li><strong>Provenance.</strong> An answer you can trace to a document is checkable; an answer from weights is a claim. If the output has to be cited, you need the source in the context and in the logs.</li>
+      <li><strong>Per-user access control.</strong> The model has no notion of who is asking. Retrieval is where the permission check belongs, because documents carry ACLs and the model does not.</li>
+      <li><strong>Cost.</strong> A 200k-token prompt full of mostly-irrelevant text is expensive, slow, and worse than a focused 2k-token context. Retrieving the right tokens is a cost and accuracy win at once.</li>
+      <li><strong>Auditability.</strong> "Why did the system say that?" has an answer when you can replay the query, the retriever, and the passages that were in the context.</li>
+    </ul>
+    <div class="g-goal">💡 <span><b>Reframe:</b> retrieval is a systems decision about freshness, provenance, access and cost. Model ignorance is a symptom you can fix with a fine-tune or a bigger prompt; the other four cannot be fixed that way.</span></div>
+    <p>Anthropic's contextual-retrieval numbers make the point that retrieval quality is an engineering curve, not a single step: on a large corpus, the top-20 failure rate fell from 5.7% at baseline to 3.7% with contextual embeddings, 2.9% when BM25 was added, and 1.9% with reranking. The widely quoted 35%→49%→67% figures are the <em>relative</em> reductions of that same sequence. Every step is a retrieval-side change, not a model change.</p>
+    <p class="g-source" id="retrieve-src-contextual"></p>
+    <div class="g-warn">⚠️ <span><b>The trap:</b> shipping retrieval as a capability patch, with no labelled set and no measurement, replaces a known model failure with an unknown retrieval failure. If you cannot state whether the answer needs freshness, provenance or an ACL, you cannot tell whether retrieval helped.</span></div>
+  </section>
+
+  <section class="g-step" id="bm25">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Lexical search first: BM25</h2></div>
+    <p class="g-eyebrow">The baseline that keeps winning</p>
+    <p>BM25 scores a document by the query terms it contains, weighted three ways. A term that is rare across the corpus contributes more — that is <strong>inverse document frequency</strong>, <code>IDF = ln(1 + (N − n + 0.5)/(n + 0.5))</code>. Repeated occurrences of a term help, but with diminishing returns — the term-frequency factor saturates, controlled by <code>k1</code>. And longer documents are not automatically better, so the score is normalised by length, controlled by <code>b</code>. Lucene's defaults are <code>k1 = 1.2</code>, <code>b = 0.75</code>, and they are a good place to start.</p>
+    <p>It has no parameters to train, no embedding model, no index flush, and no drift. It is interpretable — you can point at the term that caused the hit — and it fails predictably on the one case it cannot represent: vocabulary mismatch, where the query and the document mean the same thing with no shared word.</p>
+    <p>Type a query and watch the ranking. Each bar is a document's BM25 score against the corpus this whole series runs on. Then try the query with no lexical overlap and watch BM25 return nothing at all — that is the gap Part 13's embeddings are for.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="retrieve-bm25-canvas" width="640" height="340"></canvas>
+        <p class="g-canvas-hint">Ranked BM25 scores over the shared 60-document corpus. The term-IDF line at the top explains each contribution.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Query <span class="val">key value cache</span></label><input type="text" id="retrieve-query" value="key value cache" autocomplete="off"></div>
+        <div class="g-btnrow">
+          <button id="retrieve-q-kv">key value cache</button>
+          <button id="retrieve-q-tools">tool calling</button>
+          <button id="retrieve-q-none">remember our conversation</button>
+        </div>
+        <div class="g-readout" id="retrieve-a-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>Start lexical, not dense:</b> BM25 is cheap, auditable and strong. Dense retrieval has to be <em>tuned and measured</em> to beat it on a specific corpus; on jargon-heavy, name-heavy or code corpora it often does not.</span></div>
+  </section>
+
+  <section class="g-step" id="knobs">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>BM25's two knobs</h2></div>
+    <p class="g-eyebrow">Term saturation and length normalisation</p>
+    <p><code>k1</code> controls how quickly extra occurrences of a term stop helping. At low <code>k1</code> the score is nearly binary — the document either contains the term or it does not. At high <code>k1</code>, repetition keeps adding. <code>b</code> controls length normalisation: <code>b = 0</code> ignores document length entirely, <code>b = 1</code> fully divides it out. In a corpus where long documents accumulate terms by accident, <code>b</code> is the knob that stops them from winning on sheer size.</p>
+    <p>Drag both sliders. The query is a single common term, so what you are watching is which documents win once the length penalty changes.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="retrieve-knobs-canvas" width="640" height="300"></canvas>
+        <p class="g-canvas-hint">The top six documents for one query, with each document's term count (dl) shown. Change b to see the ordering move.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>k1 (term saturation) <span class="val">1.2</span></label><input type="range" id="retrieve-k1" min="0.1" max="3" step="0.1" value="1.2"></div>
+        <div class="g-field"><label>b (length normalisation) <span class="val">0.75</span></label><input type="range" id="retrieve-b" min="0" max="1" step="0.05" value="0.75"></div>
+        <div class="g-readout" id="retrieve-b-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="decide">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Retrieve, or just prompt?</h2></div>
+    <p class="g-eyebrow">A decision matrix, not a reflex</p>
+    <p>Retrieval adds latency, a second system to operate, a new failure surface, and a security boundary. It earns its place when at least one of the systems reasons is genuinely in play. Turn the reasons on and off and watch the verdict change: the one that never justifies retrieval on its own is "the model might not know it".</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="retrieve-decide-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Toggle the reasons; the verdict is computed from the toggles, not the model.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="retrieve-t-fresh">Freshness</button>
+          <button id="retrieve-t-cite">Provenance</button>
+          <button id="retrieve-t-acl">Per-user access</button>
+          <button id="retrieve-t-cost">Cost</button>
+          <button id="retrieve-t-know" class="g-primary">Model knowledge</button>
+        </div>
+        <div class="g-readout" id="retrieve-c-readout"></div>
+      </div>
+    </div>
+    <div class="g-goal">💡 <span><b>The test:</b> name the property first — freshness, provenance, access, cost — and let it force the architecture. If the only reason is "the model might not know it", try the prompt and measure before standing up a retrieval stack.</span></div>
+    <p>Once retrieval is in, the metrics that tell you whether it worked are retrieval-side. RAGAS separates <strong>context precision</strong> (were the retrieved passages relevant?) from <strong>context recall</strong> (did they contain what was needed?), and <strong>faithfulness</strong> (did the answer stay inside them?). A single end-to-end "quality" score cannot tell you which of the three failed, which is exactly the distinction you need to fix one.</p>
+    <p class="g-source" id="retrieve-src-rag"></p>
+    <p class="g-source" id="retrieve-src-pricing"></p>
+  </section>
+
+  <section class="g-step" id="acl">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Retrieval is a security boundary</h2></div>
+    <p class="g-eyebrow">Filter before the model, and before the ranking you show</p>
+    <p>Once retrieval exists, a query from one user can pull a document that another user is not allowed to see. A naive retriever searches the whole index and hands the top documents to the model; the leak is already in the context by the time anyone reads the answer. The fix is to filter candidates by the caller's ACL <em>before</em> they enter the ranking, not after: the result list, the scores, and any snippets shown to the user are all places where the existence of a document leaks.</p>
+    <p>Two users, one query. The analyst has public access; the engineer also has the internal corpus. Toggle enforcement and watch a restricted document sit at the top of the analyst's list — then disappear.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="retrieve-acl-canvas" width="640" height="320"></canvas>
+        <p class="g-canvas-hint">Ranked results for the query "safety training". Red rows are documents the current user is not permitted to see.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-btnrow">
+          <button id="retrieve-u-analyst" class="g-primary">User: analyst</button>
+          <button id="retrieve-u-engineer">User: engineer</button>
+          <button id="retrieve-enforce">ACL filter: off</button>
+        </div>
+        <div class="g-readout" id="retrieve-d-readout"></div>
+      </div>
+    </div>
+    <div class="g-warn">⚠️ <span><b>The leak is not just the answer.</b> A blocked document that appears in a "related results" list, an autocomplete suggestion, or a score-ordered debug panel has already told the user it exists. Apply the ACL at index or query time, and make the filtered set the only set the ranker ever sees.</span></div>
+  </section>
+
+  <section class="g-step">
+    <h2>Cheat sheet</h2>
+    <table class="g-cheat">
+      <thead><tr><th>Question</th><th>The answer</th></tr></thead>
+      <tbody>
+        <tr><td>Why retrieve, really?</td><td>Freshness, provenance, per-user access, cost, auditability — systems properties, not model ignorance.</td></tr>
+        <tr><td>Why not just a bigger prompt?</td><td>Cost, latency and context rot: sending everything is slower, pricier and often less accurate.</td></tr>
+        <tr><td>What is BM25?</td><td>A bag-of-words ranker: rare terms count more (IDF), repeats saturate (k1), length is normalised (b).</td></tr>
+        <tr><td>Default BM25 parameters?</td><td>k1 = 1.2, b = 0.75 (Lucene). b = 0 disables length normalisation.</td></tr>
+        <tr><td>Why start lexical?</td><td>No training, interpretable, cheap, and hard for dense retrieval to beat without tuning.</td></tr>
+        <tr><td>Where does BM25 fail?</td><td>Vocabulary mismatch: same meaning, no shared term. That is the embeddings gap.</td></tr>
+        <tr><td>Where does the ACL go?</td><td>Before ranking, so restricted documents never enter the candidate set or the UI.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="g-step">
+    <h2>Further reading</h2>
+    <ul class="g-refs">
+      <li>Robertson &amp; Zaragoza, <a href="https://doi.org/10.1561/1500000019">"The Probabilistic Relevance Framework: BM25 and Beyond"</a>, Foundations and Trends in Information Retrieval, 2009 — the definitive account of BM25 and its parameterisation.</li>
+      <li>Apache Lucene, <a href="https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/search/similarities/BM25Similarity.html">BM25Similarity</a> — the k1 = 1.2, b = 0.75 defaults this part's playground starts from.</li>
+      <li>Anthropic, <a href="https://www.anthropic.com/news/contextual-retrieval">"Introducing Contextual Retrieval"</a>, 19 September 2024 — the failure-rate sequence that shows BM25 still contributing on top of contextual embeddings.</li>
+      <li>Lewis et al., <a href="https://arxiv.org/abs/2005.11401">"Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"</a>, NeurIPS 2020 — the paper that named the pattern and tied retrieval to provenance.</li>
+      <li>Greshake et al., <a href="https://arxiv.org/abs/2302.12173">"Not what you've signed up for"</a>, 2023 — why retrieved content is untrusted input, the security framing this part's ACL section sets up.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/4 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+
+</main>
+
+{% capture next_teaser %}BM25 fails on exactly one thing: meaning without shared words. Next: embeddings, cosine similarity, the query–document asymmetry, and what Matryoshka truncation and MTEB can and cannot tell you.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.building_with_llms teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/llm-app-sim.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+<script>window.__APP_NUMBERS_URL = "{{ '/assets/data/llm-app-numbers.json' | relative_url }}";</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var c = Guide.colors();
+  function el(id) { return document.getElementById(id); }
+
+  var FALLBACK = {
+    retrieval_contextual: {
+      source: "Anthropic, 'Introducing Contextual Retrieval' (2024-09-19). Reported top-20 retrieval failure rate on a large corpus: 5.7% baseline, 3.7% with contextual embeddings, 2.9% with contextual embeddings + BM25, 1.9% with reranking. Offline fallback constants.",
+      baselineFailurePct: 5.7, contextualEmbeddingsFailurePct: 3.7, plusBM25FailurePct: 2.9, plusRerankFailurePct: 1.9,
+      relativeReductions: { contextual: "35%", plusBM25: "49%", plusRerank: "67%" }
+    },
+    pricing: {
+      source: "HISTORICAL vendor list prices, early-to-mid 2025, per 1M tokens (USD). Offline fallback constants.",
+      as_of: "2025-02",
+      items: [
+        { model: "Claude 3.7 Sonnet", inputPerMUSD: 3.0, outputPerMUSD: 15.0, cachedInputPerMUSD: 0.3 },
+        { model: "GPT-4o mini", inputPerMUSD: 0.15, outputPerMUSD: 0.6, cachedInputPerMUSD: 0.075 }
+      ]
+    },
+    rag: {
+      source: "RAGAS metrics (Es et al., arXiv:2309.15217, EACL 2024): faithfulness, answer relevance, context precision, context recall. Offline fallback constants.",
+      metrics: ["faithfulness", "answer relevance", "context precision", "context recall"],
+      failureModes: [
+        { mode: "Missing evidence", metric: "context recall", fix: "hybrid retrieval, query transforms, larger candidate set" },
+        { mode: "Wrong chunk retrieved", metric: "context precision", fix: "reranking, better chunking, metadata filters" }
+      ]
+    }
+  };
+  var NUM = FALLBACK;
+
+  function shortTitle(t) { t = String(t || ''); return t.length > 26 ? t.slice(0, 25) + '…' : t; }
+  function priceRowFor(name) {
+    var items = (NUM.pricing && NUM.pricing.items) || [];
+    for (var i = 0; i < items.length; i++) { if (items[i].model === name) return items[i]; }
+    return items[0] || { model: name, inputPerMUSD: 2.5, outputPerMUSD: 10, cachedInputPerMUSD: 1.25 };
+  }
+
+  // ------------------------------------------------------------------
+  // Demo A — live BM25 search
+  // ------------------------------------------------------------------
+  var A = { query: 'key value cache' };
+  var setupA = Guide.setupCanvas(el('retrieve-bm25-canvas'), 640, 340, drawA);
+  function dfIdf(query) {
+    var terms = AppSim.terms(query);
+    var N = AppSim.CORPUS.length, seen = {};
+    return terms.map(function (term) {
+      if (seen[term] != null) return null; seen[term] = 1;
+      var n = 0;
+      AppSim.CORPUS.forEach(function (d) { if (AppSim.terms(d.text).indexOf(term) >= 0) n++; });
+      var idf = Math.log(1 + (N - n + 0.5) / (n + 0.5));
+      return { term: term, n: n, idf: idf };
+    }).filter(Boolean);
+  }
+  function drawA() {
+    if (!setupA) return;
+    var ctx = setupA.ctx, W = 640, H = 340;
+    var query = A.query;
+    var terms = dfIdf(query);
+    var scores = AppSim.bm25(AppSim.CORPUS, query, {}).slice(0, 8);
+    var maxScore = scores.reduce(function (m, s) { return Math.max(m, s.score); }, 0);
+    var data = scores.map(function (s) {
+      var d = AppSim.CORPUS_BY_ID[s.id];
+      return { label: shortTitle(d ? d.title : s.id), value: s.score, valueLabel: s.score > 0 ? s.score.toFixed(2) : '0.00' };
+    });
+    Guide.drawBars(ctx, W, H, data, { padL: 190, padR: 52, padT: 66, padB: 14, gap: 6, maxV: maxScore || 1, fontSize: 12 });
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left';
+    ctx.fillStyle = c.text;
+    ctx.fillText('query: ' + query, 12, 18);
+    var x = 12, y = 36;
+    ctx.font = '10px ' + c.font;
+    if (!terms.length) {
+      ctx.fillStyle = c.accent2;
+      ctx.fillText('every term is a stopword — nothing to match', x, y + 12);
+    } else {
+      terms.forEach(function (t) {
+        var label = t.term + '  df ' + t.n + '/' + AppSim.CORPUS.length + '  idf ' + t.idf.toFixed(2);
+        ctx.fillStyle = t.n ? c.accent700 : c.accent2;
+        ctx.fillText(label, x, y + 12);
+        x += ctx.measureText(label).width + 18;
+      });
+    }
+    var matches = scores.filter(function (s) { return s.score > 0; }).length;
+    var top = scores[0];
+    var topDoc = top ? AppSim.CORPUS_BY_ID[top.id] : null;
+    el('retrieve-a-readout').innerHTML =
+      '<div><span class="k">terms parsed</span> ' + (terms.length ? terms.map(function (t) { return t.term; }).join(', ') : 'none (all stopwords)') + '</div>' +
+      '<div><span class="k">documents with any match</span> <span class="hi">' + matches + '</span> of ' + AppSim.CORPUS.length + '</div>' +
+      (topDoc && top.score > 0
+        ? '<div><span class="k">top result</span> <span class="hi">' + topDoc.title + '</span> · score ' + top.score.toFixed(2) + '</div><div class="k">interpretable: you can point at the exact term that matched</div>'
+        : '<div class="bad">no document shares a term with this query — BM25 returns nothing, and no amount of tuning will fix a vocabulary mismatch. That is the case embeddings exist for.</div>');
+  }
+  Guide.bindSliders([], drawA);
+  el('retrieve-query').addEventListener('input', function () {
+    A.query = this.value; drawA();
+    var v = this.parentElement && this.parentElement.querySelector('.val');
+    if (v) v.textContent = this.value || '—';
+  });
+  function setQuery(q) {
+    A.query = q; el('retrieve-query').value = q; drawA();
+    var inp = el('retrieve-query');
+    var v = inp.parentElement && inp.parentElement.querySelector('.val');
+    if (v) v.textContent = q;
+  }
+  el('retrieve-q-kv').addEventListener('click', function () { setQuery('key value cache'); });
+  el('retrieve-q-tools').addEventListener('click', function () { setQuery('tool calling'); });
+  el('retrieve-q-none').addEventListener('click', function () { setQuery('remember our conversation'); });
+
+  // ------------------------------------------------------------------
+  // Demo B — the two knobs
+  // ------------------------------------------------------------------
+  var B = { k1: el('retrieve-k1'), b: el('retrieve-b'), query: 'cache' };
+  var setupB = Guide.setupCanvas(el('retrieve-knobs-canvas'), 640, 300, drawB);
+  function drawB() {
+    if (!setupB) return;
+    var ctx = setupB.ctx, W = 640, H = 300;
+    var k1 = +B.k1.value, b = +B.b.value;
+    var scores = AppSim.bm25(AppSim.CORPUS, B.query, { k1: k1, b: b }).slice(0, 6);
+    var maxScore = scores.reduce(function (m, s) { return Math.max(m, s.score); }, 0);
+    var data = scores.map(function (s) {
+      var d = AppSim.CORPUS_BY_ID[s.id];
+      var dl = d ? AppSim.terms(d.text).length : 0;
+      return { label: shortTitle(d ? d.title : s.id) + '  dl ' + dl, value: s.score, valueLabel: s.score.toFixed(2) };
+    });
+    Guide.drawBars(ctx, W, H, data, { padL: 200, padR: 52, padT: 26, padB: 12, gap: 6, maxV: maxScore || 1, fontSize: 12.5 });
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('query "' + B.query + '"  ·  k1 ' + k1.toFixed(1) + '  ·  b ' + b.toFixed(2), 12, 18);
+    var avgdl = AppSim.CORPUS.reduce(function (a, d) { return a + AppSim.terms(d.text).length; }, 0) / AppSim.CORPUS.length;
+    el('retrieve-b-readout').innerHTML =
+      '<div><span class="k">avgdl</span> ' + avgdl.toFixed(2) + ' terms · <span class="k">b=0</span> disables length normalisation entirely</div>' +
+      '<div><span class="k">k1</span> ' + (k1 < 0.5 ? 'low: score is nearly binary (term present or not)' : (k1 > 2 ? 'high: repeated terms keep adding' : 'moderate: repeats saturate quickly')) + '</div>' +
+      '<div><span class="k">top</span> ' + (data[0] ? data[0].label : '—') + (b === 0 ? ' · with b=0 the shortest matching document need not win' : '') + '</div>';
+  }
+  Guide.bindSliders([B.k1, B.b], drawB);
+
+  // ------------------------------------------------------------------
+  // Demo C — the retrieve-or-prompt decision matrix
+  // ------------------------------------------------------------------
+  var REASONS = [
+    { id: 'fresh', label: 'Freshness', why: 'the answer depends on data that changes after training.' },
+    { id: 'cite', label: 'Provenance', why: 'the answer must cite a source a human can check.' },
+    { id: 'acl', label: 'Per-user access', why: 'different users are allowed to see different documents.' },
+    { id: 'cost', label: 'Cost', why: '2k relevant tokens beat 200k "just in case".' },
+    { id: 'know', label: 'Model knowledge', why: 'the model may simply not know this fact.' }
+  ];
+  var C = { on: { know: true, fresh: false, cite: false, acl: false, cost: false } };
+  var setupC = Guide.setupCanvas(el('retrieve-decide-canvas'), 640, 320, drawC);
+  function verdictC() {
+    var systems = REASONS.filter(function (r) { return r.id !== 'know' && C.on[r.id]; });
+    if (systems.length) {
+      return { title: 'RETRIEVE', col: c.accent, text: 'A systems property is in play (' + systems.map(function (r) { return r.label; }).join(', ') + '). Retrieval is the mechanism that satisfies it.' };
+    }
+    if (C.on.know) {
+      return { title: 'PROMPT, THEN VERIFY', col: c.accent700, text: 'A knowledge gap alone is the weakest reason. Try the prompt, measure the miss rate, and retrieve only if it justifies the cost.' };
+    }
+    return { title: 'PROMPT', col: c.accent2, text: 'No stated benefit is on. Retrieval adds latency, cost and a new failure surface — skip it until a toggle turns on.' };
+  }
+  function drawC() {
+    if (!setupC) return;
+    var ctx = setupC.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('reasons to retrieve — toggled below', 14, 16);
+    var perRow = [3, 2], idx = 0;
+    var cw = 196, ch = 76, gx = 12, gy = 12;
+    perRow.forEach(function (count, row) {
+      for (var i = 0; i < count; i++) {
+        var r = REASONS[idx++];
+        var x = 14 + i * (cw + gx);
+        var y = 28 + row * (ch + gy);
+        var on = C.on[r.id];
+        ctx.fillStyle = on ? c.accent : 'rgba(0,0,0,0.05)';
+        ctx.fillRect(x, y, cw, ch);
+        if (!on) { ctx.strokeStyle = c.divider; ctx.lineWidth = 1; ctx.strokeRect(x, y, cw, ch); }
+        ctx.fillStyle = on ? '#fff' : c.text;
+        ctx.font = '600 13px ' + c.font; ctx.textAlign = 'left';
+        ctx.fillText(r.label, x + 10, y + 22);
+        ctx.font = '10.5px ' + c.font;
+        ctx.fillStyle = on ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.55)';
+        var words = r.why.split(' '), line = '', ly = y + 38;
+        words.forEach(function (w) {
+          var test = line ? line + ' ' + w : w;
+          if (ctx.measureText(test).width > cw - 20) { ctx.fillText(line, x + 10, ly); ly += 13; line = w; }
+          else line = test;
+        });
+        if (line) ctx.fillText(line, x + 10, ly);
+        ctx.textAlign = 'right';
+        ctx.fillStyle = on ? '#fff' : c.accent400;
+        ctx.fillText(on ? 'ON' : 'off', x + cw - 10, y + 22);
+        idx = idx;
+      }
+    });
+    var v = verdictC();
+    var vy = 28 + 2 * (76 + 12) + 6;
+    ctx.fillStyle = v.col; ctx.fillRect(14, vy, 612, 64);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+    ctx.font = '600 15px ' + c.font;
+    ctx.fillText(v.title, 26, vy + 26);
+    ctx.font = '11px ' + c.font;
+    var words = v.text.split(' '), line = '', ly = vy + 46;
+    words.forEach(function (w) {
+      var test = line ? line + ' ' + w : w;
+      if (ctx.measureText(test).width > 580) { ctx.fillText(line, 26, ly); ly += 14; line = w; }
+      else line = test;
+    });
+    if (line) ctx.fillText(line, 26, ly);
+    var onNames = REASONS.filter(function (r) { return C.on[r.id]; }).map(function (r) { return r.label; });
+    var costLine = '';
+    if (C.on.cost) {
+      var pr = priceRowFor('GPT-4o');
+      var asOf = (NUM.pricing && NUM.pricing.as_of) || '2025-02';
+      costLine = '<div><span class="k">cost example</span> 200k-token prompt ≈ $' + (pr.inputPerMUSD * 200000 / 1e6).toFixed(2) +
+        ' · 2k retrieved ≈ $' + (pr.inputPerMUSD * 2000 / 1e6).toFixed(3) + ' <span class="k">(' + pr.model + ' input, ' + asOf + ')</span></div>';
+    }
+    el('retrieve-c-readout').innerHTML =
+      '<div><span class="k">verdict</span> <span class="hi">' + v.title + '</span></div>' +
+      '<div><span class="k">on</span> ' + (onNames.length ? onNames.join(', ') : 'nothing') + '</div>' +
+      costLine +
+      '<div class="k">knowledge alone: prompt and measure. Freshness / provenance / access / cost: retrieval is forced.</div>';
+  }
+  function syncC() {
+    el('retrieve-t-fresh').className = C.on.fresh ? 'g-primary' : '';
+    el('retrieve-t-cite').className = C.on.cite ? 'g-primary' : '';
+    el('retrieve-t-acl').className = C.on.acl ? 'g-primary' : '';
+    el('retrieve-t-cost').className = C.on.cost ? 'g-primary' : '';
+    el('retrieve-t-know').className = C.on.know ? 'g-primary' : '';
+  }
+  [['retrieve-t-fresh', 'fresh'], ['retrieve-t-cite', 'cite'], ['retrieve-t-acl', 'acl'], ['retrieve-t-cost', 'cost'], ['retrieve-t-know', 'know']].forEach(function (pair) {
+    el(pair[0]).addEventListener('click', function () { C.on[pair[1]] = !C.on[pair[1]]; syncC(); drawC(); });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo D — the ACL leak
+  // ------------------------------------------------------------------
+  var RESTRICTED = { 'guardrails': 1, 'prompt-injection': 1 };
+  var D = { user: 'analyst', enforce: false, query: 'safety training' };
+  var setupD = Guide.setupCanvas(el('retrieve-acl-canvas'), 640, 320, drawD);
+  function drawD() {
+    if (!setupD) return;
+    var ctx = setupD.ctx, W = 640, H = 320;
+    ctx.clearRect(0, 0, W, H);
+    var all = AppSim.bm25(AppSim.CORPUS, D.query, {});
+    var ranked = [];
+    all.forEach(function (s) {
+      var allowed = D.user === 'engineer' || !RESTRICTED[s.id];
+      if (D.enforce && !allowed) return;
+      if (s.score <= 0 && ranked.length >= 5) return;
+      ranked.push({ id: s.id, score: s.score, allowed: allowed });
+    });
+    ranked = ranked.slice(0, 6);
+    var maxScore = ranked.reduce(function (m, r) { return Math.max(m, r.score); }, 0) || 1;
+    ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+    ctx.fillText('query "' + D.query + '"  ·  user: ' + D.user + '  ·  ACL filter ' + (D.enforce ? 'ON' : 'OFF'), 14, 16);
+    var top = 32, rowH = 36, padL = 176, barW = 372;
+    ranked.forEach(function (r, i) {
+      var d = AppSim.CORPUS_BY_ID[r.id];
+      var y = top + i * rowH;
+      ctx.fillStyle = r.allowed ? c.accent : c.accent2;
+      ctx.globalAlpha = 0.16; ctx.fillRect(10, y, 620, rowH - 8); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'right';
+      ctx.fillText(shortTitle(d ? d.title : r.id), padL - 8, y + 20);
+      ctx.fillStyle = r.allowed ? c.accent : c.accent2;
+      ctx.fillRect(padL, y + 6, Math.max(1, barW * (r.score / maxScore)), 18);
+      ctx.textAlign = 'left'; ctx.fillStyle = c.text;
+      ctx.fillText(r.score.toFixed(2), padL + Math.max(1, barW * (r.score / maxScore)) + 6, y + 20);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = r.allowed ? c.accent700 : c.accent2;
+      ctx.fillText(r.allowed ? 'allowed' : 'BLOCKED', 626, y + 20);
+    });
+    var leaked = ranked.filter(function (r) { return !r.allowed; }).length;
+    var banner = leaked ? ('LEAK: ' + leaked + ' restricted document(s) in the context') :
+      (D.enforce ? 'clean: no restricted document entered the candidate set' : 'clean for this query, but nothing is enforcing that');
+    ctx.textAlign = 'left';
+    ctx.fillStyle = leaked ? c.accent2 : c.accent700;
+    ctx.font = '600 12px ' + c.font;
+    ctx.fillText(banner, 14, H - 10);
+    el('retrieve-d-readout').innerHTML =
+      '<div><span class="k">user</span> ' + D.user + ' · <span class="k">filter</span> ' + (D.enforce ? 'before ranking' : 'none') + '</div>' +
+      '<div>' + (leaked
+        ? '<span class="bad">' + leaked + ' restricted document(s) reached the model and the UI list.</span>'
+        : '<span class="hi">no restricted document in the ranked set.</span>') + '</div>' +
+      '<div class="k">restricted here: ' + Object.keys(RESTRICTED).join(', ') + ' — the analyst ACL excludes them.</div>';
+  }
+  function syncD() {
+    el('retrieve-u-analyst').className = D.user === 'analyst' ? 'g-primary' : '';
+    el('retrieve-u-engineer').className = D.user === 'engineer' ? 'g-primary' : '';
+    el('retrieve-enforce').className = D.enforce ? 'g-primary' : '';
+    el('retrieve-enforce').textContent = 'ACL filter: ' + (D.enforce ? 'on' : 'off');
+  }
+  el('retrieve-u-analyst').addEventListener('click', function () { D.user = 'analyst'; syncD(); drawD(); });
+  el('retrieve-u-engineer').addEventListener('click', function () { D.user = 'engineer'; syncD(); drawD(); });
+  el('retrieve-enforce').addEventListener('click', function () { D.enforce = !D.enforce; syncD(); drawD(); });
+
+  // ------------------------------------------------------------------
+  // numbers fetch — fallback renders first, JSON refines it
+  // ------------------------------------------------------------------
+  function applyNumbers(data) {
+    NUM = data || FALLBACK;
+    var src = el('retrieve-src-contextual');
+    if (src) src.textContent = (NUM.retrieval_contextual && NUM.retrieval_contextual.source) || FALLBACK.retrieval_contextual.source;
+    var srcRag = el('retrieve-src-rag');
+    if (srcRag) srcRag.textContent = (NUM.rag && NUM.rag.source) || FALLBACK.rag.source;
+    var srcPrice = el('retrieve-src-pricing');
+    if (srcPrice) srcPrice.textContent = (NUM.pricing && NUM.pricing.source) || FALLBACK.pricing.source;
+    drawA(); drawB(); drawC(); drawD();
+  }
+  fetch(window.__APP_NUMBERS_URL)
+    .then(function (r) { return r.json(); })
+    .then(applyNumbers)
+    .catch(function () { applyNumbers(FALLBACK); });
+
+  drawA(); drawB(); syncC(); drawC(); syncD(); drawD();
+
+  var QUIZ_QUESTIONS = [
+    {
+      id: 'why-retrieve-reason',
+      kind: 'choice',
+      prompt: 'Which is the strongest reason to add retrieval to a system that already uses a capable model?',
+      options: [
+        { label: 'Different users are allowed to see different documents, and the answer must be citable.', correct: true },
+        { label: 'The model has not been trained on your domain.' },
+        { label: 'Retrieval always improves answer quality.' },
+        { label: 'The context window is small.' }
+      ],
+      explanation: 'Per-user access control and provenance are systems properties the model cannot supply at any size. "The model has not seen it" is the weakest reason, and retrieval can hurt quality when it is added without measurement.'
+    },
+    {
+      id: 'why-retrieve-baseline',
+      kind: 'choice',
+      prompt: 'Why start a new retrieval system with BM25 rather than a dense embedding index?',
+      options: [
+        { label: 'It needs no training, is interpretable and cheap, and dense retrieval often fails to beat it without corpus-specific tuning.', correct: true },
+        { label: 'Because embeddings cannot handle short queries.' },
+        { label: 'Because BM25 is always more accurate than dense retrieval.' },
+        { label: 'Because BM25 understands synonyms better than embeddings.' }
+      ],
+      explanation: 'BM25 is a strong, auditable baseline. It is not always better, and it does not handle synonyms — it is the reference point against which a tuned dense retriever has to demonstrate a win.'
+    },
+    {
+      id: 'why-retrieve-idf',
+      kind: 'numeric',
+      prompt: 'A term appears in 6 of 60 documents. Using BM25 IDF = ln(1 + (N − n + 0.5)/(n + 0.5)), what is the IDF to two decimal places?',
+      answer: 2.24,
+      tolerance: 0.02,
+      explanation: '(60 − 6 + 0.5)/(6 + 0.5) = 54.5/6.5 = 8.385; 1 + 8.385 = 9.385; ln(9.385) = 2.239, so 2.24. Rarer terms carry more weight, which is BM25\'s IDF.'
+    },
+    {
+      id: 'why-retrieve-acl',
+      kind: 'choice',
+      prompt: 'Where must a per-user access check be applied?',
+      options: [
+        { label: 'Before ranking, so restricted documents never enter the candidate set the ranker or the UI sees.', correct: true },
+        { label: 'After the model writes the answer, by redacting the response.' },
+        { label: 'In the system prompt, by telling the model not to reveal restricted text.' },
+        { label: 'Only for the final top-1 result.' }
+      ],
+      explanation: 'Filtering after ranking leaks existence and scores, and a prompt instruction is not an access control. Apply the ACL at index or query time so the filtered set is the only set ever ranked or shown.'
+    }
+  ];
+  GuideQuiz.init(document.getElementById('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>
