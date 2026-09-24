@@ -174,7 +174,10 @@ is: **generic primitives go in the kit, domain-shaped code goes in the series fi
 their own inline `<style>` blocks and per-page scripts exactly as they are — don't migrate
 them to the guide kit opportunistically. Likewise `llm-guide.css`/`llm-guide.js` stay as
 they are; the 16 LLM-training pages keep using `window.LLMG`, not
-`window.Guide`/`window.GuideMath`. The kit exists so a genuinely new guide page is cheap to
+`window.Guide`/`window.GuideMath`. The one exception is the quiz: every LLM-training part also
+links `guide.css` and loads `guide-quiz.js` so it can end with the shared "check your
+understanding" section (its section carries both `llmt-step` and `g-step`, because
+`GuideQuiz` finds its badge via `.g-step`). The kit exists so a genuinely new guide page is cheap to
 start, not to unify what already ships. `vision/guide-kit-demo/` is a small demo series
 proving the kit renders — not real content, kept as a working example.
 
