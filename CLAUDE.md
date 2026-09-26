@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A Jekyll site published by GitHub Pages at https://denimpatel.github.io/interactive-courses/.
-It holds every hand-written interactive guide: 15 series, 255 parts, across three subjects
+It holds every hand-written interactive guide: 16 series, 267 parts, across three subjects
 (`ai`, `vision`, `math`).
 
 Since the Aug 2026 split it is the companion to `DenimPatel/AI`
@@ -52,6 +52,7 @@ node scripts/smoke-guides.js math/statistics
 node scripts/check-stats-viz.js        # statistics domain layer
 node scripts/check-genmedia-viz.js     # generative-media / multimodal domain layer
 node scripts/check-llm-app-sim.js      # LLM application simulator
+node scripts/check-lie-viz.js          # Lie groups domain layer (Exp/Log, Jacobians, adjoints)
 ```
 
 `--safe` matches the GitHub Pages sandbox and rejects non-whitelisted plugins, so always
@@ -100,6 +101,7 @@ from its side.
 
 1. **Standalone interactive guides** (`ai/llm-training/*/index.html`,
    `vision/{multi-view-geometry,nonlinear-optimization}/*/index.html`,
+   `vision/lie-theory/*/index.html`,
    `math/{linear-algebra,calculus,calculus-in-motion,probability,probability-in-action,statistics}/*/index.html`).
    These have **no `layout:`** — each is a complete `<!DOCTYPE html>` document with its own
    `<head>` and its own page-specific `<style>` block. They pull in shared chrome explicitly:
@@ -209,6 +211,16 @@ Per-series domain layers sit on top, following the same split:
   schedules/solvers/flow matching/guidance, and the ViT/CLIP/retrieval helpers.
 - `assets/js/serving-sim.js`, `assets/js/llm-app-sim.js`, `assets/js/calc-viz.js` — the LLM
   Serving, LLM application and calculus domain layers.
+- `assets/js/lie-viz.js` (`window.Lie`) and `assets/css/lie-guide.css` — the Lie Groups &
+  Lie Algebras series (`vision/lie-theory/`): SO(2)/SO(3)/SE(2)/SE(3) hat, vee, Exp, Log
+  (with the near-0 and near-π branches), adjoints, right/left Jacobians (SE(3) via Barfoot's
+  Q block), quaternions, Euler angles, `Lie.numJac` for tangent-space central differences,
+  Kabsch/Horn alignment, and `Lie.view3d`, a small orthographic canvas with drag-to-orbit.
+  Conventions are translation-first twists and right perturbations. Its numerics are
+  asserted by `scripts/check-lie-viz.js`; extend that script whenever you add a formula.
+  `lie-guide.css` also makes `.g-math.g-katex` and `.g-table-wrap` positioned, because
+  KaTeX's absolutely positioned MathML otherwise escapes their `overflow-x` and widens the
+  page on phones.
 
 ## Assets
 
