@@ -114,6 +114,18 @@ for (let k = 0; k < 40; k++) {
   closeM(m3.scale(R, -1), JinvNum, 1e-6, 'd(R^-1)/dR = -Ad_R');
 }
 
+// minus and the rotation pose-graph edge r = Log(Zᵀ R1ᵀ R2), as used in the Jacobians part
+for (let k = 0; k < 20; k++) {
+  const A = so3.random(rng), B = so3.plus(A, randVec(3, 0.9)), tau = so3.minus(B, A);
+  closeM(m3.scale(so3.JlInv(tau), -1), Lie.numJac(function (X) { return so3.minus(B, X); }, A, 3, so3.plus, Lie.vecMinus), 1e-6, 'd(R2 (-) R1)/dR1 = -Jl^-1');
+  closeM(so3.JrInv(tau), Lie.numJac(function (X) { return so3.minus(X, A); }, B, 3, so3.plus, Lie.vecMinus), 1e-6, 'd(R2 (-) R1)/dR2 = Jr^-1');
+  const Z = so3.plus(m3.mul(m3.T(A), B), randVec(3, 0.2));
+  const res = function (X, Y) { return so3.log(m3.mul(m3.mul(m3.T(Z), m3.T(X)), Y)); };
+  const r = res(A, B);
+  closeM(m3.scale(m3.mul(so3.JlInv(r), m3.T(Z)), -1), Lie.numJac(function (X) { return res(X, B); }, A, 3, so3.plus, Lie.vecMinus), 1e-6, 'pose-graph edge d r/d R1');
+  closeM(so3.JrInv(r), Lie.numJac(function (X) { return res(A, X); }, B, 3, so3.plus, Lie.vecMinus), 1e-6, 'pose-graph edge d r/d R2');
+}
+
 // ---------------------------------------------------------------- quaternions
 section('Quaternions');
 for (let k = 0; k < 100; k++) {
