@@ -175,6 +175,11 @@ for (let k = 0; k < 50; k++) {
   closeM(mN.mul(T, se2.exp(d)), mN.mul(se2.exp(mN.mulV(se2.Ad(T), d)), T), 1e-12, 'se2 T Exp(d) = Exp(Ad d) T');
   closeM(mN.mul(T, se2.inv(T)), mN.eye(3), 1e-12, 'se2 T T^-1 = I');
 }
+for (let k = 0; k < 30; k++) {
+  const tau = randVec(3, 2); if (k < 3) tau[2] *= 1e-7;
+  closeM(se2.Jr(tau), Lie.numJac(function (x) { return se2.exp(x); }, tau, 3, Lie.vecPlus, se2.minus), 1e-6, 'se2 Jr analytic = numeric');
+  closeM(se2.Jl(tau), Lie.numJac(function (x) { return se2.exp(x); }, tau, 3, Lie.vecPlus, function (A, B) { return se2.log(mN.mul(A, se2.inv(B))); }), 1e-6, 'se2 Jl analytic = numeric');
+}
 { // pure rotation leaves origin fixed; pure translation is a straight line
   const T = se2.exp([1, 0, Math.PI]);
   close(T[0][2], 0, 1e-12, 'se2 half-turn with rho=(1,0): x'); close(T[1][2], 2 / Math.PI, 1e-12, 'se2 half-turn: y = 2/pi');

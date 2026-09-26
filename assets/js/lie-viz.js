@@ -411,6 +411,23 @@
     },
     act: function (T, p) { return [T[0][0] * p[0] + T[0][1] * p[1] + T[0][2], T[1][0] * p[0] + T[1][1] * p[1] + T[1][2]]; },
     Ad: function (T) { return [[T[0][0], T[0][1], T[1][2]], [T[1][0], T[1][1], -T[0][2]], [0, 0, 1]]; },
+    // Right and left Jacobians (Sola et al., eqs. 163-164); tau = [rho1, rho2, theta].
+    Jr: function (tau) {
+      var r1 = tau[0], r2 = tau[1], th = tau[2];
+      if (Math.abs(th) < 1e-5) return [[1, th / 2, -r2 / 2], [-th / 2, 1, r1 / 2], [0, 0, 1]];
+      var s = Math.sin(th), c = Math.cos(th), t2 = th * th;
+      return [[s / th, (1 - c) / th, (th * r1 - r2 + r2 * c - r1 * s) / t2],
+              [(c - 1) / th, s / th, (r1 + th * r2 - r1 * c - r2 * s) / t2],
+              [0, 0, 1]];
+    },
+    Jl: function (tau) {
+      var r1 = tau[0], r2 = tau[1], th = tau[2];
+      if (Math.abs(th) < 1e-5) return [[1, -th / 2, r2 / 2], [th / 2, 1, -r1 / 2], [0, 0, 1]];
+      var s = Math.sin(th), c = Math.cos(th), t2 = th * th;
+      return [[s / th, (c - 1) / th, (th * r1 + r2 - r2 * c - r1 * s) / t2],
+              [(1 - c) / th, s / th, (-r1 + th * r2 + r1 * c - r2 * s) / t2],
+              [0, 0, 1]];
+    },
     plus: function (T, d) { return mN.mul(T, se2.exp(d)); },
     minus: function (T2, T1) { return se2.log(mN.mul(se2.inv(T1), T2)); }
   };
