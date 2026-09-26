@@ -706,9 +706,10 @@
       return v3.add(anchor, v3.add(v3.scale(b.r, dx), v3.scale(b.u, dy)));
     };
 
-    // setupCanvas sizes the backing store for the device pixel ratio and calls redraw
-    // now and on every resize.
-    G.setupCanvas(canvas, W, H, redraw);
+    // setupCanvas sizes the backing store for the device pixel ratio and calls redraw now
+    // and on every resize. It is deferred to a microtask so a page can create the view
+    // first and define the state its draw callback reads afterwards.
+    Promise.resolve().then(function () { G.setupCanvas(canvas, W, H, redraw); });
     return view;
   }
 
