@@ -1,0 +1,312 @@
+---
+title: "Interpolation, integration and IMU preintegration"
+description: "Moving along a Lie group in time: piecewise geodesics versus cumulative B-splines on SO(3) through several keyframes, integrating angular velocity with additive Euler, re-orthonormalized Euler and exponential steps on a coning motion, gyroscope preintegration with its first-order bias correction, and a map of the whole toolkit with references."
+permalink: "/vision/lie-theory/interpolation-and-dynamics/"
+section: "vision"
+series: "lie_theory"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<link rel="stylesheet" href="{{ '/assets/css/lie-guide.css' | relative_url }}">
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.lie_theory %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Lie groups &amp; Lie algebras · Act IV</span>
+    <h1>Interpolation, integration and IMU preintegration</h1>
+    <p>The series ends by adding time. A trajectory is a curve on the group, and three tasks come up constantly. Draw a smooth curve through keyframes, for animation, camera paths and continuous-time estimation. Integrate a measured angular velocity into an orientation, which is the core of every attitude filter. And compress a burst of gyroscope samples into one relative rotation that can be re-used when the bias estimate changes, the trick that makes visual-inertial odometry fast. All three are built from Exp, Log, $\oplus$ and the right Jacobian.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="splines">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Through several keyframes: geodesics and B-splines</h2></div>
+    <p class="g-eyebrow">Smooth curves on SO(3)</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> see why chaining geodesics (slerps) through keyframes gives angular-velocity jumps, and how a cumulative B-spline built from Exp and Log gives a smooth curve instead.</span></div>
+    <p>Between two orientations the geodesic $R_0\operatorname{Exp}(t\operatorname{Log}(R_0^\top R_1))$ is the natural path (Part 6). Through many keyframes, chaining geodesics gives a curve whose angular velocity jumps at every keyframe: fine for a slideshow, bad for a camera path or for modelling a rolling-shutter sensor. The standard fix transfers B-splines to the group through relative rotations. A <strong>cumulative cubic B-spline</strong> on segment $i$ is</p>
+    <div class="g-math g-katex">$$ R(u) = R_{i-1}\prod_{j=1}^{3}\operatorname{Exp}\!\bigl(\tilde B_j(u)\,\Omega_{i+j-1}\bigr), \qquad \Omega_k = \operatorname{Log}(R_{k-1}^\top R_k), $$</div>
+    <div class="g-math g-katex">$$ \tilde B_1 = \tfrac16(5 + 3u - 3u^2 + u^3),\quad \tilde B_2 = \tfrac16(1 + 3u + 3u^2 - 2u^3),\quad \tilde B_3 = \tfrac16u^3. $$</div>
+    <p>Each factor is an honest rotation, so the curve never leaves $SO(3)$. It is twice continuously differentiable, which gives smooth angular velocity and acceleration, and it depends only on four neighbouring control rotations. That local support keeps continuous-time SLAM tractable. Unlike the geodesic chain, it only <em>approaches</em> the control points: it smooths them rather than passing through them.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="s-c" width="640" height="400"></canvas>
+        <p class="g-canvas-hint">Left: where each curve points the body's nose (its $x$ axis) on the unit sphere. Dots are the keyframes. Right: angular speed along each curve; the geodesic chain jumps at every keyframe. Drag to orbit.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Keyframe spread (deg) <span class="val" id="s-a-v"></span></label><input type="range" id="s-a" min="10" max="90" step="1" value="55"></div>
+        <div class="g-btnrow"><button id="s-new" class="g-primary">New keyframes</button></div>
+        <div class="g-readout" id="s-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="integrate">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Integrating angular velocity</h2></div>
+    <p class="g-eyebrow">Ṙ = R[ω]×, three ways</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> integrate a gyroscope's body rate on a coning motion with three schemes and see which stays on the group and which stays accurate.</span></div>
+    <p>A gyroscope samples $\omega_b$ at interval $\Delta t$, and attitude obeys $\dot R = R[\omega_b]_\times$ (Part 4). Three integrators:</p>
+    <div class="g-math g-katex">$$ \underbrace{R \leftarrow R + R[\omega]_\times\Delta t}_{\text{additive Euler}},\qquad \underbrace{R\leftarrow \operatorname{GS}\bigl(R + R[\omega]_\times\Delta t\bigr)}_{\text{Euler, re-orthonormalized}},\qquad \underbrace{R\leftarrow R\operatorname{Exp}(\omega\,\Delta t)}_{\text{exponential}}. $$</div>
+    <p>Two separate errors are at play. The first is <em>leaving the group</em>. The additive step does it immediately, since $I+[\omega]_\times\Delta t$ is not orthogonal, and its determinant grows by a factor of $1+\lVert\omega\rVert^2\Delta t^2$ every step. Re-orthonormalizing hides the symptom. The exponential step never leaves $SO(3)$ at all. The second is <em>time discretization</em>. Every scheme that holds $\omega$ at its start-of-step value over the whole step is only first-order accurate in time, whatever it does to stay on the group. Sampling $\omega$ at the midpoint makes the exponential step second-order. The test motion is <strong>coning</strong>, where the body's axis sweeps a cone so $\omega_b$ keeps rotating: the classic stress test for strapdown integrators. On the log-scale plot, the three start-of-step schemes share a degree-level error (and additive Euler's determinant runs away), while the midpoint exponential is two orders of magnitude better. What remains of its error grows slowly and steadily. That is the <em>coning error</em>, the non-commutativity residue that high-rate inertial systems remove with dedicated multi-sample coning corrections.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="i-c" width="640" height="360"></canvas>
+        <p class="g-canvas-hint">$\log_{10}$ attitude error (degrees) against time for each integrator. The inset reports how far each result has left $SO(3)$.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Sample interval Δt (ms) <span class="val" id="i-dt-v"></span></label><input type="range" id="i-dt" min="1" max="50" step="1" value="10"></div>
+        <div class="g-field"><label>Cone half-angle (deg) <span class="val" id="i-b-v"></span></label><input type="range" id="i-b" min="1" max="45" step="1" value="20"></div>
+        <div class="g-field"><label>Coning rate (Hz) <span class="val" id="i-f-v"></span></label><input type="range" id="i-f" min="0.1" max="3" step="0.1" value="1"></div>
+        <div class="g-readout" id="i-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="preint">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Preintegrating a gyroscope</h2></div>
+    <p class="g-eyebrow">One relative rotation per keyframe pair, corrected for bias</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> compress hundreds of gyro samples between two camera frames into one relative rotation, and update it for a new bias estimate with a single Jacobian instead of re-integrating.</span></div>
+    <p>A visual-inertial system receives maybe 200 gyro samples between two camera frames. Integrating them from the current attitude estimate would force re-integration every time that estimate changes, which happens at every optimizer iteration. <strong>Preintegration</strong> (Lupton &amp; Sukkarieh; Forster et al.) integrates the <em>relative</em> rotation instead, which does not depend on the start attitude at all:</p>
+    <div class="g-math g-katex">$$ \Delta R_{ij} = \prod_{k=i}^{j-1}\operatorname{Exp}\bigl((\tilde\omega_k - b_g)\,\Delta t\bigr), \qquad R_j = R_i\,\Delta R_{ij}. $$</div>
+    <p>It still depends on the gyro bias $b_g$, which the estimator refines as it goes. Instead of re-integrating, push the bias change through the product with the right Jacobian and the adjoint, exactly as in Parts 8 and 9:</p>
+    <div class="g-math g-katex">$$ \Delta R_{ij}(b_g + \delta b) \approx \Delta R_{ij}(b_g)\,\operatorname{Exp}\!\Bigl(\frac{\partial\Delta R_{ij}}{\partial b_g}\,\delta b\Bigr), \qquad \frac{\partial\Delta R_{ij}}{\partial b_g} = -\sum_{k=i}^{j-1}\Delta R_{k+1,j}^\top\,J_r\bigl((\tilde\omega_k - b_g)\Delta t\bigr)\,\Delta t. $$</div>
+    <p>The demo preintegrates a gyro stream with a bias guess, then treats the slider as the correction $\delta b$ the estimator later finds. It compares the first-order update with a full re-integration. For realistic corrections (a few degrees per second or less) the two agree to a small fraction of a degree, at the cost of one $3\times3$ matrix product instead of hundreds of Exp calls.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="p-c" width="640" height="380"></canvas>
+        <p class="g-canvas-hint">The body's nose over the preintegration window. Gray: truth. Magenta: preintegrated with the old bias guess. Blue: after the first-order bias correction. Dashed green: fully re-integrated with the corrected bias. Drag to orbit.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Bias correction |δb| (deg/s) <span class="val" id="p-b-v"></span></label><input type="range" id="p-b" min="0" max="20" step="0.25" value="3"></div>
+        <div class="g-field"><label>Window length (s) <span class="val" id="p-t-v"></span></label><input type="range" id="p-t" min="0.1" max="3" step="0.05" value="1"></div>
+        <div class="g-readout" id="p-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="map">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>The whole toolkit on one page</h2></div>
+    <p class="g-eyebrow">What each part gave you</p>
+    <div class="lie-map">
+      <div>Compose in the group</div><div>Multiply poses; never add them (Parts 1–2). Subscripts cancel: $T_{AB}T_{BC} = T_{AC}$.</div>
+      <div>Compute in the tangent space</div><div>Steps, errors, velocities and noise are vectors in $\mathbb{R}^n$ (Parts 3–4).</div>
+      <div>Move between them</div><div>$\operatorname{Exp}$ and $\operatorname{Log}$, with their numerical branches (Parts 5, 7); $\oplus$ and $\ominus$ built on them (Part 3).</div>
+      <div>Store sensibly</div><div>Matrices or quaternions for state; rotation vectors for small quantities; Euler angles only for people (Part 6).</div>
+      <div>Change sides</div><div>The adjoint converts left and right perturbations, twists and covariances (Part 8).</div>
+      <div>Differentiate</div><div>Right and left Jacobians and the elementary table; always check numerically (Part 9).</div>
+      <div>Optimize</div><div>Gauss–Newton or LM in the tangent space, update with $\oplus$ (Part 10).</div>
+      <div>Be uncertain</div><div>Gaussians on $\varepsilon$, propagated with Ad and $J_r$ (Part 11).</div>
+      <div>Move in time</div><div>Geodesics, B-splines, exponential integration, preintegration (this part).</div>
+    </div>
+    <p>The <a href="{{ '/vision/lie-theory/cheat-sheet/' | relative_url }}">formula sheet</a> collects every formula for $SO(2)$, $SO(3)$, $SE(2)$ and $SE(3)$ on one page. To see these tools inside full estimators, continue with <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">Nonlinear Optimization</a> (localization, SLAM, pose graphs and 3D rotation estimation) and <a href="{{ '/vision/multi-view-geometry/' | relative_url }}">Multi-View Geometry</a> (the five-point algorithm, PnP and bundle adjustment).</p>
+  </section>
+
+  <section class="g-step" id="refs">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Further reading</h2></div>
+    <ul class="g-refs">
+      <li><a href="https://arxiv.org/abs/1812.01537">Solà, Deray &amp; Atchuthan, "A micro Lie theory for state estimation in robotics"</a> — the compact reference whose notation this series follows; pairs with the <code>manif</code> library.</li>
+      <li><a href="http://asrl.utias.utoronto.ca/~tdb/bib/barfoot_ser17.pdf">Barfoot, <em>State Estimation for Robotics</em></a> — matrix Lie groups, uncertainty on SE(3) and batch estimation, with left-perturbation conventions.</li>
+      <li><a href="https://arxiv.org/abs/1512.02363">Forster, Carlone, Dellaert &amp; Scaramuzza, "On-Manifold Preintegration for Real-Time Visual-Inertial Odometry"</a> — IMU preintegration on SO(3), including the bias Jacobians of section 3.</li>
+      <li><a href="https://arxiv.org/abs/1911.08860">Sommer, Usenko, Schubert, Demmel &amp; Cremers, "Efficient Derivative Computation for Cumulative B-Splines on Lie Groups"</a> — the splines of section 1 and their derivatives.</li>
+      <li><a href="https://arxiv.org/abs/1410.1465">Barrau &amp; Bonnabel, "The Invariant Extended Kalman Filter as a Stable Observer"</a> — left and right errors, SE₂(3), and why group-affine dynamics linearize exactly.</li>
+      <li><a href="https://link.springer.com/book/10.1007/978-3-319-13467-3">Hall, <em>Lie Groups, Lie Algebras, and Representations</em></a> — the mathematics done properly, for readers who want proofs.</li>
+    </ul>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+</main>
+
+{% capture next_teaser %}That completes the course. The formula sheet collects everything above for SO(2), SO(3), SE(2) and SE(3) on one page.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.lie_theory teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/lie-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var m3 = Lie.m3, v3 = Lie.v3, mN = Lie.mN, so3 = Lie.so3, deg = Lie.deg, rad = Lie.rad, fmt = Lie.fmt;
+  function el(id) { return document.getElementById(id); }
+  function num(id) { return parseFloat(el(id).value); }
+  function speedPlot(ctx, series, box, c) {
+    var X0 = box[0], Y0 = box[1], X1 = box[2], Y1 = box[3], mx = 1e-6;
+    series.forEach(function (s) { s.v.forEach(function (x) { if (isFinite(x)) mx = Math.max(mx, x); }); });
+    mx *= 1.1;
+    ctx.save(); ctx.strokeStyle = c.text; ctx.globalAlpha = 0.25; ctx.lineWidth = 1; ctx.strokeRect(X0, Y0, X1 - X0, Y1 - Y0); ctx.restore();
+    series.forEach(function (s) {
+      ctx.save(); ctx.strokeStyle = s.col; ctx.lineWidth = 2; ctx.setLineDash(s.dash ? [5, 4] : []); ctx.beginPath();
+      s.v.forEach(function (x, i) { var X = X0 + (X1 - X0) * i / (s.v.length - 1), Y = Y1 - (Y1 - Y0) * x / mx; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
+      ctx.stroke(); ctx.restore();
+    });
+  }
+
+  // ---------------------------------------------------------------- 1. splines
+  (function () {
+    var seed = 3, keys = [];
+    function gen() {
+      var rng = Guide.seededRandom(seed), a = rad(num('s-a')); keys = [m3.I()];
+      for (var i = 1; i < 7; i++) keys.push(so3.plus(keys[i - 1], [a * (0.3 + 0.4 * rng()) , a * (Lie.gauss(rng) * 0.6), a * (Lie.gauss(rng) * 0.6)]));
+    }
+    function geo(t) { // t in [0, n-1]
+      var i = Math.min(keys.length - 2, Math.floor(t)), u = t - i;
+      return so3.interp(keys[i], keys[i + 1], u);
+    }
+    function bspline(t) { // uses keys[i-1..i+2] for segment i in [1, n-3]
+      var i = Math.min(keys.length - 3, Math.max(1, Math.floor(t))), u = t - i;
+      var B1 = (5 + 3 * u - 3 * u * u + u * u * u) / 6, B2 = (1 + 3 * u + 3 * u * u - 2 * u * u * u) / 6, B3 = u * u * u / 6;
+      var R = keys[i - 1];
+      [[B1, i], [B2, i + 1], [B3, i + 2]].forEach(function (p) { R = m3.mul(R, so3.exp(v3.scale(so3.minus(keys[p[1]], keys[p[1] - 1]), p[0]))); });
+      return R;
+    }
+    var view = Lie.view3d(el('s-c'), { width: 640, height: 400, scale: 120, cx: 200, draw: draw });
+    function draw(v) {
+      if (!keys.length) return;
+      v.sphere(1, { alpha: 0.1 });
+      var n = keys.length, gp = [], bp = [], gs = [], bs = [], h = 1e-3;
+      for (var k = 0; k <= 300; k++) {
+        var t = (n - 1) * k / 300; gp.push(m3.col(geo(t), 0));
+        var tb = 1 + (n - 4) * k / 300; bp.push(m3.col(bspline(tb), 0));
+        gs.push(so3.dist(geo(Math.max(0, t - h)), geo(Math.min(n - 1, t + h))) / (Math.min(n - 1, t + h) - Math.max(0, t - h)));
+        bs.push(so3.dist(bspline(tb - h), bspline(tb + h)) / (2 * h));
+      }
+      v.poly(gp, { color: v.colors.accent2, width: 2 });
+      v.poly(bp, { color: v.colors.accent, width: 3 });
+      keys.forEach(function (K) { v.point(m3.col(K, 0), { r: 5, color: v.colors.text }); });
+      speedPlot(v.ctx, [{ v: gs, col: v.colors.accent2 }, { v: bs, col: v.colors.accent }], [400, 70, 625, 320], v.colors);
+      v.ctx.fillStyle = v.colors.text; v.ctx.font = '11px ' + v.colors.mono; v.ctx.globalAlpha = 0.7; v.ctx.fillText('angular speed along the curve', 400, 60); v.ctx.globalAlpha = 1;
+      v.ctx.fillStyle = v.colors.accent2; v.ctx.fillText('geodesic chain', 405, 338); v.ctx.fillStyle = v.colors.accent; v.ctx.fillText('B-spline', 530, 338);
+      el('s-a-v').textContent = el('s-a').value + '°';
+      var jumps = 0; for (var q = 1; q < gs.length; q++) jumps = Math.max(jumps, Math.abs(gs[q] - gs[q - 1]));
+      var bj = 0; for (var q2 = 1; q2 < bs.length; q2++) bj = Math.max(bj, Math.abs(bs[q2] - bs[q2 - 1]));
+      el('s-readout').innerHTML = '<div><span class="k">largest speed jump, geodesic chain</span> <span class="bad">' + deg(jumps).toFixed(1) + '°/unit</span></div>' +
+        '<div><span class="k">largest speed jump, B-spline</span> <span class="ok">' + deg(bj).toFixed(2) + '°/unit</span></div>' +
+        '<div><span class="k">B-spline orthogonality error</span> ' + Lie.sci(m3.orthoError(bspline(2.37))) + ' (always a rotation)</div>' +
+        '<div style="opacity:.75;margin-top:4px">The B-spline covers the middle segments (it needs a neighbour on each side), and passes near, not through, the keyframes.</div>';
+    }
+    el('s-new').onclick = function () { seed++; gen(); view.redraw(); };
+    Guide.bindSliders([el('s-a')], function () { gen(); view.redraw(); });
+  })();
+
+  // ---------------------------------------------------------------- 2. integration on a coning motion
+  (function () {
+    var canvas = el('i-c'), W = 640, H = 360, ctx = canvas.getContext('2d');
+    function draw() {
+      var c = Guide.colors(), dt = num('i-dt') / 1000, beta = rad(num('i-b')), f = num('i-f'), Om = 2 * Math.PI * f, T = 10;
+      function Rt(t) { return m3.mul(m3.mul(m3.Rz(Om * t), m3.Rx(beta)), m3.Rz(-Om * t)); }
+      function wb(t) { var h = 1e-5; return v3.scale(so3.log(m3.mul(m3.T(Rt(t - h)), Rt(t + h))), 1 / (2 * h)); }
+      var n = Math.round(T / dt), Ra = Rt(0), Rg = Rt(0), Re = Rt(0), Rm = Rt(0), out = { a: [], g: [], e: [], m: [] }, every = Math.max(1, Math.floor(n / 200));
+      for (var k = 0; k < n; k++) {
+        var t = k * dt, w0 = wb(t), wm = wb(t + dt / 2);
+        Ra = m3.add(Ra, m3.scale(m3.mul(Ra, so3.hat(w0)), dt));
+        Rg = m3.gramSchmidt(m3.add(Rg, m3.scale(m3.mul(Rg, so3.hat(w0)), dt)));
+        Re = m3.mul(Re, so3.exp(v3.scale(w0, dt)));
+        Rm = m3.mul(Rm, so3.exp(v3.scale(wm, dt)));
+        if (k % every === 0 || k === n - 1) {
+          var Rtr = Rt(t + dt);
+          out.a.push(deg(so3.dist(m3.gramSchmidt(Ra), Rtr))); out.g.push(deg(so3.dist(Rg, Rtr))); out.e.push(deg(so3.dist(Re, Rtr))); out.m.push(deg(so3.dist(Rm, Rtr)));
+        }
+      }
+      ctx.clearRect(0, 0, W, H);
+      var X0 = 50, X1 = 620, Y0 = 20, Y1 = 300, lo = -8, hi = 2.5;
+      function py(l) { return Y0 + (Y1 - Y0) * (hi - l) / (hi - lo); }
+      ctx.strokeStyle = c.text; ctx.globalAlpha = 0.25; ctx.lineWidth = 1; ctx.strokeRect(X0, Y0, X1 - X0, Y1 - Y0); ctx.globalAlpha = 1;
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.mono; ctx.globalAlpha = 0.7;
+      [-6, -4, -2, 0, 2].forEach(function (l) { ctx.fillText(l === 0 ? '1°' : '1e' + l + '°', X0 - 46, py(l) + 4); });
+      ctx.fillText('0 s', X0, Y1 + 14); ctx.fillText(T + ' s', X1 - 24, Y1 + 14); ctx.globalAlpha = 1;
+      var S = [['a', c.accent2, 'additive Euler'], ['g', '#e8590c', 'Euler + re-orthonormalize'], ['e', c.accent, 'Exp, ω at step start'], ['m', '#2f9e44', 'Exp, midpoint ω']];
+      S.forEach(function (s, si) {
+        var arr = out[s[0]]; ctx.strokeStyle = s[1]; ctx.lineWidth = 2.2; ctx.beginPath();
+        arr.forEach(function (x, i) { var X = X0 + (X1 - X0) * i / (arr.length - 1), Y = py(Math.max(lo, Math.min(hi, Math.log10(Math.max(x, 1e-12))))); if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
+        ctx.stroke(); ctx.fillStyle = s[1]; ctx.font = '11px ' + c.font; ctx.fillText(s[2], X0 + 8, Y0 + 14 + 14 * si);
+      });
+      el('i-dt-v').textContent = num('i-dt') + ' ms'; el('i-b-v').textContent = el('i-b').value + '°'; el('i-f-v').textContent = f.toFixed(1) + ' Hz';
+      el('i-readout').innerHTML = '<div><b>after 10 s</b></div>' +
+        '<div><span class="k" style="color:' + c.accent2 + '">additive Euler</span> error ' + out.a[out.a.length - 1].toFixed(3) + '°, det R = <span class="bad">' + m3.det(Ra).toFixed(4) + '</span></div>' +
+        '<div><span class="k" style="color:#e8590c">Euler + GS</span> error ' + out.g[out.g.length - 1].toFixed(3) + '°</div>' +
+        '<div><span class="k" style="color:' + c.accent + '">Exp</span> error ' + out.e[out.e.length - 1].toFixed(4) + '°, ‖RᵀR − I‖ = ' + Lie.sci(m3.orthoError(Re)) + '</div>' +
+        '<div><span class="k" style="color:#2f9e44">Exp, midpoint</span> error <span class="ok">' + out.m[out.m.length - 1].toExponential(1) + '°</span></div>';
+    }
+    ['i-dt', 'i-b', 'i-f'].forEach(function (id) { el(id).addEventListener('input', draw); });
+    Guide.setupCanvas(canvas, W, H, draw);
+  })();
+
+  // ---------------------------------------------------------------- 3. preintegration
+  (function () {
+    var dt = 0.005, bTrue = [rad(1.5), rad(-2), rad(1)];
+    function stream(Tw) {
+      var n = Math.round(Tw / dt), rng = Guide.seededRandom(8), W = [];
+      for (var k = 0; k < n; k++) { var t = k * dt; W.push([0.8 * Math.sin(2.1 * t) + 0.3, 0.6 * Math.cos(1.3 * t), 0.9 * Math.sin(0.7 * t + 1)]); }
+      return W.map(function (w) { return v3.add(w, v3.add(bTrue, [0.002 * Lie.gauss(rng), 0.002 * Lie.gauss(rng), 0.002 * Lie.gauss(rng)])); });
+    }
+    function preint(Wm, b) { var R = m3.I(), path = [R]; Wm.forEach(function (w) { R = m3.mul(R, so3.exp(v3.scale(v3.sub(w, b), dt))); path.push(R); }); return path; }
+    function biasJac(Wm, b) {
+      var n = Wm.length, phis = Wm.map(function (w) { return v3.scale(v3.sub(w, b), dt); });
+      var suffix = new Array(n + 1); suffix[n] = m3.I();
+      for (var k = n - 1; k >= 0; k--) suffix[k] = m3.mul(so3.exp(phis[k]), suffix[k + 1]);
+      var J = m3.zero();
+      for (var k2 = 0; k2 < n; k2++) J = m3.sub(J, m3.scale(m3.mul(m3.T(suffix[k2 + 1]), so3.Jr(phis[k2])), dt));
+      return J;
+    }
+    var view = Lie.view3d(el('p-c'), { width: 640, height: 380, scale: 130, draw: draw });
+    function draw(v) {
+      if (!el('p-b')) return;
+      var Tw = num('p-t'), Wm = stream(Tw), mag = rad(num('p-b'));
+      var dirB = v3.normalize([1, -1.2, 0.6]), db = v3.scale(dirB, mag);
+      var bGuess = v3.sub(bTrue, db); // the estimator later learns the correction db
+      var old = preint(Wm, bGuess), J = biasJac(Wm, bGuess);
+      var corrected = m3.mul(old[old.length - 1], so3.exp(m3.mulV(J, db)));
+      var reint = preint(Wm, v3.add(bGuess, db));
+      var truthPath = (function () { var R = m3.I(), p = [R]; Wm.forEach(function (w) { R = m3.mul(R, so3.exp(v3.scale(v3.sub(w, bTrue), dt))); p.push(R); }); return p; })();
+      v.sphere(1, { alpha: 0.1 });
+      function nose(path) { var pts = []; for (var i = 0; i < path.length; i += Math.max(1, Math.floor(path.length / 150))) pts.push(m3.col(path[i], 0)); pts.push(m3.col(path[path.length - 1], 0)); return pts; }
+      v.poly(nose(truthPath), { color: v.colors.text, width: 3, alpha: 0.35 });
+      v.poly(nose(old), { color: v.colors.accent2, width: 2 });
+      v.poly(nose(reint), { color: '#2f9e44', width: 2, dash: true });
+      v.point(m3.col(corrected, 0), { r: 6, color: v.colors.accent });
+      v.point(m3.col(old[old.length - 1], 0), { r: 5, color: v.colors.accent2 });
+      v.point(m3.col(truthPath[0], 0), { r: 4, color: v.colors.text });
+      el('p-b-v').textContent = num('p-b').toFixed(2) + '°/s'; el('p-t-v').textContent = Tw.toFixed(2) + ' s';
+      var Rre = reint[reint.length - 1];
+      el('p-readout').innerHTML = '<div><span class="k">samples in window</span> ' + Wm.length + ' at 200 Hz</div>' +
+        '<div class="lie-matlabel">∂ΔR/∂b_g</div>' + Lie.matHTML(J, 4) +
+        '<div><span class="k">old bias: error vs re-integrated</span> <span class="bad">' + deg(so3.dist(old[old.length - 1], Rre)).toFixed(3) + '°</span></div>' +
+        '<div><span class="k">first-order correction: error</span> <span class="ok">' + deg(so3.dist(corrected, Rre)).toExponential(2) + '°</span></div>' +
+        '<div style="opacity:.75;margin-top:4px">One 3×3 product replaces ' + Wm.length + ' Exp evaluations; the residual error is second order in δb.</div>';
+    }
+    Guide.bindSliders([el('p-b'), el('p-t')], function () { view.redraw(); });
+  })();
+
+  var QUIZ_QUESTIONS = [
+    { id: 'id-euler', kind: 'choice', prompt: 'What happens to a rotation matrix integrated with the additive step R ← R + R[ω]×Δt?',
+      options: [{ label: 'It stays exactly in SO(3).', correct: false }, { label: 'It drifts off SO(3): its columns lengthen and det R grows every step.', correct: true }, { label: 'It becomes a reflection.', correct: false }],
+      explanation: '(I + [ω]×Δt) is not orthogonal: its determinant is 1 + |ω|²Δt². The exponential step R·Exp(ωΔt) is exactly orthogonal for any Δt.' },
+    { id: 'id-exp-exact', kind: 'choice', prompt: 'When is R ← R·Exp(ωΔt) exact (up to round-off)?',
+      options: [{ label: 'Always', correct: false }, { label: 'When the body rate ω is constant over the step', correct: true }, { label: 'Only when ω is small', correct: false }],
+      explanation: 'For constant body rate, Ṙ = R[ω]× has the exact solution R(t)·Exp(ωΔt). When ω varies within the step, as in coning, the error comes from ignoring that variation, and a midpoint sample or a higher-order scheme reduces it.' },
+    { id: 'id-preint', kind: 'choice', prompt: 'Why is the preintegrated rotation ΔR_ij useful in visual-inertial optimization?',
+      options: [{ label: 'It removes all gyro noise.', correct: false }, { label: 'It does not depend on the attitude at frame i, so it need not be re-integrated when that estimate changes; bias changes are applied with a Jacobian.', correct: true }, { label: 'It replaces the camera measurements.', correct: false }],
+      explanation: 'R_j = R_i·ΔR_ij separates the unknown start attitude from the measured relative rotation. Only the bias enters ΔR_ij, and a first-order bias Jacobian handles small bias updates.' },
+    { id: 'id-spline', kind: 'choice', prompt: 'What does a cumulative cubic B-spline on SO(3) improve over a chain of slerps through keyframes?',
+      options: [{ label: 'It passes exactly through every keyframe.', correct: false }, { label: 'Its angular velocity is continuous (no jumps at keyframes), and it stays on SO(3).', correct: true }, { label: 'It needs no Exp or Log.', correct: false }],
+      explanation: 'The B-spline is C² smooth, which gives continuous angular velocity and acceleration, and each factor is an Exp, so it never leaves the group. It approximates the control rotations rather than interpolating them.' },
+    { id: 'id-rate', kind: 'numeric', prompt: 'A gyro runs at 200 Hz. How many Exp evaluations does a full re-integration over a 1.5 s window need?', answer: 300, tolerance: 0,
+      explanation: '200 samples/s × 1.5 s = 300 samples, one Exp each. The first-order bias correction replaces all of them with one Exp and a 3×3 product.' }
+  ];
+  GuideQuiz.init(el('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>
