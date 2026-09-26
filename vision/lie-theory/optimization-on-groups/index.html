@@ -1,0 +1,341 @@
+---
+title: "Optimization on manifolds"
+description: "Gauss-Newton and Levenberg-Marquardt on Lie groups with the plus retraction: point-cloud alignment on SE(3) against an Euler-angle parametrization and the closed-form Kabsch solution, rotation averaging with the geodesic mean, chordal mean and geodesic median under outliers, and a small SE(2) pose graph closed by one loop-closure edge."
+permalink: "/vision/lie-theory/optimization-on-groups/"
+section: "vision"
+series: "lie_theory"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<link rel="stylesheet" href="{{ '/assets/css/lie-guide.css' | relative_url }}">
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.lie_theory %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Lie groups &amp; Lie algebras · Act IV</span>
+    <h1>Optimization on manifolds</h1>
+    <p>Everything built so far comes together here. A least-squares problem over rotations or poses is solved exactly like one over vectors, with a single change. The step is computed in the tangent space and applied with $\oplus$ instead of $+$. This part runs that recipe on three problems that together cover much of robotics and vision: aligning two point clouds, averaging noisy rotations, and correcting a drifting trajectory with a loop closure. The companion guide <a href="{{ '/vision/nonlinear-optimization/' | relative_url }}">Nonlinear Optimization</a> develops the solvers themselves in depth.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="recipe">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>The recipe</h2></div>
+    <p class="g-eyebrow">Linearize in the tangent space, retract with ⊕</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> state Gauss–Newton on a Lie group in four lines, and see why it beats both "optimize a parametrization" and "optimize the matrix entries, then fix them up".</span></div>
+    <p>To minimize $F(X) = \tfrac12\sum_i\lVert r_i(X)\rVert^2$ over a group element $X$:</p>
+    <div class="g-math g-katex">$$ J_i = \frac{\partial r_i(X\oplus\delta)}{\partial\delta}\Big|_{\delta=0},\qquad \Bigl(\sum_i J_i^\top J_i + \lambda I\Bigr)\,\delta = -\sum_i J_i^\top r_i,\qquad X \leftarrow X\oplus\delta. $$</div>
+    <p>With $\lambda = 0$ this is Gauss–Newton; with $\lambda &gt; 0$ adapted per iteration it is Levenberg–Marquardt. The linear system always has the dimension of the <em>group</em> (3 for a rotation, 6 for a pose), never the 9 or 12 entries of a matrix, and $\oplus$ keeps every iterate a valid rotation. The alternatives each break something. Optimizing Euler angles inherits gimbal lock: the Jacobian loses rank near $\pm90^\circ$ pitch, and the solver crawls or diverges there. Optimizing nine matrix entries and re-orthonormalizing afterwards takes steps the constraint immediately undoes. It wastes iterations, and it has no clean covariance at the end. Solvers expose the recipe as an interface: Ceres calls it a <code>Manifold</code> (<code>Plus</code> and <code>Minus</code>), GTSAM calls it <code>retract</code> and <code>localCoordinates</code>, and g2o calls it <code>oplusImpl</code>.</p>
+  </section>
+
+  <section class="g-step" id="align">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>Aligning two point clouds on SE(3)</h2></div>
+    <p class="g-eyebrow">The inner loop of ICP</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> run Gauss–Newton on $SE(3)$ to align matched point clouds, compare with an Euler-angle parametrization near gimbal lock, and check the result against the closed-form Kabsch solution.</span></div>
+    <p>Given matched points $p_i$ (source) and $q_i$ (target), find the pose $T$ minimizing $\sum_i\lVert Tp_i - q_i\rVert^2$. The residual is $r_i = Tp_i - q_i$, and its right Jacobian comes straight from the table in Part 9: $J_i = [\,R\ \ -R[p_i]_\times\,]$. This is the inner loop of ICP (iterative closest point), which re-matches points between solves. With known matches there is also a closed-form answer, Kabsch's SVD method (here computed with Horn's quaternion form). Gauss–Newton on $SE(3)$ reaches it in a handful of iterations from almost any start.</p>
+    <p>Switch the solver to "Euler angles" to see what a parametrization costs. The true pose is pitched to $85^\circ$, close to gimbal lock, and the same Gauss–Newton steps on $(\psi,\theta,\phi,t)$ with a numerical Jacobian converge far more slowly, or stall.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="a-c" width="640" height="420"></canvas>
+        <p class="g-canvas-hint">Magenta: target points $q_i$. Blue: source points moved by the current estimate $T p_i$, with a thin line to their match. Right: $\log_{10}$ cost per iteration. Drag to orbit.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Solver</label>
+          <select id="a-mode"><option value="lie">Gauss–Newton on SE(3) with ⊕</option><option value="euler">Gauss–Newton on Euler angles + translation</option></select>
+        </div>
+        <div class="g-field"><label>Noise σ <span class="val" id="a-n-v"></span></label><input type="range" id="a-n" min="0" max="0.2" step="0.005" value="0.03"></div>
+        <div class="g-btnrow"><button id="a-step" class="g-primary">Step</button><button id="a-run">Run 10</button><button id="a-reset">Reset</button></div>
+        <div class="g-readout" id="a-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="average">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Averaging rotations</h2></div>
+    <p class="g-eyebrow">Geodesic mean, chordal mean, geodesic median</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> compute the mean of a set of rotations three ways, and see how each reacts to outliers.</span></div>
+    <p>Many sensors measure one orientation, or many relative measurements imply one: the best single rotation is some kind of average. The <strong>geodesic (Karcher) mean</strong> minimizes $\sum_i\lVert\operatorname{Log}(M^\top R_i)\rVert^2$. Its Gauss–Newton step is just the average of the residuals, $M\leftarrow M\oplus\tfrac1N\sum_i\operatorname{Log}(M^\top R_i)$, which is the circle's intrinsic mean from Part 1 in 3D. The <strong>chordal mean</strong> averages the matrices and projects back to $SO(3)$ (Part 1's "average then snap"). It is closed-form, and because chordal distance saturates at large angles (Part 5), a far-away outlier pulls on it only weakly. The <strong>geodesic median</strong> minimizes $\sum_i\lVert\operatorname{Log}(M^\top R_i)\rVert$ (not squared) with Weiszfeld's reweighting. Being an L1 estimator, it also shrugs off gross outliers. Add outliers and compare: the geodesic mean, whose pull grows with an outlier's distance, is dragged by more than ten degrees, while the other two stay within a few degrees.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="m-c" width="640" height="400"></canvas>
+        <p class="g-canvas-hint">Every rotation drawn as $\operatorname{Log}(R_{\text{true}}^\top R)$, so the truth is the centre of the ball of radius π. Gray: inliers. Magenta: outliers. Colored crosses: the three estimates. Drag to orbit.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Inlier noise σ (degrees) <span class="val" id="m-s-v"></span></label><input type="range" id="m-s" min="1" max="40" step="1" value="5"></div>
+        <div class="g-field"><label>Outliers (of 30 samples) <span class="val" id="m-o-v"></span></label><input type="range" id="m-o" min="0" max="12" step="1" value="8"></div>
+        <div class="g-readout" id="m-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="posegraph">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>A pose graph closed by one loop</h2></div>
+    <p class="g-eyebrow">Gauss–Newton on 20 poses in SE(2)</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> watch Gauss–Newton over many $SE(2)$ poses at once spread the error of one loop closure around a whole trajectory.</span></div>
+    <p>A robot drives a loop of 20 poses, integrating noisy odometry $Z_{i,i+1}$, and at the end recognizes its starting place, which gives one extra edge $Z_{19,0}$. Each edge has the residual $r_{ij} = \operatorname{Log}(Z_{ij}^{-1}X_i^{-1}X_j)\in\mathbb{R}^3$. The state is 19 free poses (the first is fixed), so each Gauss–Newton step solves a $57\times57$ system and updates every pose by $X_k\leftarrow X_k\oplus\delta_k$. The Jacobians here are numerical, for brevity. A real solver uses the analytic ones from Part 9 and exploits the sparsity: each edge touches only two poses. Dead reckoning (magenta) drifts; one step bends the whole loop back toward the truth.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="p-c" width="640" height="400"></canvas>
+        <div class="lie-legend">
+          <span><i style="background:var(--color-text);opacity:.5"></i>truth</span>
+          <span><i class="dash" style="color:var(--color-accent-2)"></i>dead reckoning (initial guess)</span>
+          <span><i style="background:var(--color-accent)"></i>current estimate</span>
+        </div>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Odometry heading noise (deg) <span class="val" id="p-h-v"></span></label><input type="range" id="p-h" min="0" max="8" step="0.25" value="3"></div>
+        <div class="g-field"><label>Odometry position noise <span class="val" id="p-x-v"></span></label><input type="range" id="p-x" min="0" max="0.1" step="0.005" value="0.03"></div>
+        <label style="font-size:13px;display:flex;gap:6px;align-items:center;margin-bottom:10px"><input type="checkbox" id="p-loop" checked> Include the loop-closure edge</label>
+        <div class="g-btnrow"><button id="p-step" class="g-primary">Gauss–Newton step</button><button id="p-reset">Reset</button><button id="p-new">New noise</button></div>
+        <div class="g-readout" id="p-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="practice">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>In practice</h2></div>
+    <div class="lie-map">
+      <div>Where ⊕ goes</div><div>Always apply the update with the <em>same</em> ⊕ the Jacobians were derived for. Right Jacobians with a left update (or the reverse) converge slowly or not at all: a classic silent bug.</div>
+      <div>Retraction choice</div><div>Exp is the natural ⊕, but any map that agrees with it to first order works (Cayley map, $R(I+[\delta]_\times)$ followed by projection). Convergence near the optimum is unchanged; large steps differ.</div>
+      <div>Robust losses</div><div>Replace $\lVert r\rVert^2$ with Huber or Cauchy on the tangent-space residual to down-weight outliers, as the geodesic median did in section 3.</div>
+      <div>Initialization</div><div>Rotation problems are non-convex. Chordal relaxations and closed forms (Kabsch, rotation averaging) give starting points inside the basin of convergence of the refinement.</div>
+      <div>Uncertainty</div><div>At convergence, $(\sum J_i^\top J_i)^{-1}$ is the covariance of the tangent-space error $\delta$ at the optimum, which is the subject of the next part.</div>
+    </div>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+</main>
+
+{% capture next_teaser %}The solver's normal equations hold a covariance, but a covariance of what? Next: Gaussians that live in the tangent space, and why a robot's uncertainty is banana-shaped.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.lie_theory teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/lie-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var m3 = Lie.m3, v3 = Lie.v3, mN = Lie.mN, so3 = Lie.so3, se2 = Lie.se2, se3 = Lie.se3, euler = Lie.euler, deg = Lie.deg, rad = Lie.rad, fmt = Lie.fmt;
+  function el(id) { return document.getElementById(id); }
+  function num(id) { return parseFloat(el(id).value); }
+  function logPlot(ctx, costs, box, col, c) {
+    var X0 = box[0], Y0 = box[1], X1 = box[2], Y1 = box[3];
+    ctx.save(); ctx.strokeStyle = c.text; ctx.globalAlpha = 0.25; ctx.lineWidth = 1; ctx.strokeRect(X0, Y0, X1 - X0, Y1 - Y0); ctx.restore();
+    var ls = costs.map(function (x) { return Math.log10(Math.max(x, 1e-12)); }), hi = Math.max.apply(null, ls.concat([-1])) + 0.3, lo = Math.min.apply(null, ls.concat([hi - 2])) - 0.3;
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath();
+    ls.forEach(function (l, i) { var x = X0 + (X1 - X0) * i / Math.max(10, ls.length - 1), y = Y0 + (Y1 - Y0) * (hi - l) / (hi - lo); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+    ctx.stroke();
+    ls.forEach(function (l, i) { var x = X0 + (X1 - X0) * i / Math.max(10, ls.length - 1), y = Y0 + (Y1 - Y0) * (hi - l) / (hi - lo); ctx.beginPath(); ctx.arc(x, y, 2.5, 0, 7); ctx.fillStyle = col; ctx.fill(); });
+    ctx.fillStyle = c.text; ctx.font = '10px ' + c.mono; ctx.globalAlpha = 0.7; ctx.fillText('log₁₀ cost / iter', X0, Y0 - 6); ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------- 2. point-cloud alignment
+  (function () {
+    var P = [], Q = [], Ttrue, T, e, costs = [];
+    var rng0 = Guide.seededRandom(9);
+    for (var i = 0; i < 18; i++) P.push([0.9 * Lie.gauss(rng0), 0.6 * Lie.gauss(rng0), 0.4 * Lie.gauss(rng0)]);
+    Ttrue = se3.make(euler.toMat(rad(40), rad(85), rad(-30)), [0.6, -0.3, 0.4]);
+    function gen() {
+      var rng = Guide.seededRandom(17), s = num('a-n');
+      Q = P.map(function (p) { return v3.add(se3.act(Ttrue, p), [s * Lie.gauss(rng), s * Lie.gauss(rng), s * Lie.gauss(rng)]); });
+    }
+    function reset() { T = mN.eye(4); e = [0, 0, 0, 0, 0, 0]; costs = [cost()]; }
+    function Tcur() { return el('a-mode').value === 'lie' ? T : se3.make(euler.toMat(e[0], e[1], e[2]), [e[3], e[4], e[5]]); }
+    function cost() { var Tc = Tcur(), s = 0; P.forEach(function (p, i) { var r = v3.sub(se3.act(Tc, p), Q[i]); s += v3.dot(r, r); }); return 0.5 * s; }
+    function step() {
+      var H = mN.zeros(6, 6), g = [0, 0, 0, 0, 0, 0];
+      if (el('a-mode').value === 'lie') {
+        var R = se3.R(T);
+        P.forEach(function (p, i) {
+          var r = v3.sub(se3.act(T, p), Q[i]), B = m3.scale(m3.mul(R, so3.hat(p)), -1);
+          var J = [0, 1, 2].map(function (k) { return R[k].concat(B[k]); });
+          H = mN.add(H, mN.mul(mN.T(J), J)); var jr = mN.mulV(mN.T(J), r); g = g.map(function (x, k) { return x + jr[k]; });
+        });
+        T = se3.plus(T, mN.solve(H, g.map(function (x) { return -x; })));
+      } else {
+        P.forEach(function (p, i) {
+          var f = function (x) { return v3.sub(v3.add(m3.mulV(euler.toMat(x[0], x[1], x[2]), p), [x[3], x[4], x[5]]), Q[i]); };
+          var r = f(e), J = Lie.numJac(f, e, 6, Lie.vecPlus, Lie.vecMinus);
+          H = mN.add(H, mN.mul(mN.T(J), J)); var jr = mN.mulV(mN.T(J), r); g = g.map(function (x, k) { return x + jr[k]; });
+        });
+        for (var d = 0; d < 6; d++) H[d][d] += 1e-9;
+        var dx = mN.solve(H, g.map(function (x) { return -x; }));
+        e = e.map(function (x, k) { return x + dx[k]; });
+      }
+      costs.push(cost()); view.redraw();
+    }
+    var view = Lie.view3d(el('a-c'), { width: 640, height: 420, scale: 85, cx: 230, draw: draw });
+    function draw(v) {
+      if (!Q.length) return;
+      var Tc = Tcur();
+      v.grid({ z: -1.4, n: 4, step: 0.6 });
+      P.forEach(function (p, i) { var a = se3.act(Tc, p); v.line(a, Q[i], { color: v.colors.text, width: 1, alpha: 0.3 }); v.point(Q[i], { r: 4, color: v.colors.accent2 }); v.point(a, { r: 4, color: v.colors.accent }); });
+      v.frame(se3.R(Tc), se3.t(Tc), { len: 0.5, width: 2 });
+      v.frame(se3.R(Ttrue), se3.t(Ttrue), { len: 0.5, width: 1.2, alpha: 0.4, dash: true });
+      logPlot(v.ctx, costs, [460, 60, 625, 300], v.colors.accent, v.colors);
+      el('a-n-v').textContent = num('a-n').toFixed(3);
+      var K = Lie.kabsch(P, Q), Tk = se3.make(K.R, K.t), eu = euler.fromMat(se3.R(Tc));
+      el('a-readout').innerHTML = '<div><span class="k">iterations</span> ' + (costs.length - 1) + '</div>' +
+        '<div><span class="k">cost</span> <span class="hi">' + Lie.sci(costs[costs.length - 1]) + '</span></div>' +
+        '<div><span class="k">rotation error vs truth</span> ' + deg(so3.dist(se3.R(Tc), se3.R(Ttrue))).toFixed(3) + '°</div>' +
+        '<div><span class="k">distance to Kabsch optimum</span> ' + deg(so3.dist(se3.R(Tc), K.R)).toFixed(4) + '°, ' + v3.norm(v3.sub(se3.t(Tc), K.t)).toFixed(4) + '</div>' +
+        '<div><span class="k">estimate pitch</span> ' + deg(eu.pitch).toFixed(1) + '° (truth 85°)</div>' +
+        '<div><span class="k">Kabsch cost</span> ' + Lie.sci((function () { var s = 0; P.forEach(function (p, i) { var r = v3.sub(se3.act(Tk, p), Q[i]); s += v3.dot(r, r); }); return 0.5 * s; })()) + '</div>';
+    }
+    el('a-step').onclick = step;
+    el('a-run').onclick = function () { for (var k = 0; k < 10; k++) step(); };
+    el('a-reset').onclick = function () { reset(); view.redraw(); };
+    el('a-mode').onchange = function () { reset(); view.redraw(); };
+    el('a-n').addEventListener('input', function () { gen(); reset(); view.redraw(); });
+    gen(); reset();
+  })();
+
+  // ---------------------------------------------------------------- 3. rotation averaging
+  (function () {
+    var ids = ['m-s', 'm-o'], Rtrue = euler.toMat(rad(20), rad(-35), rad(50));
+    function samples() {
+      var rng = Guide.seededRandom(33), s = rad(num('m-s')), no = parseInt(el('m-o').value, 10), out = [];
+      for (var i = 0; i < 30; i++) {
+        if (i < no) out.push({ R: so3.random(rng), out: true });
+        else out.push({ R: so3.plus(Rtrue, [s * Lie.gauss(rng), s * Lie.gauss(rng), s * Lie.gauss(rng)]), out: false });
+      }
+      return out;
+    }
+    function median(Rs, init) {
+      var M = init;
+      for (var k = 0; k < 60; k++) {
+        var num_ = [0, 0, 0], den = 0;
+        Rs.forEach(function (R) { var r = so3.minus(R, M), n = Math.max(v3.norm(r), 1e-6); num_ = v3.add(num_, v3.scale(r, 1 / n)); den += 1 / n; });
+        var d = v3.scale(num_, 1 / den); M = so3.plus(M, d); if (v3.norm(d) < 1e-10) break;
+      }
+      return M;
+    }
+    var view = Lie.view3d(el('m-c'), { width: 640, height: 400, scale: 52, draw: draw });
+    function draw(v) {
+      if (!el('m-s')) return;
+      var S = samples(), Rs = S.map(function (s) { return s.R; });
+      var chord = so3.chordalMean(Rs), karcher = so3.mean(Rs, 60), med = median(Rs, chord);
+      function L(R) { return so3.log(m3.mul(m3.T(Rtrue), R)); }
+      v.sphere(Math.PI, { alpha: 0.1 }); v.worldAxes(3.5);
+      S.forEach(function (s) { v.point(L(s.R), { r: s.out ? 4 : 3, color: s.out ? v.colors.accent2 : v.colors.text, alpha: s.out ? 0.9 : 0.55 }); });
+      var ests = [[karcher, v.colors.accent, 'geodesic mean'], [chord, '#2f9e44', 'chordal'], [med, '#e8590c', 'median']];
+      ests.forEach(function (e2) { var p = L(e2[0]), d = 0.18; v.line(v3.sub(p, [d, 0, 0]), v3.add(p, [d, 0, 0]), { color: e2[1], width: 3 }); v.line(v3.sub(p, [0, d, 0]), v3.add(p, [0, d, 0]), { color: e2[1], width: 3 }); v.line(v3.sub(p, [0, 0, d]), v3.add(p, [0, 0, d]), { color: e2[1], width: 3 }); });
+      v.point([0, 0, 0], { r: 5, color: v.colors.text, hollow: true });
+      el('m-s-v').textContent = el('m-s').value + '°'; el('m-o-v').textContent = el('m-o').value;
+      el('m-readout').innerHTML = ests.map(function (e2) { return '<div><span class="k" style="color:' + e2[1] + '">' + e2[2] + '</span> error ' + deg(so3.dist(e2[0], Rtrue)).toFixed(2) + '°</div>'; }).join('') +
+        '<div style="opacity:.75;margin-top:4px">With no outliers all three agree to within the noise. Outliers drag the geodesic mean far off; the chordal mean and the median both resist, the median most of all as the outlier count grows.</div>';
+    }
+    Guide.bindSliders(ids.map(el), function () { view.redraw(); });
+  })();
+
+  // ---------------------------------------------------------------- 4. SE(2) pose graph
+  (function () {
+    var canvas = el('p-c'), W = 640, H = 400, ctx = canvas.getContext('2d');
+    var N = 20, truth = [], edges = [], X = [], X0 = [], costs = [], seed = 1;
+    var P = Lie.plane2d(ctx, 420, H, { xr: [-3.2, 3.2], yr: [-3.2, 3.2] });
+    for (var i = 0; i < N; i++) { var a = 2 * Math.PI * i / N; truth.push(se2.make(2.5 * Math.sin(a), 2.5 - 2.5 * Math.cos(a) - 2.5, a)); }
+    function gen() {
+      var rng = Guide.seededRandom(seed), sh = rad(num('p-h')), sx = num('p-x');
+      edges = [];
+      for (var i = 0; i < N; i++) {
+        var j = (i + 1) % N; if (j === 0 && !el('p-loop').checked) continue;
+        var rel = se2.mul(se2.inv(truth[i]), truth[j]);
+        var noisy = j === 0 ? rel : se2.plus(rel, [sx * Lie.gauss(rng), sx * Lie.gauss(rng), sh * Lie.gauss(rng)]);
+        edges.push({ i: i, j: j, Z: noisy, loop: j === 0 });
+      }
+      X0 = [truth[0]];
+      for (var k = 1; k < N; k++) X0.push(se2.mul(X0[k - 1], edges[k - 1].Z));
+      reset();
+    }
+    function resid(e, Xs) { return se2.log(se2.mul(se2.inv(e.Z), se2.mul(se2.inv(Xs[e.i]), Xs[e.j]))); }
+    function cost(Xs) { var s = 0; edges.forEach(function (e) { var r = resid(e, Xs); s += r[0] * r[0] + r[1] * r[1] + r[2] * r[2]; }); return 0.5 * s; }
+    function reset() { X = X0.slice(); costs = [cost(X)]; }
+    function step() {
+      var n = 3 * (N - 1), Hm = mN.zeros(n, n), g = new Array(n).fill(0);
+      edges.forEach(function (e) {
+        var r = resid(e, X), blocks = {};
+        [e.i, e.j].forEach(function (k) {
+          if (k === 0) return;
+          blocks[k] = Lie.numJac(function (Xk) { var Xs = X.slice(); Xs[k] = Xk; return resid(e, Xs); }, X[k], 3, se2.plus, Lie.vecMinus);
+        });
+        Object.keys(blocks).forEach(function (a) {
+          var Ja = blocks[a], oa = 3 * (a - 1), jr = mN.mulV(mN.T(Ja), r);
+          for (var u = 0; u < 3; u++) g[oa + u] += jr[u];
+          Object.keys(blocks).forEach(function (b) {
+            var JtJ = mN.mul(mN.T(Ja), blocks[b]), ob = 3 * (b - 1);
+            for (var u2 = 0; u2 < 3; u2++) for (var w = 0; w < 3; w++) Hm[oa + u2][ob + w] += JtJ[u2][w];
+          });
+        });
+      });
+      for (var d = 0; d < n; d++) Hm[d][d] += 1e-9;
+      var dx = mN.solve(Hm, g.map(function (x) { return -x; }));
+      X = X.map(function (Xk, k) { return k === 0 ? Xk : se2.plus(Xk, dx.slice(3 * (k - 1), 3 * k)); });
+      costs.push(cost(X)); draw();
+    }
+    function traj(Xs, col, w, dash, alpha) {
+      ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = w; ctx.setLineDash(dash ? [5, 4] : []); ctx.globalAlpha = alpha == null ? 1 : alpha; ctx.beginPath();
+      Xs.forEach(function (T, i) { if (i) ctx.lineTo(P.px(T[0][2]), P.py(T[1][2])); else ctx.moveTo(P.px(T[0][2]), P.py(T[1][2])); });
+      ctx.stroke(); ctx.setLineDash([]);
+      Xs.forEach(function (T) { var p = se2.parts(T); ctx.beginPath(); ctx.arc(P.px(p.x), P.py(p.y), 2.5, 0, 7); ctx.fillStyle = col; ctx.fill(); ctx.beginPath(); ctx.moveTo(P.px(p.x), P.py(p.y)); ctx.lineTo(P.px(p.x + 0.22 * Math.cos(p.th)), P.py(p.y + 0.22 * Math.sin(p.th))); ctx.strokeStyle = col; ctx.stroke(); });
+      ctx.restore();
+    }
+    function draw() {
+      var c = Guide.colors(); ctx.clearRect(0, 0, W, H);
+      traj(truth.concat([truth[0]]), c.text, 1.5, false, 0.35);
+      traj(X0, c.accent2, 1.8, true);
+      traj(X, c.accent, 2.5);
+      var loopE = edges.filter(function (e) { return e.loop; })[0];
+      if (loopE) { ctx.save(); ctx.setLineDash([2, 3]); ctx.strokeStyle = '#2f9e44'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(P.px(X[N - 1][0][2]), P.py(X[N - 1][1][2])); ctx.lineTo(P.px(X[0][0][2]), P.py(X[0][1][2])); ctx.stroke(); ctx.restore(); }
+      logPlot(ctx, costs, [450, 60, 625, 300], c.accent, c);
+      el('p-h-v').textContent = num('p-h').toFixed(2) + '°'; el('p-x-v').textContent = num('p-x').toFixed(3);
+      var err = 0, err0 = 0; for (var k = 0; k < N; k++) { err += Math.hypot(X[k][0][2] - truth[k][0][2], X[k][1][2] - truth[k][1][2]); err0 += Math.hypot(X0[k][0][2] - truth[k][0][2], X0[k][1][2] - truth[k][1][2]); }
+      el('p-readout').innerHTML = '<div><span class="k">edges</span> ' + edges.length + (loopE ? ' (incl. loop closure)' : ' (odometry only)') + '</div>' +
+        '<div><span class="k">iterations</span> ' + (costs.length - 1) + ', <span class="k">cost</span> ' + Lie.sci(costs[costs.length - 1]) + '</div>' +
+        '<div><span class="k">mean position error, dead reckoning</span> <span class="bad">' + (err0 / N).toFixed(3) + '</span></div>' +
+        '<div><span class="k">mean position error, estimate</span> <span class="hi">' + (err / N).toFixed(3) + '</span></div>' +
+        '<div style="opacity:.75;margin-top:4px">Untick the loop closure: odometry alone is already consistent, so Gauss–Newton has nothing to fix.</div>';
+    }
+    el('p-step').onclick = step;
+    el('p-reset').onclick = function () { reset(); draw(); };
+    el('p-new').onclick = function () { seed++; gen(); draw(); };
+    ['p-h', 'p-x', 'p-loop'].forEach(function (id) { el(id).addEventListener('input', function () { gen(); draw(); }); });
+    el('p-loop').addEventListener('change', function () { gen(); draw(); });
+    gen();
+    Guide.setupCanvas(canvas, W, H, draw);
+  })();
+
+  var QUIZ_QUESTIONS = [
+    { id: 'op-dim', kind: 'numeric', prompt: 'Gauss–Newton over one SE(3) pose solves a linear system of what size (n for an n×n system)?', answer: 6, tolerance: 0,
+      explanation: 'The step lives in the 6-dimensional tangent space, not in the 12 free entries of the matrix. ⊕ then maps it back onto the group.' },
+    { id: 'op-euler', kind: 'choice', prompt: 'Why does Gauss–Newton on Euler angles struggle near 90° pitch?',
+      options: [{ label: 'The cost function has no minimum there.', correct: false }, { label: 'The Jacobian with respect to the angles loses rank (gimbal lock), so JᵀJ is nearly singular.', correct: true }, { label: 'Euler angles cannot represent that pose.', correct: false }],
+      explanation: 'The pose is fine, but the coordinates are degenerate: two angles move the body the same way, so the normal equations are ill-conditioned. The Lie-group step has no such singularity.' },
+    { id: 'op-karcher', kind: 'choice', prompt: 'What is one Gauss–Newton step for the geodesic (Karcher) mean M of rotations Rᵢ?',
+      options: [{ label: 'M ← project(Σ Rᵢ / N)', correct: false }, { label: 'M ← M ⊕ (1/N) Σ Log(Mᵀ Rᵢ)', correct: true }, { label: 'M ← Exp((1/N) Σ Log Rᵢ)', correct: false }],
+      explanation: 'The residuals are Rᵢ ⊖ M and their Jacobian is (approximately) −I, so the step is their average, applied with ⊕. The first option is the chordal mean. The third averages logs about the identity, which is wrong unless M ≈ I.' },
+    { id: 'op-median', kind: 'choice', prompt: 'Which rotation average is least affected by a few gross outliers?',
+      options: [{ label: 'Geodesic L2 mean', correct: false }, { label: 'Chordal L2 mean', correct: false }, { label: 'Geodesic median (L1)', correct: true }],
+      explanation: 'An L1 cost grows only linearly with a residual, so a far-away outlier pulls with bounded force. The squared costs let each outlier pull in proportion to its distance.' },
+    { id: 'op-loop', kind: 'choice', prompt: 'In the pose-graph demo, why does Gauss–Newton change nothing when the loop-closure edge is removed?',
+      options: [{ label: 'The solver is broken without it.', correct: false }, { label: 'Dead reckoning already satisfies every odometry edge exactly, so all residuals are zero.', correct: true }, { label: 'SE(2) cannot be optimized.', correct: false }],
+      explanation: 'The initial guess is built by chaining the odometry, so every odometry residual is zero. Only a redundant constraint, the loop closure, creates disagreement to distribute.' }
+  ];
+  GuideQuiz.init(el('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

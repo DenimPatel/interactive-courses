@@ -1,0 +1,348 @@
+---
+title: "Euler angles, axis-angle and quaternions"
+description: "Every common way to write a 3D rotation down, compared: Euler angles and gimbal lock with the rate matrix that goes singular, the rotation vector, unit quaternions as SU(2) and their double cover shown with the belt trick, slerp versus nlerp versus Euler interpolation, quaternion sign pitfalls in averaging, and a table for choosing."
+permalink: "/vision/lie-theory/parametrizations/"
+section: "vision"
+series: "lie_theory"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+{% include guide-head.html katex=true %}
+<link rel="stylesheet" href="{{ '/assets/css/lie-guide.css' | relative_url }}">
+</head>
+<body>
+
+{% include site-nav.html %}
+{% include series-nav.html series=site.data.series.lie_theory %}
+
+<main class="wrap g">
+  <header class="page-header">
+    <span class="section-kicker">Interactive guide · Lie groups &amp; Lie algebras · Act II</span>
+    <h1>Euler angles, axis-angle and quaternions</h1>
+    <p>$SO(3)$ is a 3-dimensional curved space, and there is a theorem (a consequence of its topology) that no set of 3 numbers can cover it smoothly and without a singularity somewhere. Every parametrization therefore trades something away. Euler angles are readable but lock up. The rotation vector has a seam at $\pi$. Quaternions spend a fourth number to remove every singularity, and in return count each rotation twice. This part shows each trade in action and ends with a table for choosing. The Lie-group view settles the confusion: parametrizations are for storage and I/O, and the <em>group</em> is what you compute with.</p>
+  </header>
+  <div class="stats-rule" style="border-top-color: var(--color-divider); margin-bottom: 8px;"></div>
+
+  <section class="g-step" id="euler">
+    <div class="g-step-head"><span class="g-step-num">1</span><h2>Euler angles and gimbal lock</h2></div>
+    <p class="g-eyebrow">Three readable numbers, one fatal pose</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> drive a yaw–pitch–roll gimbal into lock, see two of its three axes line up, and measure the lost degree of freedom as a singular matrix.</span></div>
+    <p>The aerospace convention writes $R = R_z(\psi)\,R_y(\theta)\,R_x(\phi)$: yaw about the world vertical, then pitch about the new $y$ axis, then roll about the newest $x$ axis. Each angle has a physical meaning, which is why Euler angles are the right choice for <em>displaying</em> an attitude to a person. The trouble is the map from angle <em>rates</em> to body angular velocity:</p>
+    <div class="g-math g-katex">$$ \omega_b = E(\theta,\phi)\begin{bmatrix}\dot\psi\\ \dot\theta\\ \dot\phi\end{bmatrix}, \qquad E = \begin{bmatrix} -\sin\theta & 0 & 1\\ \cos\theta\sin\phi & \cos\phi & 0\\ \cos\theta\cos\phi & -\sin\phi & 0\end{bmatrix}, \qquad \det E = -\cos\theta. $$</div>
+    <p>At pitch $\theta = \pm 90^\circ$ the determinant vanishes: the yaw axis and the roll axis point the same way, and the three angle rates can only produce <em>two</em> independent body rotations. That is <strong>gimbal lock</strong>. Nothing is wrong with the body, which can rotate any way it likes; the <em>coordinates</em> have lost a direction. Near lock, a small, ordinary body rotation needs enormous angle rates, and any filter that integrates Euler angles blows up. Slide pitch toward $90^\circ$ and watch the yaw and roll circles merge while the required rates explode.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="e-c" width="640" height="400"></canvas>
+        <div class="lie-legend">
+          <span><i style="background:#e8590c"></i>yaw axis and circle</span>
+          <span><i style="background:#2f9e44"></i>pitch axis</span>
+          <span><i style="background:var(--color-accent)"></i>roll axis</span>
+        </div>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Yaw ψ <span class="val" id="e-y-v"></span></label><input type="range" id="e-y" min="-180" max="180" step="1" value="30"></div>
+        <div class="g-field"><label>Pitch θ <span class="val" id="e-p-v"></span></label><input type="range" id="e-p" min="-90" max="90" step="0.5" value="60"></div>
+        <div class="g-field"><label>Roll φ <span class="val" id="e-r-v"></span></label><input type="range" id="e-r" min="-180" max="180" step="1" value="20"></div>
+        <div class="g-btnrow"><button id="e-lock" class="g-primary">Go to pitch 89.5°</button></div>
+        <div class="g-readout" id="e-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="axisangle">
+    <div class="g-step-head"><span class="g-step-num">2</span><h2>The rotation vector, revisited</h2></div>
+    <p class="g-eyebrow">Minimal, nearly singularity-free, and not closed under addition</p>
+    <p>The rotation vector $\omega = \theta k$ from Part 5 is the Lie-algebra coordinate itself. It has three numbers and is smooth everywhere inside the ball $\lVert\omega\rVert &lt; \pi$. Its one seam is the antipodal gluing at $\lVert\omega\rVert = \pi$. Its weakness is composition: $\operatorname{Exp}(a)\operatorname{Exp}(b) \ne \operatorname{Exp}(a+b)$, and the correction is the BCH series. It is the ideal coordinate for a <em>small</em> quantity, such as an update step, an error, a covariance or a velocity, and a poor one for storing a large orientation that will be composed many times. That split, a large state kept in the group plus a small error kept as a rotation vector, is exactly how modern estimators work (Parts 10–12).</p>
+  </section>
+
+  <section class="g-step" id="quaternions">
+    <div class="g-step-head"><span class="g-step-num">3</span><h2>Quaternions and the double cover</h2></div>
+    <p class="g-eyebrow">Four numbers, no singularity, every rotation twice</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> see a unit quaternion as the "half-angle" encoding of a rotation, check that $q$ and $-q$ give the same rotation, and watch a quaternion need $720^\circ$ to return to where it started.</span></div>
+    <p>A unit quaternion $q = (w, x, y, z)$ with $w^2+x^2+y^2+z^2 = 1$ is a point on the 3-sphere $S^3$. Rotation by $\theta$ about $k$ is encoded with <em>half</em> the angle:</p>
+    <div class="g-math g-katex">$$ q = \Bigl(\cos\tfrac\theta2,\ \sin\tfrac\theta2\,k\Bigr), \qquad v' = q\,v\,q^{*}, \qquad q_{AC} = q_{AB}\,q_{BC}. $$</div>
+    <p>Quaternions are a Lie group in their own right. $S^3$ with the quaternion product is $SU(2)$, the group of $2\times2$ unitary matrices, and its Lie algebra is the same $\mathbb{R}^3$ as $\mathfrak{so}(3)$. The exponential is $\operatorname{Exp}(\omega) = (\cos\tfrac{\lVert\omega\rVert}2, \sin\tfrac{\lVert\omega\rVert}2\tfrac{\omega}{\lVert\omega\rVert})$. The map $q \mapsto R(q)$ is two-to-one, because the half-angle means $q$ and $-q$ produce the same rotation. So $S^3$ <strong>double-covers</strong> $SO(3)$. That doubling is exactly what removes the seam: $S^3$ has no antipodal gluing, so quaternions can be interpolated, integrated and differentiated with no special cases anywhere.</p>
+    <p>The demo spins a body steadily about a fixed axis. At $360^\circ$ the body is back where it began, but the quaternion is at $-q_0$; only at $720^\circ$ does it return to $q_0$. The ribbon connecting the body to a fixed base is the classic <em>belt trick</em>. After one turn it holds a twist that no sliding can remove; after two turns the twist can be undone completely. That is the topological fact that loops in $SO(3)$ come in two kinds, and the quaternion keeps track of which.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="q-c" width="640" height="420"></canvas>
+        <p class="g-canvas-hint">Left: the body and its ribbon to a fixed base; each slice of the ribbon is oriented along the shortest quaternion path from the base. Right: the four quaternion components over two full turns, with the current angle marked.</p>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>Spin angle <span class="val" id="q-t-v"></span></label><input type="range" id="q-t" min="0" max="720" step="1" value="300"></div>
+        <div class="g-btnrow"><button id="q-play" class="g-primary">Play</button></div>
+        <div class="g-readout" id="q-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="interp">
+    <div class="g-step-head"><span class="g-step-num">4</span><h2>Interpolating between two orientations</h2></div>
+    <p class="g-eyebrow">slerp, nlerp and Euler lerp</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> compare three ways of blending two orientations and see which ones follow the geodesic and which move at constant speed.</span></div>
+    <p>Blending orientations is needed everywhere: animation keyframes, trajectory smoothing, and timestamp alignment between a camera and an IMU. There are three common recipes:</p>
+    <div class="g-math g-katex">$$ \text{slerp: } q_0\,(q_0^{*}q_1)^{t}, \qquad \text{nlerp: } \frac{(1-t)q_0 + t q_1}{\lVert\cdot\rVert}, \qquad \text{Euler lerp: } (1-t)\,\mathbf{e}_0 + t\,\mathbf{e}_1. $$</div>
+    <p><strong>Slerp</strong> (spherical linear interpolation) is the geodesic $R_0\operatorname{Exp}(t\operatorname{Log}(R_0^\top R_1))$ written in quaternions. It follows the shortest path at constant angular speed. <strong>nlerp</strong> follows the same path, because the normalized chord projects onto the same great circle, but it speeds up in the middle. It is cheaper and fine for small gaps. <strong>Euler lerp</strong> takes a different path entirely, and it can swing wildly when the endpoints are near lock. The traces show where each one sends the body's nose (its $x$ axis), and the plot shows the angular speed along each.</p>
+    <div class="g-demo">
+      <div class="g-canvas-wrap">
+        <canvas id="i-c" width="640" height="400"></canvas>
+        <div class="lie-legend">
+          <span><i style="background:var(--color-accent)"></i>slerp</span>
+          <span><i class="dash" style="color:#2f9e44"></i>nlerp</span>
+          <span><i style="background:var(--color-accent-2)"></i>Euler lerp</span>
+        </div>
+      </div>
+      <div class="g-controls">
+        <div class="g-field"><label>End pose yaw <span class="val" id="i-y-v"></span></label><input type="range" id="i-y" min="-180" max="180" step="1" value="150"></div>
+        <div class="g-field"><label>End pose pitch <span class="val" id="i-p-v"></span></label><input type="range" id="i-p" min="-89" max="89" step="1" value="70"></div>
+        <div class="g-field"><label>End pose roll <span class="val" id="i-r-v"></span></label><input type="range" id="i-r" min="-180" max="180" step="1" value="-120"></div>
+        <div class="g-field"><label>Blend t <span class="val" id="i-t-v"></span></label><input type="range" id="i-t" min="0" max="1" step="0.01" value="0.5"></div>
+        <div class="g-readout" id="i-readout"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="g-step" id="signs">
+    <div class="g-step-head"><span class="g-step-num">5</span><h2>Quaternion pitfalls: signs, order and drift</h2></div>
+    <p class="g-eyebrow">What goes wrong in real code</p>
+    <div class="g-goal">🎯 <span><b>Goal:</b> see how the $\pm q$ ambiguity silently breaks averaging, and learn the conventions to check when two libraries disagree.</span></div>
+    <p>Because $q$ and $-q$ are the same rotation, any operation that treats quaternions as 4-vectors has to be told which sign to use. Averaging is the classic trap. Five noisy measurements of one orientation, where a couple happen to be stored as $-q$, average component-wise to nearly nothing. Aligning signs first (flip any $q_i$ with $q_i\cdot q_1 &lt; 0$) fixes it. The robust method used in attitude estimation (Markley et al.) avoids the problem entirely: the average is the dominant eigenvector of $\sum_i q_iq_i^\top$, and $q q^\top$ is the same for both signs.</p>
+    <div class="g-demo">
+      <div class="g-controls" style="flex:1 1 100%;">
+        <div class="g-btnrow"><button id="s-flip" class="g-primary">Flip random signs</button><button id="s-new">New noisy samples</button></div>
+        <div class="g-readout" id="s-readout"></div>
+      </div>
+    </div>
+    <p>Three more conventions to check before trusting a quaternion from someone else's code:</p>
+    <div class="lie-map">
+      <div>Storage order</div><div>Eigen and ROS messages store $(x,y,z,w)$; Sophus, Ceres and most papers write $(w,x,y,z)$. Swapping them gives a valid-looking, wrong rotation.</div>
+      <div>Hamilton vs JPL</div><div>Hamilton's product ($ij = k$) is the default almost everywhere. The JPL convention ($ij = -k$) appears in some aerospace and VIO literature (Trawny &amp; Roumeliotis). Mixing them reverses the order of composition.</div>
+      <div>Active vs passive</div><div>Does $q$ rotate the vector, or the frame the vector is written in? The two differ by a conjugate. Frame subscripts (Part 2) settle it.</div>
+      <div>Drift</div><div>Repeated products slowly leave $\lVert q\rVert = 1$. Renormalize after every composition; unlike re-orthonormalizing a matrix, it costs four multiplications.</div>
+    </div>
+  </section>
+
+  <section class="g-step" id="compare">
+    <div class="g-step-head"><span class="g-step-num">6</span><h2>Choosing a representation</h2></div>
+    <div class="g-table-wrap"><table class="g-cheat">
+      <thead><tr><th></th><th>Rotation matrix</th><th>Unit quaternion</th><th>Rotation vector</th><th>Euler angles</th></tr></thead>
+      <tbody>
+        <tr><td>Numbers stored</td><td>9</td><td>4</td><td>3</td><td>3</td></tr>
+        <tr><td>Constraint</td><td>$R^\top R=I$, $\det R=1$</td><td>$\lVert q\rVert = 1$</td><td>none (wrap at $\pi$)</td><td>none (wrap, lock)</td></tr>
+        <tr><td>Singularities</td><td>none</td><td>none (double cover)</td><td>at $\lVert\omega\rVert=\pi$</td><td>gimbal lock at $\theta=\pm90^\circ$</td></tr>
+        <tr><td>Compose</td><td>matrix product (27 mult.)</td><td>quaternion product (16 mult.)</td><td>via BCH / Exp–Log</td><td>via matrices</td></tr>
+        <tr><td>Rotate a vector</td><td>9 mult.</td><td>~15–18 mult. (or convert)</td><td>Rodrigues</td><td>via matrices</td></tr>
+        <tr><td>Interpolate</td><td>via Log/Exp</td><td>slerp</td><td>only when small</td><td>poor</td></tr>
+        <tr><td>Renormalize</td><td>SVD or Gram–Schmidt</td><td>divide by the norm</td><td>—</td><td>—</td></tr>
+        <tr><td>Best for</td><td>transforming many points; clarity</td><td>state storage, integration, interpolation</td><td>errors, steps, covariances</td><td>display and human input only</td></tr>
+      </tbody>
+    </table></div>
+    <p>The Lie-group view resolves what could look like a contest. Store the state as a group element (matrix or quaternion, whichever is convenient). Express every small quantity, meaning steps, errors, noise and velocities, as a rotation vector in the tangent space. Move between the two only with Exp and Log. Use Euler angles only at the human interface.</p>
+  </section>
+
+  <section class="g-step" id="check-yourself">
+    <div class="g-step-head"><span class="g-step-num">7</span><h2>Check your understanding</h2></div>
+    <div class="g-quiz-head"><span class="g-quiz-badge" data-quiz-badge>0/5 answered</span></div>
+    <div class="g-quiz" id="quiz-root"></div>
+  </section>
+</main>
+
+{% capture next_teaser %}Rotations are only half of a pose. Act III adds translation: the group SE(3), twists, and why the exponential of a constant velocity is a screw.{% endcapture %}
+{% include series-prevnext.html series=site.data.series.lie_theory teaser=next_teaser %}
+{% include guide-footer.html %}
+
+<script src="{{ '/assets/js/guide-core.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/lie-viz.js' | relative_url }}"></script>
+<script src="{{ '/assets/js/guide-quiz.js' | relative_url }}"></script>
+<script>window.__GUIDE_PAGE_ID__ = {{ page.permalink | jsonify }};</script>
+{% raw %}
+<script>
+(function () {
+  "use strict";
+  var m3 = Lie.m3, v3 = Lie.v3, mN = Lie.mN, so3 = Lie.so3, quat = Lie.quat, euler = Lie.euler, deg = Lie.deg, rad = Lie.rad, fmt = Lie.fmt;
+  function el(id) { return document.getElementById(id); }
+  function num(id) { return parseFloat(el(id).value); }
+  function circleAbout(v, axis, r, o) {
+    var a = v3.normalize(axis), u = Math.abs(a[2]) < 0.9 ? v3.normalize(v3.cross(a, [0, 0, 1])) : v3.normalize(v3.cross(a, [1, 0, 0])), w = v3.cross(a, u), pts = [];
+    for (var i = 0; i <= 72; i++) { var t = 2 * Math.PI * i / 72; pts.push(v3.add(v3.scale(u, r * Math.cos(t)), v3.scale(w, r * Math.sin(t)))); }
+    v.poly(pts, o);
+  }
+
+  // ---------------------------------------------------------------- 1. gimbal lock
+  (function () {
+    var ids = ['e-y', 'e-p', 'e-r'];
+    var view = Lie.view3d(el('e-c'), { width: 640, height: 400, scale: 105, draw: draw });
+    function draw(v) {
+      if (!el('e-y')) return;
+      var y = rad(num('e-y')), p = rad(num('e-p')), r = rad(num('e-r'));
+      var Rz = m3.Rz(y), Rzy = m3.mul(Rz, m3.Ry(p)), R = m3.mul(Rzy, m3.Rx(r));
+      var aY = [0, 0, 1], aP = m3.col(Rz, 1), aR = m3.col(Rzy, 0);
+      v.grid({ z: -1.4 });
+      circleAbout(v, aY, 1.55, { color: '#e8590c', width: 2.5, alpha: 0.85 });
+      circleAbout(v, aP, 1.3, { color: '#2f9e44', width: 2.5, alpha: 0.85 });
+      circleAbout(v, aR, 1.05, { color: v.colors.accent, width: 2.5, alpha: 0.85 });
+      v.arrow([0, 0, 0], v3.scale(aY, 1.8), { color: '#e8590c', width: 2.5, label: 'yaw' });
+      v.arrow([0, 0, 0], v3.scale(aP, 1.5), { color: '#2f9e44', width: 2.5, label: 'pitch' });
+      v.arrow([0, 0, 0], v3.scale(aR, 1.3), { color: v.colors.accent, width: 2.5, label: 'roll' });
+      v.box(R, [0, 0, 0], [0.55, 0.32, 0.12], { color: v.colors.text, width: 1.6 });
+      ids.forEach(function (id) { el(id + '-v').textContent = el(id).value + '°'; });
+      var E = euler.rateMatrix(p, r), d = m3.det(E);
+      // Euler rates needed for a unit body rate are E^-1 w; the worst body direction needs 1/sigma_min.
+      var ev = mN.eigSym(m3.mul(m3.T(E), E)), smin = Math.sqrt(Math.max(0, ev.values[2])), smax = Math.sqrt(ev.values[0]);
+      var worst = smin > 1e-12 ? 1 / smin : Infinity;
+      el('e-readout').innerHTML = '<div class="lie-matlabel">rate matrix E(θ, φ)</div>' + Lie.matHTML(E, 3) +
+        '<div><span class="k">det E = −cos θ</span> <span class="' + (Math.abs(d) < 0.05 ? 'bad' : 'hi') + '">' + fmt(d, 4) + '</span></div>' +
+        '<div><span class="k">angle between yaw and roll axes</span> ' + deg(Math.acos(Math.min(1, Math.abs(v3.dot(aY, aR))))).toFixed(2) + '°</div>' +
+        '<div><span class="k">singular values of E</span> ' + smax.toFixed(3) + ', …, ' + smin.toFixed(4) + '</div>' +
+        '<div><span class="k">Euler rates for a 1 rad/s body turn in the worst direction</span> <span class="' + (worst > 10 ? 'bad' : '') + '">' + (isFinite(worst) ? worst.toFixed(1) + ' rad/s' : '∞') + '</span></div>';
+    }
+    Guide.bindSliders(ids.map(el), function () { view.redraw(); });
+    el('e-lock').onclick = function () { el('e-p').value = 89.5; el('e-p').dispatchEvent(new Event('input')); };
+  })();
+
+  // ---------------------------------------------------------------- 3. quaternion double cover & belt
+  (function () {
+    var axis = v3.normalize([0.15, 0.2, 1]);
+    var view = Lie.view3d(el('q-c'), { width: 640, height: 420, scale: 95, cx: 190, cy: 225, draw: draw });
+    function qAt(a) { return [Math.cos(a / 2), Math.sin(a / 2) * axis[0], Math.sin(a / 2) * axis[1], Math.sin(a / 2) * axis[2]]; }
+    function draw(v) {
+      if (!el('q-t')) return;
+      var a = rad(num('q-t')), q = qAt(a), R = quat.toMat(q);
+      var top = [0, 0, 0.9], base = [0, 0, -1.6];
+      // ribbon from base (identity) to body (q), slices oriented by shortest slerp
+      var N = 28, left = [], right = [];
+      for (var i = 0; i <= N; i++) {
+        var s = i / N, qs = quat.slerp([1, 0, 0, 0], q, s, true), Rs = quat.toMat(qs);
+        var c = v3.lerp(base, [0, 0, 0], s), half = m3.mulV(Rs, [0.35, 0, 0]);
+        left.push(v3.add(c, half)); right.push(v3.sub(c, half));
+      }
+      for (var j = 0; j < N; j++) v.poly([left[j], left[j + 1], right[j + 1], right[j]], { color: v.colors.accent, width: 0.8, alpha: 0.6, close: true, fill: j % 2 ? v.colors.accent : v.colors.accent2, fillAlpha: 0.25 });
+      v.poly([[-0.6, -0.4, -1.6], [0.6, -0.4, -1.6], [0.6, 0.4, -1.6], [-0.6, 0.4, -1.6]], { color: v.colors.text, width: 1.5, close: true, fill: v.colors.text, fillAlpha: 0.1 });
+      v.box(R, [0, 0, 0], [0.45, 0.45, 0.2], { color: v.colors.text, width: 1.8 });
+      v.line(v3.scale(axis, -0.2), v3.add(top, [0, 0, 0.3]), { color: v.colors.text, width: 1, alpha: 0.4, dash: true });
+      // component plot on the right
+      var ctx = v.ctx, c2 = v.colors, X0 = 380, X1 = 625, Y0 = 60, Y1 = 330;
+      function px(d) { return X0 + (X1 - X0) * d / 720; }
+      function py(val) { return (Y0 + Y1) / 2 - (Y1 - Y0) / 2 * val; }
+      ctx.save(); ctx.strokeStyle = c2.text; ctx.globalAlpha = 0.25; ctx.lineWidth = 1; ctx.strokeRect(X0, Y0, X1 - X0, Y1 - Y0);
+      ctx.beginPath(); ctx.moveTo(X0, py(0)); ctx.lineTo(X1, py(0)); ctx.moveTo(px(360), Y0); ctx.lineTo(px(360), Y1); ctx.stroke(); ctx.restore();
+      var cols = [c2.text, '#d6336c', '#2f9e44', c2.accent], names = ['w', 'x', 'y', 'z'];
+      for (var k = 0; k < 4; k++) {
+        ctx.strokeStyle = cols[k]; ctx.lineWidth = k === 0 ? 2.8 : 1.6; ctx.beginPath();
+        for (var dd = 0; dd <= 720; dd += 5) { var qq = qAt(rad(dd)); if (dd) ctx.lineTo(px(dd), py(qq[k])); else ctx.moveTo(px(dd), py(qq[k])); }
+        ctx.stroke(); ctx.fillStyle = cols[k]; ctx.font = '11px ' + c2.mono; ctx.fillText(names[k], X1 + 4, py(qAt(4 * Math.PI)[k]) + (k - 1.5) * 9);
+      }
+      ctx.strokeStyle = c2.accent2; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(px(num('q-t')), Y0); ctx.lineTo(px(num('q-t')), Y1); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c2.text; ctx.font = '11px ' + c2.mono; ctx.globalAlpha = 0.7; ctx.fillText('0°', X0, Y1 + 14); ctx.fillText('360°', px(360) - 14, Y1 + 14); ctx.fillText('720°', X1 - 26, Y1 + 14); ctx.fillText('+1', X0 - 20, Y0 + 4); ctx.fillText('−1', X0 - 20, Y1); ctx.globalAlpha = 1;
+      el('q-t-v').textContent = el('q-t').value + '°';
+      var twist = 2 * Math.acos(Math.min(1, Math.abs(q[0])));
+      el('q-readout').innerHTML = '<div><span class="k">q</span> (' + q.map(function (x) { return fmt(x, 3); }).join(', ') + ')</div>' +
+        '<div><span class="k">R(q) vs start</span> ' + deg(so3.dist(R, m3.I())).toFixed(1) + '° away</div>' +
+        '<div><span class="k">q vs start</span> ' + (q[0] < -0.999 ? '<span class="bad">q = −q₀: same rotation, other sheet</span>' : (q[0] > 0.999 ? '<span class="ok">q = q₀</span>' : 'distance on S³: ' + deg(2 * Math.acos(Math.max(-1, Math.min(1, q[0])))).toFixed(0) + '°')) + '</div>' +
+        '<div><span class="k">ribbon twist</span> ' + deg(twist).toFixed(0) + '° (it follows the shorter of q and −q)</div>';
+    }
+    Guide.bindSliders([el('q-t')], function () { view.redraw(); });
+    var acc = 0;
+    Guide.loop({ button: el('q-play'), onStep: function (dt) { acc += dt; el('q-t').value = Math.round((acc / 16) % 720); el('q-t').dispatchEvent(new Event('input')); } });
+  })();
+
+  // ---------------------------------------------------------------- 4. interpolation
+  (function () {
+    var ids = ['i-y', 'i-p', 'i-r', 'i-t'];
+    var e0 = [rad(-40), rad(-20), rad(10)];
+    var view = Lie.view3d(el('i-c'), { width: 640, height: 400, scale: 115, cx: 230, draw: draw });
+    function paths() {
+      var e1 = [rad(num('i-y')), rad(num('i-p')), rad(num('i-r'))];
+      var R0 = euler.toMat(e0[0], e0[1], e0[2]), R1 = euler.toMat(e1[0], e1[1], e1[2]);
+      var q0 = quat.fromMat(R0), q1 = quat.fromMat(R1);
+      if (quat.dot(q0, q1) < 0) q1 = q1.map(function (x) { return -x; });
+      return {
+        R0: R0, R1: R1,
+        slerp: function (t) { return quat.toMat(quat.slerp(q0, q1, t)); },
+        nlerp: function (t) { return quat.toMat(quat.normalize(q0.map(function (x, i) { return (1 - t) * x + t * q1[i]; }))); },
+        euler: function (t) { return euler.toMat(e0[0] + t * (e1[0] - e0[0]), e0[1] + t * (e1[1] - e0[1]), e0[2] + t * (e1[2] - e0[2])); }
+      };
+    }
+    function draw(v) {
+      if (!el('i-y')) return;
+      var P = paths(), t = num('i-t');
+      v.sphere(1, { alpha: 0.1 });
+      var defs = [['slerp', v.colors.accent, false], ['nlerp', '#2f9e44', true], ['euler', v.colors.accent2, false]];
+      defs.forEach(function (d) {
+        var pts = []; for (var i = 0; i <= 80; i++) pts.push(m3.col(P[d[0]](i / 80), 0));
+        v.poly(pts, { color: d[1], width: d[2] ? 2 : 3, dash: d[2] });
+        v.point(m3.col(P[d[0]](t), 0), { r: 5, color: d[1] });
+      });
+      v.frame(P.R0, [0, 0, 0], { len: 1, alpha: 0.35, width: 1.5 });
+      v.frame(P.R1, [0, 0, 0], { len: 1, alpha: 0.35, width: 1.5 });
+      v.frame(P.slerp(t), [0, 0, 0], { len: 1, width: 2.5 });
+      // angular speed plot
+      var ctx = v.ctx, c = v.colors, X0 = 440, X1 = 625, Y0 = 60, Y1 = 330, total = so3.dist(P.R0, P.R1);
+      function speed(fn, tt) { var h = 1e-3; return so3.dist(fn(Math.max(0, tt - h)), fn(Math.min(1, tt + h))) / (Math.min(1, tt + h) - Math.max(0, tt - h)); }
+      var mx = 0, sp = {};
+      defs.forEach(function (d) { sp[d[0]] = []; for (var i = 0; i <= 60; i++) { var s = speed(P[d[0]], i / 60); sp[d[0]].push(s); mx = Math.max(mx, s); } });
+      mx = Math.max(mx, 1e-6) * 1.1;
+      ctx.save(); ctx.strokeStyle = c.text; ctx.globalAlpha = 0.25; ctx.lineWidth = 1; ctx.strokeRect(X0, Y0, X1 - X0, Y1 - Y0); ctx.restore();
+      defs.forEach(function (d) {
+        ctx.save(); ctx.strokeStyle = d[1]; ctx.lineWidth = 2.2; ctx.setLineDash(d[2] ? [5, 4] : []); ctx.beginPath();
+        sp[d[0]].forEach(function (s, i) { var x = X0 + (X1 - X0) * i / 60, y = Y1 - (Y1 - Y0) * s / mx; if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+        ctx.stroke(); ctx.restore();
+      });
+      ctx.fillStyle = c.text; ctx.font = '11px ' + c.mono; ctx.globalAlpha = 0.7; ctx.fillText('angular speed vs t', X0, Y0 - 10); ctx.globalAlpha = 1;
+      ids.forEach(function (id) { el(id + '-v').textContent = id === 'i-t' ? num(id).toFixed(2) : el(id).value + '°'; });
+      function len(fn) { var L = 0, prev = fn(0); for (var i = 1; i <= 200; i++) { var cur = fn(i / 200); L += so3.dist(prev, cur); prev = cur; } return L; }
+      el('i-readout').innerHTML = '<div><span class="k">geodesic distance R₀→R₁</span> ' + deg(total).toFixed(1) + '°</div>' +
+        '<div><span class="k">path length slerp</span> <span style="color:' + c.accent + '">' + deg(len(P.slerp)).toFixed(1) + '°</span></div>' +
+        '<div><span class="k">path length nlerp</span> <span style="color:#2f9e44">' + deg(len(P.nlerp)).toFixed(1) + '°</span></div>' +
+        '<div><span class="k">path length Euler lerp</span> <span style="color:' + c.accent2 + '">' + deg(len(P.euler)).toFixed(1) + '°</span></div>' +
+        '<div style="opacity:.75;margin-top:4px">slerp and nlerp share the geodesic; only slerp moves at constant speed. Euler lerp takes a longer, different path.</div>';
+    }
+    Guide.bindSliders(ids.map(el), function () { view.redraw(); });
+  })();
+
+  // ---------------------------------------------------------------- 5. quaternion averaging
+  (function () {
+    var seed = 5, flips = 0, Qs = [], signs = [1, 1, 1, 1, 1];
+    var qTrue = quat.fromMat(euler.toMat(rad(40), rad(-15), rad(25)));
+    function gen() { var rng = Guide.seededRandom(seed); Qs = []; for (var i = 0; i < 5; i++) Qs.push(quat.fromMat(so3.plus(quat.toMat(qTrue), [0.12 * Lie.gauss(rng), 0.12 * Lie.gauss(rng), 0.12 * Lie.gauss(rng)]))); }
+    function render() {
+      var Q = Qs.map(function (q, i) { return q.map(function (x) { return x * signs[i]; }); });
+      var naive = [0, 0, 0, 0]; Q.forEach(function (q) { for (var k = 0; k < 4; k++) naive[k] += q[k] / Q.length; });
+      var aligned = [0, 0, 0, 0]; Q.forEach(function (q) { var s = quat.dot(q, Q[0]) < 0 ? -1 : 1; for (var k = 0; k < 4; k++) aligned[k] += s * q[k] / Q.length; });
+      var M = mN.zeros(4, 4); Q.forEach(function (q) { for (var i = 0; i < 4; i++) for (var j = 0; j < 4; j++) M[i][j] += q[i] * q[j]; });
+      var mark = mN.eigSym(M).vectors[0];
+      function err(q) { var n = quat.norm(q); if (n < 1e-9) return 'undefined (zero vector)'; return deg(so3.dist(quat.toMat(quat.normalize(q)), quat.toMat(qTrue))).toFixed(2) + '° from truth'; }
+      el('s-readout').innerHTML =
+        Q.map(function (q, i) { return '<div><span class="k">q' + (i + 1) + '</span> (' + q.map(function (x) { return fmt(x, 3); }).join(', ') + ')' + (signs[i] < 0 ? ' <span class="bad">stored as −q</span>' : '') + '</div>'; }).join('') +
+        '<div style="margin-top:6px"><span class="k">component mean</span> ‖·‖ = ' + quat.norm(naive).toFixed(3) + ', <span class="' + (signs.indexOf(-1) >= 0 ? 'bad' : '') + '">' + err(naive) + '</span></div>' +
+        '<div><span class="k">sign-aligned mean</span> <span class="ok">' + err(aligned) + '</span></div>' +
+        '<div><span class="k">eigenvector of Σ q qᵀ</span> <span class="ok">' + err(mark) + '</span></div>';
+    }
+    el('s-flip').onclick = function () { flips++; var rng = Guide.seededRandom(seed * 31 + flips); signs = signs.map(function () { return rng() < 0.45 ? -1 : 1; }); if (signs.indexOf(-1) < 0) signs[2] = -1; render(); };
+    el('s-new').onclick = function () { seed++; gen(); render(); };
+    gen(); signs = [1, -1, 1, -1, 1]; render();
+  })();
+
+  var QUIZ_QUESTIONS = [
+    { id: 'pa-lock', kind: 'numeric', prompt: 'For ZYX (yaw–pitch–roll) Euler angles, at what pitch angle, in degrees (positive), does the rate matrix become singular?', answer: 90, tolerance: 0.01, unit: '°',
+      explanation: 'det E = −cos(pitch), which is zero at pitch = ±90°. There the yaw and roll axes coincide and one degree of freedom is lost from the coordinates (not from the body).' },
+    { id: 'pa-half', kind: 'numeric', prompt: 'What is the w (scalar) component of the unit quaternion for a 120° rotation about any axis?', answer: 0.5, tolerance: 0.001,
+      explanation: 'w = cos(θ/2) = cos 60° = 0.5. Quaternions use the half angle, which is the source of the double cover.' },
+    { id: 'pa-cover', kind: 'choice', prompt: 'A body spins steadily through 360° about a fixed axis. Where is its quaternion?',
+      options: [{ label: 'Back at q₀', correct: false }, { label: 'At −q₀, the same rotation on the other sheet of the double cover', correct: true }, { label: 'Undefined', correct: false }],
+      explanation: 'q(θ) = (cos θ/2, sin θ/2 · k), so at θ = 360° it is (−1, 0) · q₀ = −q₀. It takes 720° to return to q₀.' },
+    { id: 'pa-nlerp', kind: 'choice', prompt: 'How does nlerp (normalized linear interpolation of quaternions) differ from slerp?',
+      options: [{ label: 'It takes a completely different path.', correct: false }, { label: 'Same geodesic path, but non-constant angular speed.', correct: true }, { label: 'It is identical in every respect.', correct: false }],
+      explanation: 'Normalizing a chord of the 3-sphere projects it onto the same great circle, so the path matches slerp; the parametrization is not uniform, and the speed peaks at the middle.' },
+    { id: 'pa-avg', kind: 'choice', prompt: 'Why can the component-wise mean of quaternions fail?',
+      options: [{ label: 'Quaternions cannot be added.', correct: false }, { label: 'q and −q are the same rotation, so a sample stored with the other sign cancels the others.', correct: true }, { label: 'The mean is never unit length.', correct: false }],
+      explanation: 'Align signs to a reference first, or use the dominant eigenvector of Σ qqᵀ (Markley\'s method), which is invariant to each sample\'s sign.' }
+  ];
+  GuideQuiz.init(el('quiz-root'), QUIZ_QUESTIONS, window.__GUIDE_PAGE_ID__);
+})();
+</script>
+{% endraw %}
+
+</body>
+</html>

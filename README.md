@@ -7,11 +7,11 @@ interactive guide:
 - **AI** — LLM Training (15 parts), LLM Serving (20), Building with LLMs (17),
   Agents in Action (19), Generative Media (20), Multimodal Models (16).
 - **Vision & Geometry** — Multi-View Geometry (20), Nonlinear Optimization (5),
-  plus the Guide Kit Demo.
+  Lie Groups & Lie Algebras (12), plus the Guide Kit Demo.
 - **Math** — Linear Algebra (22), Calculus (14), Calculus in Motion (14),
   Probability (20), Probability in Action (20), Statistics (32).
 
-255 parts across 15 guides. Every guide is a standalone `<!DOCTYPE html>` page of
+267 parts across 16 guides. Every guide is a standalone `<!DOCTYPE html>` page of
 hand-written `<canvas>` and vanilla JS — no framework, no npm, no build step beyond
 Jekyll.
 
