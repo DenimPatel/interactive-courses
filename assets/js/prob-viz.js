@@ -7,7 +7,10 @@
 
   function G() { return global.Guide; }
   function LA() { return global.LinAlg.mat; }
-  function colors() { return G().colors(); }
+  // The whole resolved palette, re-read at draw time. themeColors() is the
+  // single reader of the theme layer in assets/js, so a theme change reaches
+  // every mark this file draws — series palette and chart type sizes included.
+  function colors() { return G().themeColors(); }
 
   var LOG_SQRT_2PI = 0.5 * Math.log(2 * Math.PI);
   var SQRT2PI = Math.sqrt(2 * Math.PI);
@@ -587,7 +590,7 @@
       ctx.save();
       ctx.strokeStyle = a.color || c.divider; ctx.lineWidth = a.width || 1;
       ctx.fillStyle = c.text;
-      ctx.font = (a.fontSize || 10) + 'px ' + c.font;
+      ctx.font = G().fontAt(c, a.fontSize, 'tick');
       var xAxis = (yRange[0] <= 0 && yRange[1] >= 0) ? py(0) : padT + plotH;
       var yAxis = (xRange[0] <= 0 && xRange[1] >= 0) ? px(0) : padL;
       ctx.beginPath(); ctx.moveTo(padL, xAxis); ctx.lineTo(padL + plotW, xAxis); ctx.stroke();
@@ -671,10 +674,13 @@
       }
       ctx.lineTo(px(b), py(base));
       ctx.closePath();
-      ctx.fillStyle = o.color || 'rgba(43,95,255,0.2)';
+      // A 20% wash of the accent, composed from its channel token, so the area
+      // fill is a wash of *this* theme's accent rather than a frozen rgba().
+      var wash = o.color || G().alpha(c, 'accentCh', 0.2);
+      ctx.fillStyle = wash;
       ctx.fill();
       ctx.restore();
-      if (o.label) legendEntries.push({ label: o.label, color: o.color || 'rgba(43,95,255,0.2)', fill: true });
+      if (o.label) legendEntries.push({ label: o.label, color: wash, fill: true });
     }
 
     function inferWidth(items) {
@@ -755,7 +761,7 @@
     function lineLabel(text, X, Y, color) {
       if (!text) return;
       var c = colors();
-      ctx.font = '11px ' + c.font;
+      ctx.font = c.tickFont;
       ctx.fillStyle = color || c.text;
       ctx.textAlign = 'left';
       ctx.fillText(text, X + 4, Y - 4);
@@ -794,11 +800,11 @@
       var c = colors();
       ctx.save();
       clip();
-      ctx.fillStyle = o.color || 'rgba(214,0,108,0.12)';
+      var wash2 = o.color || G().alpha(c, 'accent2Ch', 0.12);
       var X0 = px(x0), X1 = px(x1);
       ctx.fillRect(Math.min(X0, X1), padT, Math.abs(X1 - X0), plotH);
       ctx.restore();
-      if (o.label) legendEntries.push({ label: o.label, color: o.color || 'rgba(214,0,108,0.12)', fill: true });
+      if (o.label) legendEntries.push({ label: o.label, color: wash2, fill: true });
     }
 
     function legend(items) {
@@ -806,13 +812,16 @@
       var list = items || legendEntries;
       if (!list.length) return;
       ctx.save();
-      ctx.font = '12px ' + c.font;
+      ctx.font = c.legendFont;
       var pad = 8, lineH = 18, sw = 16, textW = 0, i;
       for (i = 0; i < list.length; i++) textW = Math.max(textW, ctx.measureText(list[i].label).width);
       var boxW = textW + sw + 22 + 2 * pad;
       var boxH = list.length * lineH + 2 * pad;
       var x0 = padL + plotW - boxW - 8, y0 = padT + 8;
-      ctx.fillStyle = 'rgba(255,255,255,0.86)';
+      // The legend plate is a raised surface at 86%, in the surface colour. The
+      // literal white this replaces was correct in light and a searchlight in
+      // dark, and a legend that outshines the plot it annotates is a bug.
+      ctx.fillStyle = G().alpha(c, 'surfaceCh', 0.86);
       ctx.strokeStyle = c.divider;
       ctx.lineWidth = 1;
       ctx.fillRect(x0, y0, boxW, boxH);
@@ -848,9 +857,11 @@
             ctx.beginPath();
             ctx.arc(px(h.x), py(h.y), h.r || 9, 0, 2 * Math.PI);
             ctx.fillStyle = h.color || c.accent2; ctx.fill();
-            ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.5; ctx.stroke();
+            // A halo in the surface colour, not a white ring: a fixed white is a
+            // highlight in light and a glare in dark.
+            ctx.strokeStyle = G().alpha(c, 'surfaceCh', 0.9); ctx.lineWidth = 1.5; ctx.stroke();
             if (h.label) {
-              ctx.fillStyle = h.labelColor || c.text; ctx.font = '12px ' + c.font;
+              ctx.fillStyle = h.labelColor || c.text; ctx.font = c.legendFont;
               ctx.textAlign = 'left';
               ctx.fillText(h.label, px(h.x) + (h.r || 9) + 4, py(h.y) - (h.r || 9) - 2);
             }

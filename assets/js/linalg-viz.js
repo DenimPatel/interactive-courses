@@ -22,7 +22,10 @@
 
   function Guide() { return global.Guide; }
   function GM() { return global.GuideMath; }
-  function colors() { return Guide().colors(); }
+  // The whole resolved palette, re-read at draw time. themeColors() is the
+  // single reader of the theme layer in assets/js, so a theme change reaches
+  // every mark this file draws — series palette and chart type sizes included.
+  function colors() { return Guide().themeColors(); }
 
   // =========================================================================
   // small N-dimensional vector helpers (local; GuideMath's are 3-D only)
@@ -425,7 +428,7 @@
       ctx.strokeStyle = a.color || c.divider; ctx.lineWidth = a.width || 1;
       ctx.beginPath(); ctx.moveTo(padL, y0); ctx.lineTo(W - padR, y0); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(x0, padT); ctx.lineTo(x0, H - padB); ctx.stroke();
-      ctx.font = (a.fontSize || 10) + 'px ' + c.font;
+      ctx.font = Guide().fontAt(c, a.fontSize, 'tick');
       ctx.fillStyle = c.text;
       var step = a.step || 1;
       var from = Math.ceil(xRange[0] / step) * step;
@@ -490,7 +493,7 @@
         var cx = 0, cy = 0;
         pts.forEach(function (p) { cx += p[0]; cy += p[1]; });
         cx /= pts.length; cy /= pts.length;
-        ctx.fillStyle = o.labelColor || c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'center';
+        ctx.fillStyle = o.labelColor || c.text; ctx.font = c.legendFont; ctx.textAlign = 'center';
         ctx.fillText(o.label, px(cx), py(cy));
       }
     }
@@ -545,7 +548,7 @@
         var dir = n1 > 1e-9 ? vscale(v1, 1 / n1) : [1, 0];
         var big = diag;
         var a = vscale(dir, -big * 3), b = vscale(dir, big * 3);
-        ctx.strokeStyle = o.color || 'rgba(43,95,255,0.18)';
+        ctx.strokeStyle = o.color || Guide().alpha(c, 'accentCh', 0.18);
         ctx.lineWidth = 10; ctx.lineCap = 'round';
         ctx.beginPath(); ctx.moveTo(px(a[0]), py(a[1])); ctx.lineTo(px(b[0]), py(b[1])); ctx.stroke();
       } else {
@@ -553,7 +556,7 @@
         var K = 3 * diag / m;
         var p1 = vscale(v1, K), p2 = vscale(v2, K);
         var quad = [vadd(p1, p2), vsub(p1, p2), vscale(vadd(p1, p2), -1), vsub(p2, p1)];
-        ctx.fillStyle = o.color || 'rgba(43,95,255,0.12)';
+        ctx.fillStyle = o.color || Guide().alpha(c, 'accentCh', 0.12);
         ctx.beginPath();
         ctx.moveTo(px(quad[0][0]), py(quad[0][1]));
         for (var i = 1; i < quad.length; i++) ctx.lineTo(px(quad[i][0]), py(quad[i][1]));
@@ -575,9 +578,11 @@
             ctx.beginPath();
             ctx.arc(px(h.x), py(h.y), h.r || 9, 0, 2 * Math.PI);
             ctx.fillStyle = h.color || c.accent2; ctx.fill();
-            ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.5; ctx.stroke();
+            // A halo in the surface colour, not a white ring: a fixed white is a
+            // highlight in light and a glare in dark.
+            ctx.strokeStyle = Guide().alpha(c, 'surfaceCh', 0.9); ctx.lineWidth = 1.5; ctx.stroke();
             if (h.label) {
-              ctx.fillStyle = h.labelColor || c.text; ctx.font = '12px ' + c.font;
+              ctx.fillStyle = h.labelColor || c.text; ctx.font = c.legendFont;
               ctx.textAlign = 'left';
               ctx.fillText(h.label, px(h.x) + (h.r || 9) + 4, py(h.y) - (h.r || 9) - 2);
             }

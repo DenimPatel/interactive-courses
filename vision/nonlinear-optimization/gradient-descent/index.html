@@ -14,7 +14,14 @@ redirect_from:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page.title }} · {{ site.title }}</title>
 <meta name="description" content="{{ page.description }}">
+{% include theme-boot.html %}
+<script src="{{ '/assets/js/theme-tokens.js' | relative_url }}"></script>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f2f5fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#090c11" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{{ '/assets/css/theme.css' | relative_url }}">
 <link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+<link rel="stylesheet" href="{{ '/assets/css/chrome.css' | relative_url }}">
 {% include favicon.html %}
 <style>
   .nlo { max-width: 1180px; }
@@ -52,7 +59,6 @@ redirect_from:
   .nlo-demo {
     display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
     background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
-    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
     box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
     margin-top: 8px;
   }
@@ -74,7 +80,7 @@ redirect_from:
     padding: 7px 13px; border-radius: var(--radius-md);
   }
   .nlo-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-  .nlo-btnrow button.nlo-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .nlo-btnrow button.nlo-primary { background: var(--color-accent); color: var(--c-surface); border-color: var(--color-accent); }
   .nlo-btnrow button.nlo-primary:hover { background: var(--color-accent-600); }
   .nlo-btnrow button:disabled { opacity: 0.45; cursor: default; }
   .nlo-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
@@ -107,7 +113,7 @@ redirect_from:
 {% include site-nav.html %}
 {% include series-nav.html series=site.data.series.nonlinear_optimization %}
 
-<main>
+<main id="main">
 <div class="wrap nlo">
   <section class="page-header">
     <span class="section-kicker">Interactive guide</span>
@@ -289,10 +295,10 @@ redirect_from:
         <div id="s7-plot3d" class="nlo-plot3d nlo-plot3d-tall"></div>
         <p class="nlo-canvas-hint">Drag to orbit, scroll to zoom. Click the surface to set the shared starting guess.</p>
         <div class="nlo-legend">
-          <span><i style="background:#9b9797"></i>Gradient descent</span>
+          <span><i style="background:var(--c-fg-subtle)"></i>Gradient descent</span>
           <span><i style="background:var(--color-accent)"></i>Newton</span>
           <span><i style="background:var(--color-accent-2)"></i>Gauss-Newton</span>
-          <span><i style="background:#1a7a3a"></i>Levenberg-Marquardt</span>
+          <span><i style="background:var(--c-ok)"></i>Levenberg-Marquardt</span>
         </div>
       </div>
       <div class="nlo-controls">
@@ -349,11 +355,43 @@ redirect_from:
 (function(){
   "use strict";
 
-  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-  var COLOR_TEXT = css('--color-text') || '#201e1d';
-  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
-  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
-  var PALETTE = [100,200,300,400,500,600,700,800,900].map(function(n){ return css('--color-accent-'+n) || '#93aefe'; });
+  /* Read at draw time, never captured into module state. These were read
+     once, here, while the parser was still inside <head> — and a Plotly layout
+     or a canvas stroke bakes whatever colour it is handed at the moment it is
+     handed it, so a reader who loaded in light and then switched to dark was
+     left looking at light-ink frames until some unrelated interaction happened
+     to repaint. THEME.token() reads the same token the old css() read was
+     reaching for (theme.css aliases --color-text onto --c-fg and the rest the
+     same way), which is why there is no second fallback left to keep in step. */
+  function COLOR_TEXT(){ return THEME.token('--c-fg'); }
+  function COLOR_ACCENT(){ return THEME.token('--c-accent'); }
+  function COLOR_ACCENT2(){ return THEME.token('--c-accent-2'); }
+  function PALETTE(){ return [100,200,300,400,500,600,700,800,900].map(function(n){ return THEME.token('--color-accent-'+n); }); }
+
+  /* These pages load theme-tokens.js but not guide-core.js, so no canvas here
+     is registered with the shared repaint scheduler and no draw path re-runs
+     when the reader changes theme. Every step below registers the function it
+     already draws from and this one listener replays them, so the lazy reads
+     above actually get a chance to happen. preferences.js dispatches
+     `ic:theme` for every commit — a theme flip, a chart-grid toggle, and once
+     at load — so a registered path has to be safe to run more than once, and
+     one step throwing must not take the rest of the page's canvases with it. */
+  var repaint = [];
+  var primed = false;
+  function onTheme(){
+    /* preferences.js dispatches `ic:theme` once at load as well as on every
+       change, and it does so from a deferred script — so the first event this
+       page ever sees is that load-time one, arriving after its own first draw
+       has already used the resolved theme. Replaying every draw path there would
+       buy nothing and double the cost of loading the page. */
+    if (!primed) { primed = true; return; }
+    THEME.refresh();
+    for (var i=0;i<repaint.length;i++){
+      try { repaint[i](); }
+      catch (e) { if (window.console && window.console.error) window.console.error('[theme] repaint failed', e); }
+    }
+  }
+  document.addEventListener('ic:theme', onTheme, false);
 
   function gaussianNoise(std){
     var u = Math.max(Math.random(), 1e-9), v = Math.random();
@@ -423,7 +461,7 @@ redirect_from:
 
     function draw(){
       ctx.clearRect(0,0,W,H);
-      ctx.strokeStyle = COLOR_ACCENT; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.strokeStyle = COLOR_ACCENT(); ctx.lineWidth = 2; ctx.beginPath();
       for (var px=0; px<=W; px++){
         var xw = xRange[0] + px/W*(xRange[1]-xRange[0]);
         var py = toPy(f(xw));
@@ -431,23 +469,23 @@ redirect_from:
       }
       ctx.stroke();
       // ground line for robot cartoon
-      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.beginPath(); ctx.moveTo(0,H-8); ctx.lineTo(W,H-8); ctx.stroke();
+      ctx.strokeStyle = THEME.alpha('--c-fg', 0.15); ctx.beginPath(); ctx.moveTo(0,H-8); ctx.lineTo(W,H-8); ctx.stroke();
       // landmark marker on cartoon strip
       var lpx = toPx(L[0]);
-      ctx.fillStyle = COLOR_ACCENT2;
+      ctx.fillStyle = COLOR_ACCENT2();
       ctx.beginPath(); ctx.moveTo(lpx,H-16); ctx.lineTo(lpx-6,H-4); ctx.lineTo(lpx+6,H-4); ctx.closePath(); ctx.fill();
 
       var xv = parseFloat(document.getElementById('s1-x').value);
       var xpx = toPx(xv), ypx = toPy(f(xv));
-      ctx.fillStyle = COLOR_TEXT;
+      ctx.fillStyle = COLOR_TEXT();
       ctx.beginPath(); ctx.arc(xpx, ypx, 5, 0, 7); ctx.fill();
-      ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.setLineDash([3,3]);
+      ctx.strokeStyle = THEME.alpha('--c-fg', 0.25); ctx.setLineDash([3,3]);
       ctx.beginPath(); ctx.moveTo(xpx,ypx); ctx.lineTo(xpx,H-8); ctx.stroke(); ctx.setLineDash([]);
       // robot marker on cartoon strip
-      ctx.fillStyle = COLOR_TEXT;
+      ctx.fillStyle = COLOR_TEXT();
       ctx.beginPath(); ctx.arc(xpx, H-8, 5, 0, 7); ctx.fill();
       // dashed line from robot to landmark showing measured distance
-      ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.setLineDash([2,3]);
+      ctx.strokeStyle = THEME.alpha('--c-fg', 0.3); ctx.setLineDash([2,3]);
       ctx.beginPath(); ctx.moveTo(xpx,H-8); ctx.lineTo(lpx,H-8); ctx.stroke(); ctx.setLineDash([]);
     }
     function updateReadout(){
@@ -461,6 +499,7 @@ redirect_from:
     }
     document.getElementById('s1-x').addEventListener('input', updateReadout);
     updateReadout();
+    repaint.push(draw);
   })();
 
   // ---------- Shared 1D engine for gradient descent / Newton ----------
@@ -484,7 +523,7 @@ redirect_from:
 
     function draw(){
       ctx.clearRect(0,0,W,H);
-      ctx.strokeStyle = COLOR_ACCENT; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.strokeStyle = COLOR_ACCENT(); ctx.lineWidth = 2; ctx.beginPath();
       for (var px=0; px<=W; px++){
         var xw = xRange[0] + px/W*(xRange[1]-xRange[0]);
         var py = toPy(f(xw));
@@ -494,7 +533,7 @@ redirect_from:
 
       if (cfg.method === 'newton'){
         var x0 = currentX(), a = 0.5*fpp(x0), b = fp(x0), c = f(x0);
-        ctx.strokeStyle = COLOR_ACCENT2; ctx.setLineDash([4,3]); ctx.lineWidth = 1.5; ctx.beginPath();
+        ctx.strokeStyle = COLOR_ACCENT2(); ctx.setLineDash([4,3]); ctx.lineWidth = 1.5; ctx.beginPath();
         for (var px2=0; px2<=W; px2++){
           var xw2 = xRange[0] + px2/W*(xRange[1]-xRange[0]);
           var dx = xw2-x0, yv = c + b*dx + a*dx*dx;
@@ -504,7 +543,7 @@ redirect_from:
         ctx.stroke(); ctx.setLineDash([]);
       }
 
-      ctx.strokeStyle = 'rgba(32,30,29,0.35)'; ctx.lineWidth = 1.5; ctx.beginPath();
+      ctx.strokeStyle = THEME.alpha('--c-fg', 0.35); ctx.lineWidth = 1.5; ctx.beginPath();
       for (var i=0;i<history.length-1;i++){
         ctx.moveTo(toPx(history[i]), toPy(f(history[i])));
         ctx.lineTo(toPx(history[i+1]), toPy(f(history[i+1])));
@@ -512,7 +551,7 @@ redirect_from:
       ctx.stroke();
       for (var j=0;j<history.length;j++){
         var last = j===history.length-1;
-        ctx.fillStyle = last ? COLOR_TEXT : 'rgba(32,30,29,0.35)';
+        ctx.fillStyle = last ? COLOR_TEXT() : THEME.alpha('--c-fg', 0.35);
         ctx.beginPath(); ctx.arc(toPx(history[j]), toPy(f(history[j])), last?6:3.5, 0, 7); ctx.fill();
       }
     }
@@ -583,16 +622,28 @@ redirect_from:
       document.getElementById(cfg.alphaValId).textContent = parseFloat(alphaSlider.value).toFixed(2);
     }
     render();
+    return { render: render };
   }
 
-  make1DDemo({ method:'gd', canvasId:'s2-canvas', stepId:'s2-step', runId:'s2-run', resetId:'s2-reset',
-    readoutId:'s2-readout', alphaId:'s2-alpha', alphaValId:'s2-aval', initialX:-6 });
-  make1DDemo({ method:'newton', canvasId:'s3-canvas', stepId:'s3-step', runId:'s3-run', resetId:'s3-reset',
-    readoutId:'s3-readout', initialX:-6 });
+  repaint.push(make1DDemo({ method:'gd', canvasId:'s2-canvas', stepId:'s2-step', runId:'s2-run', resetId:'s2-reset',
+    readoutId:'s2-readout', alphaId:'s2-alpha', alphaValId:'s2-aval', initialX:-6 }).render);
+  repaint.push(make1DDemo({ method:'newton', canvasId:'s3-canvas', stepId:'s3-step', runId:'s3-run', resetId:'s3-reset',
+    readoutId:'s3-readout', initialX:-6 }).render);
 
   // ---------- Shared 3D cost-surface engine (Plotly) ----------
-  var SURFACE_COLORSCALE = PALETTE.slice().reverse().map(function(c,i){ return [i/(PALETTE.length-1), c]; });
-  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+  // A function, not an array: the ramp is a sequence of accent steps, so it
+  // has to be re-read with everything else or the surface keeps the load
+  // theme's ramp after the reader switches.
+  function surfaceColorscale(){
+    var ramp = PALETTE().slice().reverse();
+    return ramp.map(function(c,i){ return [i/(ramp.length-1), c]; });
+  }
+  function COLOR_DIVIDER(){ return THEME.token('--c-border'); }
+
+  // The plot lattice, which is not a divider. --c-grid is the token the
+  // chart-grid preference repoints at the border colour, so reading it here
+  // is what lets data-chart-grid="off" reach a gridline.
+  function COLOR_GRID(){ return THEME.token('--c-grid'); }
 
   function computeCostGrid(landmarks, meas, worldRange, gridN){
     gridN = gridN || 44;
@@ -617,9 +668,9 @@ redirect_from:
   function sceneLayout(worldRange, zMin, zMax){
     var zPad = (zMax-zMin) * 0.06 || 1;
     return {
-      xaxis: { title:'x', range: worldRange.x, backgroundcolor:'transparent', gridcolor: COLOR_DIVIDER, zerolinecolor: COLOR_DIVIDER, color: COLOR_TEXT },
-      yaxis: { title:'y', range: worldRange.y, backgroundcolor:'transparent', gridcolor: COLOR_DIVIDER, zerolinecolor: COLOR_DIVIDER, color: COLOR_TEXT },
-      zaxis: { title:'cost', range: [zMin-zPad, zMax+zPad], backgroundcolor:'transparent', gridcolor: COLOR_DIVIDER, zerolinecolor: COLOR_DIVIDER, color: COLOR_TEXT },
+      xaxis: { title:'x', range: worldRange.x, backgroundcolor:'transparent', gridcolor: COLOR_GRID(), zerolinecolor: COLOR_DIVIDER(), color: COLOR_TEXT() },
+      yaxis: { title:'y', range: worldRange.y, backgroundcolor:'transparent', gridcolor: COLOR_GRID(), zerolinecolor: COLOR_DIVIDER(), color: COLOR_TEXT() },
+      zaxis: { title:'cost', range: [zMin-zPad, zMax+zPad], backgroundcolor:'transparent', gridcolor: COLOR_GRID(), zerolinecolor: COLOR_DIVIDER(), color: COLOR_TEXT() },
       aspectmode: 'manual',
       aspectratio: { x:1, y: (worldRange.y[1]-worldRange.y[0])/(worldRange.x[1]-worldRange.x[0]), z:0.65 },
       camera: { eye: { x:1.5, y:-1.5, z:1.05 } }
@@ -634,7 +685,7 @@ redirect_from:
 
     var surfaceTrace = {
       type:'surface', x: grid.x, y: grid.y, z: grid.z,
-      colorscale: SURFACE_COLORSCALE, showscale:false, opacity:0.96,
+      colorscale: surfaceColorscale(), showscale:false, opacity:0.96,
       contours: { z: { show:true, usecolormap:true, project:{z:true}, highlightwidth:1 } },
       lighting: { ambient:0.7, diffuse:0.55, specular:0.12, roughness:0.9 },
       hovertemplate: 'x=%{x:.2f}<br>y=%{y:.2f}<br>cost=%{z:.3f}<extra></extra>'
@@ -644,13 +695,13 @@ redirect_from:
       x: landmarks.map(function(L){ return L[0]; }),
       y: landmarks.map(function(L){ return L[1]; }),
       z: landmarks.map(function(){ return floorZ; }),
-      marker:{ size:6, color: COLOR_ACCENT2, symbol:'diamond' },
+      marker:{ size:6, color: COLOR_ACCENT2(), symbol:'diamond' },
       hovertemplate:'landmark<extra></extra>'
     };
     var truthTrace = {
       type:'scatter3d', mode:'markers', name:'true position',
       x:[trueP[0]], y:[trueP[1]], z:[floorZ],
-      marker:{ size:7, color: COLOR_TEXT, symbol:'diamond-open', line:{width:2,color:COLOR_TEXT} },
+      marker:{ size:7, color: COLOR_TEXT(), symbol:'diamond-open', line:{width:2,color:COLOR_TEXT()} },
       hovertemplate:'true position<extra></extra>'
     };
     var data = [surfaceTrace, landmarkTrace, truthTrace];
@@ -742,9 +793,14 @@ redirect_from:
     var worldRange = opts.scenario.worldRange;
     var landmarks = opts.scenario.landmarks, meas = opts.scenario.meas, trueP = opts.scenario.trueP;
 
-    var pathSpecs = [{ key:'main', name: opts.methodLabel || opts.method, color: opts.pathColor || COLOR_ACCENT }];
-    if (opts.compareMethod) pathSpecs.push({ key:'compare', name: opts.compareLabel || opts.compareMethod, color: COLOR_ACCENT, visible: opts.getCompareOn ? opts.getCompareOn() : true });
-    var fig = make3DSurfaceFigure(opts.divId, landmarks, meas, trueP, worldRange, pathSpecs);
+    // Built on demand, for the same reason as the colorscale: make3DSurfaceFigure
+    // bakes spec.color into the trace, and the figure is rebuilt on a theme change.
+    function pathSpecs(){
+      var specs = [{ key:'main', name: opts.methodLabel || opts.method, color: opts.pathColor ? opts.pathColor() : COLOR_ACCENT() }];
+      if (opts.compareMethod) specs.push({ key:'compare', name: opts.compareLabel || opts.compareMethod, color: COLOR_ACCENT(), visible: opts.getCompareOn ? opts.getCompareOn() : true });
+      return specs;
+    }
+    var fig = make3DSurfaceFigure(opts.divId, landmarks, meas, trueP, worldRange, pathSpecs());
 
     var p = opts.initial.slice();
     var path = [p.slice()];
@@ -833,18 +889,25 @@ redirect_from:
     });
 
     reset(opts.initial);
+    // redraw() only restyles the path traces; the layout and the surface ramp
+    // are baked in when the figure is built, so a theme change goes through
+    // this step's own rebuild path first.
+    repaint.push(function(){
+      rebuild3DSurfaceFigure(fig, opts.divId, landmarks, meas, trueP, worldRange, pathSpecs());
+      redraw();
+    });
     return { reset: reset, redraw: redraw };
   }
 
   var scenario2 = makeScenario(2, [1,-2], 0.15, { x:[-8,8], y:[-6,6] });
-  make3DDemo({ method:'newton', divId:'s4-plot3d', stepId:'s4-step', runId:'s4-run', resetId:'s4-reset',
-    readoutId:'s4-readout', scenario: scenario2, initial:[6,5], pathColor: COLOR_ACCENT, methodLabel:'Newton' });
+  repaint.push(make3DDemo({ method:'newton', divId:'s4-plot3d', stepId:'s4-step', runId:'s4-run', resetId:'s4-reset',
+    readoutId:'s4-readout', scenario: scenario2, initial:[6,5], pathColor: COLOR_ACCENT, methodLabel:'Newton' }));
 
   var scenario3 = makeScenario(3, [1,-2], 0.15, { x:[-8,8], y:[-6,6] });
   var s5compareBox = document.getElementById('s5-compare');
-  make3DDemo({ method:'gauss-newton', divId:'s5-plot3d', stepId:'s5-step', runId:'s5-run', resetId:'s5-reset',
+  repaint.push(make3DDemo({ method:'gauss-newton', divId:'s5-plot3d', stepId:'s5-step', runId:'s5-run', resetId:'s5-reset',
     readoutId:'s5-readout', scenario: scenario3, initial:[6,5], pathColor: COLOR_ACCENT2, methodLabel:'Gauss-Newton',
-    compareMethod:'newton', compareLabel:'Newton (comparison)', getCompareOn: function(){ return s5compareBox.checked; } });
+    compareMethod:'newton', compareLabel:'Newton (comparison)', getCompareOn: function(){ return s5compareBox.checked; } }));
   s5compareBox.addEventListener('change', function(){ /* redraw triggered on next step/reset; force one now */
     var evt = new Event('click'); document.getElementById('s5-reset').dispatchEvent(evt);
   });
@@ -859,14 +922,14 @@ redirect_from:
   function toggleLambdaField(){ s6lambdaField.style.opacity = s6adaptive.checked ? 0.35 : 1; s6lambdaSlider.disabled = s6adaptive.checked; }
   toggleLambdaField();
   s6adaptive.addEventListener('change', toggleLambdaField);
-  make3DDemo({
+  repaint.push(make3DDemo({
     method:'lm', divId:'s6-plot3d', stepId:'s6-step', runId:'s6-run', resetId:'s6-reset',
-    readoutId:'s6-readout', scenario: scenario4, initial:[7,-5.5], pathColor: '#1a7a3a', lambda0: 1, methodLabel:'Levenberg-Marquardt',
+    readoutId:'s6-readout', scenario: scenario4, initial:[7,-5.5], pathColor: function(){ return THEME.ink('#1a7a3a'); }, lambda0: 1, methodLabel:'Levenberg-Marquardt',
     getLambda: function(state){
       if (s6adaptive.checked) return state.lambda;
       return Math.pow(10, parseFloat(s6lambdaSlider.value));
     }
-  });
+  }));
 
   // ---------- Step 7: playground race ----------
   (function(){
@@ -874,13 +937,14 @@ redirect_from:
     var scenario = makeScenario(4, [1,-2], 0.15, worldRange);
     var initial = [6.5,5];
     var methods = [
-      { key:'gd', label:'Gradient descent', color:'#9b9797' },
+      { key:'gd', label:'Gradient descent', color:THEME.ink('#9b9797') },
       { key:'newton', label:'Newton', color: COLOR_ACCENT },
       { key:'gauss-newton', label:'Gauss-Newton', color: COLOR_ACCENT2 },
-      { key:'lm', label:'Levenberg-Marquardt', color: '#1a7a3a' }
+      { key:'lm', label:'Levenberg-Marquardt', color: THEME.ink('#1a7a3a') }
     ];
-    var pathSpecs = methods.map(function(m){ return { key:m.key, name:m.label, color:m.color }; });
-    var fig = make3DSurfaceFigure('s7-plot3d', scenario.landmarks, scenario.meas, scenario.trueP, worldRange, pathSpecs);
+    // Built on demand so the path colours are read again on a theme change.
+    function pathSpecs(){ return methods.map(function(m){ return { key:m.key, name:m.label, color: typeof m.color === 'function' ? m.color() : m.color }; }); }
+    var fig = make3DSurfaceFigure('s7-plot3d', scenario.landmarks, scenario.meas, scenario.trueP, worldRange, pathSpecs());
     var paths, states, done, running=false, timer=null;
 
     var clickPending = false;
@@ -903,7 +967,8 @@ redirect_from:
       var rows = methods.map(function(m,i){
         var err = NLO.dist(paths[i][paths[i].length-1][0],paths[i][paths[i].length-1][1], scenario.trueP[0], scenario.trueP[1]);
         var status = done[i] ? (done[i]==='ok' ? 'converged' : done[i]) : 'running';
-        return '<tr><td><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+m.color+';margin-right:6px;"></i>'+m.label+'</td><td>'+(paths[i].length-1)+'</td><td>'+err.toFixed(3)+'</td><td>'+status+'</td></tr>';
+        var swatch = typeof m.color === 'function' ? m.color() : m.color;
+        return '<tr><td><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+swatch+';margin-right:6px;"></i>'+m.label+'</td><td>'+(paths[i].length-1)+'</td><td>'+err.toFixed(3)+'</td><td>'+status+'</td></tr>';
       });
       tbody().innerHTML = rows.join('');
     }
@@ -915,7 +980,7 @@ redirect_from:
       if (newScenario) scenario = newScenario;
       if (newInitial) initial = newInitial;
       if (newScenario){
-        rebuild3DSurfaceFigure(fig, 's7-plot3d', scenario.landmarks, scenario.meas, scenario.trueP, worldRange, pathSpecs);
+        rebuild3DSurfaceFigure(fig, 's7-plot3d', scenario.landmarks, scenario.meas, scenario.trueP, worldRange, pathSpecs());
         bindClick();
       }
       paths = methods.map(function(){ return [initial.slice()]; });
@@ -960,6 +1025,15 @@ redirect_from:
       reset(initial, makeScenario(4, trueP, 0.15, worldRange));
     });
     reset(initial);
+    // redraw() only restyles the path traces; the surface ramp and the layout
+    // are baked in when the figure is built, so a theme change goes through
+    // this step's own rebuild path first, then redraws the paths it has.
+    repaint.push(function(){
+      rebuild3DSurfaceFigure(fig, 's7-plot3d', scenario.landmarks, scenario.meas, scenario.trueP, worldRange, pathSpecs());
+      bindClick();
+      redraw();
+      renderTable();
+    });
   })();
 
 })();

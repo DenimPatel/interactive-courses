@@ -14,7 +14,14 @@ redirect_from:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page.title }} · {{ site.title }}</title>
 <meta name="description" content="{{ page.description }}">
+{% include theme-boot.html %}
+<script src="{{ '/assets/js/theme-tokens.js' | relative_url }}"></script>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f2f5fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#090c11" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{{ '/assets/css/theme.css' | relative_url }}">
 <link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+<link rel="stylesheet" href="{{ '/assets/css/chrome.css' | relative_url }}">
 {% include favicon.html %}
 <style>
   .nlo { max-width: 1180px; }
@@ -56,7 +63,6 @@ redirect_from:
   .nlo-demo {
     display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
     background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
-    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
     box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
     margin-top: 8px;
   }
@@ -75,7 +81,7 @@ redirect_from:
     padding: 7px 13px; border-radius: var(--radius-md);
   }
   .nlo-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-  .nlo-btnrow button.nlo-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .nlo-btnrow button.nlo-primary { background: var(--color-accent); color: var(--c-surface); border-color: var(--color-accent); }
   .nlo-btnrow button.nlo-primary:hover { background: var(--color-accent-600); }
   .nlo-btnrow button:disabled { opacity: 0.45; cursor: default; }
   .nlo-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
@@ -109,7 +115,7 @@ redirect_from:
 {% include site-nav.html %}
 {% include series-nav.html series=site.data.series.nonlinear_optimization %}
 
-<main>
+<main id="main">
 <div class="wrap nlo">
   <section class="page-header">
     <span class="section-kicker">Interactive guide · part 4</span>
@@ -237,9 +243,9 @@ redirect_from:
       <div class="nlo-canvas-wrap">
         <canvas id="s5-canvas" width="520" height="420"></canvas>
         <div class="nlo-legend">
-          <span><i style="background:#9b9797"></i>Gradient descent</span>
+          <span><i style="background:var(--c-fg-subtle)"></i>Gradient descent</span>
           <span><i style="background:var(--color-accent-2)"></i>Gauss-Newton</span>
-          <span><i style="background:#1a7a3a"></i>Levenberg-Marquardt</span>
+          <span><i style="background:var(--c-ok)"></i>Levenberg-Marquardt</span>
         </div>
       </div>
       <div class="nlo-controls">
@@ -297,11 +303,43 @@ redirect_from:
 (function(){
   "use strict";
 
-  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-  var COLOR_TEXT = css('--color-text') || '#201e1d';
-  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
-  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
-  var PALETTE = [100,200,300,400,500,600,700,800,900].map(function(n){ return css('--color-accent-'+n) || '#93aefe'; });
+  /* Read at draw time, never captured into module state. These were read
+     once, here, while the parser was still inside <head> — and a Plotly layout
+     or a canvas stroke bakes whatever colour it is handed at the moment it is
+     handed it, so a reader who loaded in light and then switched to dark was
+     left looking at light-ink frames until some unrelated interaction happened
+     to repaint. THEME.token() reads the same token the old css() read was
+     reaching for (theme.css aliases --color-text onto --c-fg and the rest the
+     same way), which is why there is no second fallback left to keep in step. */
+  function COLOR_TEXT(){ return THEME.token('--c-fg'); }
+  function COLOR_ACCENT(){ return THEME.token('--c-accent'); }
+  function COLOR_ACCENT2(){ return THEME.token('--c-accent-2'); }
+  function PALETTE(){ return [100,200,300,400,500,600,700,800,900].map(function(n){ return THEME.token('--color-accent-'+n); }); }
+
+  /* These pages load theme-tokens.js but not guide-core.js, so no canvas here
+     is registered with the shared repaint scheduler and no draw path re-runs
+     when the reader changes theme. Every step below registers the function it
+     already draws from and this one listener replays them, so the lazy reads
+     above actually get a chance to happen. preferences.js dispatches
+     `ic:theme` for every commit — a theme flip, a chart-grid toggle, and once
+     at load — so a registered path has to be safe to run more than once, and
+     one step throwing must not take the rest of the page's canvases with it. */
+  var repaint = [];
+  var primed = false;
+  function onTheme(){
+    /* preferences.js dispatches `ic:theme` once at load as well as on every
+       change, and it does so from a deferred script — so the first event this
+       page ever sees is that load-time one, arriving after its own first draw
+       has already used the resolved theme. Replaying every draw path there would
+       buy nothing and double the cost of loading the page. */
+    if (!primed) { primed = true; return; }
+    THEME.refresh();
+    for (var i=0;i<repaint.length;i++){
+      try { repaint[i](); }
+      catch (e) { if (window.console && window.console.error) window.console.error('[theme] repaint failed', e); }
+    }
+  }
+  document.addEventListener('ic:theme', onTheme, false);
   var R0 = 3;
 
   function mulberry32(seed){
@@ -531,10 +569,10 @@ redirect_from:
         ctx.lineTo(end[0]-9*Math.cos(ang+0.4), end[1]-9*Math.sin(ang+0.4));
         ctx.closePath(); ctx.fillStyle=color; ctx.fill();
       }
-      drawRobot(ctx, mapper, [0,0,theta], COLOR_TEXT, true);
-      arrow(worldDx, worldDy, COLOR_ACCENT2);
+      drawRobot(ctx, mapper, [0,0,theta], COLOR_TEXT(), true);
+      arrow(worldDx, worldDy, COLOR_ACCENT2());
       var bodyEnd = [c*u.dx - s*0, s*u.dx + c*0];
-      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.setLineDash([2,3]);
+      ctx.strokeStyle = THEME.alpha('--c-fg', 0.15); ctx.setLineDash([2,3]);
       ctx.beginPath(); ctx.moveTo(origin[0],origin[1]); var e2=mapper.toPx([worldDx,worldDy]); ctx.lineTo(e2[0],e2[1]); ctx.stroke(); ctx.setLineDash([]);
       document.getElementById('s1-tval').textContent = thetaDeg.toFixed(0) + '°';
       document.getElementById('s1-readout').innerHTML =
@@ -543,6 +581,7 @@ redirect_from:
     }
     document.getElementById('s1-theta').addEventListener('input', draw);
     draw();
+    repaint.push(draw);
   })();
 
   // ---------- Step 2: dead reckoning ----------
@@ -554,9 +593,9 @@ redirect_from:
     var idx = 0;
     function redraw(){
       ctx.clearRect(0,0,mapper.W,mapper.H);
-      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.4)', true);
+      drawPath(ctx, mapper, scenario.truePoses, THEME.alpha('--c-fg', 0.4), true);
       var estimate = deadReckon(scenario.truePoses[0], scenario.odoms.slice(0, idx));
-      drawPath(ctx, mapper, estimate, COLOR_ACCENT2, false);
+      drawPath(ctx, mapper, estimate, COLOR_ACCENT2(), false);
       var last = estimate[estimate.length-1];
       var trueLast = scenario.truePoses[idx];
       var err = Math.hypot(last[0]-trueLast[0], last[1]-trueLast[1]);
@@ -569,6 +608,7 @@ redirect_from:
     }
     document.getElementById('s2-step').addEventListener('click', function(){ idx = Math.min(6, idx+1); redraw(); });
     document.getElementById('s2-reset').addEventListener('click', function(){ idx = 0; redraw(); });
+    repaint.push(redraw);
     redraw();
   })();
 
@@ -605,7 +645,7 @@ redirect_from:
         for (var j=0;j<n;j++){
           var d = document.createElement('div');
           var mag = Math.min(1, Math.abs(H[i][j])/maxAbs);
-          d.style.background = Math.abs(H[i][j]) > 1e-9 ? PALETTE[Math.max(1,Math.round(mag*7))] : 'var(--color-neutral-200)';
+          d.style.background = Math.abs(H[i][j]) > 1e-9 ? PALETTE()[Math.max(1,Math.round(mag*7))] : 'var(--color-neutral-200)';
           d.title = 'H[' + i + '][' + j + '] = ' + H[i][j].toFixed(4);
           sparsityGrid.appendChild(d);
         }
@@ -626,20 +666,20 @@ redirect_from:
       document.querySelector('#s3-poseTable tbody').innerHTML = rows.join('');
     }
     function drawSightingRay(poseIdx, poses){
-      ctx.strokeStyle = COLOR_ACCENT2; ctx.lineWidth = 1.3; ctx.setLineDash([3,3]);
+      ctx.strokeStyle = COLOR_ACCENT2(); ctx.lineWidth = 1.3; ctx.setLineDash([3,3]);
       var a = mapper.toPx(poses[poseIdx]), b = mapper.toPx(scenario.landmark);
       ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
       ctx.setLineDash([]);
     }
     function redraw(){
       ctx.clearRect(0,0,mapper.W,mapper.H);
-      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.35)', true);
-      drawPath(ctx, mapper, deadReckonEstimate, COLOR_ACCENT2, true);
+      drawPath(ctx, mapper, scenario.truePoses, THEME.alpha('--c-fg', 0.35), true);
+      drawPath(ctx, mapper, deadReckonEstimate, COLOR_ACCENT2(), true);
       var poses = stateAsPoses();
       drawSightingRay(6, poses);
       if (loopBox.checked) drawSightingRay(1, poses);
-      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2);
-      drawPath(ctx, mapper, poses, COLOR_ACCENT, false);
+      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2());
+      drawPath(ctx, mapper, poses, COLOR_ACCENT(), false);
     }
     function updateReadout(){
       var edges = buildEdges();
@@ -676,6 +716,8 @@ redirect_from:
       running=true; document.getElementById('s3-run').textContent='Stop';
       var count=0; timer=setInterval(function(){ var done=doStep(); count++; if (done||count>50) stopRun(); }, 320);
     });
+    repaint.push(redraw);
+    repaint.push(updateReadout);
     loopBox.addEventListener('change', reset);
     reset();
   })();
@@ -702,10 +744,10 @@ redirect_from:
     }
     function redraw(){
       ctx.clearRect(0,0,mapper.W,mapper.H);
-      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.35)', true);
-      drawPath(ctx, mapper, deadReckonEstimate, COLOR_ACCENT2, true);
-      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2);
-      drawPath(ctx, mapper, stateAsPoses(), '#1a7a3a', false);
+      drawPath(ctx, mapper, scenario.truePoses, THEME.alpha('--c-fg', 0.35), true);
+      drawPath(ctx, mapper, deadReckonEstimate, COLOR_ACCENT2(), true);
+      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2());
+      drawPath(ctx, mapper, stateAsPoses(), THEME.ink('#1a7a3a'), false);
     }
     function updateReadout(){
       var poses = stateAsPoses();
@@ -735,6 +777,7 @@ redirect_from:
     document.getElementById('s4-run').addEventListener('click', function(){
       if (running){ stopRun(); return; }
       running=true; document.getElementById('s4-run').textContent='Stop';
+    repaint.push(redraw);
       var count=0; timer=setInterval(function(){ var done=doStep(); count++; if (done||count>50) stopRun(); }, 320);
     });
     reset();
@@ -757,9 +800,9 @@ redirect_from:
       return e;
     }
     var methods = [
-      { key:'gd', label:'Gradient descent', color:'#9b9797' },
-      { key:'gauss-newton', label:'Gauss-Newton', color: COLOR_ACCENT2 },
-      { key:'lm', label:'Levenberg-Marquardt', color: '#1a7a3a' }
+      { key:'gd', label:'Gradient descent', color:THEME.ink('#9b9797') },
+      { key:'gauss-newton', label:'Gauss-Newton', color: COLOR_ACCENT2() },
+      { key:'lm', label:'Levenberg-Marquardt', color: THEME.ink('#1a7a3a') }
     ];
     var states, engineStates, paths, done, running=false, timer=null;
     function initialState(){ return deadReckonEstimate.slice(1).reduce(function(acc,p){ return acc.concat(p); }, []); }
@@ -783,8 +826,8 @@ redirect_from:
     }
     function redraw(){
       ctx.clearRect(0,0,mapper.W,mapper.H);
-      drawPath(ctx, mapper, scenario.truePoses, 'rgba(32,30,29,0.3)', true);
-      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2);
+      drawPath(ctx, mapper, scenario.truePoses, THEME.alpha('--c-fg', 0.3), true);
+      drawDiamond(ctx, mapper, scenario.landmark, COLOR_ACCENT2());
       methods.forEach(function(m,i){ drawPath(ctx, mapper, statePoses(states[i]), m.color, false); });
     }
     function reset(newScenario){
@@ -815,6 +858,7 @@ redirect_from:
       if (running){ stopRun(); return; }
       running=true; document.getElementById('s5-run').textContent='Stop';
       timer=setInterval(tick, 260);
+    repaint.push(redraw);
     });
     document.getElementById('s5-reset').addEventListener('click', function(){ reset(); });
     document.getElementById('s5-scenario').addEventListener('click', function(){ reset(buildTrajectory(0.08, 0.024, 0.05)); });

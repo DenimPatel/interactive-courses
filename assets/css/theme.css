@@ -1,0 +1,1285 @@
+/* ==========================================================================
+   Theme layer — the "instrument" system
+   --------------------------------------------------------------------------
+   Single source of truth for colour, type, spacing, radii, elevation and
+   motion. Everything else in this repo is expressed in these tokens: the
+   shared stylesheets, the guide kit, and the ~260 standalone pages that
+   carry their own inline <style> block. Nothing below this file should
+   contain a raw hex, rem or millisecond.
+
+   Loaded FIRST on every page, before styles.css and before any page's own
+   inline <style> block, so that a page can override a token but can never
+   be overridden by one.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   0. Typeface
+
+   Self-hosted rather than linked from a CDN, for two reasons: the pages are
+   read offline as often as they are read deployed, and a page that renders
+   differently depending on whether a third party answered is a page whose
+   measure — declared in `ch`, and therefore in this typeface's own advance
+   widths — is not the measure the design was checked at.
+
+   The file is the latin subset of the variable weight axis, 48 kB. `swap` so
+   the text paints immediately in the fallback and swaps when the face
+   arrives; the fallback stack is metrically close enough that the swap is
+   not a visible reflow at reading sizes. `font-display: swap` plus
+   `size-adjust` on the fallback is the combination that keeps the line
+   boxes stable across the swap.
+   -------------------------------------------------------------------------- */
+@font-face {
+  font-family: 'Inter Variable';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../fonts/inter-var-latin.woff2') format('woff2');
+  /* The latin subset only. Declare what is actually there, so the browser
+     does not wait on a unicode-range probe it cannot satisfy. */
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Inter Fallback';
+  src: local('Helvetica Neue'), local('Arial'), local('Liberation Sans');
+  size-adjust: 107%;
+  ascent-override: 90%;
+  descent-override: 22.5%;
+  line-gap-override: 0%;
+}
+
+/* --------------------------------------------------------------------------
+   1. Palette slots — the only values that flip between modes
+   -------------------------------------------------------------------------- 
+   THE PALETTE
+   A cool neutral "instrument" scheme: slate-ink neutrals, a single azure
+   accent, and one ordinal azure ramp for course tiers. Cool rather than
+   warm because the subjects are quantitative — curves, axes, grids, series.
+   There is no paper texture and no decorative noise; a flat surface with a
+   hairline is the whole visual vocabulary.
+
+   Two rules govern colour use:
+
+   1. The accent carries interaction (links, focus, active state). It is
+      never a background wash.
+   2. Course tiers are an *ordinal* ramp of one hue, not a rainbow.
+      Difficulty is communicated by a level meter and a label; the steps
+      are near neighbours by design.
+
+   Because tiers no longer double as semantics, "correct", "wrong" and
+   "warning" get their own ok / warn / bad tokens. An earlier version of
+   this site overloaded a series colour for "correct answer", which had
+   nothing to do with either concept.
+
+   THE -ch PATTERN
+   Colours are stored as space-separated RGB channels in `-ch` vars and
+   exposed as `rgb()` in the plain `-c-` vars. Both forms are needed: the
+   channels let a colour be written with an alpha channel
+   (`rgb(var(--c-accent-ch) / 0.12)`), and the `rgb()` form is what the
+   `color-mix()` rules consume. The numbers appear exactly once, in the
+   `-ch` var; everything else derives from it, so the two cannot drift.
+
+   WHY A PRIVATE PALETTE NAMESPACE
+   The values that flip between modes are written once per mode into
+   `--t-*` slots, and the semantic `--c-*` layer is a set of indirections
+   over them. A custom property is substituted, not inherited-as-a-value,
+   so `--c-bg: rgb(var(--c-bg-ch))` re-resolves against whichever `--t-bg-ch`
+   the active mode installed. One rule therefore owns the mapping, and
+   turning a mode on is a single list of slot assignments rather than a
+   second copy of the semantic layer that could drift out of step.
+
+   THE TWO MODES
+   `data-theme` on <html> is the source of truth and always holds a
+   resolved value ('light' or 'dark'). The inline boot script in
+   _includes/theme-boot.html writes it before first paint, so a reader who
+   chose Dark never sees a light frame. The `prefers-color-scheme` block
+   further down is the no-JavaScript fallback: with no `data-theme` at all,
+   the reader's operating system decides.
+
+   PREFERENCE SCALES
+   `--pref-text-scale`, `--pref-measure`, `--pref-line-height`,
+   `--pref-space` and `--pref-motion-scale` are the reader's settings. They
+   are written onto <html> by assets/js/preferences.js and by the inline
+   boot script. The defaults declared here are the values a visitor with
+   nothing stored, a visitor whose JavaScript never runs, and a visitor
+   who arrives before the module loads all get — the identical page.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. Palette slots — the only values that flip between modes
+   -------------------------------------------------------------------------- */
+:root {
+  /* ---- LIGHT (the default; dark installs over these same slots) ---- */
+
+  /* Cool neutral surfaces.
+     The canvas (`bg`) is a hair *below* the content surfaces, not a hair
+     above, and that direction is load-bearing: cards sit on the canvas, so
+     the canvas has to be the dimmer plane or a card and the page it sits on
+     collapse into one another. It is as far down as it goes on purpose —
+     `fg-subtle` has to clear 4.5:1 on the canvas and on `surface-2`.
+     `surface-2` therefore moves with the canvas, to keep the canvas/well
+     step at the same 5/255 it is.
+     `surface-raised` is *identical to* `surface` in light, and that is the
+     correct value, not an oversight: white is already the top of the light
+     ramp, so there is no lighter fill available and a "raised" surface could
+     only fake depth by going darker, which reads as recessed. Above white
+     the only honest depth signals are the elevation shadow and the lit
+     edge. Dark does the opposite and really is lighter. */
+  --t-bg-ch: 242 245 250;
+  --t-surface-ch: 255 255 255;
+  --t-surface-raised-ch: 255 255 255;
+  --t-surface-2-ch: 237 240 244;
+  --t-border-ch: 217 222 230;
+  --t-border-strong-ch: 185 193 205;
+  /* The plot grid. One step quieter than the card border, on purpose: a
+     gridline is the reader's ruler, and a ruler that competes with the
+     2.25px data stroke is a second, louder thing saying the same numbers. */
+  --t-grid-ch: 227 231 237;
+  --t-fg-ch: 12 17 24;
+  --t-fg-muted-ch: 63 72 84;
+  --t-fg-subtle-ch: 99 108 122;
+
+  /* Accent: azure. Reserved for interaction. */
+  --t-accent-ch: 0 105 214;
+  --t-accent-ink-ch: 0 74 168;
+  --t-accent-fg-ch: 255 255 255;
+
+  /* The second series hue. Azure's neighbour that still separates from it
+     by hue and by luminance — teal, the second slot of the categorical
+     chart palette. Not a tint of the accent: two series that differ only in
+     lightness are one series to a reader scanning a legend. */
+  --t-accent-2-ch: 13 148 136;
+  --t-accent-2-ink-ch: 10 103 95;
+
+  /* Tier ramp: four ordinal steps of a single azure hue. */
+  --t-tier-1-ch: 43 127 184;
+  --t-tier-2-ch: 31 102 176;
+  --t-tier-3-ch: 21 74 148;
+  --t-tier-4-ch: 15 53 114;
+  /* Tier ink: AA text on a tier-tinted fill. One step deeper than the base. */
+  --t-tier-1-ink-ch: 31 102 176;
+  --t-tier-2-ink-ch: 21 74 148;
+  --t-tier-3-ink-ch: 15 53 114;
+  --t-tier-4-ink-ch: 10 38 87;
+
+  /* Status semantics, independent of tier. */
+  --t-ok-ch: 21 128 61;
+  --t-ok-ink-ch: 22 101 52;
+  --t-warn-ch: 180 83 9;
+  --t-warn-ink-ch: 146 64 14;
+  --t-bad-ch: 190 18 60;
+  --t-bad-ink-ch: 159 18 57;
+
+  --t-code-bg-ch: 237 240 244;
+
+  /* The ink every shadow is mixed from. Alpha-only by rule: a tinted or warm
+     shadow on a neutral plane reads as dirt rather than as distance. Light
+     uses the foreground ink so the shadow belongs to the palette; dark uses
+     pure black, because on a near-black canvas a shadow cast by near-white
+     ink would glow. */
+  --t-shadow-ink-ch: 12 17 24;
+
+  /* The modal veil behind a dialog. Same ink, alpha carried separately
+     because a veil is translucent and the `-ch` form only holds three
+     numbers. */
+  --t-scrim-ch: 12 17 24;
+  --t-scrim-a: 0.5;
+
+  /* ---- Neutral ramp ----
+     Used for the greys a page mixes on the fly. The ramp is *inverted in
+     dark*: 50 sits at the canvas and 900 at the text colour, so "100 is a
+     subtle wash" means the same thing in both themes. Every step below is
+     pinned to a semantic token on purpose — recolouring the theme moves the
+     whole ramp instead of leaving one hand-picked grey behind. */
+  --t-neutral-50-ch: var(--t-bg-ch);
+  --t-neutral-100-ch: var(--t-surface-2-ch);
+  --t-neutral-200-ch: var(--t-border-ch);
+  --t-neutral-300-ch: 196 203 214;
+  --t-neutral-400-ch: var(--t-border-strong-ch);
+  --t-neutral-500-ch: 138 147 163;
+  --t-neutral-600-ch: var(--t-fg-subtle-ch);
+  --t-neutral-700-ch: var(--t-fg-muted-ch);
+  --t-neutral-800-ch: 32 39 49;
+  --t-neutral-900-ch: var(--t-fg-ch);
+
+  /* ---- Accent ramp ----
+     Same inversion. 100 is the tint a chip or a selected row sits on, 500
+     is the accent itself, 700 is the ink that has to stay AA on that tint,
+     900 is the deepest step. */
+  --t-accent-100-ch: 226 240 253;
+  --t-accent-200-ch: 186 219 250;
+  --t-accent-300-ch: 124 189 246;
+  --t-accent-400-ch: 42 137 224;
+  --t-accent-500-ch: var(--t-accent-ch);
+  --t-accent-600-ch: 0 88 187;
+  --t-accent-700-ch: var(--t-accent-ink-ch);
+  --t-accent-800-ch: 0 58 128;
+  --t-accent-900-ch: 0 38 87;
+
+  /* ---- Accent-2 ramp ----
+     Teal, same shape as the azure ramp so the two read as one scale. */
+  --t-accent-2-100-ch: 218 244 240;
+  --t-accent-2-200-ch: 176 233 225;
+  --t-accent-2-300-ch: 94 199 187;
+  --t-accent-2-400-ch: 32 168 154;
+  --t-accent-2-500-ch: var(--t-accent-2-ch);
+  --t-accent-2-600-ch: 11 125 115;
+  --t-accent-2-700-ch: var(--t-accent-2-ink-ch);
+  --t-accent-2-800-ch: 7 76 71;
+  --t-accent-2-900-ch: 4 46 43;
+
+  /* ---- Elevation ----
+     Depth is the one axis this palette varies along besides hue, and it is
+     one scale rather than a shadow per component, so a card, a control
+     panel and a popover always sit at a predictable distance from the
+     canvas.
+
+     Each step is a PAIR of layers doing two different jobs: a tight contact
+     layer that says "this touches the surface" and a wider ambient layer
+     that says "and it is this far above it". As the step rises the contact
+     layer gets deeper and the ambient layer widens and deepens faster, so
+     adjacent steps are perceptibly different rather than cosmetically
+     different. Both layers are the same cool neutral ink at low alpha, by
+     rule.
+
+       --elev-0  flush with the canvas
+       --elev-1  resting card or plate on the canvas
+       --elev-2  raised: hovered cards, control panels, chart plates
+       --elev-3  floating: popovers, tooltips, dialogs
+       --elev-4  modal, on top of an overlay
+
+     The light alphas are tuned to be *perceptible* against a near-white
+     card on a near-white canvas, which is the whole difficulty in light
+     mode: there is no fill difference to fall back on. The dark alphas stay
+     lower, because in dark the fill is already lighter than its parent and
+     a heavy shadow on top of that turns to mud. */
+  --t-elev-0: none;
+  --t-elev-1: 0 1px 2px rgb(var(--t-shadow-ink-ch) / 0.07), 0 2px 6px -2px rgb(var(--t-shadow-ink-ch) / 0.1);
+  --t-elev-2: 0 1px 2px rgb(var(--t-shadow-ink-ch) / 0.08), 0 6px 16px -6px rgb(var(--t-shadow-ink-ch) / 0.15);
+  --t-elev-3: 0 2px 6px rgb(var(--t-shadow-ink-ch) / 0.1), 0 16px 32px -12px rgb(var(--t-shadow-ink-ch) / 0.22);
+  --t-elev-4: 0 4px 10px rgb(var(--t-shadow-ink-ch) / 0.12), 0 30px 60px -20px rgb(var(--t-shadow-ink-ch) / 0.3);
+
+  /* The lit edge: a 1px inset highlight along the top of a raised plate.
+     In dark it is what stops a raised plate from looking like a hole; in
+     light it does real work on the `surface-2` fills (control panels, notes,
+     tiles) and is a deliberate no-op on a pure-white fill, since there is
+     nothing lighter than white to add. It pairs with a shadow, never
+     replaces one. */
+  --t-elev-inset-hi: rgb(255 255 255 / 0.9);
+}
+
+/* --------------------------------------------------------------------------
+   DARK — installed over the same slots, so the semantic layer below is
+   written once for both modes.
+   -------------------------------------------------------------------------- */
+:root[data-theme='dark'] {
+  /* Cool ink dark, re-derived from the light scheme rather than inverted. */
+  --t-bg-ch: 9 12 17;
+  --t-surface-ch: 17 21 28;
+  --t-surface-raised-ch: 25 30 39;
+  --t-surface-2-ch: 30 36 46;
+  --t-border-ch: 39 46 58;
+  --t-border-strong-ch: 61 71 87;
+  /* The same one-step-quieter relationship to the card border that light
+     has: 1.19:1 against the plate here against 1.24:1 there. */
+  --t-grid-ch: 31 37 50;
+  --t-fg-ch: 237 242 248;
+  --t-fg-muted-ch: 168 179 194;
+  --t-fg-subtle-ch: 134 146 162;
+
+  --t-accent-ch: 77 163 255;
+  --t-accent-ink-ch: 147 197 253;
+  --t-accent-fg-ch: 8 17 28;
+
+  --t-accent-2-ch: 94 199 187;
+  --t-accent-2-ink-ch: 150 219 209;
+
+  --t-tier-1-ch: 124 192 232;
+  --t-tier-2-ch: 90 163 220;
+  --t-tier-3-ch: 74 142 203;
+  --t-tier-4-ch: 63 123 191;
+  --t-tier-1-ink-ch: 158 208 240;
+  --t-tier-2-ink-ch: 124 192 232;
+  --t-tier-3-ink-ch: 90 163 220;
+  --t-tier-4-ink-ch: 74 142 203;
+
+  --t-ok-ch: 74 222 128;
+  --t-ok-ink-ch: 134 239 172;
+  --t-warn-ch: 251 191 36;
+  --t-warn-ink-ch: 252 211 77;
+  --t-bad-ch: 251 113 133;
+  --t-bad-ink-ch: 253 164 175;
+
+  --t-code-bg-ch: 30 36 46;
+
+  --t-shadow-ink-ch: 0 0 0;
+  --t-scrim-ch: 0 0 0;
+  /* Higher than light, not lower: the dark canvas is already near-black, so
+     the veil's job here is to push the page *under* the dialog, and it has
+     almost no luminance to work with. */
+  --t-scrim-a: 0.62;
+
+  --t-neutral-300-ch: 52 61 75;
+  --t-neutral-500-ch: 98 110 128;
+  --t-neutral-800-ch: 208 217 228;
+
+  --t-accent-100-ch: 17 38 63;
+  --t-accent-200-ch: 22 51 85;
+  --t-accent-300-ch: 30 71 120;
+  --t-accent-400-ch: 52 122 190;
+  --t-accent-600-ch: 110 184 255;
+  --t-accent-800-ch: 176 214 252;
+  --t-accent-900-ch: 219 234 254;
+
+  --t-accent-2-100-ch: 12 43 41;
+  --t-accent-2-200-ch: 15 60 57;
+  --t-accent-2-300-ch: 24 87 82;
+  --t-accent-2-400-ch: 40 140 130;
+  --t-accent-2-600-ch: 122 211 201;
+  --t-accent-2-800-ch: 183 235 229;
+  --t-accent-2-900-ch: 222 246 243;
+
+  /* The same five steps at lower alphas. Dark carries most of its depth in
+     the fill — `surface-raised` really is lighter than `surface` here — so
+     these sit a stop quieter than the light set, and they pull back harder
+     (spread -2/-8/-16/-24 against the light set's -2/-6/-12/-20) so the
+     steps stay separated without piling on blur. */
+  --t-elev-0: none;
+  --t-elev-1: 0 1px 2px rgb(var(--t-shadow-ink-ch) / 0.4), 0 2px 6px -2px rgb(var(--t-shadow-ink-ch) / 0.28);
+  --t-elev-2: 0 1px 2px rgb(var(--t-shadow-ink-ch) / 0.44), 0 8px 20px -8px rgb(var(--t-shadow-ink-ch) / 0.5);
+  --t-elev-3: 0 2px 8px rgb(var(--t-shadow-ink-ch) / 0.48), 0 20px 44px -16px rgb(var(--t-shadow-ink-ch) / 0.64);
+  --t-elev-4: 0 4px 12px rgb(var(--t-shadow-ink-ch) / 0.52), 0 32px 64px -24px rgb(var(--t-shadow-ink-ch) / 0.74);
+
+  /* Near-white at very low alpha: just enough to catch a top edge. */
+  --t-elev-inset-hi: rgb(255 255 255 / 0.07);
+}
+
+/* No-JavaScript fallback. The boot script normally resolves the reader's
+   System choice to a concrete `data-theme` before first paint, so this only
+   runs for a visitor whose JavaScript never executes at all. Scoped to
+   `:not([data-theme])` so an explicit choice always wins. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --t-bg-ch: 9 12 17;
+    --t-surface-ch: 17 21 28;
+    --t-surface-raised-ch: 25 30 39;
+    --t-surface-2-ch: 30 36 46;
+    --t-border-ch: 39 46 58;
+    --t-border-strong-ch: 61 71 87;
+    --t-grid-ch: 31 37 50;
+    --t-fg-ch: 237 242 248;
+    --t-fg-muted-ch: 168 179 194;
+    --t-fg-subtle-ch: 134 146 162;
+    --t-accent-ch: 77 163 255;
+    --t-accent-ink-ch: 147 197 253;
+    --t-accent-fg-ch: 8 17 28;
+    --t-accent-2-ch: 94 199 187;
+    --t-accent-2-ink-ch: 150 219 209;
+    --t-tier-1-ch: 124 192 232;
+    --t-tier-2-ch: 90 163 220;
+    --t-tier-3-ch: 74 142 203;
+    --t-tier-4-ch: 63 123 191;
+    --t-tier-1-ink-ch: 158 208 240;
+    --t-tier-2-ink-ch: 124 192 232;
+    --t-tier-3-ink-ch: 90 163 220;
+    --t-tier-4-ink-ch: 74 142 203;
+    --t-ok-ch: 74 222 128;
+    --t-ok-ink-ch: 134 239 172;
+    --t-warn-ch: 251 191 36;
+    --t-warn-ink-ch: 252 211 77;
+    --t-bad-ch: 251 113 133;
+    --t-bad-ink-ch: 253 164 175;
+    --t-code-bg-ch: 30 36 46;
+    --t-shadow-ink-ch: 0 0 0;
+    --t-scrim-ch: 0 0 0;
+    --t-scrim-a: 0.62;
+    --t-neutral-300-ch: 52 61 75;
+    --t-neutral-500-ch: 98 110 128;
+    --t-neutral-800-ch: 208 217 228;
+    --t-accent-100-ch: 17 38 63;
+    --t-accent-200-ch: 22 51 85;
+    --t-accent-300-ch: 30 71 120;
+    --t-accent-400-ch: 52 122 190;
+    --t-accent-600-ch: 110 184 255;
+    --t-accent-800-ch: 176 214 252;
+    --t-accent-900-ch: 219 234 254;
+    --t-accent-2-100-ch: 12 43 41;
+    --t-accent-2-200-ch: 15 60 57;
+    --t-accent-2-300-ch: 24 87 82;
+    --t-accent-2-400-ch: 40 140 130;
+    --t-accent-2-600-ch: 122 211 201;
+    --t-accent-2-800-ch: 183 235 229;
+    --t-accent-2-900-ch: 222 246 243;
+    --t-elev-0: none;
+    --t-elev-1: 0 1px 2px rgb(var(--t-shadow-ink-ch) / 0.4), 0 2px 6px -2px rgb(var(--t-shadow-ink-ch) / 0.28);
+    --t-elev-2: 0 1px 2px rgb(var(--t-shadow-ink-ch) / 0.44), 0 8px 20px -8px rgb(var(--t-shadow-ink-ch) / 0.5);
+    --t-elev-3: 0 2px 8px rgb(var(--t-shadow-ink-ch) / 0.48), 0 20px 44px -16px rgb(var(--t-shadow-ink-ch) / 0.64);
+    --t-elev-4: 0 4px 12px rgb(var(--t-shadow-ink-ch) / 0.52), 0 32px 64px -24px rgb(var(--t-shadow-ink-ch) / 0.74);
+    --t-elev-inset-hi: rgb(255 255 255 / 0.07);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   2. Semantic colour — written once, resolves against the active mode
+   -------------------------------------------------------------------------- */
+:root {
+  --c-bg-ch: var(--t-bg-ch);
+  --c-surface-ch: var(--t-surface-ch);
+  --c-surface-raised-ch: var(--t-surface-raised-ch);
+  --c-surface-2-ch: var(--t-surface-2-ch);
+  --c-border-ch: var(--t-border-ch);
+  --c-border-strong-ch: var(--t-border-strong-ch);
+  --c-grid-ch: var(--t-grid-ch);
+  --c-fg-ch: var(--t-fg-ch);
+  --c-fg-muted-ch: var(--t-fg-muted-ch);
+  --c-fg-subtle-ch: var(--t-fg-subtle-ch);
+  --c-accent-ch: var(--t-accent-ch);
+  --c-accent-ink-ch: var(--t-accent-ink-ch);
+  --c-accent-fg-ch: var(--t-accent-fg-ch);
+  --c-accent-2-ch: var(--t-accent-2-ch);
+  --c-accent-2-ink-ch: var(--t-accent-2-ink-ch);
+  --c-tier-1-ch: var(--t-tier-1-ch);
+  --c-tier-2-ch: var(--t-tier-2-ch);
+  --c-tier-3-ch: var(--t-tier-3-ch);
+  --c-tier-4-ch: var(--t-tier-4-ch);
+  --c-tier-1-ink-ch: var(--t-tier-1-ink-ch);
+  --c-tier-2-ink-ch: var(--t-tier-2-ink-ch);
+  --c-tier-3-ink-ch: var(--t-tier-3-ink-ch);
+  --c-tier-4-ink-ch: var(--t-tier-4-ink-ch);
+  --c-ok-ch: var(--t-ok-ch);
+  --c-ok-ink-ch: var(--t-ok-ink-ch);
+  --c-warn-ch: var(--t-warn-ch);
+  --c-warn-ink-ch: var(--t-warn-ink-ch);
+  --c-bad-ch: var(--t-bad-ch);
+  --c-bad-ink-ch: var(--t-bad-ink-ch);
+  --c-code-bg-ch: var(--t-code-bg-ch);
+
+  /* The ramp steps in channel form as well.
+   *
+   * The site contract below has two aliases that want a ramp step as a raw
+   * channel triple — `--color-accent-deep` and `--color-accent-tint` both
+   * compose their own alpha through `rgb(<channels> / a)`, which the `rgb()`
+   * form cannot do. Without these two lines those aliases resolve to the
+   * guaranteed-invalid value and the rules that read them fall back to
+   * whatever literal they carry, which is exactly the drift the `-ch`
+   * pattern exists to prevent. */
+  --c-accent-100-ch: var(--t-accent-100-ch);
+  --c-accent-900-ch: var(--t-accent-900-ch);
+  --c-accent-2-100-ch: var(--t-accent-2-100-ch);
+  --c-accent-2-900-ch: var(--t-accent-2-900-ch);
+
+  /* Every hue that can appear as text on a tinted fill also has an `-ink`
+     variant. Fills and borders are derived with `color-mix()`; text is NOT,
+     because mixing toward the surface lightens it and drops it below AA. */
+  --c-bg: rgb(var(--c-bg-ch));
+  --c-surface: rgb(var(--c-surface-ch));
+  --c-surface-raised: rgb(var(--c-surface-raised-ch));
+  --c-surface-2: rgb(var(--c-surface-2-ch));
+  --c-border: rgb(var(--c-border-ch));
+  --c-border-strong: rgb(var(--c-border-strong-ch));
+  --c-grid: rgb(var(--c-grid-ch));
+  --c-fg: rgb(var(--c-fg-ch));
+  --c-fg-muted: rgb(var(--c-fg-muted-ch));
+  --c-fg-subtle: rgb(var(--c-fg-subtle-ch));
+  --c-accent: rgb(var(--c-accent-ch));
+  --c-accent-ink: rgb(var(--c-accent-ink-ch));
+  --c-accent-fg: rgb(var(--c-accent-fg-ch));
+  /* The accent ramp, as plain rgb() forms.
+   *
+   * The ramps are read from two different places and both spellings have to
+   * exist. A stylesheet reaches them as `var(--color-accent-N)` (aliased in
+   * section 10); `assets/js/theme-tokens.js` reaches them by NAME through
+   * getComputedStyle, because a canvas cannot resolve a custom property at
+   * all. Defining only the `-ch` channel forms satisfies the first and leaves
+   * the second silently returning an empty string — and an empty string is
+   * indistinguishable from "not found" in a `THEME.ink('#93aefe')` call, so
+   * those paint calls quietly return the original literal and the colour
+   * never follows the theme. */
+  --c-accent-100: rgb(var(--t-accent-100-ch));
+  --c-accent-200: rgb(var(--t-accent-200-ch));
+  --c-accent-300: rgb(var(--t-accent-300-ch));
+  --c-accent-400: rgb(var(--t-accent-400-ch));
+  --c-accent-600: rgb(var(--t-accent-600-ch));
+  --c-accent-700: rgb(var(--t-accent-700-ch));
+  --c-accent-800: rgb(var(--t-accent-800-ch));
+  --c-accent-900: rgb(var(--t-accent-900-ch));
+
+  --c-accent-2-100: rgb(var(--t-accent-2-100-ch));
+  --c-accent-2-200: rgb(var(--t-accent-2-200-ch));
+  --c-accent-2-300: rgb(var(--t-accent-2-300-ch));
+  --c-accent-2-400: rgb(var(--t-accent-2-400-ch));
+  --c-accent-2-600: rgb(var(--t-accent-2-600-ch));
+  --c-accent-2-700: rgb(var(--t-accent-2-700-ch));
+  --c-accent-2-800: rgb(var(--t-accent-2-800-ch));
+  --c-accent-2-900: rgb(var(--t-accent-2-900-ch));
+
+  /* Tier steps as plain rgb(), for the same reason. */
+  --c-tier-1: rgb(var(--c-tier-1-ch));
+  --c-tier-2: rgb(var(--c-tier-2-ch));
+  --c-tier-3: rgb(var(--c-tier-3-ch));
+  --c-tier-4: rgb(var(--c-tier-4-ch));
+  --c-tier-1-ink: rgb(var(--c-tier-1-ink-ch));
+  --c-tier-2-ink: rgb(var(--c-tier-2-ink-ch));
+  --c-tier-3-ink: rgb(var(--c-tier-3-ink-ch));
+  --c-tier-4-ink: rgb(var(--c-tier-4-ink-ch));
+  --c-accent-2: rgb(var(--c-accent-2-ch));
+  --c-accent-2-ink: rgb(var(--c-accent-2-ink-ch));
+  --c-tier-1: rgb(var(--c-tier-1-ch));
+  --c-tier-2: rgb(var(--c-tier-2-ch));
+  --c-tier-3: rgb(var(--c-tier-3-ch));
+  --c-tier-4: rgb(var(--c-tier-4-ch));
+  --c-tier-1-ink: rgb(var(--c-tier-1-ink-ch));
+  --c-tier-2-ink: rgb(var(--c-tier-2-ink-ch));
+  --c-tier-3-ink: rgb(var(--c-tier-3-ink-ch));
+  --c-tier-4-ink: rgb(var(--c-tier-4-ink-ch));
+  --c-ok: rgb(var(--c-ok-ch));
+  --c-ok-ink: rgb(var(--c-ok-ink-ch));
+  --c-warn: rgb(var(--c-warn-ch));
+  --c-warn-ink: rgb(var(--c-warn-ink-ch));
+  --c-bad: rgb(var(--c-bad-ch));
+  --c-bad-ink: rgb(var(--c-bad-ink-ch));
+  --c-code-bg: rgb(var(--c-code-bg-ch));
+  --c-scrim: rgb(var(--t-scrim-ch) / var(--t-scrim-a));
+
+  --c-elev-0: var(--t-elev-0);
+  --c-elev-1: var(--t-elev-1);
+  --c-elev-2: var(--t-elev-2);
+  --c-elev-3: var(--t-elev-3);
+  --c-elev-4: var(--t-elev-4);
+  --c-elev-inset-hi: var(--t-elev-inset-hi);
+}
+
+/* --------------------------------------------------------------------------
+   3. Reader preferences
+
+   Written onto <html> by assets/js/preferences.js and by the inline boot
+   script, before first paint. The defaults below are the values a visitor
+   with nothing stored gets, which is the whole point of declaring them: a
+   visitor with no storage, a visitor whose JavaScript never runs, and a
+   visitor who arrives before the module loads all get the identical page.
+
+     --pref-text-scale    unitless, multiplies the root font size
+     --pref-measure       reading column width
+     --pref-line-height   unitless, body leading
+     --pref-space         density multiplier for padding and gaps.
+                          Consumed ONLY by the --space-* scale below;
+                          nothing else multiplies by it.
+     --pref-motion-scale  1 for motion, 0 for a still page
+   -------------------------------------------------------------------------- */
+:root {
+  --pref-text-scale: 1;
+  --pref-measure: 70ch;
+  --pref-line-height: 1.6;
+  --pref-space: 1;
+  --pref-motion-scale: 1;
+
+  /* The root font size is where the text-size preference lands, so a `rem`
+     anywhere on the site moves with it. Every type and space step below is a
+     rem, which is why a single number scales the whole page.
+
+     PERCENT, not `16px * scale`. A bare `16px` would overwrite a reader who
+     has changed their browser's own default font size, and a text-scale
+     control that fixes their font size as a side effect is not a text-scale
+     control. `1rem` here would be circular — on the root element it resolves
+     to the root's own size. */
+  font-size: calc(100% * var(--pref-text-scale, 1));
+}
+
+/* --------------------------------------------------------------------------
+   4. Duration scale
+
+   Three steps, and each one is a number that must stay recognisable in a
+   rule body — a `calc(120ms * ...)` written inline is a duration that has
+   forgotten which step it is. These are named for what the transition is
+   DOING, which is the only distinction a reader can perceive:
+
+     --dur-fast   a control acknowledging a press. Colour, a ring, a
+                  thumb. Must land before the finger lifts.
+     --dur-base   something appearing or arriving. A 4px rise, a skip link
+                  sliding out from under the header.
+     --dur-slow   a value animating to a NEW magnitude — a progress bar
+                  filling, a cross-fade between two themes. The only step
+                  where a quarter of a second is right.
+
+   All three multiply `--pref-motion-scale`, which is `0` for an explicit
+   Reduced choice and for the OS asking for less motion. That is a `0ms`
+   transition rather than a removed declaration, which is deliberate:
+   `transition: none` would also remove the `transition-property` list, and
+   an element that inherited a transition from a class it no longer matches
+   would keep animating.
+
+   This scale is the ONLY place `--pref-motion-scale` is multiplied. */
+:root {
+  --dur-fast: calc(120ms * var(--pref-motion-scale, 1));
+  --dur-base: calc(150ms * var(--pref-motion-scale, 1));
+  --dur-slow: calc(300ms * var(--pref-motion-scale, 1));
+}
+
+/* --------------------------------------------------------------------------
+   5. Derived reading scale
+
+   `--read-lead` is the reader's chosen leading expressed as a ratio against
+   the 1.6 this site shipped with, so 1 is exactly "the page as it looked
+   before preferences existed" and every rule written as a multiple of it
+   moves with the preference instead of being re-declared per surface.
+
+   `--read-line` is the same idea for the prose leading. Long-form reading
+   wants more leading than a UI label does, which is why prose is pinned at
+   1.75 while the body sits at 1.6 — and pinning it in a rule meant the
+   reader's line-height control reached only the chrome and stopped dead at
+   the first paragraph. 1.6 * 1.09375 is 1.75, so the default is unchanged
+   and Tight / Relaxed now reach the prose body as well.
+
+   Nothing writes these two: they are functions of a preference, not
+   preferences themselves, so they stay out of the persistence contract. */
+:root {
+  --read-lead: calc(var(--pref-line-height, 1.6) / 1.6);
+  --read-line: calc(var(--pref-line-height, 1.6) * 1.09375);
+
+  /* Where a `#fragment` link parks its heading. In rem, because the things
+     it clears — the sticky site nav and the per-series sub-nav — are in rem
+     and the text-size preference scales the root font size. A px offset is
+     short by 20px at 130% text. */
+  --read-anchor-offset: 7rem;
+
+  /* The colour the prose column sits on. Not `--c-bg` by definition: a
+     focus-mode reading column lifts onto a surface plate, and the
+     horizontal scroll shadows blend with whatever is behind them. */
+  --prose-bg: var(--c-bg);
+}
+
+/* --------------------------------------------------------------------------
+   6. Spacing scale
+
+   `--pref-space` is the reader's density choice, and a preference that
+   reaches two rules is a preference that looks broken. So the multiplier
+   appears in exactly one place per step below, and every gap, inset, margin
+   and rhythm on the site is expressed in those steps rather than in its own
+   rem value. A STEP is the thing that scales. Everything else composes steps.
+
+   A step is a rem length multiplied by a plain number, which is the one
+   multiplication here that cannot go wrong:
+
+     - `rem` is an absolute length, so the product is a length. CSS does not
+       need the multiplier to carry a unit, and there is no `rem * unitless`
+       ambiguity to guard against.
+     - it is NOT `em`. An `em` would resolve against the ELEMENT's own
+       computed font size, so a step declared in `em` and inherited into a
+       heading would compound with the text-size preference: 1.3 in the
+       element, times 1.3 at the root. Steps are `rem`, exactly like the type
+       scale, and they scale with the root (text size) and with
+       `--pref-space` (density) independently.
+     - a custom property is substituted, not inherited-as-a-value: every
+       descendant re-evaluates `var(--pref-space)` against its own inherited
+       copy, so one write on <html> moves the whole page.
+
+   `--pref-space` can only ever be 0.85, 1 or 1.15. preferences.js validates
+   the choice before it is stored, and the inline boot script reads the same
+   three values — so a negative or NaN multiplier cannot reach a `calc()`.
+   Each step also carries its own `, 1` fallback, which is what makes a bare
+   `var(--space-4)` correct on a page whose preferences module never loaded.
+
+   A 4px grid at 16px root. Three steps sit off that grid, and each is off
+   it for one reason:
+
+     --space-hair   2.4px  the inside of a chip, a badge, a mini label.
+                         A 4px inset turns an 11px level meter into a 19px
+                         pill in a syllabus row.
+     --space-tight  6.4px  a nav row's vertical inset and a tile's
+                         label-to-value rhythm.
+     --space-inset  21.6px the padding of a control panel and a chart
+                         plate. It is the most repeated value in the tool
+                         chrome, so it is named rather than rounded. */
+:root {
+  --space-hair: calc(0.15rem * var(--pref-space, 1));
+  --space-tight: calc(0.4rem * var(--pref-space, 1));
+  --space-1: calc(0.25rem * var(--pref-space, 1));
+  --space-2: calc(0.5rem * var(--pref-space, 1));
+  --space-3: calc(0.75rem * var(--pref-space, 1));
+  --space-4: calc(1rem * var(--pref-space, 1));
+  --space-5: calc(1.25rem * var(--pref-space, 1));
+  --space-6: calc(1.5rem * var(--pref-space, 1));
+  --space-7: calc(1.75rem * var(--pref-space, 1));
+  --space-8: calc(2rem * var(--pref-space, 1));
+  --space-10: calc(2.5rem * var(--pref-space, 1));
+  --space-inset: calc(1.35rem * var(--pref-space, 1));
+  --space-12: calc(3rem * var(--pref-space, 1));
+  --space-16: calc(4rem * var(--pref-space, 1));
+}
+
+/* --------------------------------------------------------------------------
+   7. Radii
+
+   Three values, one definition, two consumers: this stylesheet reads them
+   directly and any other rule reads the same vars, so the corner of a card,
+   a control and a plate is visibly one vocabulary rather than three values
+   that happen to match.
+
+   Radii do NOT scale with density — a corner is a shape, and a shape that
+   changes with a spacing preference reads as a rendering fault. */
+:root {
+  --radius-control: 8px;
+  --radius-card: 10px;
+  --radius-plate: 12px;
+  --radius-pill: 999px;
+}
+
+/* --------------------------------------------------------------------------
+   8. Type scale
+
+   Every entry is a `rem`, never a `px`, and every line height is unitless.
+   That is the whole mechanism behind the reader's text-size preference:
+   `--pref-text-scale` multiplies the root font size, and a `rem` moves with
+   it. A single `px` in this table would leave one label or tile at its old
+   size while everything around it grew, which reads as a rendering fault
+   rather than a preference. A unitless line height does the same job for
+   `--pref-line-height`: it is a ratio, so it survives the type growing
+   underneath it.
+
+     --text-micro      uppercase eyebrow / section rule / tier micro-label
+     --text-label-sm   small control and nav label
+     --text-sm         secondary body, card description
+     --text-base       the body size
+     --text-prose      the reading column, 1.75 leading by default
+     --text-lg         card title
+     --text-xl         section heading
+     --text-display-sm page title
+     --text-display-md part title
+     --text-display-lg home page title
+
+   ONE FAMILY, DELIBERATELY. A second display face is what made the previous
+   design read as a warm reading nook; Inter carries prose, chrome and
+   numbers without a size or weight jump at the seams. */
+:root {
+  --text-micro: 0.6875rem;
+  --text-micro-lh: 1.4;
+  --text-micro-ls: 0.06em;
+
+  --text-label-sm: 0.8125rem;
+  --text-label-sm-lh: 1.45;
+
+  --text-sm: 0.875rem;
+  --text-sm-lh: 1.5;
+
+  --text-base: 1rem;
+  --text-base-lh: 1.6;
+
+  --text-prose: 1.0625rem;
+  --text-prose-lh: 1.75;
+
+  --text-lg: 1.125rem;
+  --text-lg-lh: 1.45;
+
+  --text-xl: 1.5rem;
+  --text-xl-lh: 1.25;
+  --text-xl-ls: -0.02em;
+
+  --text-display-sm: 2.125rem;
+  --text-display-sm-lh: 1.12;
+  --text-display-sm-ls: -0.028em;
+
+  --text-display-md: 2.75rem;
+  --text-display-md-lh: 1.08;
+  --text-display-md-ls: -0.032em;
+
+  --text-display-lg: 3.5rem;
+  --text-display-lg-lh: 1.04;
+  --text-display-lg-ls: -0.035em;
+}
+
+/* --------------------------------------------------------------------------
+   9. Chart chrome
+
+   Three numbers, all of them the last place `--pref-text-scale` has to
+   reach. Canvas axis ticks, the legend and the tooltip are sized in JS from
+   these, and a canvas cannot resolve `ch`, so each one is a `rem` with a
+   px floor: the floor is a legibility floor, not a scale floor. Axis ticks
+   are the smallest type on the site; below 11px the y gutter starts costing
+   more plot width than the extra digits buy. The legend and the tooltip are
+   UI text next to body copy, so they hold 12px.
+
+   `--chart-axis-label-size` is the same size as the ticks on purpose. A
+   label at a different size from the numbers it names reads as a different
+   kind of object. */
+:root {
+  --chart-tick-size: max(11px, 0.6875rem);
+  --chart-legend-size: max(12px, 0.75rem);
+  --chart-tooltip-size: max(12px, 0.75rem);
+  --chart-axis-label-size: max(11px, 0.6875rem);
+  /* The categorical series palette. Seven fixed slots, because a series that
+     changed colour when the theme changed would be a different series. The
+     order is a convention and not a scale: index 0 is the series a reader is
+     meant to be looking at. Every value clears 3:1 against a card and
+     against the plot well in both themes. */
+  --chart-series-1: rgb(3 105 161);
+  --chart-series-2: rgb(13 148 136);
+  --chart-series-3: rgb(180 83 9);
+  --chart-series-4: rgb(124 58 237);
+  --chart-series-5: rgb(201 19 64);
+  --chart-series-6: rgb(77 124 15);
+  --chart-series-7: rgb(14 116 144);
+
+  /* The plot area is a well, and the well is the canvas colour. The canvas
+     is darker than the surface in *both* themes, so a plot on the canvas is
+     a real recess in both, and it costs the palette nothing. */
+  --plot-bg: var(--c-bg);
+  --plot-h: 400px;
+}
+
+/* ==========================================================================
+   10. Site contract aliases
+
+   The names below are this repo's public token contract. They are already
+   referenced by ~260 standalone pages that carry their own inline <style>
+   block, by the guide kit, and by every canvas routine in assets/js — so
+   they are kept as names and repointed at the palette above rather than
+   renamed. A page written against `--color-accent` follows the theme; a page
+   written against a raw hex never did and still will not.
+
+   The indirection is deliberate on both sides: the alias is a `var()`
+   reference, so it re-resolves against whatever the active mode says, and
+   a token is defined in exactly one file.
+   ========================================================================== */
+:root {
+  --color-bg: var(--c-bg);
+  --color-surface: var(--c-surface);
+  --color-surface-2: var(--c-surface-2);
+  --color-wash: var(--c-surface-2);
+  --color-text: var(--c-fg);
+  --color-text-strong: var(--c-fg);
+  --color-text-muted: var(--c-fg-muted);
+  --color-text-subtle: var(--c-fg-subtle);
+  /* A page on the far side of the series uses this one with no fallback of
+     its own, so it has to be a real token rather than an accident. */
+  --color-text-600: var(--c-fg-subtle);
+  --color-muted: var(--c-fg-muted);
+  --color-divider: var(--c-border);
+  --color-border: var(--c-border);
+  /* Pairs with `--color-border`. A rule that wants a control edge rather than
+     a card edge needs the second step, and giving it a name is cheaper than
+     every such rule remembering which one to reach for. */
+  --color-border-strong: var(--c-border-strong);
+  /* The plot grid, exposed to canvas code that reads CSS for its ruler
+     colour. One step quieter than the card border, by design. */
+  --color-grid: var(--c-grid);
+  --color-accent: var(--c-accent);
+  --color-accent-ink: var(--c-accent-ink);
+  --color-accent-hover: var(--c-accent-ink);
+  --color-accent-deep: rgb(var(--c-accent-900-ch));
+  --color-accent-tint: rgb(var(--c-accent-100-ch));
+  --color-accent-2: var(--c-accent-2);
+  --color-accent-2-hover: var(--c-accent-2-ink);
+  --color-ok: var(--c-ok);
+  --color-ok-ink: var(--c-ok-ink);
+  --color-warn: var(--c-warn);
+  --color-warn-ink: var(--c-warn-ink);
+  --color-bad: var(--c-bad);
+  --color-bad-ink: var(--c-bad-ink);
+  --color-code-bg: var(--c-code-bg);
+  /* The ink every shadow is mixed from, exposed so a page that builds its
+     own shadow can stay inside the palette. */
+  --color-card-shadow: var(--t-shadow-ink-ch);
+
+  /* Neutral ramp. Inverted in dark, so `--color-neutral-100` is always "one
+     step off the canvas" rather than "light grey". */
+  --color-neutral-50: rgb(var(--t-neutral-50-ch));
+  --color-neutral-100: rgb(var(--t-neutral-100-ch));
+  --color-neutral-200: rgb(var(--t-neutral-200-ch));
+  --color-neutral-300: rgb(var(--t-neutral-300-ch));
+  --color-neutral-400: rgb(var(--t-neutral-400-ch));
+  --color-neutral-500: rgb(var(--t-neutral-500-ch));
+  --color-neutral-600: rgb(var(--t-neutral-600-ch));
+  --color-neutral-700: rgb(var(--t-neutral-700-ch));
+  --color-neutral-800: rgb(var(--t-neutral-800-ch));
+  --color-neutral-900: rgb(var(--t-neutral-900-ch));
+
+  --color-accent-100: rgb(var(--t-accent-100-ch));
+  --color-accent-200: rgb(var(--t-accent-200-ch));
+  --color-accent-300: rgb(var(--t-accent-300-ch));
+  --color-accent-400: rgb(var(--t-accent-400-ch));
+  --color-accent-500: rgb(var(--t-accent-500-ch));
+  --color-accent-600: rgb(var(--t-accent-600-ch));
+  --color-accent-700: rgb(var(--t-accent-700-ch));
+  --color-accent-800: rgb(var(--t-accent-800-ch));
+  --color-accent-900: rgb(var(--t-accent-900-ch));
+
+  --color-accent-2-100: rgb(var(--t-accent-2-100-ch));
+  --color-accent-2-200: rgb(var(--t-accent-2-200-ch));
+  --color-accent-2-300: rgb(var(--t-accent-2-300-ch));
+  --color-accent-2-400: rgb(var(--t-accent-2-400-ch));
+  --color-accent-2-500: rgb(var(--t-accent-2-500-ch));
+  --color-accent-2-600: rgb(var(--t-accent-2-600-ch));
+  --color-accent-2-700: rgb(var(--t-accent-2-700-ch));
+  --color-accent-2-800: rgb(var(--t-accent-2-800-ch));
+  --color-accent-2-900: rgb(var(--t-accent-2-900-ch));
+
+  /* Channel forms, for a rule that has to compose its own alpha. The `-ch`
+     pattern is what makes `rgb(var(--color-accent-ch) / 0.12)` possible. */
+  --color-bg-ch: var(--c-bg-ch);
+  --color-surface-ch: var(--c-surface-ch);
+  --color-text-ch: var(--c-fg-ch);
+  --color-accent-ch: var(--c-accent-ch);
+  --color-accent-2-ch: var(--c-accent-2-ch);
+  --color-divider-ch: var(--c-border-ch);
+
+  /* Typography. One family. */
+  --font-body: 'Inter Variable', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-sans: var(--font-body);
+  /* The previous design set a serif here. One family is deliberate: a second
+     face is what made the old theme read as a reading nook, and 273 canvas
+     rules resolve this name for their labels. */
+  --font-serif: var(--font-body);
+  --font-heading: var(--font-body);
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --font-heading-weight: 600;
+  --font-body-weight: 400;
+  --font-mono-weight: 400;
+
+  /* Radii, aligned to the scale in section 7. */
+  --radius-0: 0;
+  --radius-1: 3px;
+  --radius-2: 4px;
+  --radius-3: 6px;
+  --radius-sm: 6px;
+  --radius-md: var(--radius-control);
+  --radius-lg: var(--radius-card);
+  --radius-xl: var(--radius-plate);
+  --radius-2xl: var(--radius-plate);
+
+  /* Elevation. The three names the old stylesheet used, kept alive as
+     indirections so nothing breaks. */
+  --shadow-1: var(--c-elev-1);
+  --shadow-2: var(--c-elev-2);
+  --shadow-3: var(--c-elev-3);
+  --shadow-sm: var(--c-elev-1);
+  --shadow-md: var(--c-elev-2);
+  --shadow-lg: var(--c-elev-3);
+  /* The modal step. Its only user on this site is the settings dialog, which is
+     the single surface that sits above a scrim and above the sticky header.
+     It existed as a name in chrome.css's prose before it existed as a value,
+     and a comment is not a declaration. */
+  --shadow-4: var(--c-elev-4);
+  --shadow-card: var(--c-elev-1);
+  --shadow-plate: var(--c-elev-2);
+  --shadow-pop: var(--c-elev-3);
+  /* The lit top edge, composed rather than replacing: a bare `var(--elev-N)`
+     would write `box-shadow` wholesale and drop the inset.
+     THE `inset` KEYWORD IS LOAD-BEARING. Without it this paints a 1px rule
+     just OUTSIDE the border box — a hairline under the card — instead of a
+     highlight inside its top edge, and it looks correct enough in a diff to
+     survive review. The `.elev-*` utilities in section 13 declare their own
+     `--elev-inset` and so shadow this value; the alias exists for a rule that
+     composes its own elevation by hand. */
+  --elev-inset: inset 0 1px 0 var(--c-elev-inset-hi);
+
+  /* Spacing — the density-aware scale from section 6. */
+  --space-1: calc(0.25rem * var(--pref-space, 1));
+  --space-2: calc(0.5rem * var(--pref-space, 1));
+  --space-3: calc(0.75rem * var(--pref-space, 1));
+  --space-4: calc(1rem * var(--pref-space, 1));
+  --space-5: calc(1.25rem * var(--pref-space, 1));
+  --space-6: calc(1.5rem * var(--pref-space, 1));
+  --space-7: calc(1.75rem * var(--pref-space, 1));
+  --space-8: calc(2rem * var(--pref-space, 1));
+  --space-10: calc(2.5rem * var(--pref-space, 1));
+  --space-12: calc(3rem * var(--pref-space, 1));
+  --space-16: calc(4rem * var(--pref-space, 1));
+  --space-hair: calc(0.15rem * var(--pref-space, 1));
+  --space-tight: calc(0.4rem * var(--pref-space, 1));
+  --space-inset: calc(1.35rem * var(--pref-space, 1));
+
+  /* ------------------------------------------------------------------------
+     The `glass-*` names.
+
+     The old design ran a liquid-glass treatment through the nav, the side
+     panels and the cards: a translucent blur that sampled whatever was
+     behind it. That is the single strongest visual difference between the
+     two themes, and it is a removal rather than a retune: an instrument
+     panel is read, not looked through, and a blur under a number makes the
+     number harder to read on exactly the surfaces that matter.
+
+     The names stay, because ~157 rules across the site reference them and
+     because they still mean "a raised surface that floats above the
+     canvas". They now resolve to a flat, hairline-bordered plate on the
+     elevation scale, which is what the new design calls for. A rule that
+     wants translucency has to say so deliberately from here on.
+     ------------------------------------------------------------------------ */
+  --glass-bg: var(--c-bg);
+  --glass-bg-strong: var(--c-bg);
+  --glass-border: var(--c-border);
+  --glass-shadow: var(--c-elev-1);
+  --glass-shadow-hover: var(--c-elev-2);
+  --glass-blue: var(--c-accent-2);
+  --glass-blue-dark: var(--c-accent-2-ink);
+  --glass-ink: var(--c-fg);
+
+  /* Layout geometry. */
+  --nav-w: 240px;
+  --content-width: 1160px;
+}
+
+/* ==========================================================================
+   11. Reduced motion — honoured twice, by both routes, in CSS
+
+   A media query is evaluated by the browser before the document is
+   interactive, so the OS route is already in force on the very first frame.
+   That is the route that matters; the attribute route exists for a reader
+   who asked this site for less motion without asking their operating system
+   for it.
+
+   NOTE THE ORDERING RULE. An explicit `Full` choice does NOT override
+   `prefers-reduced-motion: reduce`. A system-level accessibility setting is
+   not something a per-site toggle gets to overrule, and the settings panel
+   says so in as many words when the OS has asked.
+
+   THE RESET IS REPEATED ON THE ROOT ELEMENT ITSELF, and that is not
+   duplication. `html[data-pref-motion='reduced'] *` does not match `html` —
+   the universal selector is descendants only — so without the root rule the
+   document element is the one thing in the tree whose own transitions keep
+   running. It happens to declare none today, which is exactly why the hole
+   was worth closing. */
+html[data-pref-motion='reduced'] {
+  --pref-motion-scale: 0;
+  scroll-behavior: auto;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  animation-delay: 0ms !important;
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+}
+
+html[data-pref-motion='reduced'] *,
+html[data-pref-motion='reduced'] *::before,
+html[data-pref-motion='reduced'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  animation-delay: 0ms !important;
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    --pref-motion-scale: 0;
+    scroll-behavior: auto;
+  }
+
+  html *,
+  html *::before,
+  html *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    animation-delay: 0ms !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ==========================================================================
+   12. The theme cross-fade
+
+   A theme switch repaints every custom property in the document on one
+   frame, so without help the page snaps. The obvious fix — a transition on
+   the colours themselves — does not work and cannot be made to: `transition`
+   is not inherited, and the number of elements on this site that set their
+   own `color` or `background-color` runs to hundreds. The only rule covering
+   all of them is a rule on `*`, and a transition on `*` is the documented way
+   to leave a permanent compositing layer on every element in the document.
+
+   So the cross-fade is ONE full-viewport veil in the DESTINATION canvas
+   colour, over the top, `pointer-events: none`: cover, flip, uncover. About
+   270ms of the reader's time and one layer, and only when the theme is
+   actually toggled. assets/js/preferences.js adds and removes the two classes.
+
+   GATED TWICE, AND THE GATE IS NOT BOOKKEEPING. Under reduced motion the
+   duration tokens compute to `0ms`, and a `0ms` animation with `forwards`
+   HOLDS ITS LAST KEYFRAME — which for the out-phase is `opacity: 1`. A theme
+   switch half-guarded in script would therefore black the page out
+   permanently rather than merely failing to fade. The script reads
+   `--pref-motion-scale` and skips the sequence outright, and this block
+   refuses to arm the animation in the first place.
+
+   The veil sits above the settings dialog and the skip link. A cross-fade
+   that leaves the chrome behind is not a cross-fade. */
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-pref-motion='reduced']) body.theme-shift-out::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    pointer-events: none;
+    background-color: var(--c-bg);
+    animation: theme-veil-in var(--dur-fast) ease-in forwards;
+  }
+
+  html:not([data-pref-motion='reduced']) body.theme-shift-in::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    pointer-events: none;
+    background-color: var(--c-bg);
+    animation: theme-veil-out var(--dur-base) ease-out forwards;
+  }
+}
+
+@keyframes theme-veil-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes theme-veil-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+/* Print. Both veil arms go, or a reader who printed from the settings panel
+   mid-animation gets a solid rectangle of canvas over the top of the page —
+   and printing does not animate, so it would simply stay there. */
+@media print {
+  body.theme-shift-out::after,
+  body.theme-shift-in::after {
+    display: none !important;
+  }
+}
+
+/* ==========================================================================
+   13. Canonical elevation utilities
+
+   THE ONLY sanctioned way to raise something, and the reason it lives here
+   rather than in each stylesheet is that it has to be one definition. Three
+   stylesheets each writing their own hover rule is three chances to drop the
+   lit edge.
+
+   The mechanism is the two-property composition. A `box-shadow` written
+   literally can only be changed by writing another literal, and the two
+   layers then have to be re-stated every time — which is precisely how a
+   hover state used to silently drop the lit top edge for as long as the
+   pointer was over the element. Changing `--elev-shadow` re-resolves the SAME
+   declaration, so a hover cannot drop the inset. The `0 0 0 0` fallback is
+   what keeps the form usable on an element that never declared an inset: a
+   fully transparent shadow, which draws nothing rather than being an invalid
+   list.
+
+   `.elev-N` and `.edge-lit` compose, because each writes a DIFFERENT custom
+   property: `class="elev-2 edge-lit"`. */
+.elev-0 {
+  box-shadow: none;
+}
+
+.elev-1,
+.elev-2,
+.elev-3,
+.elev-4 {
+  --elev-inset: 0 0 0 0;
+  box-shadow: var(--elev-shadow), var(--elev-inset);
+}
+
+.elev-1 { --elev-shadow: var(--c-elev-1); }
+.elev-2 { --elev-shadow: var(--c-elev-2); }
+.elev-3 { --elev-shadow: var(--c-elev-3); }
+.elev-4 { --elev-shadow: var(--c-elev-4); }
+
+.edge-lit {
+  --elev-inset: inset 0 1px 0 var(--c-elev-inset-hi);
+}
+
+/* The one canonical hover-elevation.
+
+   The budget is a budget: ONE step up, a 1px rise, and `transform` +
+   `box-shadow` only. No `scale` — a scale re-flows the text, so a grid of
+   twenty cards re-wraps every description as the pointer crosses it, and it
+   reads as a toy rather than an instrument. No layout property, because
+   neither of the two above reflows a sibling.
+
+   `.lift` does NOT combine with `.elev-3` or `.elev-4`. Those are floating
+   and modal; "hover makes it higher" has no meaning at the top of a
+   five-step scale.
+
+   `.lift:hover` is deliberately NOT gated behind the pointer query, unlike
+   the navigation rows. The asymmetry is deliberate too: a stuck hover leaves
+   a drawer full of lit rows the reader cannot clear, which is a broken
+   control, whereas a stuck card lift leaves one card a pixel high until the
+   next tap, which is a blemish. */
+.lift {
+  --elev-shadow: var(--c-elev-1);
+  --elev-inset: inset 0 1px 0 var(--c-elev-inset-hi);
+  box-shadow: var(--elev-shadow), var(--elev-inset);
+  transition: box-shadow var(--dur-fast) ease, transform var(--dur-fast) ease;
+}
+
+.lift:hover,
+.lift.is-hover {
+  --elev-shadow: var(--c-elev-2);
+  transform: translateY(-1px);
+}
+
+.lift:focus-visible {
+  --elev-shadow: var(--c-elev-2);
+}
+
+/* ==========================================================================
+   14. Mode-declared behaviour
+
+   Two axes that need a hook of their own: a smooth scroll that has to be
+   gated twice, and a focus-mode reading aid.
+
+   SMOOTH SCROLL, GATED TWICE AND DELIBERATELY. The media query is the half
+   that is conventional: the OS asking for less motion has to be honoured
+   before the document is interactive, or the very first frame is already
+   moving. The `:not()` is the half that is not, and it is a real bug rather
+   than belt-and-braces. `html { scroll-behavior: smooth }` inside a media
+   query is specificity (0,0,1) and the in-app preference's
+   `html[data-pref-motion='reduced']` rule is (0,1,1), so the attribute rule
+   would win — but only because it happens to sit later in this file than
+   that block. That is a coincidence, not a relationship, and the first
+   edit that moves either silently gives a reader who asked for a still page
+   an animated jump to every `#` anchor. Excluding the attribute here makes
+   the gate independent of source order. */
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-pref-motion='reduced']) {
+    scroll-behavior: smooth;
+  }
+}
+
+/* FOCUS MODE. A reading aid: it centres the text column and calms the page
+   down to the canvas.
+
+   IT REDUCES CHROME AND NEVER REMOVES IT. Hiding the navigation would mean
+   the only way out is a control that focus mode itself had hidden, which is
+   the natural next edit for anyone tidying this block and it would render
+   fine. The nav, the sub-nav and the header all stay exactly where they are;
+   what changes is that the article becomes the only raised thing on the page
+   and the eye has nowhere else to go.
+
+   It is a data attribute rather than a stylesheet swap because it has to
+   survive a navigation — the boot script reads it before first paint. */
+:root[data-focus-mode='on'] {
+  --prose-bg: var(--c-surface);
+}
+
+:root[data-focus-mode='on'] .focus-plate {
+  box-shadow: none;
+}
+
+:root[data-focus-mode='on'] .focus-dim {
+  opacity: 0.55;
+  transition: opacity var(--dur-base) ease;
+}
+
+:root[data-focus-mode='on'] .focus-dim:hover,
+:root[data-focus-mode='on'] .focus-dim:focus-within {
+  opacity: 1;
+}
+
+/* CHART GRID LINES. A reader-facing preference, not a theme value: the grid
+   is the ruler behind every plot, and some readers want it gone. The var is
+   read by the canvas routines in assets/js as well as by any SVG chart, and
+   the alias below is what lets both of them key off one flag. */
+:root[data-chart-grid='off'] {
+  --c-grid-ch: var(--c-border-ch);
+}

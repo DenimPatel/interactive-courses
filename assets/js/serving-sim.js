@@ -377,13 +377,22 @@
     var t1 = opts.t1 != null ? opts.t1 : Math.max.apply(null, items.map(function (p) { return p.completion || p.arrival; })) || 1;
     var plotW = W - padL - padR, plotH = H - padT - padB;
     var laneH = Math.max(2, plotH / items.length);
-    var c = opts.colors || {};
+    // opts.colors is still honoured (pages pass Guide.colors() in by
+    // convention), but a page that does not is no longer stuck with the
+    // light-mode palette: guide-core resolves the tokens when it is on the page,
+    // and this file resolves them itself when it is not.
+    var c = opts.colors || ganttColors();
+    // Every segment type is a token rather than a literal. `queued` is a recessive
+    // neutral so the eye skips it; `prefill` and `decode` are two steps of one
+    // series ramp, because a prefill and the decode that follows it are one
+    // request doing one thing; `swap` is the second categorical hue; and
+    // `preempted` is `warn`, which is what it means.
     var palette = {
-      queued: opts.queuedColor || '#d9d4cc',
-      prefill: opts.prefillColor || (c.accent500 || '#93aefe'),
-      decode: opts.decodeColor || (c.accent || '#2b5fff'),
-      swap: opts.swapColor || (c.accent2 || '#d6006c'),
-      preempted: opts.preemptedColor || '#c9a227'
+      queued: opts.queuedColor || c.surface2 || '#edf0f4',
+      prefill: opts.prefillColor || c.accent400 || '#2a89e0',
+      decode: opts.decodeColor || c.accent || '#0069d6',
+      swap: opts.swapColor || c.accent2 || '#0d9488',
+      preempted: opts.preemptedColor || c.warn || '#b45309'
     };
     function px(t) { return padL + plotW * (t - t0) / Math.max(1e-9, t1 - t0); }
     items.forEach(function (pr, i) {
@@ -399,9 +408,10 @@
       });
     });
     // time axis
-    ctx.strokeStyle = c.divider || '#ccc'; ctx.lineWidth = 1;
+    ctx.strokeStyle = c.divider || '#d9dee6'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.stroke();
-    ctx.fillStyle = c.text || '#201e1d'; ctx.font = '10px ' + (c.font || 'sans-serif');
+    ctx.fillStyle = c.text || '#0c1118';
+    ctx.font = ganttFont(c, opts.fontSize);
     ctx.textAlign = 'center';
     var ticks = 5;
     for (var k = 0; k <= ticks; k++) {
@@ -409,6 +419,45 @@
       ctx.fillText((tv / 1000).toFixed(1) + 's', px(tv), H - 5);
     }
     return { px: px, t0: t0, t1: t1 };
+  }
+
+  // The theme, resolved at draw time. guide-core owns the token layer when the
+  // page loaded it; these fallbacks keep this file usable on its own, which is
+  // how the LLM-serving pages load it.
+  function ganttColors() {
+    var G = global.Guide;
+    if (G && G.themeColors) return G.themeColors();
+    function v(name, fb) {
+      if (typeof document === 'undefined' || !document.documentElement) return fb;
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fb;
+    }
+    return {
+      accent: v('--color-accent', '#0069d6'),
+      accent400: v('--color-accent-400', '#2a89e0'),
+      accent2: v('--color-accent-2', '#0d9488'),
+      warn: v('--color-warn', '#b45309'),
+      surface2: v('--color-surface-2', '#edf0f4'),
+      divider: v('--color-divider', '#d9dee6'),
+      text: v('--color-text', '#0c1118'),
+      font: v('--font-body', 'sans-serif'),
+      tick: tickPx()
+    };
+  }
+
+  // --chart-tick-size, resolved to a number. A canvas font string cannot carry
+  // the `max(11px, 0.6875rem)` the token is written with, so the arithmetic
+  // happens here; 11px is the legibility floor the token itself declares.
+  function tickPx() {
+    if (typeof document === 'undefined' || !document.documentElement) return 11;
+    var cs = getComputedStyle(document.documentElement);
+    var m = /max\s*\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)rem\s*\)/.exec(cs.getPropertyValue('--chart-tick-size'));
+    if (!m) return 11;
+    return Math.max(parseFloat(m[1]), parseFloat(m[2]) * (parseFloat(cs.fontSize) || 16));
+  }
+
+  function ganttFont(c, fontSize) {
+    var n = fontSize != null ? fontSize : (c && c.tick != null ? c.tick : 11);
+    return n + 'px ' + ((c && c.font) || 'sans-serif');
   }
 
   global.ServingSim = {

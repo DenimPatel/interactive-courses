@@ -27,8 +27,29 @@
 
   function guideColors(opts) {
     if (opts && opts.colors) return opts.colors;
-    if (global.Guide && global.Guide.colors) return global.Guide.colors();
-    return { accent: '#2b5fff', accent2: '#d6006c', accent400: '#5d85fd', accent700: '#0b3cd0', text: '#201e1d', divider: '#ccc', font: 'sans-serif' };
+    if (global.Guide && global.Guide.themeColors) return global.Guide.themeColors();
+    // Only reached on a page that loaded calc-viz.js without guide-core.js. The
+    // fallbacks are the light scheme's values, so a page with no stylesheet at
+    // all looks like the light theme rather than the palette this file predates.
+    return { accent: '#0069d6', accent2: '#0d9488', accent400: '#2a89e0', accent700: '#004aa8', text: '#0c1118', divider: '#d9dee6', font: 'sans-serif', tick: 11, axisLabel: 11, legend: 12, accentCh: '', textCh: '' };
+  }
+
+  // Chart type size, as a CSS font shorthand. `c` may be a hand-built colour
+  // object a page passed in, so every field falls back rather than throwing.
+  function fontAt(c, px, which) {
+    var n = px != null ? px : (c && c[which] != null ? c[which] : (which === 'legend' ? 12 : 11));
+    return n + 'px ' + ((c && c.font) || 'sans-serif');
+  }
+
+  // A translucent version of a token, from its `-ch` channel form. Composed here
+  // rather than hard-coded so a wash drawn by this file is a wash of the accent
+  // the active theme installed.
+  function alpha(c, key, a) {
+    var ch = c && c[key];
+    if (ch) return 'rgb(' + ch + ' / ' + a + ')';
+    var v = toRgb(c && c[key.replace(/Ch$/, '')]);
+    if (v) return 'rgba(' + Math.round(v[0]) + ',' + Math.round(v[1]) + ',' + Math.round(v[2]) + ',' + a + ')';
+    return 'rgba(0,0,0,' + a + ')';
   }
 
   function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -107,14 +128,14 @@
           if (xv < xRange[0]) continue;
           tx = px(xv);
           if (showGrid) { ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(tx, padT); ctx.lineTo(tx, padT + plotH); ctx.stroke(); ctx.globalAlpha = 1; }
-          if (showTicks) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fmtTick(xv), tx, padT + plotH + 4); }
+          if (showTicks) { ctx.fillStyle = c.text; ctx.font = fontAt(c, null, 'tick'); ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fmtTick(xv), tx, padT + plotH + 4); }
         }
       } else {
         var sx = niceStep(xRange[1] - xRange[0], opts.tickTarget);
         for (var xk = Math.ceil(xRange[0] / sx) * sx; xk <= xRange[1] + 1e-9; xk += sx) {
           tx = px(xk);
           if (showGrid) { ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(tx, padT); ctx.lineTo(tx, padT + plotH); ctx.stroke(); ctx.globalAlpha = 1; }
-          if (showTicks) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fmtTick(xk, sx), tx, padT + plotH + 4); }
+          if (showTicks) { ctx.fillStyle = c.text; ctx.font = fontAt(c, null, 'tick'); ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fmtTick(xk, sx), tx, padT + plotH + 4); }
         }
       }
       var ty;
@@ -124,14 +145,14 @@
           if (yv < yRange[0]) continue;
           ty = py(yv);
           if (showGrid) { ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(padL, ty); ctx.lineTo(padL + plotW, ty); ctx.stroke(); ctx.globalAlpha = 1; }
-          if (showTicks) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fmtTick(yv), padL - 6, ty); }
+          if (showTicks) { ctx.fillStyle = c.text; ctx.font = fontAt(c, null, 'tick'); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fmtTick(yv), padL - 6, ty); }
         }
       } else {
         var sy = niceStep(yRange[1] - yRange[0], opts.tickTarget);
         for (var yk = Math.ceil(yRange[0] / sy) * sy; yk <= yRange[1] + 1e-9; yk += sy) {
           ty = py(yk);
           if (showGrid) { ctx.strokeStyle = c.divider; ctx.globalAlpha = 0.35; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(padL, ty); ctx.lineTo(padL + plotW, ty); ctx.stroke(); ctx.globalAlpha = 1; }
-          if (showTicks) { ctx.fillStyle = c.text; ctx.font = '10px ' + c.font; ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fmtTick(yk, sy), padL - 6, ty); }
+          if (showTicks) { ctx.fillStyle = c.text; ctx.font = fontAt(c, null, 'tick'); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fmtTick(yk, sy), padL - 6, ty); }
         }
       }
     }
@@ -149,9 +170,9 @@
     }
 
     // Labels.
-    ctx.fillStyle = c.text; ctx.font = '11px ' + c.font; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = c.text; ctx.font = fontAt(c, null, 'axisLabel'); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
     if (opts.xLabel) ctx.fillText(opts.xLabel, padL + plotW / 2, H - 6);
-    if (opts.title) { ctx.font = '600 12px ' + c.font; ctx.textAlign = 'left'; ctx.fillText(opts.title, padL, Math.max(12, padT - 8)); }
+    if (opts.title) { ctx.font = '600 ' + fontAt(c, null, 'legend'); ctx.textAlign = 'left'; ctx.fillText(opts.title, padL, Math.max(12, padT - 8)); }
     if (opts.yLabel) {
       ctx.save(); ctx.translate(14, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
       ctx.textAlign = 'center'; ctx.fillText(opts.yLabel, 0, 0); ctx.restore();
@@ -434,7 +455,9 @@
     if (opts.shade !== false) {
       // Fill each contour band by sampling colour on a coarse grid.
       var nx = opts.nx || 100, ny = opts.ny || 100;
-      var lo = opts.colorLow || hexToRgb(c.accent400), hi = opts.colorHigh || hexToRgb(c.accent700);
+      // Read as channels, not hex: the ramp is a ramp on whatever accent the
+      // active theme installed rather than on the blue this file shipped with.
+      var lo = toRgb(opts.colorLow || c.tint || c.accent400), hi = toRgb(opts.colorHigh || c.accent);
       var vmin = data.min, vmax = data.max;
       for (var i = 0; i < ny - 1; i++) {
         for (var j = 0; j < nx - 1; j++) {
@@ -456,7 +479,10 @@
     Object.keys(byLevel).forEach(function (key) {
       var segs = byLevel[key];
       var t = (parseFloat(key) - data.min) / Math.max(1e-12, data.max - data.min);
-      ctx.strokeStyle = opts.lineColor || 'rgba(32,30,29,0.45)';
+      // The foreground at 45%, not a frozen warm grey: on the light canvas this
+      // is the same ink, and in dark it is the light one rather than near-black
+      // contour lines on a near-black plot.
+      ctx.strokeStyle = opts.lineColor || alpha(c, 'textCh', 0.45);
       ctx.globalAlpha = lerp(0.35, 0.85, clamp(t, 0, 1));
       ctx.beginPath();
       segs.forEach(function (s) { ctx.moveTo(axes.px(s.x0), axes.py(s.y0)); ctx.lineTo(axes.px(s.x1), axes.py(s.y1)); });
@@ -467,12 +493,32 @@
     return data;
   }
 
+  // A CSS colour string as [r, g, b]. Named hexToRgb for historical reasons —
+  // it is on window.CalcViz and pages call it — but it has to understand the
+  // space-separated `rgb(0 105 214)` the theme tokens resolve to, not just
+  // #rrggbb, or every contour ramp in the maths guides came out black the moment
+  // the token layer landed. Handles #rgb, #rrggbb, rgb()/rgba() with either
+  // separator, an optional alpha, and bare `r g b`. Non-strings pass through.
   function hexToRgb(hex) {
-    if (!hex) return [43, 95, 255];
-    var h = hex.replace('#', '');
-    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+    if (typeof hex !== 'string') return hex;
+    var s = hex.trim();
+    if (s.charAt(0) === '#') {
+      var h = s.slice(1);
+      if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+    }
+    var p = s.indexOf('(');
+    if (p >= 0) {
+      var close = s.lastIndexOf(')');
+      s = s.slice(p + 1, close >= 0 ? close : s.length);
+    }
+    if (s.indexOf('/') >= 0) s = s.slice(0, s.indexOf('/'));
+    s = s.replace(/rgba?\s*|\s*,\s*|\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+    var parts = s ? s.split(' ') : [];
+    return [parseFloat(parts[0]) || 0, parseFloat(parts[1]) || 0, parseFloat(parts[2]) || 0];
   }
+
+  function toRgb(c) { return hexToRgb(c); }
 
   // ---------------------------------------------------------------------------
   // Vector fields.

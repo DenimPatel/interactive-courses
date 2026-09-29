@@ -11,10 +11,26 @@
   "use strict";
 
   function css(name) {
+    if (typeof document === 'undefined' || !document.documentElement) return '';
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
-  var COLOR_TEXT = css('--color-text') || '#201e1d';
-  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+
+  // Resolved at CALL time, never cached in module state. The two constants this
+  // file used to read once at load were the exact read-once defect the theme
+  // layer exists to remove: a Plotly scene built after a theme switch fell back
+  // to the colours the page loaded with. The fallbacks are the light scheme's
+  // values, so a page with no theme.css looks like light rather than like a
+  // palette this file predates.
+  function themeColors() {
+    var G = global.Guide;
+    if (G && G.themeColors) return G.themeColors();
+    return {
+      text: css('--color-text') || '#0c1118',
+      divider: css('--color-divider') || '#d9dee6',
+      grid: css('--c-grid') || css('--color-divider') || '#e3e7ed',
+      font: css('--font-body') || 'sans-serif'
+    };
+  }
 
   // ---------- shared scene: a cube centered at the origin ----------
   var CUBE_R = 0.9;
@@ -93,18 +109,23 @@
   // opts: {range, aspectmode, aspect:{x,y,z}, eye, colors}
   function baseLayout(opts) {
     opts = opts || {};
-    // Resolve theme colours at call time so a runtime theme switch is picked up
-    // (the module-level constants are only a fallback).
+    // Resolve theme colours at call time so a runtime theme switch is picked up.
+    var t = themeColors();
     var c = opts.colors || {};
-    var text = c.text || css('--color-text') || COLOR_TEXT;
-    var divider = c.divider || css('--color-divider') || COLOR_DIVIDER;
+    var text = c.text || t.text;
+    var grid = c.grid || t.grid;
     var rx = axisRange(opts.range, 'x', [-6, 6]);
     var ry = axisRange(opts.range, 'y', [-6, 6]);
     var rz = axisRange(opts.range, 'z', [-6, 6]);
+    // The axis RULE is the border; the pane gridlines are the plot grid. They used
+    // to be the same value, which is the same "one thing saying the numbers
+    // twice" problem a 2-D plot has: --c-grid is deliberately one step quieter
+    // than --c-border, and theme.css can turn the grid off entirely for a reader
+    // who wants the ruler gone.
     var scene = {
-      xaxis: { range: rx, backgroundcolor: 'transparent', gridcolor: divider, zerolinecolor: divider, color: text, title: opts.xTitle || 'x' },
-      yaxis: { range: ry, backgroundcolor: 'transparent', gridcolor: divider, zerolinecolor: divider, color: text, title: opts.yTitle || 'y' },
-      zaxis: { range: rz, backgroundcolor: 'transparent', gridcolor: divider, zerolinecolor: divider, color: text, title: opts.zTitle || 'z' },
+      xaxis: { range: rx, backgroundcolor: 'transparent', gridcolor: grid, zerolinecolor: text, color: text, title: opts.xTitle || 'x' },
+      yaxis: { range: ry, backgroundcolor: 'transparent', gridcolor: grid, zerolinecolor: text, color: text, title: opts.yTitle || 'y' },
+      zaxis: { range: rz, backgroundcolor: 'transparent', gridcolor: grid, zerolinecolor: text, color: text, title: opts.zTitle || 'z' },
       aspectmode: opts.aspectmode || 'cube',
       camera: { eye: opts.eye || { x: 1.4, y: -1.4, z: 1.0 } }
     };
@@ -115,9 +136,44 @@
     };
   }
 
+  // Repaint a Plotly scene when the theme or the reader's preferences change.
+  //
+  // A canvas can be repainted because the kit owns a repaint function for it. A
+  // Plotly div cannot: Plotly has already rasterised the scene into its own
+  // buffers and nothing about a CSS custom property change tells it to redraw, so
+  // the scene keeps whatever colours it was built with. The fix has to be a
+  // re-`react` with a freshly-built layout, and only the page knows its traces.
+  // So this is the one-line opt-in a page adds next to its existing
+  // `Plotly.react(div, traces, GuidePlot3D.baseLayout({...}), PLOT_OPTS)`:
+  //
+  //   GuidePlot3D.bindScene(div, function () { return traces; },
+  //                              function () { return GuidePlot3D.baseLayout(opts); });
+  //
+  // It routes through guide-core's scheduler when that is on the page, so adding
+  // a scene adds no animation frame, and it is a no-op when guide-core is absent
+  // rather than an error. Without this call a scene still *rebuilds* correctly the
+  // next time the reader drags it — baseLayout resolves at call time — it just
+  // does not switch on its own.
+  function bindScene(div, getTraces, getLayout, opts) {
+    opts = opts || {};
+    if (!div || typeof getTraces !== 'function' || typeof getLayout !== 'function') return function () {};
+    function repaint() {
+      var P = global.Plotly;
+      if (!P) return;
+      if (typeof P.react === 'function') P.react(div, getTraces(), getLayout(), opts.plotly || {});
+      else if (typeof P.newPlot === 'function') P.newPlot(div, getTraces(), getLayout(), opts.plotly || {});
+    }
+    if (global.Guide && global.Guide.onTheme) return global.Guide.onTheme(repaint);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('ic:theme', repaint, false);
+      document.addEventListener('ic:prefs', repaint, false);
+    }
+    return function () {};
+  }
+
   global.GuidePlot3D = {
     CUBE_VERTS: CUBE_VERTS, CUBE_EDGES: CUBE_EDGES,
     cubeLineTrace: cubeLineTrace, cameraFrustumTrace: cameraFrustumTrace,
-    cameraCenterTrace: cameraCenterTrace, baseLayout: baseLayout
+    cameraCenterTrace: cameraCenterTrace, baseLayout: baseLayout, bindScene: bindScene
   };
-})(window);
+})(typeof window !== 'undefined' ? window : this);

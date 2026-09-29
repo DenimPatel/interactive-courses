@@ -614,10 +614,20 @@
     view.text = function (p, s, o) {
       o = o || {}; var P = view.project(p), ctx = view.ctx;
       ctx.save(); ctx.fillStyle = o.color || view.colors.text; ctx.globalAlpha = o.alpha == null ? 0.9 : o.alpha;
-      ctx.font = (o.size || 12) + 'px ' + view.colors.font; ctx.textAlign = o.align || 'left'; ctx.textBaseline = 'middle';
+      var fam = view.colors.font || 'sans-serif';
+      var sz = o.size != null ? o.size : (view.colors.legend != null ? view.colors.legend : 12);
+      ctx.font = sz + 'px ' + fam; ctx.textAlign = o.align || 'left'; ctx.textBaseline = 'middle';
       ctx.fillText(s, P[0] + (o.dx || 0), P[1] + (o.dy || 0)); ctx.restore();
     };
-    view.axisColors = function () { return ['#d6336c', '#2f9e44', view.colors.accent]; };
+    // x, y, z take the first three categorical series slots. They used to be a
+    // fixed pink/green/blue triad, which is invisible to the theme; the slots are
+    // well separated by hue AND by luminance in both themes, which is what a
+    // coordinate triad actually needs, and they are deliberately theme-invariant
+    // — the x axis of the same scene must not change colour when the reader does.
+    view.axisColors = function () {
+      var s = view.colors.series || [];
+      return [s[0] || view.colors.accent, s[1] || view.colors.accent2, s[2] || view.colors.accent700 || view.colors.accent];
+    };
     // Coordinate triad for rotation R at origin t: x, y, z columns.
     view.frame = function (R, t, o) {
       o = o || {}; t = t || [0, 0, 0]; var len = o.len || 1, cols = o.colors || view.axisColors();
@@ -637,7 +647,7 @@
       len = len || 1.4; var cols = view.axisColors();
       [[1, 0, 0], [0, 1, 0], [0, 0, 1]].forEach(function (e, j) {
         view.line([0, 0, 0], v3.scale(e, len), { color: cols[j], width: 1, alpha: 0.35, dash: true });
-        view.text(v3.scale(e, len * 1.06), ['X', 'Y', 'Z'][j], { color: cols[j], alpha: 0.55, size: 11 });
+        view.text(v3.scale(e, len * 1.06), ['X', 'Y', 'Z'][j], { color: cols[j], alpha: 0.55, size: view.colors.tick != null ? view.colors.tick : 11 });
       });
     };
     // Wireframe sphere of radius r with back-facing arcs faded.
@@ -678,7 +688,11 @@
       if (o.nose !== false) view.arrow(t, v3.add(t, m3.mulV(R, [h[0] * 1.9, 0, 0])), { color: o.color || view.colors.text, width: 1.6, alpha: o.alpha == null ? 0.8 : o.alpha });
     };
     view.clear = function () {
-      view.colors = G.colors();
+      // Re-read at every redraw, not once at construction. A 3D view is redrawn
+      // on every orbit drag and on every theme change, so this is the read that
+      // makes the switch work: the colours below are the ones in force for the
+      // frame about to be drawn.
+      view.colors = G.themeColors ? G.themeColors() : G.colors();
       view.ctx.clearRect(0, 0, W, H);
     };
 
@@ -743,7 +757,7 @@
       sx: sx, sy: sy
     };
     P.axes = function (col) {
-      var c = global.Guide ? global.Guide.colors() : { text: '#222' };
+      var c = global.Guide ? (global.Guide.themeColors ? global.Guide.themeColors() : global.Guide.colors()) : { text: '#0c1118' };
       ctx.save(); ctx.strokeStyle = col || c.text; ctx.globalAlpha = 0.18; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(0, P.py(0)); ctx.lineTo(W, P.py(0)); ctx.moveTo(P.px(0), 0); ctx.lineTo(P.px(0), H); ctx.stroke();
       ctx.restore();

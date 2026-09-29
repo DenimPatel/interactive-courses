@@ -1,0 +1,171 @@
+{%- comment -%}
+The no-flash boot. Include this as the FIRST thing in <head>, before any
+stylesheet link, on every page that renders one.
+
+It duplicates two things from assets/js/preferences.js on purpose: how a
+stored preference set is read, and how a preference maps to a CSS value.
+The module cannot do this job because it is a deferred external file — by the
+time it runs the browser has already decided what colour the first frame is.
+A reader who chose Dark has to never see a light frame, and that guarantee can
+only be made from an inline script that runs before first paint.
+
+THE CONSTRAINT: this is inlined into ~570 pages and served by GitHub Pages to
+everything, so it is ES3/ES5-safe. No `const`, no `let`, no arrow functions, no
+template literals, no optional chaining, no `Array.prototype.includes`, no
+`Object.assign`. `var`, functions, string concatenation, and try/catch, and the
+whole body is wrapped so that a thrown error cannot leave the page half-themed.
+
+It is written as a function on `window` rather than a bare IIFE so that
+_includes/site-nav.html can call it again. Roughly thirty standalone guide
+pages carry a hand-written <head> and never include this file; on those the
+first shot at the theme happens after <body> has begun, so site-nav re-runs the
+boot. Re-running is safe — every write below is idempotent — and it is skipped
+entirely on a page whose head already booted, which is all 540 of the others.
+
+THEME-COLOUR NOTE. `--c-bg-ch` is `242 245 250` in light and `9 12 17` in dark,
+i.e. #f2f5fa and #090c11. The sibling site hard-codes #f7f8fa against its own
+identical #f2f5fa canvas; that is a five-point drift, and the bug is not
+copied here.
+{%- endcomment -%}
+<script>
+window.__icThemeBoot = (function () {
+  /* The chrome colour the mobile address bar and the OS window frame take:
+     theme.css's own `--c-bg-ch`, which is `242 245 250` in light and
+     `9 12 17` in dark. The same pair is restated in assets/js/preferences.js,
+     and both files say where it comes from, because a literal has to exist in
+     both and the only defence against the two drifting is a comment in each
+     naming the token. The sibling site carries exactly that drift — it ships
+     #f7f8fa against its own identical #f2f5fa canvas. */
+  var THEME_COLOR = { light: '#f2f5fa', dark: '#090c11' };
+  var STORAGE_KEY = 'ic-prefs';
+
+  /* Preference value -> CSS custom property value. These tables ARE the
+     contract with assets/css/theme.css and with preferences.js; the `normal`
+     entries are the values the site shipped with before preferences existed,
+     which is what makes a visitor with nothing stored see no change at all.
+     `text` is stored as the percentage a reader chose and resolves to a
+     unitless multiplier on the root font size. */
+  var TEXT_SCALE = { 90: 0.9, 100: 1, 115: 1.15, 130: 1.3 };
+  var MEASURE = { narrow: '58ch', normal: '70ch', wide: '82ch' };
+  var LINE_HEIGHT = { tight: '1.4', normal: '1.6', relaxed: '1.8' };
+  var SPACE_SCALE = { compact: '0.85', normal: '1', spacious: '1.15' };
+
+  function has(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  return function icThemeBoot() {
+    var prefs = {
+      theme: 'system',
+      text: 100,
+      measure: 'normal',
+      leading: 'normal',
+      density: 'normal',
+      motion: 'system',
+      focusMode: false,
+      chartGrid: true
+    };
+
+    try {
+      /* 1. Read the stored envelope, defensively at every level. `localStorage`
+            throws outright in some privacy modes, `getItem` throws in others,
+            and the value itself is attacker-editable. Anything unrecognised
+            degrades to the default for that ONE key rather than discarding
+            the whole set: a preferences layer that can wedge the page on a bad
+            value is worse than one that forgets a preference. */
+      var raw = null;
+      try { raw = window.localStorage.getItem(STORAGE_KEY); } catch (e) { raw = null; }
+
+      if (raw !== null && typeof JSON !== 'undefined') {
+        var parsed = null;
+        try { parsed = JSON.parse(raw); } catch (e2) { parsed = null; }
+
+        if (parsed && typeof parsed === 'object' && !parsed.nodeType) {
+          var source = has(parsed, 'prefs') ? parsed.prefs : parsed;
+          if (source && typeof source === 'object') {
+            for (var key in prefs) {
+              if (!has(source, key)) continue;
+              var value = source[key];
+              var ok = typeof value === typeof prefs[key];
+              if (key === 'text') ok = has(TEXT_SCALE, value);
+              else if (key === 'theme') ok = value === 'light' || value === 'dark' || value === 'system';
+              else if (key === 'measure') ok = has(MEASURE, value);
+              else if (key === 'leading') ok = has(LINE_HEIGHT, value);
+              else if (key === 'density') ok = has(SPACE_SCALE, value);
+              else if (key === 'motion') ok = value === 'system' || value === 'reduced' || value === 'full';
+              if (ok) prefs[key] = value;
+            }
+          }
+        }
+      }
+
+      /* 2. Resolve the two preferences that consult the operating system. */
+      var osDark = false;
+      var osReduced = false;
+      try {
+        if (window.matchMedia) {
+          osDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          osReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        }
+      } catch (e3) { /* an old browser without the queries gets the defaults */ }
+
+      var dark = prefs.theme === 'dark' || (prefs.theme === 'system' && osDark);
+
+      /* Motion: an explicit Reduced turns animation off; System defers to the
+         operating system; Full is the reader saying they want it. All three
+         land in one number, and the same number drives BOTH the duration
+         scale in theme.css and the smooth-scroll gate. */
+      var motionScale = (prefs.motion === 'reduced' || (prefs.motion === 'system' && osReduced)) ? '0' : '1';
+
+      /* 3. Write the DOM contract. `data-theme` always holds a RESOLVED value,
+            never 'system' — the stylesheet and every canvas routine in
+            assets/js are written against exactly two modes. */
+      var root = document.documentElement;
+      if (!root) return;
+
+      root.setAttribute('data-theme', dark ? 'dark' : 'light');
+      /* Not part of the required contract: the raw choice, so the theme
+         toggle can show the PREFERENCE rather than the resolved mode. A reader
+         who picked System can see that they have. */
+      root.setAttribute('data-pref-theme', prefs.theme);
+      root.setAttribute('data-focus-mode', prefs.focusMode ? 'on' : 'off');
+      root.setAttribute('data-chart-grid', prefs.chartGrid ? 'on' : 'off');
+      /* The attribute IS the scale: theme.css reads `[data-pref-motion]` to
+         gate `scroll-behavior`, and a `0ms` transition rather than a removed
+         declaration is what keeps an inherited transition from surviving. */
+      if (motionScale === '0') root.setAttribute('data-pref-motion', 'reduced');
+      else root.removeAttribute('data-pref-motion');
+
+      root.style.setProperty('--pref-text-scale', String(TEXT_SCALE[prefs.text]));
+      root.style.setProperty('--pref-measure', MEASURE[prefs.measure]);
+      root.style.setProperty('--pref-line-height', LINE_HEIGHT[prefs.leading]);
+      root.style.setProperty('--pref-space', SPACE_SCALE[prefs.density]);
+      root.style.setProperty('--pref-motion-scale', motionScale);
+
+      /* `color-scheme` so native form controls, the caret, and the scrollbar
+         follow the mode rather than staying the OS default. */
+      root.style.setProperty('color-scheme', dark ? 'dark' : 'light');
+
+      /* 4. Browser chrome. The two metas are emitted with `prefers-color-scheme`
+            media variants so a visitor whose JavaScript never runs still gets
+            a correct address bar; once this script runs it owns the value, so
+            the media attribute comes off and both metas are set to the mode
+            actually in force. Setting the content on both rather than on the
+            first is what makes the media-less result order-independent. */
+      var metas = document.getElementsByTagName('meta');
+      for (var i = 0; i < metas.length; i++) {
+        if (!metas[i].getAttribute) continue;
+        var name = metas[i].getAttribute('name');
+        if (name !== 'theme-color') continue;
+        metas[i].setAttribute('content', dark ? THEME_COLOR.dark : THEME_COLOR.light);
+        metas[i].removeAttribute('media');
+      }
+    } catch (e4) {
+      /* Nothing here is worth an exception. A reader whose storage is blocked
+         or whose value is corrupt still gets a themed, readable page — the
+         stylesheet's own `prefers-color-scheme` fallback covers the rest. */
+    }
+  };
+})();
+window.__icThemeBoot();
+</script>

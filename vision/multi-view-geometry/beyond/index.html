@@ -14,7 +14,14 @@ redirect_from:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page.title }} · {{ site.title }}</title>
 <meta name="description" content="{{ page.description }}">
+{% include theme-boot.html %}
+<script src="{{ '/assets/js/theme-tokens.js' | relative_url }}"></script>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f2f5fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#090c11" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{{ '/assets/css/theme.css' | relative_url }}">
 <link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+<link rel="stylesheet" href="{{ '/assets/css/chrome.css' | relative_url }}">
 {% include favicon.html %}
 <style>
   .mvg { max-width: 1180px; }
@@ -52,7 +59,6 @@ redirect_from:
   .mvg-demo {
     display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
     background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
-    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
     box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
     margin-top: 8px;
   }
@@ -73,7 +79,7 @@ redirect_from:
     padding: 7px 13px; border-radius: var(--radius-md);
   }
   .mvg-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .mvg-btnrow button.mvg-primary { background: var(--color-accent); color: var(--c-surface); border-color: var(--color-accent); }
   .mvg-btnrow button.mvg-primary:hover { background: var(--color-accent-600); }
   .mvg-btnrow button:disabled { opacity: 0.45; cursor: default; }
   .mvg-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
@@ -104,7 +110,7 @@ redirect_from:
 {% include site-nav.html %}
 {% include series-nav.html series=site.data.series.multi_view_geometry %}
 
-<main>
+<main id="main">
 <div class="wrap mvg">
   <section class="page-header">
     <span class="section-kicker">Interactive guide · Part 19 of {{ site.data.series.multi_view_geometry.parts | size }}</span>
@@ -300,11 +306,43 @@ redirect_from:
 (function(){
   "use strict";
 
-  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-  var COLOR_TEXT = css('--color-text') || '#201e1d';
-  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
-  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
-  var COLOR_DIVIDER = css('--color-divider') || 'rgba(32,30,29,0.16)';
+  /* Read at draw time, never captured into module state. These were read
+     once, here, while the parser was still inside <head> — and a Plotly layout
+     or a canvas stroke bakes whatever colour it is handed at the moment it is
+     handed it, so a reader who loaded in light and then switched to dark was
+     left looking at light-ink frames until some unrelated interaction happened
+     to repaint. THEME.token() reads the same token the old css() read was
+     reaching for (theme.css aliases --color-text onto --c-fg and the rest the
+     same way), which is why there is no second fallback left to keep in step. */
+  function COLOR_TEXT(){ return THEME.token('--c-fg'); }
+  function COLOR_ACCENT(){ return THEME.token('--c-accent'); }
+  function COLOR_ACCENT2(){ return THEME.token('--c-accent-2'); }
+  function COLOR_DIVIDER(){ return THEME.token('--c-border'); }
+
+  /* These pages load theme-tokens.js but not guide-core.js, so no canvas here
+     is registered with the shared repaint scheduler and no draw path re-runs
+     when the reader changes theme. Every step below registers the function it
+     already draws from and this one listener replays them, so the lazy reads
+     above actually get a chance to happen. preferences.js dispatches
+     `ic:theme` for every commit — a theme flip, a chart-grid toggle, and once
+     at load — so a registered path has to be safe to run more than once, and
+     one step throwing must not take the rest of the page's canvases with it. */
+  var repaint = [];
+  var primed = false;
+  function onTheme(){
+    /* preferences.js dispatches `ic:theme` once at load as well as on every
+       change, and it does so from a deferred script — so the first event this
+       page ever sees is that load-time one, arriving after its own first draw
+       has already used the resolved theme. Replaying every draw path there would
+       buy nothing and double the cost of loading the page. */
+    if (!primed) { primed = true; return; }
+    THEME.refresh();
+    for (var i=0;i<repaint.length;i++){
+      try { repaint[i](); }
+      catch (e) { if (window.console && window.console.error) window.console.error('[theme] repaint failed', e); }
+    }
+  }
+  document.addEventListener('ic:theme', onTheme, false);
 
   // ---------- shared math / rendering helpers ----------
   var MVG = {};
@@ -507,7 +545,7 @@ redirect_from:
     function avgOf(arr){ var s=0; for (var i=0;i<arr.length;i++) s+=arr[i]; return s/arr.length; }
 
     var COLD = [46,44,42];
-    var HOT = colorToRGB(COLOR_ACCENT);
+    var HOT = colorToRGB(COLOR_ACCENT());
     function drawHeatmap(scores){
       var ctx = heatCanvas.getContext('2d');
       var img = ctx.createImageData(W,H);
@@ -548,14 +586,14 @@ redirect_from:
       function xOf(z){ return padL + (w-padL-padR)*(z-ZMIN)/(ZMAX-ZMIN); }
       function yOf(a){ return padT + (h-padT-padB)*(1-a); }
       // reference lines
-      ctx.strokeStyle = COLOR_DIVIDER; ctx.setLineDash([3,3]); ctx.lineWidth=1;
+      ctx.strokeStyle = COLOR_DIVIDER(); ctx.setLineDash([3,3]); ctx.lineWidth=1;
       [trueDepthBox, trueDepthFloor].forEach(function(z){
         var x = xOf(z);
         ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,h-padB); ctx.stroke();
       });
       ctx.setLineDash([]);
       // curve
-      ctx.strokeStyle = COLOR_ACCENT; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.strokeStyle = COLOR_ACCENT(); ctx.lineWidth = 2; ctx.beginPath();
       curveData.forEach(function(pt,i){
         var x=xOf(pt.z), y=yOf(pt.avg);
         if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
@@ -563,9 +601,9 @@ redirect_from:
       ctx.stroke();
       // current Z marker
       var mx = xOf(curZ);
-      ctx.strokeStyle = COLOR_ACCENT2; ctx.lineWidth=1.5; ctx.beginPath();
+      ctx.strokeStyle = COLOR_ACCENT2(); ctx.lineWidth=1.5; ctx.beginPath();
       ctx.moveTo(mx,padT); ctx.lineTo(mx,h-padB); ctx.stroke();
-      ctx.fillStyle = COLOR_TEXT; ctx.font = '10px monospace';
+      ctx.fillStyle = COLOR_TEXT(); ctx.font = '10px monospace';
       ctx.fillText('box top', xOf(trueDepthBox)+3, 12);
       ctx.fillText('floor', xOf(trueDepthFloor)+3, 12);
     }
@@ -657,6 +695,7 @@ redirect_from:
     });
 
     update(parseFloat(zEl.value));
+    repaint.push(scheduleUpdate);
   })();
 
   // ================================================================
@@ -760,7 +799,7 @@ redirect_from:
         ctx.closePath();
         ctx.fillStyle = shade(t.color, t.normal);
         ctx.fill();
-        ctx.strokeStyle = 'rgba(20,18,17,0.25)'; ctx.lineWidth = 0.6; ctx.stroke();
+        ctx.strokeStyle = THEME.alpha('--c-fg', 0.25); ctx.lineWidth = 0.6; ctx.stroke();
       });
     }
 
@@ -778,7 +817,7 @@ redirect_from:
       });
       var maxB = 0; for (var i=0;i<bins.length;i++) maxB = Math.max(maxB, bins[i]);
       if (maxB === 0) maxB = 1;
-      var hot = colorToRGB(COLOR_ACCENT2);
+      var hot = colorToRGB(COLOR_ACCENT2());
       for (var cy2=0; cy2<rows; cy2++){
         for (var cx2=0; cx2<cols; cx2++){
           var d = bins[cy2*cols+cx2] / maxB;
@@ -831,14 +870,17 @@ redirect_from:
       density: document.getElementById('s5-mode-density'),
       gauss: document.getElementById('s5-mode-gauss')
     };
-    function setMode(mode){
+    var mode = 'points';
+    function setMode(m){
+      mode = m;
       ctx.clearRect(0,0,Wc,Hc);
-      MODES[mode].fn();
-      document.getElementById('s5-readout').innerHTML = MODES[mode].label;
-      Object.keys(buttons).forEach(function(k){ buttons[k].classList.toggle('mvg-primary', k===mode); });
+      MODES[m].fn();
+      document.getElementById('s5-readout').innerHTML = MODES[m].label;
+      Object.keys(buttons).forEach(function(k){ buttons[k].classList.toggle('mvg-primary', k===m); });
     }
     Object.keys(buttons).forEach(function(k){ buttons[k].addEventListener('click', function(){ setMode(k); }); });
     setMode('points');
+    repaint.push(function(){ setMode(mode); });
   })();
 
   // ================================================================
@@ -894,13 +936,13 @@ redirect_from:
             var a = 0.15 + 0.55*Math.abs(v);
             ctx.fillStyle = 'rgba(' + rr2 + ',' + gg + ',' + bb + ',' + a.toFixed(2) + ')';
           } else {
-            ctx.fillStyle = 'rgba(32,30,29,0.05)';
+            ctx.fillStyle = THEME.alpha('--c-fg', 0.05);
           }
           ctx.fillRect(x0, y0, cw+0.5, chh+0.5);
         }
       }
       // zero crossing of the fused field: small black markers at sign changes
-      ctx.fillStyle = COLOR_TEXT;
+      ctx.fillStyle = COLOR_TEXT();
       for (var r3=0; r3<NZ; r3++){
         for (var c3=0; c3<NX-1; c3++){
           var a1 = wsum[r3*NX+c3] > 0 ? tsdf[r3*NX+c3]/wsum[r3*NX+c3] : null;
@@ -923,12 +965,12 @@ redirect_from:
         }
         ctx.stroke(); ctx.setLineDash([]);
       }
-      drawSurf(surf1, 'rgba(32,30,29,0.55)');
-      drawSurf(surf2, 'rgba(214,0,108,0.55)');
+      drawSurf(surf1, THEME.alpha('--c-fg', 0.55));
+      drawSurf(surf2, THEME.alpha('--c-accent-2', 0.55));
       // ground line + labels
-      ctx.strokeStyle = COLOR_DIVIDER;
+      ctx.strokeStyle = COLOR_DIVIDER();
       ctx.beginPath(); ctx.moveTo(0, H-30); ctx.lineTo(W, H-30); ctx.stroke();
-      ctx.fillStyle = COLOR_TEXT; ctx.font = '11px monospace';
+      ctx.fillStyle = COLOR_TEXT(); ctx.font = '11px monospace';
       ctx.fillText('x', W/2-4, H-10);
       ctx.save(); ctx.translate(12, H/2); ctx.rotate(-Math.PI/2); ctx.fillText('depth', -16, 0); ctx.restore();
       document.getElementById('s2-tsdfreadout').innerHTML =
@@ -939,6 +981,7 @@ redirect_from:
     noiseEl.addEventListener('input', function(){ resampleNoise(); update(); });
     resampleBtn.addEventListener('click', function(){ resampleNoise(); update(); });
     resampleNoise();
+    repaint.push(update);
     update();
   })();
 
@@ -1041,26 +1084,27 @@ redirect_from:
       document.getElementById('s6-wval').textContent = w.toFixed(2);
       var current = relax(w);
       ctx.clearRect(0,0,W,H);
-      ctx.fillStyle = 'rgba(0,0,0,0.03)'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = THEME.alpha('--c-fg', 0.03); ctx.fillRect(0,0,W,H);
       // loop-closure edge
       var qa = toPx(current[N-1]), qb = toPx(current[0]);
-      ctx.strokeStyle = w > 0.01 ? COLOR_ACCENT : 'rgba(32,30,29,0.25)';
+      ctx.strokeStyle = w > 0.01 ? COLOR_ACCENT() : THEME.alpha('--c-fg', 0.25);
       ctx.lineWidth = w > 0.01 ? 2.6 : 1.4;
       if (w <= 0.01) ctx.setLineDash([4,4]);
       ctx.beginPath(); ctx.moveTo(qa[0],qa[1]); ctx.lineTo(qb[0],qb[1]); ctx.stroke(); ctx.setLineDash([]);
-      drawPath(truth.concat([truth[0]]), 'rgba(32,30,29,0.5)', 1.3, [5,4]);
-      drawPath(drifted, '#c23b3b', 1.6);
-      drawPath(current, COLOR_ACCENT, 2.2);
+      drawPath(truth.concat([truth[0]]), THEME.alpha('--c-fg', 0.5), 1.3, [5,4]);
+      drawPath(drifted, THEME.ink('#c23b3b'), 1.6);
+      drawPath(current, COLOR_ACCENT(), 2.2);
       var q0 = toPx(truth[0]);
-      ctx.fillStyle = COLOR_TEXT;
+      ctx.fillStyle = COLOR_TEXT();
       ctx.beginPath(); ctx.arc(q0[0], q0[1], 4, 0, 7); ctx.fill();
       var seam = Math.hypot(current[N-1].x - current[0].x, current[N-1].y - current[0].y);
       var seam0 = Math.hypot(drifted[N-1].x - drifted[0].x, drifted[N-1].y - drifted[0].y);
       var trueGap = Math.hypot(truth[N-1].x - truth[0].x, truth[N-1].y - truth[0].y);
       document.getElementById('s6-readout').innerHTML =
-        '<div><span class="k">loop gap</span>: odometry-only = <span class="hi" style="color:#c23b3b">' + seam0.toFixed(2) + ' units</span> &rarr; current estimate = <span class="hi">' + seam.toFixed(2) + ' units</span> <span class="k">(true edge length ' + trueGap.toFixed(2) + ')</span></div>' +
+        '<div><span class="k">loop gap</span>: odometry-only = <span class="hi" style="color:var(--c-bad)">' + seam0.toFixed(2) + ' units</span> &rarr; current estimate = <span class="hi">' + seam.toFixed(2) + ' units</span> <span class="k">(true edge length ' + trueGap.toFixed(2) + ')</span></div>' +
         '<div style="opacity:.65">' + (w >= 0.99 ? 'Full-weight loop closure: the drift is spread around the whole loop instead of sitting at the seam — this is the pose-graph optimization SLAM runs the moment place recognition fires.' : 'Raise the closure weight: the revisit constraint drags the whole trajectory back into agreement with itself.') + '</div>';
     }
+    repaint.push(draw);
     wEl.addEventListener('input', draw);
     draw();
   })();

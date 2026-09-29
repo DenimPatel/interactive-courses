@@ -26,7 +26,12 @@
   "use strict";
 
   function Guide() { return global.Guide; }
-  function colors() { return Guide().colors(); }
+  // The whole resolved palette, re-read at draw time. themeColors() is the
+  // single reader of the theme layer in assets/js, so this is where a
+  // theme change reaches every mark these two files draw — including the
+  // series palette and the chart type sizes, neither of which the old
+  // nine-field colors() carried.
+  function colors() { return Guide().themeColors(); }
 
   // =========================================================================
   // seeded randomness
@@ -99,16 +104,16 @@
         ctx.globalAlpha = 1;
       }
       frame();
-      ctx.fillStyle = c.text; ctx.font = '10px ' + c.font;
+      ctx.fillStyle = c.text; ctx.font = c.tickFont;
       ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       xTicks.forEach(function (t) { ctx.fillText(o.xFormat ? o.xFormat(t) : fmtTick(t, step), px(t), padT + plotH + 4); });
       ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
       yTicks.forEach(function (t) { ctx.fillText(o.yFormat ? o.yFormat(t) : fmtTick(t), padL - 6, py(t)); });
       ctx.textBaseline = 'alphabetic';
-      if (o.xLabel) { ctx.textAlign = 'center'; ctx.font = '11px ' + c.font; ctx.fillText(o.xLabel, padL + plotW / 2, H - 6); }
+      if (o.xLabel) { ctx.textAlign = 'center'; ctx.font = c.axisFont; ctx.fillText(o.xLabel, padL + plotW / 2, H - 6); }
       if (o.yLabel) {
         ctx.save(); ctx.translate(13, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
-        ctx.textAlign = 'center'; ctx.font = '11px ' + c.font; ctx.fillText(o.yLabel, 0, 0); ctx.restore();
+        ctx.textAlign = 'center'; ctx.font = c.axisFont; ctx.fillText(o.yLabel, 0, 0); ctx.restore();
       }
       return { xTicks: xTicks, yTicks: yTicks };
     }
@@ -168,7 +173,10 @@
         pts.push([x, fn(x)]);
       }
       ctx.save();
-      ctx.fillStyle = o.color || 'rgba(43,95,255,0.20)';
+      // A 20% wash of the accent, composed from its channel token, so the area
+      // fill is a wash of *this* theme's accent rather than a frozen rgba()
+      // from the palette the file was written against.
+      ctx.fillStyle = o.color || Guide().alpha(c, 'accentCh', 0.2);
       withClip(function () {
         ctx.beginPath();
         ctx.moveTo(px(pts[0][0]), py(Math.max(yRange[0], Math.min(yRange[1], pts[0][1]))));
@@ -240,7 +248,7 @@
       o = o || {};
       var c = colors();
       ctx.save();
-      ctx.fillStyle = o.color || c.text; ctx.font = (o.font || (o.size || 11) + 'px ' + c.font);
+      ctx.fillStyle = o.color || c.text; ctx.font = (o.font || Guide().fontAt(c, o.size, 'tick'));
       ctx.textAlign = o.align || 'left'; ctx.textBaseline = o.baseline || 'alphabetic';
       ctx.fillText(str, px(x) + (o.dx || 0), py(y) + (o.dy || 0));
       ctx.restore();
@@ -251,7 +259,7 @@
       var c = colors();
       var x = padL + (o.dx != null ? o.dx : 10), y = padT + (o.dy != null ? o.dy : 10);
       ctx.save();
-      ctx.font = '11px ' + c.font; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.font = c.legendFont; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
       entries.forEach(function (e, i) {
         var yy = y + i * 15;
         if (e.dash || e.dashed) {
@@ -276,9 +284,11 @@
         resolve().forEach(function (h) {
           ctx.beginPath(); ctx.arc(px(h.x), py(h.y), h.r || 8, 0, 2 * Math.PI);
           ctx.fillStyle = h.color || c.accent2; ctx.fill();
-          ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.5; ctx.stroke();
+          // A halo in the surface colour, not a white ring: a fixed white is a
+          // highlight in light and a glare in dark.
+          ctx.strokeStyle = Guide().alpha(c, 'surfaceCh', 0.9); ctx.lineWidth = 1.5; ctx.stroke();
           if (h.label) {
-            ctx.fillStyle = h.labelColor || c.text; ctx.font = '12px ' + c.font; ctx.textAlign = 'left';
+            ctx.fillStyle = h.labelColor || c.text; ctx.font = c.legendFont; ctx.textAlign = 'left';
             ctx.fillText(h.label, px(h.x) + (h.r || 8) + 4, py(h.y) - (h.r || 8) - 2);
           }
         });
@@ -373,6 +383,9 @@
       n = n || 1;
       var step = W / (cols / n);
       ctx.save();
+      // Deliberately NOT themed. This grid is drawn over decoded image content,
+      // which is a fixed set of RGB values in both themes, so a "themable" white
+      // here would vanish the moment the surface behind the raster went dark.
       ctx.strokeStyle = o.color || 'rgba(255,255,255,0.75)'; ctx.lineWidth = o.width || 1;
       for (var x = 0; x <= cols / n; x++) { var X = Math.round(x * step) + 0.5; ctx.beginPath(); ctx.moveTo(X, 0); ctx.lineTo(X, H); ctx.stroke(); }
       for (var y = 0; y <= rows / n; y++) { var Y = Math.round(y * step) + 0.5; ctx.beginPath(); ctx.moveTo(0, Y); ctx.lineTo(W, Y); ctx.stroke(); }

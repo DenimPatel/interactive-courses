@@ -14,7 +14,14 @@ redirect_from:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page.title }} · {{ site.title }}</title>
 <meta name="description" content="{{ page.description }}">
+{% include theme-boot.html %}
+<script src="{{ '/assets/js/theme-tokens.js' | relative_url }}"></script>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f2f5fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#090c11" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{{ '/assets/css/theme.css' | relative_url }}">
 <link rel="stylesheet" href="{{ '/assets/css/styles.css' | relative_url }}">
+<link rel="stylesheet" href="{{ '/assets/css/chrome.css' | relative_url }}">
 {% include favicon.html %}
 <style>
   .som { max-width: 1180px; }
@@ -53,7 +60,6 @@ redirect_from:
   .som-demo {
     display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;
     background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
-    backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
     box-shadow: var(--glass-shadow); border-radius: var(--radius-md); padding: 18px;
     margin-top: 8px;
   }
@@ -71,13 +77,13 @@ redirect_from:
     padding: 7px 13px; border-radius: var(--radius-md);
   }
   .som-btnrow button:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-  .som-btnrow button.som-primary { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+  .som-btnrow button.som-primary { background: var(--color-accent); color: var(--c-surface); border-color: var(--color-accent); }
   .som-btnrow button.som-primary:hover { background: var(--color-accent-600); }
   .som-btnrow button.som-active { background: var(--color-text); color: var(--color-bg); border-color: var(--color-text); }
   .som-readout { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.85; background: var(--color-bg); border-radius: var(--radius-sm); padding: 10px 12px; }
   .som-readout .k { opacity: 0.6; }
   .som-readout .hi { color: var(--color-accent-700); font-weight: 600; }
-  .som-readout .ok { color: #1a7a3a; font-weight: 600; }
+  .som-readout .ok { color: var(--c-ok); font-weight: 600; }
   .som-readout .bad { color: var(--color-accent-2-700); font-weight: 600; }
   .som-matgrid {
     display: inline-grid; grid-template-columns: repeat(3, 1fr); gap: 3px 10px;
@@ -98,7 +104,7 @@ redirect_from:
     border: 1px solid var(--color-divider); background: var(--color-bg); color: var(--color-text); cursor: pointer;
   }
   .som-quiz-opt:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-  .som-quiz-opt.correct { border-color: #1a7a3a; background: color-mix(in srgb, #1a7a3a 12%, var(--color-bg)); }
+  .som-quiz-opt.correct { border-color: var(--c-ok); background: color-mix(in srgb, var(--c-ok) 12%, var(--color-bg)); }
   .som-quiz-opt.wrong { border-color: var(--color-accent-2); background: color-mix(in srgb, var(--color-accent-2) 10%, var(--color-bg)); }
   .som-quiz-fb { font-size: 12.5px; margin-top: 8px; opacity: 0.85; display: none; }
   .som-cheat { width: 100%; border-collapse: collapse; font-size: 13.5px; }
@@ -120,7 +126,7 @@ redirect_from:
 {% include site-nav.html %}
 {% include series-nav.html series=site.data.series.nonlinear_optimization %}
 
-<main>
+<main id="main">
 <div class="wrap som">
   <section class="page-header">
     <span class="section-kicker">Interactive guide · math primer</span>
@@ -353,10 +359,42 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
 (function(){
   "use strict";
 
-  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-  var COLOR_TEXT = css('--color-text') || '#201e1d';
-  var COLOR_ACCENT = css('--color-accent') || '#2b5fff';
-  var COLOR_ACCENT2 = css('--color-accent-2') || '#d6006c';
+  /* Read at draw time, never captured into module state. These were read
+     once, here, while the parser was still inside <head> — and a Plotly layout
+     or a canvas stroke bakes whatever colour it is handed at the moment it is
+     handed it, so a reader who loaded in light and then switched to dark was
+     left looking at light-ink frames until some unrelated interaction happened
+     to repaint. THEME.token() reads the same token the old css() read was
+     reaching for (theme.css aliases --color-text onto --c-fg and the rest the
+     same way), which is why there is no second fallback left to keep in step. */
+  function COLOR_TEXT(){ return THEME.token('--c-fg'); }
+  function COLOR_ACCENT(){ return THEME.token('--c-accent'); }
+  function COLOR_ACCENT2(){ return THEME.token('--c-accent-2'); }
+
+  /* These pages load theme-tokens.js but not guide-core.js, so no canvas here
+     is registered with the shared repaint scheduler and no draw path re-runs
+     when the reader changes theme. Every step below registers the function it
+     already draws from and this one listener replays them, so the lazy reads
+     above actually get a chance to happen. preferences.js dispatches
+     `ic:theme` for every commit — a theme flip, a chart-grid toggle, and once
+     at load — so a registered path has to be safe to run more than once, and
+     one step throwing must not take the rest of the page's canvases with it. */
+  var repaint = [];
+  var primed = false;
+  function onTheme(){
+    /* preferences.js dispatches `ic:theme` once at load as well as on every
+       change, and it does so from a deferred script — so the first event this
+       page ever sees is that load-time one, arriving after its own first draw
+       has already used the resolved theme. Replaying every draw path there would
+       buy nothing and double the cost of loading the page. */
+    if (!primed) { primed = true; return; }
+    THEME.refresh();
+    for (var i=0;i<repaint.length;i++){
+      try { repaint[i](); }
+      catch (e) { if (window.console && window.console.error) window.console.error('[theme] repaint failed', e); }
+    }
+  }
+  document.addEventListener('ic:theme', onTheme, false);
 
   function deg2rad(d){ return d*Math.PI/180; }
   function rad2deg(r){ return r*180/Math.PI; }
@@ -443,7 +481,7 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
     return function(p){ var v = applyView(p); return [cx + scale*v[0], cy - scale*v[1]]; };
   }
   function drawGrid(ctx, project){
-    ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 1;
+    ctx.strokeStyle = THEME.alpha('--c-fg', 0.08); ctx.lineWidth = 1;
     for (var i=-2;i<=2;i++){
       var a = project([i, -1.6, -2]), b = project([i, -1.6, 2]);
       ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
@@ -493,9 +531,9 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       var Rv = matVec(R, v);
       ctx.clearRect(0,0,canvas.width,canvas.height);
       drawGrid(ctx, project);
-      drawAxisLine(ctx, project, k, COLOR_TEXT);
-      drawVec(ctx, project, [0,0,0], scale(v,1.7), COLOR_ACCENT, 1);
-      drawVec(ctx, project, [0,0,0], scale(Rv,1.7), COLOR_ACCENT2, 1);
+      drawAxisLine(ctx, project, k, COLOR_TEXT());
+      drawVec(ctx, project, [0,0,0], scale(v,1.7), COLOR_ACCENT(), 1);
+      drawVec(ctx, project, [0,0,0], scale(Rv,1.7), COLOR_ACCENT2(), 1);
       document.getElementById('s1-azval').textContent = az + '°';
       document.getElementById('s1-elval').textContent = el + '°';
       document.getElementById('s1-thval').textContent = document.getElementById('s1-th').value + '°';
@@ -508,6 +546,7 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
     }
     ['s1-az','s1-el','s1-th','s1-break'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
     draw();
+    repaint.push(draw);
   })();
 
   // ---------- Section 2: skew-symmetric / cross product ----------
@@ -522,10 +561,10 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       var kv = matVec(K, v);
       ctx.clearRect(0,0,canvas.width,canvas.height);
       drawGrid(ctx, project);
-      drawAxisLine(ctx, project, k, COLOR_TEXT);
-      drawVec(ctx, project, [0,0,0], scale(k,1.4), COLOR_TEXT, 0.9);
-      drawVec(ctx, project, [0,0,0], scale(v,1.7), COLOR_ACCENT, 1);
-      drawVec(ctx, project, [0,0,0], scale(kv,1.7), COLOR_ACCENT2, 1);
+      drawAxisLine(ctx, project, k, COLOR_TEXT());
+      drawVec(ctx, project, [0,0,0], scale(k,1.4), COLOR_TEXT(), 0.9);
+      drawVec(ctx, project, [0,0,0], scale(v,1.7), COLOR_ACCENT(), 1);
+      drawVec(ctx, project, [0,0,0], scale(kv,1.7), COLOR_ACCENT2(), 1);
       document.getElementById('s2-azval').textContent = az+'°'; document.getElementById('s2-elval').textContent = el+'°';
       document.getElementById('s2-vazval').textContent = vaz+'°'; document.getElementById('s2-velval').textContent = vel+'°';
       document.getElementById('s2-mat').innerHTML = matGridHTML(K);
@@ -536,6 +575,7 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
         '<div><span class="k">[k]&#8339;&#7488;</span> = -[k]&#8339; — skew-symmetric by construction</div>';
     }
     ['s2-az','s2-el','s2-vaz','s2-vel'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
+    repaint.push(draw);
     draw();
   })();
 
@@ -556,11 +596,11 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       var radiusAfter = norm(sub(Rv, vPar));
       ctx.clearRect(0,0,canvas.width,canvas.height);
       drawGrid(ctx, project);
-      drawAxisLine(ctx, project, k, COLOR_TEXT);
-      drawVec(ctx, project, [0,0,0], scale(v,1.7), COLOR_ACCENT, 1);
-      drawVec(ctx, project, [0,0,0], scale(Rv,1.7), COLOR_ACCENT2, 1);
+      drawAxisLine(ctx, project, k, COLOR_TEXT());
+      drawVec(ctx, project, [0,0,0], scale(v,1.7), COLOR_ACCENT(), 1);
+      drawVec(ctx, project, [0,0,0], scale(Rv,1.7), COLOR_ACCENT2(), 1);
       // draw the perpendicular radius arc endpoints as a hint
-      ctx.globalAlpha = 0.5; ctx.strokeStyle = COLOR_TEXT; ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.5; ctx.strokeStyle = COLOR_TEXT(); ctx.lineWidth = 1;
       var p1 = project(scale(vPar,1.7)), p2 = project(scale(v,1.7));
       ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
       ctx.globalAlpha = 1;
@@ -572,6 +612,7 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
         '<div><span class="k">radius of Rv⟂ after</span> = <span class="ok">'+radiusAfter.toFixed(4)+'</span> — unchanged, as the derivation predicts</div>' +
         '<div><span class="k">v&middot;k vs Rv&middot;k</span> = '+dot(v,k).toFixed(4)+' vs '+dot(Rv,k).toFixed(4)+' — the on-axis part never moves</div>';
     }
+    repaint.push(draw);
     ['s3-az','s3-el','s3-th'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
     draw();
   })();
@@ -596,9 +637,9 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       var W = canvas.width, H = canvas.height, padL=40, padB=26, padT=14, padR=14;
       var plotW = W-padL-padR, plotH = H-padT-padB;
       var maxLog = 1, minLog = -12;
-      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth=1;
+      ctx.strokeStyle = THEME.alpha('--c-fg', 0.15); ctx.lineWidth=1;
       ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,H-padB); ctx.lineTo(W-padR,H-padB); ctx.stroke();
-      ctx.fillStyle = COLOR_TEXT; ctx.font = '10px monospace'; ctx.globalAlpha=0.6;
+      ctx.fillStyle = COLOR_TEXT(); ctx.font = '10px monospace'; ctx.globalAlpha=0.6;
       ctx.fillText('log10 error', 4, padT+8);
       ctx.fillText('terms kept', W-70, H-6);
       ctx.globalAlpha=1;
@@ -608,12 +649,12 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
         var x = padL + plotW * (t-0.5)/HISTORY_N;
         var yZero = H-padB;
         var yv = yZero - plotH * (logv-minLog)/(maxLog-minLog);
-        var barColor = (t===n) ? COLOR_ACCENT2 : 'rgba(0,0,0,0.18)';
+        var barColor = (t===n) ? COLOR_ACCENT2() : THEME.alpha('--c-fg', 0.18);
         ctx.fillStyle = barColor;
         var bw = plotW/HISTORY_N*0.6;
         ctx.fillRect(x-bw/2, yv, bw, yZero-yv);
       });
-      ctx.fillStyle = COLOR_TEXT; ctx.font = '9.5px monospace'; ctx.globalAlpha=0.7;
+      ctx.fillStyle = COLOR_TEXT(); ctx.font = '9.5px monospace'; ctx.globalAlpha=0.7;
       for (var i=0;i<HISTORY_N;i++){ ctx.fillText(String(i+1), padL + plotW*(i+0.5)/HISTORY_N - 3, H-padB+12); }
       ctx.globalAlpha=1;
       document.getElementById('s4-thval').textContent = thDeg+'°';
@@ -621,6 +662,7 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       document.getElementById('s4-readout').innerHTML =
         '<div><span class="k">‖series(n='+n+') − exact‖</span> = <span class="hi">'+errNow.toExponential(2)+'</span></div>' +
         '<div style="opacity:.7;margin-top:6px;">Bar chart: log&#8321;&#8320; error vs. number of series terms kept, for the current θ. Highlighted bar = current slider position.</div>';
+    repaint.push(draw);
     }
     ['s4-th','s4-n'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
     draw();
@@ -652,10 +694,10 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       drawGrid(ctx, project);
       var axes = [[1,0,0],[0,1,0],[0,0,1]];
       axes.forEach(function(a){
-        drawVec(ctx, project, [0,0,0], scale(matVec(Rlin,a),1.5), COLOR_ACCENT2, 0.45, 2);
+        drawVec(ctx, project, [0,0,0], scale(matVec(Rlin,a),1.5), COLOR_ACCENT2(), 0.45, 2);
       });
       axes.forEach(function(a){
-        drawVec(ctx, project, [0,0,0], scale(matVec(Rexact,a),1.5), COLOR_ACCENT, 1, 2.5);
+        drawVec(ctx, project, [0,0,0], scale(matVec(Rexact,a),1.5), COLOR_ACCENT(), 1, 2.5);
       });
       var gap = rad2deg(rotAngleBetween(Rexact, Rlin));
       document.getElementById('s5-dxval').textContent = document.getElementById('s5-dx').value+'°';
@@ -663,6 +705,7 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
       document.getElementById('s5-dzval').textContent = document.getElementById('s5-dz').value+'°';
       document.getElementById('s5-readout').innerHTML =
         '<div><span class="k">gap: exact vs. linearized</span> = <span class="hi">'+gap.toFixed(2)+'°</span></div>' +
+    repaint.push(draw);
         '<div style="opacity:.7;margin-top:6px;">|δ| = '+rad2deg(norm(delta)).toFixed(1)+'°. Small δ → gap near 0. Large δ → the linear stand-in visibly drifts.</div>';
     }
     ['s5-dx','s5-dy','s5-dz'].forEach(function(id){ document.getElementById(id).addEventListener('input', draw); });
@@ -710,22 +753,23 @@ R &larr; R &middot; Exp(δ)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp
         return norm(scale(sub(rpp,rmm), 1/(2*hh)));
       });
       var maxV = Math.max.apply(null, vals.filter(isFinite)) || 1;
-      ctx.strokeStyle='rgba(0,0,0,0.15)'; ctx.lineWidth=1;
+      ctx.strokeStyle=THEME.alpha('--c-fg', 0.15); ctx.lineWidth=1;
       ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,H-padB); ctx.lineTo(W-padR,H-padB); ctx.stroke();
-      ctx.fillStyle=COLOR_TEXT; ctx.font='9.5px monospace'; ctx.globalAlpha=0.6;
+      ctx.fillStyle=COLOR_TEXT(); ctx.font='9.5px monospace'; ctx.globalAlpha=0.6;
       ctx.fillText('‖J column‖', 4, padT+8);
       ctx.globalAlpha=1;
       vals.forEach(function(v,i){
         var x = padL + plotW*(i+0.5)/hs.length;
         var hgt = isFinite(v) ? plotH*(v/maxV) : 0;
-        ctx.fillStyle = (hs[i]===h) ? COLOR_ACCENT2 : 'rgba(0,0,0,0.18)';
+        ctx.fillStyle = (hs[i]===h) ? COLOR_ACCENT2() : THEME.alpha('--c-fg', 0.18);
         var bw = plotW/hs.length*0.6;
         ctx.fillRect(x-bw/2, H-padB-hgt, bw, hgt);
       });
-      ctx.fillStyle=COLOR_TEXT; ctx.font='8.5px monospace'; ctx.globalAlpha=0.7;
+      ctx.fillStyle=COLOR_TEXT(); ctx.font='8.5px monospace'; ctx.globalAlpha=0.7;
       hs.forEach(function(hh,i){
         var x = padL + plotW*(i+0.5)/hs.length;
         ctx.save(); ctx.translate(x-2, H-padB+18); ctx.fillText('1e'+Math.round(Math.log10(hh)), 0, 0); ctx.restore();
+    repaint.push(draw);
       });
       ctx.globalAlpha=1;
     }

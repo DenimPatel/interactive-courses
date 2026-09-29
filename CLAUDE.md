@@ -224,9 +224,68 @@ Per-series domain layers sit on top, following the same split:
 
 ## Assets
 
-`assets/css/styles.css` is the whole design system; `guide.css` and `llm-guide.css` layer
-the guide chrome on top. The JSON files under `assets/data/` are fetched at runtime by the
-LLM and multimodal guides. There are no local images — all raster images are hotlinked to
+`assets/css/theme.css` is the design system: every colour, type step, space step, radius and
+duration is a token there, declared once, with light and dark as two sets of the same slots.
+No other file in this repo should contain a raw hex, a bare `rem` used as a space, or a bare
+`ms` — if one seems necessary, that is a finding, not a decision to make locally.
+
+`theme.css` also republishes this repo's older token names (`--color-*`, `--font-*`,
+`--radius-*`, `--space-*`, `--shadow-*`, `--glass-*`) as indirections onto the new palette.
+Those names are a contract, not a style choice: ~260 part pages that carry their own inline
+`<style>` blocks reference them, so changing a name breaks pages that were never touched.
+Add a token in `theme.css`; do not rename one.
+
+The rest of the layer, in the order it must be linked:
+
+| File | Role |
+| --- | --- |
+| `assets/css/theme.css` | tokens. First, so any later sheet can override a value. |
+| `assets/css/styles.css` | site chrome, cards, prose, footer, home page. |
+| `assets/css/guide.css` | the `.g-` guide kit: steps, demos, controls, quizzes. |
+| `assets/css/llm-guide.css` | the same kit under `llmt-`, for the LLM pages. |
+| `assets/css/lie-guide.css` | the LIE series. |
+| `assets/css/chrome.css` | nav, settings dialog, mobile drawer. Last, so it beats `styles.css`. |
+
+`node scripts/check-stylesheet-order.js` enforces that order (`--fix` repairs it), because
+the two ends are load-bearing: tokens first or nothing can override them, chrome last or the
+nav has to fight `styles.css` with `!important`.
+
+### Light and dark
+
+`data-theme` on `<html>` is the source of truth and always holds a resolved value, never
+`system`. `_includes/theme-boot.html` writes it, plus the `--pref-*` properties, from an
+inline script before first paint, so a reader who chose Dark never sees a light frame. It is
+ES5 on purpose — it is inlined into every page. `assets/js/preferences.js` then takes over,
+exposes `window.ICTheme`, and dispatches `ic:prefs` / `ic:theme` on `document`.
+
+`theme.css` also carries a `@media (prefers-color-scheme: dark)` block scoped to
+`:root:not([data-theme])`, so a reader whose JavaScript never runs still gets the mode their
+OS asks for. An explicit choice always wins.
+
+Canvas code cannot resolve CSS custom properties, so `assets/js/theme-tokens.js` provides a
+global `THEME` (`ink`, `token`, `alpha`, `series`, `palette`) that reads the tokens at draw
+time. It is loaded as a **synchronous** `<script src>` in every head, before anything can
+paint, because a page's inline script may paint during parse. In a page's own inline script,
+write `ctx.fillStyle = THEME.ink('#2b5fff')`; in its inline `<style>`, write
+`color: var(--c-fg-muted)`. Never `var()` a canvas paint, and never leave a hex where
+`THEME.ink` already has a mapping — an unmapped literal is a colour that will not follow the
+theme.
+
+### Checks
+
+`scripts/` holds the numerics tests (`check-*-viz.js`, `check-llm-app-sim.js`), which assert
+on the *text* of the drawing code and so are sensitive to how it is edited. The theme layer
+added three more, all of which run against the built site:
+
+- `check-inline-scripts.js` — compiles every inline `<script>` the way a browser does. A
+  top-level `return` is legal in CJS and fatal in a browser, so a boot script missing its
+  IIFE opener is discarded in full, silently, on every page.
+- `check-stylesheet-order.js` — the link order above.
+- `inject-skip-target.js` — every content page's `<main>` needs `id="main"`, which is the
+  skip link's target. A page without it gets a skip link that moves focus nowhere.
+
+The JSON files under `assets/data/` are fetched at runtime by the LLM and multimodal guides.
+There are no local images — all raster images are hotlinked to
 `roboticswithdenim.wordpress.com` and will disappear if that blog goes down.
 
 The multi-view-geometry and nonlinear-optimization pages each carry a large inline
