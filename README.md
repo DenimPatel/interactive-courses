@@ -15,11 +15,6 @@ interactive guide:
 hand-written `<canvas>` and vanilla JS — no framework, no npm, no build step beyond
 Jekyll.
 
-The AI record pages (timeline, products, benchmarks, labs, quotes, papers), the field
-notes and the blog live in the companion repo,
-[denimpatel/AI](https://github.com/DenimPatel/AI), published at
-https://denimpatel.github.io/AI/.
-
 ## Building it
 
 ```bash

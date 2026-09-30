@@ -40,9 +40,13 @@
   if (!window || !document) return;
 
   /* The chrome colour the mobile address bar takes. Deliberately derived from
-     theme.css's own `--c-bg-ch` — 242 245 250 light, 9 12 17 dark. The sibling
-     site carries a five-point drift here (#f7f8fa against the same canvas)
-     and calls it intentional; it is not copied. */
+     theme.css's own `--c-bg-ch` — 242 245 250 light, 9 12 17 dark.
+
+     The upstream original this was ported from (macro-economics) carries a
+     five-point drift on the light value: its THEME_COLOR.light is #f7f8fa
+     against its own identical #f2f5fa canvas. That is not copied. A stale
+     literal here shows up as a wrong-coloured mobile address bar, which is
+     invisible in every desktop screenshot. */
   var THEME_COLOR = { light: '#f2f5fa', dark: '#090c11' };
   var STORAGE_KEY = 'ic-prefs';
   var DARK_QUERY = '(prefers-color-scheme: dark)';
@@ -203,25 +207,33 @@
   /**
    * Motion as a number, for `--pref-motion-scale`.
    *
-   * `system` and `full` are both 1 here on purpose. The distinction between
-   * them is not "how much motion", it is "who is allowed to ask for it":
+   * The OS query wins for ALL THREE settings, including `full`:
    *
    *   reduced  the reader asked, here, at this site  -> 0
-   *   system   nobody asked; the OS decides       -> 0 if it says reduce
-   *   full     the reader asked for motion         -> 1
+   *   system   nobody asked; the OS decides         -> 0 if it says reduce
+   *   full     the reader asked for motion           -> 0 if it says reduce
    *
-   * `full` deliberately outranks the OS query. That is a divergence from the
-   * sibling site, which holds `full` subject to the media query on the
-   * argument that a per-site control should not overrule a system-level
-   * accessibility setting. It is a different call here because the motion
-   * scale here only drives `--dur-*` transitions and the `scroll-behavior`
-   * gate — there is no parallax, no long auto-playing animation and nothing
-   * vestibular to provoke. A reader who explicitly asks for full motion is
-   * answered, and the panel says out loud what the choice does.
+   * `full` being subject to the query is not a close call. theme.css already
+   * zeroes every duration under `@media (prefers-reduced-motion: reduce)` with
+   * `!important`, so returning '1' here did not restore motion — it only made
+   * the panel claim a setting was in force that the stylesheet had already
+   * overridden. The number has to agree with what the page actually does, and
+   * "what the page actually does" is the accessibility setting.
+   *
+   * It also matches the copy. prefs-panel.html tells the reader, when the OS
+   * asks, that System and Full both render a still page and that choosing Full
+   * does not override their operating system. That was true of the CSS and
+   * false of this function, so the panel contradicted itself depending on the
+   * OS setting — and it was the wrong half of the contradiction that appeared
+   * for exactly the readers who had asked for less motion.
+   *
+   * A per-site toggle does not get to overrule a system-level accessibility
+   * setting. `reduced` is still worth keeping as an explicit choice: it is the
+   * only way to get a still page on a system that does not offer the query.
    */
   function resolveMotionScale(prefs) {
     if (prefs.motion === 'reduced') return '0';
-    if (prefs.motion === 'system' && matches(REDUCED_MOTION_QUERY)) return '0';
+    if (matches(REDUCED_MOTION_QUERY)) return '0';
     return '1';
   }
 

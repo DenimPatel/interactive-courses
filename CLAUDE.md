@@ -8,11 +8,13 @@ A Jekyll site published by GitHub Pages at https://denimpatel.github.io/interact
 It holds every hand-written interactive guide: 16 series, 267 parts, across three subjects
 (`ai`, `vision`, `math`).
 
-Since the Aug 2026 split it is the companion to `DenimPatel/AI`
-(https://denimpatel.github.io/AI/), which holds the AI record pages, the field notes and
-the blog. The two repos duplicate shared chrome (`_includes/site-nav.html`,
-`_includes/guide-footer.html`, `assets/css/styles.css`, `assets/favicon.svg`) rather than
-sharing a submodule; keep the copies in sync when you change shared chrome.
+It is a self-contained site: it holds every hand-written interactive guide and
+nothing else, and it links to nothing outside itself. The AI record pages, the
+field notes and the blog live in `DenimPatel/AI` and are not reachable from
+here. The two repos shared chrome (`_includes/site-nav.html`,
+`_includes/guide-footer.html`, `assets/css/styles.css`, `assets/favicon.svg`)
+rather than sharing a submodule; that duplication is historical and is being
+retired, so do not add to it.
 
 There is no JavaScript framework, no npm, and no build step beyond Jekyll. CI
 (`.github/workflows/ci.yml`) runs a build, an internal link check and a content linter;
@@ -136,12 +138,14 @@ through `relative_url`; a bare `href="/foo/"` will 404 in production. Runtime JS
 its URLs from Liquid too — the guides do this by emitting
 `var VOCAB_URL = "{{ '/assets/data/…' | relative_url }}";`.
 
-This repo and `DenimPatel/AI` are separate GitHub Pages projects, so `relative_url` cannot
-reach across them. Anywhere a guide links to something that stayed in the AI repo (the home
-page, about, the record pages, the field notes), use an absolute
-`https://denimpatel.github.io/AI/...` URL. `_includes/site-nav.html` and
-`_includes/guide-footer.html` do this for the nav and footer. Never
-`relative_url`-wrap a cross-repo path.
+**Never link off this site.** A guide is either read or left; there is no fourth
+destination. The site is closed over this repo — the nav, the footer, the
+homepage and every guide body link only to `{{ relative_url }}` paths or to a
+part of this project. `scripts/check-no-external-links.js` fails the build if a
+`https://denimpatel.github.io/AI/` URL or a `github.com/DenimPatel/AI` URL
+reappears anywhere. If a guide needs a piece of writing that used to live in the
+other repo, either link to the equivalent part here or write the sentence to
+stand on its own — do not reach across.
 
 **Never break a URL.** Guide parts keep their pre-Jekyll `legacy` URL in `redirect_from:`,
 and `jekyll-redirect-from` emits a stub there. If you move a part, add its old permalink to

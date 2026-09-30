@@ -9,5 +9,3 @@ description: An interactive, step-by-step guide to linear algebra - vectors, spa
 ---
 
 <p class="section-lede" style="max-width:70ch;">Parts build on each other, but each one stands alone. A single running example &mdash; a 2D point cloud that becomes, in turn, a set of vectors, a transformed grid, a least-squares fit, a covariance ellipse and a PCA basis &mdash; threads through the first three acts so you see the same object gain meaning. If you have seen the symbols and never seen the pictures, start at <a href="{{ '/math/linear-algebra/vectors/' | relative_url }}">Part 1</a>. If you are here for a specific tool, jump straight to it, and keep the <a href="{{ '/math/linear-algebra/glossary/' | relative_url }}">glossary</a> open for notation.</p>
-
-<p class="section-lede" style="max-width:70ch;">An older, link-only note on linear algebra still lives under <a href="{{ 'https://denimpatel.github.io/AI/vision/notes/linear-algebra/' | relative_url }}">Vision notes</a>; it is the recommended further reading once you have been through this series.</p>

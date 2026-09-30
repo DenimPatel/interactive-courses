@@ -22,7 +22,6 @@ description: Hand-written interactive guides to AI, vision and math — LLM trai
   <p>{{ total_parts }} parts across {{ total_series }} long-form guides to AI, vision and math. Every part is interactive — you drag the point along the curve, run the training loop, and watch the solver converge. Nothing here is a static diagram.</p>
   <div class="hero-actions">
     <a href="{{ '/ai/' | relative_url }}" class="btn btn-primary">Browse the guides</a>
-    <a href="https://denimpatel.github.io/AI/" class="btn btn-ghost">Read the record &amp; notes</a>
   </div>
 </section>
 
@@ -76,11 +75,4 @@ description: Hand-written interactive guides to AI, vision and math — LLM trai
     {%- endfor %}
   </div>
   {%- endfor %}
-</section>
-
-<section class="section" style="padding-bottom: 40px;">
-  <span class="section-kicker">The other half</span>
-  <h2 class="section-title">The record &amp; the field notes</h2>
-  <p class="section-lede">The AI record — milestones, products, benchmarks, labs and voices — and the field notes and blog live in the companion site.</p>
-  <p><a href="https://denimpatel.github.io/AI/" class="btn btn-secondary">Visit denimpatel.github.io/AI &rarr;</a></p>
 </section>
